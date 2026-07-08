@@ -1,0 +1,9 @@
+# OS cruft
+Thumbs.db
+Desktop.ini
+
+# runtime artifacts (the tool writes these into %LOCALAPPDATA%\ClaudeResume, not here)
+*.log
+config.json
+state.json
+*.lock
