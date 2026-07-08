@@ -31,6 +31,8 @@ This copies the program to `%LOCALAPPDATA%\ClaudeResume`, creates the Desktop sh
 - **预演 (Preview)** — dry-run: shows what *would* happen (which projects, the computed reset time) without running anything.
 - **解除 (Disarm)** — global kill switch; stops all auto-resume instantly.
 
+> **About the countdown:** the `≈` reset time is an *estimate* reconstructed from your local `~/.claude` logs (`ccusage`'s block time can be hours off; this tool uses a closer window-chaining estimate). The **exact** reset is only on claude.ai / the extension. It doesn't matter for correctness: firing is driven by a **live probe**, so the tool resumes at the *real* reset regardless of the displayed estimate.
+
 ## Safety
 
 This runs Claude **unattended** on your real repos, so it is deliberately guarded:

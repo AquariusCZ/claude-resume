@@ -37,14 +37,24 @@ Claude Resume is split into a **GUI front-end** and a **headless engine**, on pu
 
 State lives in `%LOCALAPPDATA%\ClaudeResume`: `config.json`, `state.json`, `logs/`.
 
-## The checker state machine (every 2 min)
+## The checker state machine (every ~2 min) — probe-driven
 
-1. **Read** `ccusage blocks --active --json`. On any bad/ambiguous read → log and return (**fail-closed** — never fire on a bad read).
-2. **Adopt** the live window: if a block is active and `now < endTime`, record it as the target and **never fire mid-window** (just wait). A new block id resets per-window bookkeeping.
-3. **Fire decision**: only after the *adopted* window's `endTime + safetyMargin` has passed (or `blocks[]` is empty). A cold start with no adopted window stays idle (avoids surprise fires).
-4. **Probe** (`claude -p`) — the authoritative check that the account is usable *now*. This is the only signal that also proves the separate **weekly 7-day cap** is clear. If limited → long weekly back-off.
-5. **Fire**: mark `firedForId = targetId` **first** (idempotency), then resume selected projects **sequentially**. Per project: git dirty-guard → `claude --continue -p "continue"` (+ `--dangerously-skip-permissions` in full mode) → record status.
-6. **One-shot**: after a successful run, set `enabled=false` (disarm) so it doesn't loop every reset. Crash-recovery: if it died mid-run, remaining projects resume on the next tick (per-project status prevents re-running finished ones).
+The reset **time** is only ever an estimate (see below), so the checker does **not** fire on a clock. It fires when a **live probe** proves the account is usable again:
+
+1. If disarmed → return. If no projects selected → return.
+2. Compute the reset **estimate** (`Get-SessionReset`) — used only for the display and to gate probing.
+3. **Cost gate**: only probe when near the estimate (≤ ~25 min) or once we've already seen the account limited, and at most once every ~4 min. (A rate-limited probe is rejected server-side, so it costs no quota; the gate just avoids probing far from the reset.)
+4. **Probe** (`claude -p "ready" --max-turns 1`, cheap model):
+   - **limited** → set `sawLimited=true`, stay `waiting`.
+   - **not ready** (network/other) → `waiting`, retry — **fail-closed**, never fire on an ambiguous read.
+   - **usable + never saw limited** → you armed while not limited; **auto-disarm** with a notice (avoids a surprise resume).
+   - **usable + had been limited** → the reset happened → **FIRE**.
+5. **Fire**: resume selected projects **sequentially**. Per project: git dirty-guard → `claude --continue -p "continue"` (+ `--dangerously-skip-permissions` in full mode) → record per-project status. If a resume itself hits the limit, stop and go back to `waiting`.
+6. **One-shot**: after a successful run, `enabled=false` (disarm). Per-project status means a crash-restart resumes only the unfinished ones.
+
+### Why probe-driven? (the reset time is only an estimate)
+
+`ccusage blocks --active` reconstructs 5-hour "blocks" from local logs and **splits on activity gaps**, so its `endTime` can be hours off from Claude's real rolling session window (observed: ccusage said **4h35m** when claude.ai said **1h12m**). A closer local estimate is `Get-SessionReset`, which **chains 5-hour windows from the message timestamps** in `~/.claude` (window start = first message; a message past `start+5h` starts a new window). But even that is an estimate — the **authoritative** reset lives only on claude.ai / the extension (via the Anthropic usage API, which this tool deliberately does not call). So the **display** shows the approximate estimate, labelled `≈`, and the **firing** uses the live probe — which is correct regardless of how far off the estimate is.
 
 ## Key implementation details (and the bugs they avoid)
 
@@ -78,11 +88,11 @@ State lives in `%LOCALAPPDATA%\ClaudeResume`: `config.json`, `state.json`, `logs
 
 ```jsonc
 {
-  "targetId": "2026-07-07T15:00:00.000Z",   // adopted window's block id
-  "targetEndUtc": "2026-07-07T20:00:00Z",   // its reset instant (UTC)
-  "firedForId": null,                        // set == targetId once fired (idempotency)
+  "sawLimited": false,     // has the account been observed rate-limited during this arming?
+  "lastProbeUtc": null,    // marker for the ~4-min probe throttle
   "projectStatus": { "<path>": "success|error|timeout|limited|stopped" },
-  "phase": "idle|waiting|resuming|weekly-backoff|done"
+  "phase": "idle|waiting|resuming|done"
+  // targetId / targetEndUtc / firedForId: legacy fields, unused by the probe-driven engine
 }
 ```
 

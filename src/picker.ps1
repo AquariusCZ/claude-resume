@@ -97,7 +97,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
           <TextBlock Text="选择要自动续跑的项目" Foreground="{StaticResource Ink}" FontWeight="SemiBold" FontSize="20"/>
           <TextBlock x:Name="Subtitle" Text="勾选一个或多个,额度重置后自动继续" Foreground="{StaticResource Muted}" FontSize="12.5" Margin="0,3,0,0"/>
         </StackPanel>
-        <Border x:Name="ResetChip" HorizontalAlignment="Right" VerticalAlignment="Center" CornerRadius="999" Background="{StaticResource AccentSoft}" Padding="14,7">
+        <Border x:Name="ResetChip" ToolTip="估算值(基于本地记录),精确重置时间以 claude.ai / 扩展为准。工具靠实时探测触发续跑,不依赖此估算数字。" HorizontalAlignment="Right" VerticalAlignment="Center" CornerRadius="999" Background="{StaticResource AccentSoft}" Padding="14,7">
           <TextBlock x:Name="ResetText" Text="读取中..." Foreground="{StaticResource Accent}" FontSize="12.5" FontWeight="SemiBold"/>
         </Border>
       </Grid>
@@ -139,7 +139,7 @@ $win.Dispatcher.add_UnhandledException({ param($s,$e)
   $e.Handled = $true
 })
 
-$sync = [hashtable]::Synchronized(@{ resetUtc=$null; empty=$false; ok=$false })
+$sync = [hashtable]::Synchronized(@{ resetUtc=$null; hasActivity=$false; ok=$false })
 $script:cards = @()
 $script:flash = @{ text=''; until=[datetime]::MinValue }
 function Set-Flash($t){ $script:flash.text = $t; $script:flash.until = (Get-Date).AddSeconds(6) }
@@ -303,15 +303,15 @@ $rs = [runspacefactory]::CreateRunspace(); $rs.ApartmentState='MTA'; $rs.ThreadO
 $rs.SessionStateProxy.SetVariable('sync',$sync)
 $rs.SessionStateProxy.SetVariable('libPath',(Join-Path $PSScriptRoot 'lib.ps1'))
 $ps = [powershell]::Create(); $ps.Runspace=$rs
-[void]$ps.AddScript({ . $libPath; while($true){ try { $ri=Get-CcuResetInfo; $sync.ok=$ri.ok; $sync.empty=$ri.empty; $sync.resetUtc=$ri.resetUtc } catch {}; Start-Sleep -Seconds 3 } })
+[void]$ps.AddScript({ . $libPath; while($true){ try { $sr=Get-SessionReset; $sync.ok=$sr.ok; $sync.hasActivity=$sr.hasActivity; $sync.resetUtc=$sr.resetUtc } catch {}; Start-Sleep -Seconds 10 } })
 $hb = $ps.BeginInvoke()
 
 # ---- UI timer: repaint every second (fast local/file reads only) ----
 $timer = New-Object Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(1)
 $timer.Add_Tick({
-  if($sync.empty){ $els.ResetText.Text='额度当前可用' }
-  elseif($sync.resetUtc){ $secs=($sync.resetUtc-[DateTimeOffset]::UtcNow).TotalSeconds; $els.ResetText.Text='距离重置 '+(Format-Countdown $secs) }
+  if($sync.resetUtc){ $secs=($sync.resetUtc-[DateTimeOffset]::UtcNow).TotalSeconds; $els.ResetText.Text='≈ 距重置 '+(Format-Countdown $secs) }
+  elseif($sync.ok -and -not $sync.hasActivity){ $els.ResetText.Text='额度当前可用' }
   else { $els.ResetText.Text='读取中...' }
   $lt = Read-LogTail
   if($lt -and $els.LogText.Text -ne $lt){ $els.LogText.Text=$lt; $els.LogScroll.ScrollToEnd() }

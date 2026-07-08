@@ -64,7 +64,7 @@ function Get-CcuState {
   if(Test-Path $script:StatePath){
     try { return (Get-Content $script:StatePath -Raw -Encoding UTF8 | ConvertFrom-Json) } catch {}
   }
-  return [pscustomobject]@{ targetId=$null; targetEndUtc=$null; firedForId=$null; projectStatus=$null; phase='idle' }
+  return [pscustomobject]@{ targetId=$null; targetEndUtc=$null; firedForId=$null; projectStatus=$null; phase='idle'; sawLimited=$false; lastProbeUtc=$null }
 }
 function Set-CcuState { param($State)
   ($State | ConvertTo-Json -Depth 6) | Set-Content -Path $script:StatePath -Encoding UTF8
@@ -90,6 +90,34 @@ function Get-CcuResetInfo {
     $reset = [DateTimeOffset]::Parse($endRaw, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
     $r.resetUtc = $reset
     $r.secondsUntilReset = ($reset - $r.nowUtc).TotalSeconds
+  } catch { $r.ok = $false }
+  return $r
+}
+
+function Get-SessionReset {
+  # Estimate the 5h session reset by chaining message windows from ~/.claude jsonl timestamps.
+  # Closer to Claude's real rolling window than ccusage's gap-split blocks. Still an ESTIMATE
+  # (exact value is on claude.ai); the checker fires on a live probe, not this number.
+  $r = @{ ok=$false; resetUtc=$null; secondsUntilReset=$null; hasActivity=$false; nowUtc=[DateTimeOffset]::UtcNow }
+  try {
+    $root = Join-Path $env:USERPROFILE '.claude\projects'
+    if(-not (Test-Path $root)){ return $r }
+    $nowU = $r.nowUtc; $cutoff = $nowU.AddHours(-11)
+    $ts = New-Object System.Collections.Generic.List[DateTimeOffset]
+    foreach($f in (Get-ChildItem $root -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTimeUtc -gt $cutoff.UtcDateTime })){
+      $raw = [System.IO.File]::ReadAllText($f.FullName)
+      foreach($m in [regex]::Matches($raw, '"timestamp"\s*:\s*"([^"]+Z)"')){
+        try { $t=[DateTimeOffset]::Parse($m.Groups[1].Value,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime(); if($t -gt $cutoff -and $t -le $nowU.AddMinutes(2)){ $ts.Add($t) } } catch {}
+      }
+    }
+    $r.ok = $true
+    if($ts.Count -eq 0){ return $r }   # no recent activity -> no active session window
+    $r.hasActivity = $true
+    $sorted = $ts.ToArray(); [Array]::Sort($sorted)
+    $ws = $sorted[0]
+    foreach($t in $sorted){ if($t -gt $ws.AddHours(5)){ $ws = $t } }   # chain: new window when a msg lands past the 5h mark
+    $reset = $ws.AddHours(5)
+    $r.resetUtc = $reset; $r.secondsUntilReset = ($reset - $nowU).TotalSeconds
   } catch { $r.ok = $false }
   return $r
 }
