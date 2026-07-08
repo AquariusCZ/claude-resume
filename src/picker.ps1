@@ -142,7 +142,7 @@ $script:cards = @()
 $script:flash = @{ text=''; until=[datetime]::MinValue }
 function Set-Flash($t){ $script:flash.text = $t; $script:flash.until = (Get-Date).AddSeconds(6) }
 $script:logFile = Join-Path $script:LogDir ("run-" + (Get-Date).ToString('yyyyMMdd') + ".log")
-function Read-LogTail { try { if(Test-Path $script:logFile){ return ((Get-Content $script:logFile -Tail 40 -ErrorAction SilentlyContinue) -join "`r`n") } } catch {} return '' }
+function Read-LogTail { try { if(Test-Path $script:logFile){ return ((Get-Content $script:logFile -Tail 40 -Encoding UTF8 -ErrorAction SilentlyContinue) -join "`r`n") } } catch {} return '' }
 
 function New-ProjectCard($proj){
   $b = New-Object Windows.Controls.Border
