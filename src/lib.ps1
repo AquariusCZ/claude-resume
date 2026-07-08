@@ -234,6 +234,7 @@ function Format-Countdown { param([double]$Seconds)
   if($null -eq $Seconds){ return '-' }
   if($Seconds -lt 0){ $Seconds = 0 }
   $t = [TimeSpan]::FromSeconds($Seconds)
-  if($t.TotalHours -ge 1){ return ('{0}h {1:00}m' -f [int]$t.TotalHours, $t.Minutes) }
+  # NOTE: [int]4.59 ROUNDS to 5 in PowerShell -> use Floor for the hour part
+  if($t.TotalHours -ge 1){ return ('{0}h {1:00}m' -f [int][Math]::Floor($t.TotalHours), $t.Minutes) }
   return ('{0}m {1:00}s' -f $t.Minutes, $t.Seconds)
 }

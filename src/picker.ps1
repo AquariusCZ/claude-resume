@@ -35,8 +35,10 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
       <Setter Property="Template"><Setter.Value>
         <ControlTemplate TargetType="CheckBox">
           <Border x:Name="bx" Width="22" Height="22" CornerRadius="6" Background="#FF141413" BorderBrush="{StaticResource Border0}" BorderThickness="1.5">
-            <Path x:Name="ck" Data="M5,11 L9,15 L17,6" Stroke="White" StrokeThickness="2.2" Visibility="Collapsed"
-                  StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/>
+            <Viewbox Width="12" Height="12" HorizontalAlignment="Center" VerticalAlignment="Center">
+              <Path x:Name="ck" Data="M0,5 L4,9 L11,1" Stroke="White" StrokeThickness="1.8" Visibility="Collapsed"
+                    StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/>
+            </Viewbox>
           </Border>
           <ControlTemplate.Triggers>
             <Trigger Property="IsChecked" Value="True">
