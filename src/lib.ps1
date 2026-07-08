@@ -95,9 +95,9 @@ function Get-CcuResetInfo {
 }
 
 function Get-SessionReset {
-  # Estimate the 5h session reset by chaining message windows from ~/.claude jsonl timestamps.
-  # Closer to Claude's real rolling window than ccusage's gap-split blocks. Still an ESTIMATE
-  # (exact value is on claude.ai); the checker fires on a live probe, not this number.
+  # Estimate the 5h session reset as (oldest message still within the last 5h) + 5h -- a rolling
+  # window that tracks Claude's real session limit far better than ccusage's gap-split blocks.
+  # Still an ESTIMATE (exact value is on claude.ai); the checker fires on a live probe, not this.
   $r = @{ ok=$false; resetUtc=$null; secondsUntilReset=$null; hasActivity=$false; nowUtc=[DateTimeOffset]::UtcNow }
   try {
     $root = Join-Path $env:USERPROFILE '.claude\projects'
@@ -111,12 +111,16 @@ function Get-SessionReset {
       }
     }
     $r.ok = $true
-    if($ts.Count -eq 0){ return $r }   # no recent activity -> no active session window
-    $r.hasActivity = $true
+    if($ts.Count -eq 0){ return $r }   # no recent activity
+    # Rolling 5h window: reset = (oldest message still within the last 5h) + 5h.
+    # Matches Claude's rolling session limit far better than gap-split blocks or window-chaining.
     $sorted = $ts.ToArray(); [Array]::Sort($sorted)
-    $ws = $sorted[0]
-    foreach($t in $sorted){ if($t -gt $ws.AddHours(5)){ $ws = $t } }   # chain: new window when a msg lands past the 5h mark
-    $reset = $ws.AddHours(5)
+    $win5 = $nowU.AddHours(-5)
+    $oldest = $null
+    foreach($t in $sorted){ if($t -gt $win5){ $oldest = $t; break } }
+    if(-not $oldest){ return $r }      # activity exists but none in the last 5h -> window already clear
+    $r.hasActivity = $true
+    $reset = $oldest.AddHours(5)
     $r.resetUtc = $reset; $r.secondsUntilReset = ($reset - $nowU).TotalSeconds
   } catch { $r.ok = $false }
   return $r

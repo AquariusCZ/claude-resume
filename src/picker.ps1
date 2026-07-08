@@ -246,7 +246,27 @@ function Set-StatusLine($t){ $els.StatusText.Text = $t }
 # ---- events ----
 $els.BtnClose.Add_Click({ $win.Close() })
 $els.BtnMin.Add_Click({ $win.WindowState='Minimized' })
-$els.TitleBar.Add_MouseLeftButtonDown({ $win.DragMove() })
+# manual drag (avoids DragMove's modal loop, which can natively crash a transparent WPF window)
+$els.TitleBar.Add_MouseLeftButtonDown({
+  try {
+    $script:dragMouse = [System.Windows.Forms.Control]::MousePosition
+    $script:dragWinL = $win.Left; $script:dragWinT = $win.Top
+    $tf = [System.Windows.PresentationSource]::FromVisual($win).CompositionTarget.TransformToDevice
+    $script:dpiX = $tf.M11; $script:dpiY = $tf.M22
+    $script:dragging = $true
+    [void]$els.TitleBar.CaptureMouse()
+  } catch {}
+})
+$els.TitleBar.Add_MouseMove({
+  try {
+    if($script:dragging){
+      $cur = [System.Windows.Forms.Control]::MousePosition
+      $win.Left = $script:dragWinL + ($cur.X - $script:dragMouse.X) / $script:dpiX
+      $win.Top  = $script:dragWinT + ($cur.Y - $script:dragMouse.Y) / $script:dpiY
+    }
+  } catch {}
+})
+$els.TitleBar.Add_MouseLeftButtonUp({ try { $script:dragging = $false; $els.TitleBar.ReleaseMouseCapture() } catch {} })
 $els.BtnAll.Add_Click({ foreach($c in $script:cards){ $c.check.IsChecked=$true } })
 $els.BtnNone.Add_Click({ foreach($c in $script:cards){ $c.check.IsChecked=$false } })
 $els.BtnAdd.Add_Click({
