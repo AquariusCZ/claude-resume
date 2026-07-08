@@ -43,14 +43,19 @@ function Write-CcuLog {
 }
 
 function Get-CcuConfig {
-  if(Test-Path $script:ConfigPath){
-    try { return (Get-Content $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json) } catch {}
-  }
-  return [pscustomobject]@{
+  # merge loaded config over defaults so EVERY field always exists (settable without throwing)
+  $def = [ordered]@{
     enabled=$false; armed=$false; continuous=$false; selected=@(); customProjects=@(); hiddenProjects=@();
     resumePrompt='continue'; skipPermissions=$true; dirtyGuard='stash'; perProjectTimeoutMinutes=30;
-    safetyMarginSeconds=60; weeklyBackoffMinutes=45; probeModel='haiku'; resumeModel=''
+    safetyMarginSeconds=60; weeklyBackoffMinutes=45; probeModel='haiku'; resumeModel=''; projectHome=''
   }
+  if(Test-Path $script:ConfigPath){
+    try {
+      $loaded = Get-Content $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+      foreach($p in $loaded.PSObject.Properties){ $def[$p.Name] = $p.Value }
+    } catch {}
+  }
+  return [pscustomobject]$def
 }
 function Set-CcuConfig { param($Config)
   ($Config | ConvertTo-Json -Depth 6) | Set-Content -Path $script:ConfigPath -Encoding UTF8

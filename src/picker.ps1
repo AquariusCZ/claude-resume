@@ -109,8 +109,9 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
       <Grid Grid.Row="4" Margin="0,16,0,0">
         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
           <Button x:Name="BtnAll" Style="{StaticResource LinkBtn}" Content="全选"/>
-          <Button x:Name="BtnNone" Style="{StaticResource LinkBtn}" Content="清空" Margin="14,0,0,0"/>
+          <Button x:Name="BtnNone" Style="{StaticResource LinkBtn}" Content="取消勾选" Margin="14,0,0,0"/>
           <Button x:Name="BtnAdd" Style="{StaticResource LinkBtn}" Content="+ 文件夹" Margin="14,0,0,0"/>
+          <Button x:Name="BtnClearLog" Style="{StaticResource LinkBtn}" Content="清空日志" Margin="14,0,0,0"/>
           <TextBlock x:Name="StatusText" Text="待布防" Foreground="{StaticResource Muted}" FontSize="12.5" VerticalAlignment="Center" Margin="18,0,0,0"/>
         </StackPanel>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
@@ -129,14 +130,19 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $win = [Windows.Markup.XamlReader]::Load($reader)
 $els = @{}
-foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ProjectList','LogText','LogScroll','StatusText','BtnAll','BtnNone','BtnAdd','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
+foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ProjectList','LogText','LogScroll','StatusText','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
+# global UI-thread exception guard: never let a handler bug close the window
+$win.Dispatcher.add_UnhandledException({ param($s,$e)
+  try { [System.IO.File]::AppendAllText((Join-Path $env:LOCALAPPDATA 'ClaudeResume\logs\gui-error.log'), ((Get-Date).ToString('s') + "  " + $e.Exception.ToString() + "`r`n"), (New-Object System.Text.UTF8Encoding($false))) } catch {}
+  $e.Handled = $true
+})
 
 $sync = [hashtable]::Synchronized(@{ resetUtc=$null; empty=$false; ok=$false })
 $script:cards = @()
 $script:flash = @{ text=''; until=[datetime]::MinValue }
 function Set-Flash($t){ $script:flash.text = $t; $script:flash.until = (Get-Date).AddSeconds(6) }
 $script:logFile = Join-Path $script:LogDir ("run-" + (Get-Date).ToString('yyyyMMdd') + ".log")
-function Read-LogTail { if(Test-Path $script:logFile){ return ((Get-Content $script:logFile -Tail 40 -ErrorAction SilentlyContinue) -join "`r`n") } return '' }
+function Read-LogTail { try { if(Test-Path $script:logFile){ return ((Get-Content $script:logFile -Tail 40 -ErrorAction SilentlyContinue) -join "`r`n") } } catch {} return '' }
 
 function New-ProjectCard($proj){
   $b = New-Object Windows.Controls.Border
@@ -242,34 +248,52 @@ $els.TitleBar.Add_MouseLeftButtonDown({ $win.DragMove() })
 $els.BtnAll.Add_Click({ foreach($c in $script:cards){ $c.check.IsChecked=$true } })
 $els.BtnNone.Add_Click({ foreach($c in $script:cards){ $c.check.IsChecked=$false } })
 $els.BtnAdd.Add_Click({
-  $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-  $dlg.Description='选择要加入的项目文件夹'
-  try { $dlg.SelectedPath=[Environment]::GetFolderPath('Desktop') } catch {}
-  if($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){
-    $path = $dlg.SelectedPath
-    $proj = [pscustomobject]@{ name=(Split-Path $path -Leaf); path=$path; sessionId=$null;
-      lastUsedUtc=(Get-Item $path -ErrorAction SilentlyContinue).LastWriteTimeUtc; isGit=(Test-Path (Join-Path $path '.git')); folder='' }
-    Add-ProjectCard $proj $true
-    $c = Get-CcuConfig
-    $cust = @(); if($c.customProjects){ $cust=@($c.customProjects) }
-    if(-not ($cust | Where-Object { $_.path -eq $path })){ $cust += [pscustomobject]@{ name=$proj.name; path=$path } }
-    $c.customProjects = $cust; Set-CcuConfig $c
-    Set-Flash "已添加并勾选: $($proj.name)"
-  }
+  try {
+    $shell = New-Object -ComObject Shell.Application
+    $folder = $shell.BrowseForFolder(0, '选择要加入的项目文件夹', 0)
+    if($folder -and $folder.Self -and $folder.Self.Path){
+      $path = $folder.Self.Path
+      if(-not (Test-Path (Join-Path $path '*') -PathType Container) -and -not (Test-Path $path)){ Set-Flash '无效文件夹'; return }
+      $proj = [pscustomobject]@{ name=(Split-Path $path -Leaf); path=$path; sessionId=$null;
+        lastUsedUtc=(Get-Item $path -ErrorAction SilentlyContinue).LastWriteTimeUtc; isGit=(Test-Path (Join-Path $path '.git')); folder='' }
+      Add-ProjectCard $proj $true
+      $c = Get-CcuConfig
+      $cust = @(); if($c.customProjects){ $cust=@($c.customProjects) }
+      if(-not ($cust | Where-Object { $_.path -eq $path })){ $cust += [pscustomobject]@{ name=$proj.name; path=$path } }
+      $c.customProjects = $cust; Set-CcuConfig $c
+      Set-Flash "已添加并勾选: $($proj.name)"
+    }
+  } catch { Set-Flash ('添加出错: ' + $_.Exception.Message) }
 })
 $els.BtnArm.Add_Click({
-  $sel = @(Get-Selected)
-  if($sel.Count -eq 0){ Set-Flash '请先勾选至少一个项目'; return }
-  $c = Get-CcuConfig; $c.enabled=$true; $c.armed=$true; $c.selected=$sel; $c.skipPermissions=$true; $c.dirtyGuard='stash'; Set-CcuConfig $c
-  Set-Flash "已布防 · 监视 $($sel.Count) 个项目,重置后自动续跑"
+  try {
+    $sel = @(Get-Selected)
+    if($sel.Count -eq 0){ Set-Flash '请先勾选至少一个项目'; return }
+    $c = Get-CcuConfig; $c.enabled=$true; $c.armed=$true; $c.selected=$sel; $c.skipPermissions=$true; $c.dirtyGuard='stash'; Set-CcuConfig $c
+    Set-Flash "已布防 · 监视 $($sel.Count) 个项目,重置后自动续跑"
+  } catch { Set-Flash ('布防出错: ' + $_.Exception.Message) }
 })
-$els.BtnDisarm.Add_Click({ $c=Get-CcuConfig; $c.enabled=$false; $c.armed=$false; Set-CcuConfig $c; Set-Flash '已解除布防(全局停用)' })
+$els.BtnDisarm.Add_Click({
+  try { $c=Get-CcuConfig; $c.enabled=$false; $c.armed=$false; Set-CcuConfig $c; Set-Flash '已解除布防(全局停用)' }
+  catch { Set-Flash ('解除出错: ' + $_.Exception.Message) }
+})
+$els.BtnClearLog.Add_Click({
+  try {
+    if(Test-Path $script:logFile){ [System.IO.File]::WriteAllText($script:logFile, '') }
+    $els.LogText.Text = ''
+    Set-Flash '日志已清空'
+  } catch { Set-Flash ('清空出错: ' + $_.Exception.Message) }
+})
 $els.BtnPreview.Add_Click({
-  Set-Flash '预演中(只算不跑)...'
-  $sel = @(Get-Selected); $c = Get-CcuConfig; $c.selected=$sel; Set-CcuConfig $c
-  Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $PSScriptRoot 'checker.ps1'),'-DryRun' -WindowStyle Hidden -Wait
-  $lt = Read-LogTail; if($lt){ $els.LogText.Text=$lt; $els.LogScroll.ScrollToEnd() }
-  Set-Flash '预演完成 · 见下方日志'
+  try {
+    $sel = @(Get-Selected); $c = Get-CcuConfig; $c.selected=$sel; Set-CcuConfig $c
+    Set-Flash '预演中(只算不跑)...'
+    # a marker guarantees a fresh visible line even if the checker path changes
+    Write-CcuLog ('----- 预演 @ ' + (Get-Date).ToString('HH:mm:ss') + '  (' + $sel.Count + ' 个项目已选) -----') 'info'
+    Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $PSScriptRoot 'checker.ps1'),'-DryRun' -WindowStyle Hidden -Wait
+    $els.LogText.Text = Read-LogTail; $els.LogScroll.ScrollToEnd()
+    Set-Flash '预演完成 · 见下方日志'
+  } catch { Set-Flash ('预演出错: ' + $_.Exception.Message) }
 })
 
 # ---- background runspace: only the slow ccusage read ----
