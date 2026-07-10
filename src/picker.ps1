@@ -109,14 +109,18 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
         </DockPanel>
       </Border>
       <Grid Grid.Row="4" Margin="0,16,0,0">
-        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-          <Button x:Name="BtnAll" Style="{StaticResource LinkBtn}" Content="全选"/>
-          <Button x:Name="BtnNone" Style="{StaticResource LinkBtn}" Content="取消勾选" Margin="14,0,0,0"/>
-          <Button x:Name="BtnAdd" Style="{StaticResource LinkBtn}" Content="+ 文件夹" Margin="14,0,0,0"/>
-          <Button x:Name="BtnClearLog" Style="{StaticResource LinkBtn}" Content="清空日志" Margin="14,0,0,0"/>
-          <TextBlock x:Name="StatusText" Text="待布防" Foreground="{StaticResource Muted}" FontSize="12.5" VerticalAlignment="Center" Margin="18,0,0,0"/>
-        </StackPanel>
-        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+        <!-- DockPanel (not StackPanel): StatusText fills the finite leftover width, so long
+             flash messages truncate with an ellipsis instead of running under the buttons -->
+        <DockPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,14,0" LastChildFill="True">
+          <Button x:Name="BtnAll" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="全选" VerticalAlignment="Center"/>
+          <Button x:Name="BtnNone" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="取消勾选" Margin="14,0,0,0" VerticalAlignment="Center"/>
+          <Button x:Name="BtnAdd" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="+ 文件夹" Margin="14,0,0,0" VerticalAlignment="Center"/>
+          <Button x:Name="BtnClearLog" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="清空日志" Margin="14,0,0,0" VerticalAlignment="Center"/>
+          <Button x:Name="BtnExportLog" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="导出日志" Margin="14,0,0,0" VerticalAlignment="Center"/>
+          <TextBlock x:Name="StatusText" Text="待布防" Foreground="{StaticResource Muted}" FontSize="12.5" VerticalAlignment="Center" Margin="18,0,0,0" TextTrimming="CharacterEllipsis"/>
+        </DockPanel>
+        <StackPanel Grid.Column="1" Orientation="Horizontal">
           <Button x:Name="BtnPreview" Style="{StaticResource BtnGhost}" Content="预演" Width="88"/>
           <Button x:Name="BtnDisarm" Style="{StaticResource BtnGhost}" Content="解除" Width="88" Margin="10,0,0,0"/>
           <Button x:Name="BtnArm" Style="{StaticResource BtnPrimary}" Content="布防 (等重置续跑)" Width="180" Margin="10,0,0,0"/>
@@ -132,14 +136,14 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $win = [Windows.Markup.XamlReader]::Load($reader)
 $els = @{}
-foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ProjectList','LogText','LogScroll','StatusText','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
+foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','ProjectList','LogText','LogScroll','StatusText','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
 # global UI-thread exception guard: never let a handler bug close the window
 $win.Dispatcher.add_UnhandledException({ param($s,$e)
   try { [System.IO.File]::AppendAllText((Join-Path $env:LOCALAPPDATA 'ClaudeResume\logs\gui-error.log'), ((Get-Date).ToString('s') + "  " + $e.Exception.ToString() + "`r`n"), (New-Object System.Text.UTF8Encoding($false))) } catch {}
   $e.Handled = $true
 })
 
-$sync = [hashtable]::Synchronized(@{ resetUtc=$null; hasActivity=$false; ok=$false })
+$sync = [hashtable]::Synchronized(@{ resetUtc=$null; hasActivity=$false; ok=$false; realResetUtc=$null; probeLimited=$false })
 $script:cards = @()
 $script:flash = @{ text=''; until=[datetime]::MinValue }
 function Set-Flash($t){ $script:flash.text = $t; $script:flash.until = (Get-Date).AddSeconds(6) }
@@ -234,14 +238,21 @@ if($RenderTo){
   $win.Show(); $win.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Loaded)
   Start-Sleep -Milliseconds 500
   $win.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::ContextIdle)
+  # render via VisualBrush: Render($win.Content) directly yields a blank bitmap for a
+  # layered (AllowsTransparency) window parked off-screen
+  $dv = New-Object Windows.Media.DrawingVisual
+  $dc = $dv.RenderOpen()
+  $vb = New-Object Windows.Media.VisualBrush $win.Content
+  $dc.DrawRectangle($vb, $null, (New-Object Windows.Rect 0,0,900,650))
+  $dc.Close()
   $rtb = New-Object Windows.Media.Imaging.RenderTargetBitmap 900,650,96,96,([Windows.Media.PixelFormats]::Pbgra32)
-  $rtb.Render($win.Content)
+  $rtb.Render($dv)
   $enc = New-Object Windows.Media.Imaging.PngBitmapEncoder; $enc.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($rtb))
   $fs = [IO.File]::Open($RenderTo,'Create'); $enc.Save($fs); $fs.Close(); $win.Close(); return
 }
 
 function Get-Selected { $script:cards | Where-Object { $_.check.IsChecked } | ForEach-Object { [pscustomobject]@{ name=$_.proj.name; path=$_.proj.path } } }
-function Set-StatusLine($t){ $els.StatusText.Text = $t }
+function Set-StatusLine($t){ $els.StatusText.Text = $t; $els.StatusText.ToolTip = $t }  # tooltip carries the full text when truncated
 
 # ---- events ----
 $els.BtnClose.Add_Click({ $win.Close() })
@@ -292,6 +303,8 @@ $els.BtnArm.Add_Click({
     $sel = @(Get-Selected)
     if($sel.Count -eq 0){ Set-Flash '请先勾选至少一个项目'; return }
     $c = Get-CcuConfig; $c.enabled=$true; $c.armed=$true; $c.selected=$sel; $c.skipPermissions=$true; $c.dirtyGuard='stash'; Set-CcuConfig $c
+    # fresh cycle: stale sawLimited would fire instantly, stale projectStatus would skip projects
+    $st = Get-CcuState; $st.sawLimited=$false; $st.projectStatus=@{}; $st.phase='waiting'; $st.firedForId=$null; Set-CcuState $st
     Set-Flash "已布防 · 监视 $($sel.Count) 个项目,重置后自动续跑"
   } catch { Set-Flash ('布防出错: ' + $_.Exception.Message) }
 })
@@ -305,6 +318,34 @@ $els.BtnClearLog.Add_Click({
     $els.LogText.Text = ''
     Set-Flash '日志已清空'
   } catch { Set-Flash ('清空出错: ' + $_.Exception.Message) }
+})
+$els.BtnExportLog.Add_Click({
+  try {
+    # every run-*.log (oldest first) + the GUI error log, merged into one shareable file
+    $files = @()
+    if(Test-Path $script:LogDir){ $files = @(Get-ChildItem $script:LogDir -Filter 'run-*.log' -ErrorAction SilentlyContinue | Sort-Object Name) }
+    $guiErr = Join-Path $script:LogDir 'gui-error.log'
+    if(Test-Path $guiErr){ $files += Get-Item $guiErr }
+    $files = @($files | Where-Object { $_.Length -gt 0 })
+    if($files.Count -eq 0){ Set-Flash '没有可导出的日志'; return }
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Title = '导出运行日志'
+    $dlg.FileName = 'Claude续跑日志-' + (Get-Date).ToString('yyyyMMdd-HHmmss') + '.log'
+    $dlg.InitialDirectory = [Environment]::GetFolderPath('Desktop')
+    $dlg.Filter = '日志文件 (*.log)|*.log|文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*'
+    if($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK){ Set-Flash '已取消导出'; return }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('Claude Resume 日志导出 · ' + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
+    foreach($f in $files){
+      [void]$sb.AppendLine(''); [void]$sb.AppendLine('===== ' + $f.Name + ' =====')
+      try { [void]$sb.AppendLine([System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8).TrimEnd()) }
+      catch { [void]$sb.AppendLine('(读取失败: ' + $_.Exception.Message + ')') }   # one bad file must not abort the export
+    }
+    # UTF-8 WITH BOM so Chinese text opens correctly in any editor
+    [System.IO.File]::WriteAllText($dlg.FileName, $sb.ToString(), (New-Object System.Text.UTF8Encoding($true)))
+    Start-Process explorer.exe ('/select,"' + $dlg.FileName + '"')
+    Set-Flash ('已导出: ' + (Split-Path $dlg.FileName -Leaf))
+  } catch { Set-Flash ('导出出错: ' + $_.Exception.Message) }
 })
 $els.BtnPreview.Add_Click({
   try {
@@ -323,15 +364,58 @@ $rs = [runspacefactory]::CreateRunspace(); $rs.ApartmentState='MTA'; $rs.ThreadO
 $rs.SessionStateProxy.SetVariable('sync',$sync)
 $rs.SessionStateProxy.SetVariable('libPath',(Join-Path $PSScriptRoot 'lib.ps1'))
 $ps = [powershell]::Create(); $ps.Runspace=$rs
-[void]$ps.AddScript({ . $libPath; while($true){ try { $sr=Get-SessionReset; $sync.ok=$sr.ok; $sync.hasActivity=$sr.hasActivity; $sync.resetUtc=$sr.resetUtc } catch {}; Start-Sleep -Seconds 10 } })
+[void]$ps.AddScript({
+  . $libPath
+  $lastProbe=[datetime]::MinValue; $myReset=$null; $myResetAt=[datetime]::MinValue
+  while($true){
+    $nowU=[DateTimeOffset]::UtcNow
+    try { $sr=Get-SessionReset; $sync.ok=$sr.ok; $sync.hasActivity=$sr.hasActivity; $sync.resetUtc=$sr.resetUtc } catch { $sr=$null }
+    $estSecs=$null; if($sr -and $sr.ok -and $null -ne $sr.secondsUntilReset){ $estSecs=[double]$sr.secondsUntilReset }
+    # Own live probe for the EXACT reset: only worth it near reset (the server sends resetsAt once a
+    # window is >~75% used), once on open then every 5 min. Kept in memory -> no state write, no race
+    # with the checker. A probe is a quick haiku call: tiny quota, and free while actually rate-limited.
+    $worth = $sync.hasActivity -and (($null -eq $estSecs) -or ($estSecs -le 5400))
+    if($worth -and ((Get-Date)-$lastProbe).TotalMinutes -ge 5){
+      $lastProbe=Get-Date
+      try {
+        $cfg=Get-CcuConfig; $pr=Test-ClaudeReady -Model $cfg.probeModel
+        $sync.probeLimited=($pr.reason -eq 'limited')
+        if($pr.fiveHourResetUtc){ $myReset=$pr.fiveHourResetUtc; $myResetAt=Get-Date }
+      } catch {}
+    }
+    # exact reset the checker's own probes cached (free read), used when we have no fresher one
+    $stReset=$null
+    try {
+      $st=Get-CcuState
+      if($st.realFiveHourResetUtc -and $st.realResetProbedUtc){
+        $rr=[DateTimeOffset]::FromUnixTimeSeconds([long]$st.realFiveHourResetUtc)
+        $pb=[DateTimeOffset]::FromUnixTimeSeconds([long]$st.realResetProbedUtc)
+        if(($nowU-$pb).TotalHours -lt 5){ $stReset=$rr }
+      }
+    } catch {}
+    # prefer our own fresh probe, fall back to the checker's cache; drop any value already in the past
+    $best=$null
+    if($myReset -and ((Get-Date)-$myResetAt).TotalHours -lt 5 -and $myReset -gt $nowU){ $best=$myReset }
+    elseif($stReset -and $stReset -gt $nowU){ $best=$stReset }
+    $sync.realResetUtc=$best
+    Start-Sleep -Seconds 10
+  }
+})
 $hb = $ps.BeginInvoke()
 
 # ---- UI timer: repaint every second (fast local/file reads only) ----
 $timer = New-Object Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(1)
 $timer.Add_Tick({
-  if($sync.resetUtc){ $secs=($sync.resetUtc-[DateTimeOffset]::UtcNow).TotalSeconds; $els.ResetText.Text='≈ 距重置 '+(Format-Countdown $secs) }
-  elseif($sync.ok -and -not $sync.hasActivity){ $els.ResetText.Text='额度当前可用' }
+  if($sync.realResetUtc){
+    $secs=($sync.realResetUtc-[DateTimeOffset]::UtcNow).TotalSeconds
+    $els.ResetText.Text='距重置 '+(Format-Countdown $secs)+' · 精确'
+    if($els.ResetChip){ $els.ResetChip.ToolTip='服务器返回的精确重置时间(与 claude 的 /usage 同源),运行时实时探测读到。' }
+  } elseif($sync.resetUtc){
+    $secs=($sync.resetUtc-[DateTimeOffset]::UtcNow).TotalSeconds
+    $els.ResetText.Text='≈ 距重置 '+(Format-Countdown $secs)
+    if($els.ResetChip){ $els.ResetChip.ToolTip='估算值(基于本地记录)。接近重置或被限流时会自动探测并切换为服务器精确值。触发续跑始终靠实时探测,不依赖此数字。' }
+  } elseif($sync.ok -and -not $sync.hasActivity){ $els.ResetText.Text='额度当前可用' }
   else { $els.ResetText.Text='读取中...' }
   $lt = Read-LogTail
   if($lt -and $els.LogText.Text -ne $lt){ $els.LogText.Text=$lt; $els.LogScroll.ScrollToEnd() }

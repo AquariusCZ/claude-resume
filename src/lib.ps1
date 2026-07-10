@@ -5,6 +5,10 @@
      then [DateTimeOffset]::Parse(...RoundtripKind).ToUniversalTime() vs [DateTimeOffset]::UtcNow.
    * Launch: claude.cmd via cmd.exe /c (UseShellExecute=false cannot exec a .cmd); tail the
      redirect file for live output; kill the WHOLE process tree on stop/timeout (verified).
+   * ExitCode: PS 5.1's Start-Process -PassThru returns $null from .ExitCode after the process
+     exits unless $p.Handle was read first (WaitForExit(ms) opens SYNCHRONIZE-only; HasExited
+     polling has the same hole - both verified live). Cache the handle AND never rely on the
+     exit code alone: a stream-json "type":"result","is_error":false line is the success signal.
    * Fail-closed: bad ccusage/claude reads assume "still limited", never "clear".
    * This file must be saved UTF-8 WITH BOM so Windows PowerShell 5.1 parses non-ASCII correctly.
 #>
@@ -15,6 +19,8 @@ $script:AppDir     = Join-Path $env:LOCALAPPDATA 'ClaudeResume'
 $script:LogDir     = Join-Path $script:AppDir 'logs'
 $script:ConfigPath = Join-Path $script:AppDir 'config.json'
 $script:StatePath  = Join-Path $script:AppDir 'state.json'
+# dev runs from src/ may predate install: the probe uses AppDir as -WorkingDirectory, which throws if missing
+try { if(-not (Test-Path $script:AppDir)){ New-Item -ItemType Directory -Force -Path $script:AppDir | Out-Null } } catch {}
 
 function Get-CcuCmd {
   $c = Get-Command ccusage.cmd -ErrorAction SilentlyContinue
@@ -61,10 +67,19 @@ function Set-CcuConfig { param($Config)
   ($Config | ConvertTo-Json -Depth 6) | Set-Content -Path $script:ConfigPath -Encoding UTF8
 }
 function Get-CcuState {
-  if(Test-Path $script:StatePath){
-    try { return (Get-Content $script:StatePath -Raw -Encoding UTF8 | ConvertFrom-Json) } catch {}
+  # merge loaded state over defaults so EVERY field always exists (new fields settable without throwing)
+  $def = [ordered]@{
+    targetId=$null; targetEndUtc=$null; firedForId=$null; projectStatus=$null; phase='idle';
+    sawLimited=$false; lastProbeUtc=$null; limitedRefires=0;
+    realFiveHourResetUtc=$null; realSevenDayResetUtc=$null; realResetProbedUtc=$null; realFiveHourUtil=$null
   }
-  return [pscustomobject]@{ targetId=$null; targetEndUtc=$null; firedForId=$null; projectStatus=$null; phase='idle'; sawLimited=$false; lastProbeUtc=$null }
+  if(Test-Path $script:StatePath){
+    try {
+      $loaded = Get-Content $script:StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+      foreach($p in $loaded.PSObject.Properties){ $def[$p.Name] = $p.Value }
+    } catch {}
+  }
+  return [pscustomobject]$def
 }
 function Set-CcuState { param($State)
   ($State | ConvertTo-Json -Depth 6) | Set-Content -Path $script:StatePath -Encoding UTF8
@@ -105,6 +120,9 @@ function Get-SessionReset {
     $nowU = $r.nowUtc; $cutoff = $nowU.AddHours(-11)
     $ts = New-Object System.Collections.Generic.List[DateTimeOffset]
     foreach($f in (Get-ChildItem $root -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTimeUtc -gt $cutoff.UtcDateTime })){
+      # skip the tool's own probe sessions (cwd=AppDir) and any legacy probes that ran from
+      # System32 (scheduled-task default cwd) -- they are not user activity
+      if($f.Directory.Name -like '*AppData-Local-ClaudeResume*' -or $f.Directory.Name -like 'C--Windows-System32*'){ continue }
       $raw = [System.IO.File]::ReadAllText($f.FullName)
       foreach($m in [regex]::Matches($raw, '"timestamp"\s*:\s*"([^"]+Z)"')){
         try { $t=[DateTimeOffset]::Parse($m.Groups[1].Value,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime(); if($t -gt $cutoff -and $t -le $nowU.AddMinutes(2)){ $ts.Add($t) } } catch {}
@@ -187,32 +205,90 @@ function Protect-GitRepo {
 }
 
 function Test-ClaudeReady {
-  param([string]$Model='haiku', [int]$TimeoutSec=60)
+  # A live probe = source of truth. Runs claude -p as stream-json so we can read the EXACT
+  # reset the server sends in `rate_limit_event` messages (same numbers the /usage screen shows):
+  #   {"type":"rate_limit_event","rate_limit_info":{"status":"blocked","resetsAt":<unix>,
+  #    "rateLimitType":"five_hour|seven_day","utilization":0..1,...}}
+  # resetsAt is only sent once a window crosses ~0.75 utilization (and always when blocked),
+  # so fiveHourResetUtc is $null when you're nowhere near the 5h cap -- callers fall back to the estimate.
+  param([string]$Model='haiku', [int]$TimeoutSec=90)
   $claude = Get-ClaudeCmd
-  $r = @{ ready=$false; reason='unknown'; output='' }
+  $r = @{ ready=$false; reason='unknown'; output='';
+          fiveHourResetUtc=$null; sevenDayResetUtc=$null; fiveHourUtil=$null; sevenDayUtil=$null }
   if(-not $claude){ $r.reason='no-claude'; return $r }
   $tmpOut = [IO.Path]::GetTempFileName(); $tmpErr = [IO.Path]::GetTempFileName()
   try {
-    $a = @('/c','"'+$claude+'"','-p','ready','--model',$Model,'--max-turns','1','--output-format','text')
+    $a = @('/c','"'+$claude+'"','-p','ready','--model',$Model,'--max-turns','1','--output-format','stream-json','--verbose')
+    # -WorkingDirectory AppDir: probe sessions land in one known .claude/projects folder that
+    # Get-SessionReset excludes, so probing can't feed back into the activity estimate.
     $p = Start-Process -FilePath $env:ComSpec -ArgumentList $a -NoNewWindow -PassThru `
-          -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
+          -WorkingDirectory $script:AppDir -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
+    $null = $p.Handle   # cache NOW or .ExitCode reads $null after exit (PS 5.1, verified)
     if(-not $p.WaitForExit($TimeoutSec*1000)){ Stop-ProcessTree -ProcessId $p.Id; $r.reason='timeout'; return $r }
     $so=''; $se=''
     try { $so = [IO.File]::ReadAllText($tmpOut, [Text.Encoding]::UTF8) } catch {}
     try { $se = [IO.File]::ReadAllText($tmpErr, [Text.Encoding]::UTF8) } catch {}
-    $r.output = ($so + "`n" + $se); $blob = $r.output.ToLower()
-    if($blob -match 'usage limit|rate limit|limit reached|5-hour limit|weekly limit|too many requests|resets at'){ $r.reason='limited'; return $r }
-    if($p.ExitCode -eq 0){ $r.ready=$true; $r.reason='ok' } else { $r.reason="exit-$($p.ExitCode)" }
+    $r.output = ($so + "`n" + $se); $blob = $r.output
+
+    # ---- exact reset times, parsed from every rate_limit_info block (flat JSON, no nested braces) ----
+    foreach($m in [regex]::Matches($blob, '"rate_limit_info"\s*:\s*\{[^}]*\}')){
+      $seg  = $m.Value
+      $type = ([regex]::Match($seg, '"rateLimitType"\s*:\s*"([^"]+)"')).Groups[1].Value
+      $ra   = ([regex]::Match($seg, '"resetsAt"\s*:\s*(\d+)')).Groups[1].Value
+      $ut   = ([regex]::Match($seg, '"utilization"\s*:\s*([0-9.]+)')).Groups[1].Value
+      if($ra){
+        $dt = [DateTimeOffset]::FromUnixTimeSeconds([long]$ra)
+        if($type -eq 'five_hour'){ $r.fiveHourResetUtc=$dt; if($ut){ $r.fiveHourUtil=[double]$ut } }
+        elseif($type -eq 'seven_day'){ $r.sevenDayResetUtc=$dt; if($ut){ $r.sevenDayUtil=[double]$ut } }
+      }
+    }
+
+    # ---- decide, most-authoritative first ----
+    # 1) server says blocked -> limited. 2) a completed result line with is_error:false -> ready
+    # (this is THE success signal; it must beat the fuzzy text match so an "approaching limit"
+    # warning inside a successful run can't read as limited). 3) fuzzy limit text -> limited
+    # (covers blocked runs that emitted no structured status). 4) exit code, last resort only:
+    # it read $null for every successful probe pre-fix and silently blocked every resume.
+    if([regex]::IsMatch($blob, '"status"\s*:\s*"(blocked|rejected|limited|exceeded)"')){ $r.reason='limited'; return $r }
+    foreach($ln in ($blob -split "[`r`n]+")){
+      if($ln -match '"type"\s*:\s*"result"' -and $ln -match '"is_error"\s*:\s*false'){ $r.ready=$true; $r.reason='ok'; return $r }
+    }
+    $low = $blob.ToLower()
+    if($low -match 'usage limit|rate limit|limit reached|5-hour limit|weekly limit|too many requests|resets at'){ $r.reason='limited'; return $r }
+    $exitCode = $null; try { $exitCode = $p.ExitCode } catch {}
+    if($exitCode -eq 0){ $r.ready=$true; $r.reason='ok' }
+    else { $r.reason = 'exit-' + $(if($null -eq $exitCode){ 'null' } else { $exitCode }) }
   } catch { $r.reason="err:$($_.Exception.Message)" }
   finally { try { [IO.File]::Delete($tmpOut) } catch {}; try { [IO.File]::Delete($tmpErr) } catch {} }
   return $r
+}
+
+function Save-RealResetFromProbe {
+  # Persist the EXACT reset(s) a probe returned into a state object (only overwrites when the
+  # server actually sent a value, so a low-utilization probe never wipes a good number).
+  # Stored as Unix SECONDS (integers): ConvertFrom-Json silently rebases ISO strings to a local
+  # [DateTime], but leaves integers untouched -> timezone-safe round-trip. Read with FromUnixTimeSeconds.
+  param($Probe, $State)
+  if($null -eq $State){ $State = Get-CcuState }
+  if(-not $Probe){ return $State }
+  $nowUnix = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  if($Probe.fiveHourResetUtc){
+    $State.realFiveHourResetUtc = $Probe.fiveHourResetUtc.ToUnixTimeSeconds()
+    $State.realResetProbedUtc   = $nowUnix
+    if($null -ne $Probe.fiveHourUtil){ $State.realFiveHourUtil = $Probe.fiveHourUtil }
+  }
+  if($Probe.sevenDayResetUtc){
+    $State.realSevenDayResetUtc = $Probe.sevenDayResetUtc.ToUnixTimeSeconds()
+    $State.realResetProbedUtc   = $nowUnix
+  }
+  return $State
 }
 
 function Invoke-ClaudeResume {
   param([pscustomobject]$Project, [string]$Prompt='continue', [switch]$SkipPermissions,
         [string]$Model='', [int]$TimeoutMin=30, $UiSink=$null, $CancelFlag=$null)
   $claude = Get-ClaudeCmd
-  $res = @{ project=$Project.name; status='error'; exitCode=$null; limited=$false }
+  $res = @{ project=$Project.name; status='error'; exitCode=$null; limited=$false; resultOk=$false }
   if(-not $claude){ $res.status='no-claude'; return $res }
 
   $outFile = [IO.Path]::GetTempFileName(); $errFile = [IO.Path]::GetTempFileName()
@@ -224,6 +300,7 @@ function Invoke-ClaudeResume {
 
   $p = Start-Process -FilePath $env:ComSpec -ArgumentList $a -WorkingDirectory $Project.path `
         -NoNewWindow -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+  try { $null = $p.Handle } catch {}   # cache NOW or .ExitCode reads $null after exit (PS 5.1, verified)
 
   $posO = New-Object psobject -Property @{ v = [long]0 }
   $posE = New-Object psobject -Property @{ v = [long]0 }
@@ -235,7 +312,9 @@ function Invoke-ClaudeResume {
       $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
       while($null -ne ($ln = $sr.ReadLine())){
         if($ln.Length -gt 0){
-          if($ln.ToLower() -match 'usage limit|rate limit|limit reached|weekly limit'){ $res.limited = $true }
+          if($ln -match '"status"\s*:\s*"(blocked|rejected|limited|exceeded)"' -or
+             $ln.ToLower() -match 'usage limit|rate limit|limit reached|weekly limit'){ $res.limited = $true }
+          if($ln -match '"type"\s*:\s*"result"' -and $ln -match '"is_error"\s*:\s*false'){ $res.resultOk = $true }
           Write-CcuLog $ln 'stream' $UiSink
         }
       }
@@ -252,11 +331,24 @@ function Invoke-ClaudeResume {
   }
   Start-Sleep -Milliseconds 300
   & $drain $outFile $posO; & $drain $errFile $posE
+  # authoritative re-scan of the FULL output: the drain's ReadLine can split a line that was
+  # flushed in chunks, defeating the same-line matches above (structured checks only here)
+  try {
+    $all = ''
+    try { $all  = [IO.File]::ReadAllText($outFile, [Text.Encoding]::UTF8) } catch {}
+    try { $all += "`n" + [IO.File]::ReadAllText($errFile, [Text.Encoding]::UTF8) } catch {}
+    foreach($ln in ($all -split "[`r`n]+")){
+      if($ln -match '"type"\s*:\s*"result"' -and $ln -match '"is_error"\s*:\s*false'){ $res.resultOk = $true }
+      if($ln -match '"status"\s*:\s*"(blocked|rejected|limited|exceeded)"'){ $res.limited = $true }
+    }
+  } catch {}
   if(@('stopped','timeout') -notcontains $res.status){
     try { $res.exitCode = $p.ExitCode } catch {}
-    if($res.limited){ $res.status='limited' }
-    elseif($res.exitCode -eq 0){ $res.status='success' }
-    else { $res.status="exit-$($res.exitCode)" }
+    # a completed result line beats everything (a successful run may TALK about rate limits;
+    # a genuinely limited run never completes with is_error:false); exit code is last resort
+    if($res.resultOk -or $res.exitCode -eq 0){ $res.status='success' }
+    elseif($res.limited){ $res.status='limited' }
+    else { $res.status = 'exit-' + $(if($null -eq $res.exitCode){ 'null' } else { $res.exitCode }) }
   }
   try { [IO.File]::Delete($outFile) } catch {}; try { [IO.File]::Delete($errFile) } catch {}
   return $res

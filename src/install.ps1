@@ -5,6 +5,13 @@
 $ErrorActionPreference = 'Stop'
 $AppDir = Join-Path $env:LOCALAPPDATA 'ClaudeResume'
 
+# 0) deploy the program files from src/ to the runtime folder (this IS the redeploy step)
+if(-not (Test-Path $AppDir)){ New-Item -ItemType Directory -Force -Path $AppDir | Out-Null }
+foreach($f in 'lib.ps1','checker.ps1','picker.ps1','launcher.vbs','checker-launch.vbs'){
+  $s = Join-Path $PSScriptRoot $f
+  if(Test-Path $s){ Copy-Item $s (Join-Path $AppDir $f) -Force }
+}
+
 # 1) allow local scripts (RemoteSigned) for both PowerShell editions if needed
 try { if((Get-ExecutionPolicy -Scope CurrentUser) -in @('Restricted','Undefined','AllSigned')){ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force } } catch {}
 
