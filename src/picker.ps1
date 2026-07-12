@@ -125,8 +125,8 @@ if(-not $script:instanceOwned -and -not $RenderTo -and -not $SelfTest){
           <TextBlock x:Name="Subtitle" Text="勾选一个或多个,额度重置后自动继续" Foreground="{StaticResource Muted}" FontSize="12.5" Margin="0,3,0,0"/>
         </StackPanel>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
-          <Border x:Name="ChatModelChip" Cursor="Hand" ToolTip="飞书「闲聊模式」使用的模型(点击切换 默认 / Sonnet / Opus / Haiku)。与飞书共享同一配置,两边实时同步。" CornerRadius="9" Background="{StaticResource Card}" BorderBrush="{StaticResource Border0}" BorderThickness="1" Padding="13,7" Margin="0,0,8,0">
-            <TextBlock x:Name="ChatModelText" Text="闲聊 默认" Foreground="{StaticResource Ink2}" FontSize="12.5" FontWeight="SemiBold"/>
+          <Border x:Name="ChatModelChip" Cursor="Hand" ToolTip="飞书机器人(聊天 + 项目执行)使用的模型(点击切换 默认 / Sonnet / Opus / Haiku)。与飞书共享同一配置,两边实时同步;被限流时可换个模型重试。" CornerRadius="9" Background="{StaticResource Card}" BorderBrush="{StaticResource Border0}" BorderThickness="1" Padding="13,7" Margin="0,0,8,0">
+            <TextBlock x:Name="ChatModelText" Text="模型 默认" Foreground="{StaticResource Ink2}" FontSize="12.5" FontWeight="SemiBold"/>
           </Border>
           <Border x:Name="IntervalChip" Cursor="Hand" ToolTip="布防后每隔多久自动实探一次额度(点击切换 5 / 15 / 30 分钟);被限流后自动加密到 4 分钟。" CornerRadius="9" Background="{StaticResource Card}" BorderBrush="{StaticResource Border0}" BorderThickness="1" Padding="13,7" Margin="0,0,8,0">
             <TextBlock x:Name="IntervalText" Text="间隔 15m" Foreground="{StaticResource Ink2}" FontSize="12.5" FontWeight="SemiBold"/>
@@ -385,7 +385,7 @@ Update-IntervalChip
 # chat-model chip: click cycles 默认/Sonnet/Opus/Haiku (writes feishuChatModel — shared with the Feishu agent)
 $script:modelCycle = @('','sonnet','opus','haiku')
 function Get-ModelLabel($m){ switch("$m".ToLower()){ 'sonnet' { 'Sonnet' } 'opus' { 'Opus' } 'haiku' { 'Haiku' } default { '默认' } } }
-function Update-ChatModelChip { $m=''; try { $m="$((Get-CcuConfig).feishuChatModel)" } catch {}; $els.ChatModelText.Text = '闲聊 ' + (Get-ModelLabel $m) }
+function Update-ChatModelChip { $m=''; try { $m="$((Get-CcuConfig).feishuChatModel)" } catch {}; $els.ChatModelText.Text = '模型 ' + (Get-ModelLabel $m) }
 Update-ChatModelChip
 $els.ChatModelChip.Add_MouseLeftButtonUp({
   try {
@@ -394,7 +394,7 @@ $els.ChatModelChip.Add_MouseLeftButtonUp({
     $next = $script:modelCycle[($i + 1) % $script:modelCycle.Count]
     $c.feishuChatModel = $next; Set-CcuConfig $c
     Update-ChatModelChip
-    Set-Flash ('闲聊模型 → ' + (Get-ModelLabel $next) + '(飞书同步)')
+    Set-Flash ('模型 → ' + (Get-ModelLabel $next) + '(飞书同步)')
   } catch { Set-Flash ('设置出错: ' + $_.Exception.Message) }
 })
 $els.IntervalChip.Add_MouseLeftButtonUp({

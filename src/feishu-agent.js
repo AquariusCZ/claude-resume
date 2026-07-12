@@ -263,8 +263,8 @@ function buildMenuCard(chatId) {
     { tag: 'button', text: { tag: 'plain_text', content: (sess.mode === 'chat' ? '✅ ' : '💬 ') + '闲聊模式' }, type: sess.mode === 'chat' ? 'primary' : 'default', value: { do: 'chat' } },
     { tag: 'button', text: { tag: 'plain_text', content: 'ℹ️ 状态' }, type: 'default', value: { do: 'status' } },
   ] });
-  // chat-model switch buttons (no typing needed)
-  elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**闲聊模型:${modelLabel}** — 点下面切换(与软件同步):` } });
+  // model switch buttons (applies to BOTH chat and project execution)
+  elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**模型:${modelLabel}** — 聊天和项目执行都用它,点下面切换(被限流时可换个模型重试):` } });
   const models = [['默认', ''], ['Sonnet', 'sonnet'], ['Opus', 'opus'], ['Haiku', 'haiku']];
   elements.push({ tag: 'action', actions: models.map(([lbl, v]) => ({
     tag: 'button', text: { tag: 'plain_text', content: (eq(curModel, v) ? '✅ ' : '') + lbl },
@@ -324,7 +324,8 @@ function helpText(chatId) {
     '· <项目名> <指令> → 不切换,一次性在该项目执行',
     '· 状态 → 布防 / 额度 / 当前模式',
     '· 停止 <项目> → 取消正在跑的指令',
-    '· 模型 / 模型 opus → 查看或切换闲聊模型(与软件同步)',
+    '· 模型 / 模型 opus → 查看或切换模型(聊天+项目都用,与软件同步)',
+    '· 授权 ou_xxx / 取消授权 / 授权列表 → 管理谁能操作项目',
     '· 忘记闲聊 → 清空闲聊记忆,从头开始',
     '',
     '注:项目执行会继续 VS Code 里同一个会话,面板不实时刷新,重开可见。',
@@ -343,9 +344,7 @@ function isAuthorized(openId) {
 }
 async function denyIfUnauthorized(openId, chatId) {
   if (isAuthorized(openId)) return false;
-  const cfg = readConfig();
-  const hint = cfg.feishuAuthPassword ? '\n发「解锁 <密码>」可授权本账号。' : '';
-  await sendText(chatId, '🔒 无权限:操作项目 / 改配置仅限已授权账号(你可以闲聊)。' + hint);
+  await sendText(chatId, `🔒 无权限:操作项目 / 改配置仅限已授权账号(你可以闲聊)。\n你的 open_id:${openId || '未知'}\n把它发给管理员,让他发「授权 ${openId || 'ou_xxx'}」即可。`);
   logLine('拦截未授权操作: ' + openId);
   return true;
 }
@@ -406,6 +405,25 @@ async function onMessage(data) {
       return;
     }
 
+    // authorize other people (authorized users only): 授权 ou_xxx / 取消授权 ou_xxx / 授权列表
+    if (/^(授权列表|权限列表|谁有权限)$/.test(text)) {
+      if (await denyIfUnauthorized(senderOpen, chatId)) return;
+      const list = (readConfig().feishuAuthOpenIds || []).filter(Boolean);
+      await sendText(chatId, '已授权账号:\n' + (list.length ? list.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无 — 当前对所有人开放)'));
+      return;
+    }
+    if (/^(授权|取消授权|解除授权)\b/.test(text)) {
+      if (await denyIfUnauthorized(senderOpen, chatId)) return;
+      const idm = text.match(/(ou_[A-Za-z0-9]+)/);
+      if (!idm) { await sendText(chatId, '用法:「授权 ou_xxxx」添加,「取消授权 ou_xxxx」移除,「授权列表」查看。\n让对方给机器人发条消息,他会收到自己的 open_id,发给你即可。'); return; }
+      const c2 = readConfig(); let list = Array.isArray(c2.feishuAuthOpenIds) ? c2.feishuAuthOpenIds.filter(Boolean) : [];
+      const id = idm[1];
+      if (/^(取消授权|解除授权)/.test(text)) { list = list.filter(x => x !== id); await sendText(chatId, '已移除授权:' + id); }
+      else { if (list.indexOf(id) === -1) list.push(id); await sendText(chatId, '✅ 已授权:' + id); }
+      c2.feishuAuthOpenIds = list; try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(c2, null, 4), 'utf8'); } catch (e) {}
+      return;
+    }
+
     // ---- global commands (work in any mode) ----
     if (['帮助', 'help', '?', '？'].indexOf(low) !== -1) { await sendText(chatId, helpText(chatId)); return; }
     if (['状态', 'status', 'zt'].indexOf(low) !== -1) { if (await denyIfUnauthorized(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
@@ -424,7 +442,7 @@ async function onMessage(data) {
     if (['模型', 'model', '闲聊模型'].indexOf(low) !== -1) {
       const cur = String(readConfig().feishuChatModel || '').toLowerCase();
       const label = { sonnet: 'Sonnet', opus: 'Opus', haiku: 'Haiku' }[cur] || '默认';
-      await sendText(chatId, `闲聊模型:${label}\n改用:发「模型 opus / sonnet / haiku / 默认」;软件里也能切换,两边同步。`);
+      await sendText(chatId, `当前模型:${label}\n改用:发「模型 opus / sonnet / haiku / 默认」;软件里也能切换,两边同步。`);
       return;
     }
     const setm = text.match(/^(模型|闲聊模型|model)\s+(opus|sonnet|haiku|默认|default|清除|空|none)$/i);
@@ -433,7 +451,7 @@ async function onMessage(data) {
       const a = setm[2].toLowerCase();
       const val = (['opus', 'sonnet', 'haiku'].indexOf(a) !== -1) ? a : '';
       try { const c = readConfig(); c.feishuChatModel = val; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
-      await sendText(chatId, `闲聊模型已设为:${val || '默认'}(下一句闲聊生效;软件已同步)。`);
+      await sendText(chatId, `模型已设为:${val || '默认'}(下一句闲聊生效;软件已同步)。`);
       return;
     }
     // forget chat memory (drop the started flag + the claude session for the chat cwd)
@@ -480,7 +498,7 @@ async function onMessage(data) {
       if (await denyIfUnauthorized(senderOpen, chatId)) return;
       if (running.has(oneoff.project.path.toLowerCase())) { await sendText(chatId, `「${oneoff.project.name}」正在执行中,请稍候。`); return; }
       await sendText(chatId, `📂 一次性在「${oneoff.project.name}」执行:${oneoff.prompt}`);
-      const r = await runClaude(oneoff.project.path, oneoff.project.name, oneoff.prompt, { useContinue: true });
+      const r = await runClaude(oneoff.project.path, oneoff.project.name, oneoff.prompt, { useContinue: true, model: cfg.feishuChatModel });
       await sendText(chatId, (r.ok ? `✅ 「${oneoff.project.name}」完成:\n\n` : `⚠️ 「${oneoff.project.name}」:\n\n`) + (r.text || '(无输出)'));
       logLine(`一次性完成 ${oneoff.project.name} ok=${r.ok}`);
       return;
@@ -492,7 +510,7 @@ async function onMessage(data) {
       if (await denyIfUnauthorized(senderOpen, chatId)) return;
       if (running.has(active.path.toLowerCase())) { await sendText(chatId, `「${active.name}」正在执行中,请稍候,或发「停止」取消。`); return; }
       await sendText(chatId, `📂 在「${active.name}」执行:${text}`);
-      const r = await runClaude(active.path, active.name, text, { useContinue: true });
+      const r = await runClaude(active.path, active.name, text, { useContinue: true, model: cfg.feishuChatModel });
       await sendText(chatId, (r.ok ? `✅ 「${active.name}」完成:\n\n` : `⚠️ 「${active.name}」:\n\n`) + (r.text || '(无输出)'));
       logLine(`完成 ${active.name} ok=${r.ok}`);
       return;
@@ -539,7 +557,7 @@ async function onCardAction(ev) {
       const v = (['opus', 'sonnet', 'haiku'].indexOf(mm) !== -1) ? mm : '';
       try { const c = readConfig(); c.feishuChatModel = v; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
       const label = { sonnet: 'Sonnet', opus: 'Opus', haiku: 'Haiku' }[v] || '默认';
-      await sendText(chatId, `闲聊模型已切到:${label}(下一句闲聊生效;软件已同步)。`);
+      await sendText(chatId, `模型已切到:${label}(下一句闲聊生效;软件已同步)。`);
       return;
     }
     if (val.do === 'enter') {
