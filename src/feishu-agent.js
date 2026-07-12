@@ -576,41 +576,40 @@ async function onCardAction(ev) {
     try { if (chatId && cfg.feishuChatId !== chatId) { cfg.feishuChatId = chatId; fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 4), 'utf8'); } } catch (e) {}
     logLine(`卡片点击 chat=${chatId}: ${JSON.stringify(val)}`);
 
-    if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); await refreshCard(chatId, messageId); await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。发「退出」回主菜单。'); return; }
-    if (val.do === 'status') { if (await denyIfUnauthorized(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
+    // IMPORTANT: a card callback must respond within a few seconds or Feishu shows
+    // "目标回调服务超时未响应". So do ONLY fast local work here (sync file writes) and fire every
+    // API call (send/patch) WITHOUT await, then return immediately.
+    const gated = ['status', 'perm', 'model', 'enter', 'authorize', 'revoke'].indexOf(val.do) !== -1;
+    if (gated && !isAuthorized(senderOpen)) { denyIfUnauthorized(senderOpen, chatId); return; }
+
+    if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); refreshCard(chatId, messageId); return; }
+    if (val.do === 'status') { sendText(chatId, statusText(chatId)); return; }
     if (val.do === 'perm') {
-      if (await denyIfUnauthorized(senderOpen, chatId)) return;
       const list = (readConfig().feishuAuthOpenIds || []).filter(Boolean);
-      await sendText(chatId, '🔑 已授权账号:\n' + (list.length ? list.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无 — 当前对所有人开放)') + '\n\n加人:让对方给我发条消息 → 你会收到一张「授权此人」卡片,一键点即可(也可发「授权 ou_xxx」/「取消授权 ou_xxx」)。');
+      sendText(chatId, '🔑 已授权账号:\n' + (list.length ? list.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无 — 当前对所有人开放)') + '\n\n加人:让对方给我发条消息 → 你会收到「授权此人」卡片,一键点即可(也可发「授权 ou_xxx」/「取消授权 ou_xxx」)。');
       return;
     }
     if (val.do === 'noop') { return; }
     if (val.do === 'model') {
-      if (await denyIfUnauthorized(senderOpen, chatId)) return;
       const mm = String(val.m || '').toLowerCase();
       const v = (['opus', 'sonnet', 'haiku'].indexOf(mm) !== -1) ? mm : '';
       try { const c = readConfig(); c.feishuChatModel = v; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
-      const label = { sonnet: 'Sonnet', opus: 'Opus', haiku: 'Haiku' }[v] || '默认';
-      await refreshCard(chatId, messageId);
-      await sendText(chatId, `模型已切到:${label}(聊天和项目都用;软件已同步)。`);
+      refreshCard(chatId, messageId);      // card update is the feedback (no extra text)
       return;
     }
     if (val.do === 'enter') {
-      if (await denyIfUnauthorized(senderOpen, chatId)) return;
       const p = discoverProjects().find(x => x.path.toLowerCase() === String(val.p).toLowerCase()) || (val.p ? { name: path.basename(val.p), path: val.p } : null);
-      if (p) { setSession(chatId, { mode: 'project', project: p.path }); await refreshCard(chatId, messageId); await sendText(chatId, `已进入 📂「${p.name}」✅ 直接发问题/指令就在这里跑。`); }
-      else await sendText(chatId, '项目未找到(可能已变化)。发「菜单」重新选。');
+      if (p) { setSession(chatId, { mode: 'project', project: p.path }); refreshCard(chatId, messageId); }
+      else sendText(chatId, '项目未找到(可能已变化)。发「菜单」重新选。');
       return;
     }
-    // one-tap authorize/revoke (from the owner-notification card) — authorized users only
-    if (val.do === 'authorize' || val.do === 'revoke') {
-      if (await denyIfUnauthorized(senderOpen, chatId)) return;
+    if (val.do === 'authorize' || val.do === 'revoke') {   // one-tap from the owner-notification card
       const id = String(val.id || '');
       if (/^ou_[A-Za-z0-9]+$/.test(id)) {
         const c = readConfig(); let list = Array.isArray(c.feishuAuthOpenIds) ? c.feishuAuthOpenIds.filter(Boolean) : [];
         if (val.do === 'revoke') list = list.filter(x => x !== id); else if (list.indexOf(id) === -1) list.push(id);
         c.feishuAuthOpenIds = list; try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
-        await sendText(chatId, (val.do === 'revoke' ? '已移除授权:' : '✅ 已授权:') + id);
+        sendText(chatId, (val.do === 'revoke' ? '已移除授权:' : '✅ 已授权:') + id);
       }
       return;
     }
