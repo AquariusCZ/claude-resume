@@ -49,7 +49,7 @@ function Get-CcuConfig {
     resumePrompt='continue'; skipPermissions=$true; dirtyGuard='stash'; perProjectTimeoutMinutes=30;
     safetyMarginSeconds=60; weeklyBackoffMinutes=45; probeModel='haiku'; resumeModel=''; projectHome='';
     feishuWebhook=''; feishuSecret=''; probeIntervalMinutes=15;
-    feishuAppId=''; feishuAppSecret=''; feishuChatId=''; feishuDefaultProject=''; feishuAllowOpenIds=@()
+    feishuAppId=''; feishuAppSecret=''; feishuChatId=''; feishuDefaultProject=''; feishuAllowOpenIds=@(); feishuChatModel=''
   }
   if(Test-Path $script:ConfigPath){
     try {

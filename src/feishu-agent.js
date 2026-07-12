@@ -169,7 +169,8 @@ function runClaude(cwd, label, prompt, opts) {
     const args = ['/c', CLAUDE_CMD];
     if (opts.useContinue !== false) args.push('--continue');
     args.push('-p', prompt, '--output-format', 'stream-json', '--verbose');
-    if (cfg.resumeModel) { args.push('--model', cfg.resumeModel); }
+    const model = opts.model || cfg.resumeModel;   // opts.model lets chat use its own model
+    if (model) { args.push('--model', model); }
     const skip = (opts.skipPermissions !== undefined) ? opts.skipPermissions : cfg.skipPermissions;
     if (skip) { args.push('--dangerously-skip-permissions'); }
     const timeoutMs = Math.max(1, (parseInt(cfg.perProjectTimeoutMinutes, 10) || 30)) * 60000;
@@ -360,7 +361,7 @@ async function onMessage(data) {
     }
     // real chat with Claude, no project touched
     if (running.has(CHAT_DIR.toLowerCase())) { await sendText(chatId, '上一句还在想,请稍候…'); return; }
-    const r = await runClaude(CHAT_DIR, '闲聊', text, { useContinue: chatStarted(), skipPermissions: false });
+    const r = await runClaude(CHAT_DIR, '闲聊', text, { useContinue: chatStarted(), skipPermissions: false, model: cfg.feishuChatModel });
     if (r.ok) markChatStarted();
     await sendText(chatId, (r.text || '(无输出)') + '\n\n———\n💬 闲聊模式 · 发「项目」选项目干活');
     logLine(`闲聊 ok=${r.ok}`);

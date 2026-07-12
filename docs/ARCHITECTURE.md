@@ -114,6 +114,7 @@ Because `--continue` appends to the cwd's most-recent conversation, a project ru
   "feishuSecret": "",         // custom-bot 签名校验 secret (optional, for the webhook fallback)
   "feishuDefaultProject": "", // default project (name or path) for un-prefixed Feishu commands
   "feishuAllowOpenIds": [],   // optional allowlist of sender open_ids; empty = anyone in-chat
+  "feishuChatModel": "",      // model for chat mode (empty = CLI default; e.g. "sonnet" / "opus")
   "continuous": false,       // one-shot by default
   "projectHome": "C:\\Users\\23230\\Desktop\\claude-resume"
 }
