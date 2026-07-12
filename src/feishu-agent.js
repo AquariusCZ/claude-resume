@@ -559,7 +559,9 @@ async function onMessage(data) {
       await sendText(chatId, '🤔 正在思考…');
       logLine(`闲聊 思考中: ${text}`);
       const stopHb = startHeartbeat(chatId, '闲聊');
-      const r = await runClaude(CHAT_DIR, '闲聊', text, { useContinue: chatStarted(), skipPermissions: false, model: cfg.feishuChatModel });
+      // full tools (WebSearch/WebFetch/etc.) like the web app — headless -p has no permission
+      // prompt, so tools are simply blocked without this. Runs in the isolated scratch dir.
+      const r = await runClaude(CHAT_DIR, '闲聊', text, { useContinue: chatStarted(), skipPermissions: true, model: cfg.feishuChatModel });
       stopHb();
       if (r.ok) markChatStarted();
       await sendText(chatId, (r.text || '(无输出)') + '\n\n———\n💬 闲聊模式 · 发「菜单」切换');
