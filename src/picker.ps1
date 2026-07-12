@@ -142,22 +142,24 @@ if(-not $script:instanceOwned -and -not $RenderTo -and -not $SelfTest){
       <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto"><StackPanel x:Name="ProjectList"/></ScrollViewer>
       <Border Grid.Row="3" CornerRadius="16" Background="#FF141413" Margin="0,14,0,0" Padding="14,10">
         <DockPanel>
-          <TextBlock DockPanel.Dock="Top" Text="运行日志" Foreground="{StaticResource Muted}" FontSize="11" FontWeight="SemiBold" Margin="0,0,0,6"/>
-          <ScrollViewer x:Name="LogScroll" VerticalScrollBarVisibility="Auto"><TextBlock x:Name="LogText" FontFamily="Cascadia Code, Consolas" FontSize="11.5" Foreground="{StaticResource Ink2}" TextWrapping="Wrap"/></ScrollViewer>
+          <DockPanel DockPanel.Dock="Top" Margin="0,0,0,6" LastChildFill="False">
+            <TextBlock DockPanel.Dock="Left" Text="运行日志" Foreground="{StaticResource Muted}" FontSize="11" FontWeight="SemiBold" VerticalAlignment="Center"/>
+            <Button x:Name="BtnPopLog" DockPanel.Dock="Right" Style="{StaticResource LinkBtn}" Content="⤢ 弹出大窗" VerticalAlignment="Center"/>
+            <TextBlock x:Name="StatusText" DockPanel.Dock="Right" Text="待布防" Foreground="{StaticResource Ink2}" FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,16,0" TextTrimming="CharacterEllipsis"/>
+          </DockPanel>
+          <ScrollViewer x:Name="LogScroll" VerticalScrollBarVisibility="Auto"><TextBlock x:Name="LogText" FontFamily="Cascadia Code, Consolas" FontSize="12" TextWrapping="Wrap"/></ScrollViewer>
         </DockPanel>
       </Border>
       <Grid Grid.Row="4" Margin="0,16,0,0">
         <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-        <!-- DockPanel (not StackPanel): StatusText fills the finite leftover width, so long
-             flash messages truncate with an ellipsis instead of running under the buttons -->
-        <DockPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,14,0" LastChildFill="True">
+        <!-- status lives in the log header now, so this row only holds the action links -->
+        <DockPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,14,0" LastChildFill="False">
           <Button x:Name="BtnAll" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="全选" VerticalAlignment="Center"/>
           <Button x:Name="BtnNone" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="取消勾选" Margin="14,0,0,0" VerticalAlignment="Center"/>
           <Button x:Name="BtnAdd" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="+ 文件夹" Margin="14,0,0,0" VerticalAlignment="Center"/>
           <Button x:Name="BtnClearLog" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="清空日志" Margin="14,0,0,0" VerticalAlignment="Center"/>
           <Button x:Name="BtnExportLog" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="导出日志" Margin="14,0,0,0" VerticalAlignment="Center"/>
           <Button x:Name="BtnForgetChat" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="忘记闲聊" Margin="14,0,0,0" VerticalAlignment="Center"/>
-          <TextBlock x:Name="StatusText" Text="待布防" Foreground="{StaticResource Muted}" FontSize="12.5" VerticalAlignment="Center" Margin="18,0,0,0" TextTrimming="CharacterEllipsis"/>
         </DockPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal">
           <Button x:Name="BtnPreview" Style="{StaticResource BtnGhost}" Content="预演" Width="88"/>
@@ -181,7 +183,7 @@ try {
   if(Test-Path $icoPath){ $win.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]$icoPath) }
 } catch {}
 $els = @{}
-foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','ChatModelChip','ChatModelText','IntervalChip','IntervalText','ProjectList','LogText','LogScroll','StatusText','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnForgetChat','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
+foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','ChatModelChip','ChatModelText','IntervalChip','IntervalText','ProjectList','LogText','LogScroll','StatusText','BtnPopLog','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnForgetChat','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
 # global UI-thread exception guard: never let a handler bug close the window
 $win.Dispatcher.add_UnhandledException({ param($s,$e)
   try { [System.IO.File]::AppendAllText((Join-Path $env:LOCALAPPDATA 'ClaudeResume\logs\gui-error.log'), ((Get-Date).ToString('s') + "  " + $e.Exception.ToString() + "`r`n"), (New-Object System.Text.UTF8Encoding($false))) } catch {}
@@ -194,7 +196,55 @@ $sync = [hashtable]::Synchronized(@{ req=$true; probing=$false; fhReset=$null; f
 $script:flash = @{ text=''; until=[datetime]::MinValue }
 function Set-Flash($t){ $script:flash.text = $t; $script:flash.until = (Get-Date).AddSeconds(6) }
 $script:logFile = Join-Path $script:LogDir ("run-" + (Get-Date).ToString('yyyyMMdd') + ".log")
-function Read-LogTail { try { if(Test-Path $script:logFile){ return ((Get-Content $script:logFile -Tail 40 -Encoding UTF8 -ErrorAction SilentlyContinue) -join "`r`n") } } catch {} return '' }
+function Read-LogTail { param([int]$Tail=40) try { if(Test-Path $script:logFile){ return ((Get-Content $script:logFile -Tail $Tail -Encoding UTF8 -ErrorAction SilentlyContinue) -join "`r`n") } } catch {} return '' }
+
+# ---- colored log rendering (per [level]) ----
+function New-Brush($hex){ New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($hex)) }
+$script:logColors = @{
+  info   = (New-Brush '#FFC3C2B7')   # Ink2
+  ok     = (New-Brush '#FF3FB950')   # green
+  launch = (New-Brush '#FFE8763F')   # coral
+  warn   = (New-Brush '#FFE3B341')   # amber
+  error  = (New-Brush '#FFF07070')   # red
+  stream = (New-Brush '#FF8F8D86')   # muted
+}
+function Set-LogColored($tb, $text){
+  # rebuild the TextBlock inlines, coloring each line by its [level]. Cheap enough for the tail.
+  $tb.Inlines.Clear()
+  foreach($line in ($text -split "(`r`n|`n)")){
+    if($line -eq "`r`n" -or $line -eq "`n" -or $line.Length -eq 0){ continue }
+    $lvl='info'
+    $m=[regex]::Match($line, '^\[[^\]]+\]\s+\[(\w+)\]')
+    if($m.Success){ $lvl=$m.Groups[1].Value.ToLower() }
+    $br=$script:logColors[$lvl]; if(-not $br){ $br=$script:logColors['info'] }
+    $run=New-Object Windows.Documents.Run($line)
+    $run.Foreground=$br
+    $tb.Inlines.Add($run)
+    $tb.Inlines.Add((New-Object Windows.Documents.LineBreak))
+  }
+}
+$script:lastLogText = $null   # so the timer only re-renders when the tail changed
+
+# ---- pop-out log window (larger, resizable, colored, auto-refreshing) ----
+$script:logWin = $null
+function Show-LogWindow {
+  try {
+    if($script:logWin -and $script:logWin.IsVisible){ $script:logWin.Activate(); return }
+    $w = New-Object Windows.Window
+    $w.Title = 'Claude续跑 · 运行日志'; $w.Width = 1040; $w.Height = 720; $w.WindowStartupLocation='CenterScreen'
+    $w.Background = (New-Brush '#FF0D0D0D')
+    try { if($script:AppDir){ $ico=Join-Path $script:AppDir 'icon.ico'; if(Test-Path $ico){ $w.Icon=[Windows.Media.Imaging.BitmapFrame]::Create([Uri]$ico) } } } catch {}
+    $sv = New-Object Windows.Controls.ScrollViewer; $sv.VerticalScrollBarVisibility='Auto'; $sv.Padding='16'
+    $tb = New-Object Windows.Controls.TextBlock; $tb.FontFamily='Cascadia Code, Consolas'; $tb.FontSize=13.5; $tb.TextWrapping='Wrap'; $tb.LineHeight=19
+    $sv.Content=$tb; $w.Content=$sv
+    $render = { try { Set-LogColored $tb (Read-LogTail 400); $sv.ScrollToEnd() } catch {} }.GetNewClosure()
+    & $render
+    $t = New-Object Windows.Threading.DispatcherTimer; $t.Interval=[TimeSpan]::FromSeconds(1); $t.Add_Tick($render); $t.Start()
+    $w.Add_Closed({ try { $t.Stop() } catch {}; $script:logWin=$null }.GetNewClosure())
+    $script:logWin = $w
+    $w.Show()
+  } catch {}
+}
 
 function New-ProjectCard($proj){
   $b = New-Object Windows.Controls.Border
@@ -392,10 +442,11 @@ $els.BtnDisarm.Add_Click({
 $els.BtnClearLog.Add_Click({
   try {
     if(Test-Path $script:logFile){ [System.IO.File]::WriteAllText($script:logFile, '') }
-    $els.LogText.Text = ''
+    $els.LogText.Inlines.Clear(); $script:lastLogText = $null
     Set-Flash '日志已清空'
   } catch { Set-Flash ('清空出错: ' + $_.Exception.Message) }
 })
+$els.BtnPopLog.Add_Click({ Show-LogWindow })
 $els.BtnForgetChat.Add_Click({
   try {
     # forget the Feishu 闲聊 memory: drop the "started" flag AND the claude session for that cwd
@@ -510,7 +561,7 @@ $timer.Add_Tick({
     $els.ResetText.Text=$t
   }
   $lt = Read-LogTail
-  if($lt -and $els.LogText.Text -ne $lt){ $els.LogText.Text=$lt; $els.LogScroll.ScrollToEnd() }
+  if($lt -ne $script:lastLogText){ $script:lastLogText=$lt; Set-LogColored $els.LogText $lt; $els.LogScroll.ScrollToEnd() }
   if((Get-Date) -lt $script:flash.until){ Set-StatusLine $script:flash.text }
   else {
     $en=$false; try { $en=[bool](Get-CcuConfig).enabled } catch {}
@@ -521,6 +572,6 @@ $timer.Add_Tick({
   try { Update-IntervalChip; Update-ChatModelChip } catch {}
 })
 $timer.Start()
-$win.Add_Closed({ try { $timer.Stop() } catch {}; try { $ps.Stop(); $rs.Close() } catch {}; try { if($script:instanceOwned){ $script:instanceMutex.ReleaseMutex() } } catch {} })
+$win.Add_Closed({ try { $timer.Stop() } catch {}; try { if($script:logWin){ $script:logWin.Close() } } catch {}; try { $ps.Stop(); $rs.Close() } catch {}; try { if($script:instanceOwned){ $script:instanceMutex.ReleaseMutex() } } catch {} })
 if($SelfTest){ $tt=New-Object Windows.Threading.DispatcherTimer; $tt.Interval=[TimeSpan]::FromMilliseconds(2500); $tt.Add_Tick({ $tt.Stop(); $win.Close() }); $tt.Start() }
 [void]$win.ShowDialog()

@@ -233,6 +233,41 @@ async function sendText(chatId, text) {
     } catch (e) { logLine('发送失败: ' + (e && e.message)); }
   }
 }
+async function sendCard(chatId, card) {
+  try {
+    await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(card) } });
+  } catch (e) { logLine('发送卡片失败: ' + (e && e.message)); }
+}
+// Telegram-style menu: buttons to enter a project / chat / status (click -> card.action.trigger)
+function buildMenuCard(chatId) {
+  const ap = activeProject(chatId);
+  const projects = discoverProjects();
+  const modeLine = ap
+    ? `**当前:📂 项目「${ap.name}」** — 直接发消息就在这里续跑,或点下方切换:`
+    : '**当前:💬 闲聊模式** — 直接说话即聊天。点一个项目进入后再发问题即在该项目里跑:';
+  const elements = [{ tag: 'div', text: { tag: 'lark_md', content: modeLine } }];
+  elements.push({ tag: 'action', actions: [
+    { tag: 'button', text: { tag: 'plain_text', content: '💬 闲聊模式' }, type: ap ? 'default' : 'primary', value: { do: 'chat' } },
+    { tag: 'button', text: { tag: 'plain_text', content: 'ℹ️ 状态' }, type: 'default', value: { do: 'status' } },
+  ] });
+  if (projects.length) {
+    elements.push({ tag: 'hr' });
+    const btns = projects.slice(0, 15).map(p => ({
+      tag: 'button',
+      text: { tag: 'plain_text', content: ((ap && ap.path.toLowerCase() === p.path.toLowerCase()) ? '✅ ' : '📂 ') + p.name },
+      type: (ap && ap.path.toLowerCase() === p.path.toLowerCase()) ? 'primary' : 'default',
+      value: { do: 'enter', p: p.path },
+    }));
+    for (let i = 0; i < btns.length; i += 3) elements.push({ tag: 'action', actions: btns.slice(i, i + 3) });
+  } else {
+    elements.push({ tag: 'div', text: { tag: 'lark_md', content: '_未发现项目。先在「Claude续跑」软件里添加/勾选。_' } });
+  }
+  return {
+    config: { wide_screen_mode: true, update_multi: true },
+    header: { template: 'orange', title: { tag: 'plain_text', content: 'Claude 服务器助手 · 选择操作' } },
+    elements,
+  };
+}
 
 // ---- status / list / help (mode-aware) ----
 function statusText(chatId) {
@@ -321,7 +356,7 @@ async function onMessage(data) {
     // ---- global commands (work in any mode) ----
     if (['帮助', 'help', '?', '？', '菜单'].indexOf(low) !== -1) { await sendText(chatId, helpText(chatId)); return; }
     if (['状态', 'status', 'zt'].indexOf(low) !== -1) { await sendText(chatId, statusText(chatId)); return; }
-    if (['项目', 'list', '项目列表', '列出项目', '所有项目'].indexOf(low) !== -1) { await sendText(chatId, listText()); return; }
+    if (['项目', 'list', '项目列表', '列出项目', '所有项目', '菜单', 'menu', '选择', '操作'].indexOf(low) !== -1) { await sendCard(chatId, buildMenuCard(chatId)); return; }
     if (['退出', '返回', 'exit', 'quit', '闲聊', '退出项目'].indexOf(low) !== -1) {
       setActivePath(chatId, null);
       await sendText(chatId, '已回到 💬 闲聊模式(不碰任何项目)。发「项目」查看项目,「进入 X」开始操作。');
@@ -371,11 +406,9 @@ async function onMessage(data) {
 
     const active = activeProject(chatId);
 
-    // greetings: quick reply, never run
-    if (/^(你好|您好|hi|hello|hey|哈喽|在吗|在么|在不在|在|你好呀|嗨|yo)$/i.test(text)) {
-      await sendText(chatId, active
-        ? `在的 👋 你在项目「${active.name}」里,直接发指令即可。发「退出」回到闲聊。`
-        : '在的 👋 直接说话就是和我聊天;发「项目」选一个项目开始干活。');
+    // greetings: show the button menu (Telegram-style) so it's easy to pick chat vs a project
+    if (/^(你好|您好|hi|hello|hey|哈喽|在吗|在么|在不在|在|你好呀|嗨|yo|start|开始)$/i.test(text)) {
+      await sendCard(chatId, buildMenuCard(chatId));
       return;
     }
 
@@ -403,11 +436,43 @@ async function onMessage(data) {
     }
     // real chat with Claude, no project touched
     if (running.has(CHAT_DIR.toLowerCase())) { await sendText(chatId, '上一句还在想,请稍候…'); return; }
+    await sendText(chatId, '🤔 正在思考…');
+    logLine(`闲聊 思考中: ${text}`);
     const r = await runClaude(CHAT_DIR, '闲聊', text, { useContinue: chatStarted(), skipPermissions: false, model: cfg.feishuChatModel });
     if (r.ok) markChatStarted();
-    await sendText(chatId, (r.text || '(无输出)') + '\n\n———\n💬 闲聊模式 · 发「项目」选项目干活');
-    logLine(`闲聊 ok=${r.ok}`);
+    await sendText(chatId, (r.text || '(无输出)') + '\n\n———\n💬 闲聊模式 · 发「菜单」用按钮进项目');
+    logLine(`闲聊 完成 ok=${r.ok}`);
   } catch (e) { logLine('处理消息异常: ' + (e && e.stack || e)); }
+}
+
+// ---- interactive card button clicks (card.action.trigger) ----
+const cardSeen = new Map(); // dedup rapid Feishu re-deliveries of the same click
+async function onCardAction(ev) {
+  try {
+    const chatId = (ev.context && ev.context.open_chat_id) || ev.open_chat_id;
+    const val = (ev.action && ev.action.value) || {};
+    const senderOpen = ev.operator && ev.operator.open_id;
+    if (!chatId || !val || !val.do) return;
+    const key = chatId + ':' + JSON.stringify(val) + ':' + (senderOpen || '');
+    const now = Date.now();
+    if (cardSeen.get(key) && now - cardSeen.get(key) < 4000) return;
+    cardSeen.set(key, now); if (cardSeen.size > 300) cardSeen.clear();
+
+    const cfg = readConfig();
+    const allow = Array.isArray(cfg.feishuAllowOpenIds) ? cfg.feishuAllowOpenIds.filter(Boolean) : [];
+    if (allow.length && senderOpen && allow.indexOf(senderOpen) === -1) { logLine('拒绝未授权点击: ' + senderOpen); return; }
+    try { if (chatId && cfg.feishuChatId !== chatId) { cfg.feishuChatId = chatId; fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 4), 'utf8'); } } catch (e) {}
+    logLine(`卡片点击 chat=${chatId}: ${JSON.stringify(val)}`);
+
+    if (val.do === 'chat') { setActivePath(chatId, null); await sendText(chatId, '已切到 💬 闲聊模式,直接说话就是和我聊天。'); return; }
+    if (val.do === 'status') { await sendText(chatId, statusText(chatId)); return; }
+    if (val.do === 'enter') {
+      const p = discoverProjects().find(x => x.path.toLowerCase() === String(val.p).toLowerCase()) || (val.p ? { name: path.basename(val.p), path: val.p } : null);
+      if (p) { setActivePath(chatId, p.path); await sendText(chatId, `已进入 📂「${p.name}」✅\n现在直接发你的问题/指令,就会在这个项目里跑。发「菜单」可切换或回闲聊。`); }
+      else await sendText(chatId, '项目未找到(可能已变化)。发「菜单」重新选。');
+      return;
+    }
+  } catch (e) { logLine('卡片动作异常: ' + (e && (e.stack || e))); }
 }
 
 // ---- boot ----
@@ -415,6 +480,7 @@ const wsClient = new lark.WSClient({ appId: APP_ID, appSecret: APP_SECRET });
 // register both v1 and v2 of the receive-message event so whichever the console offers works
 const handlers = { 'im.message.receive_v1': async (data) => { await onMessage(data); } };
 try { handlers['im.message.receive_v2'] = async (data) => { await onMessage(data); }; } catch (e) {}
+handlers['card.action.trigger'] = async (ev) => { await onCardAction(ev); };   // button clicks
 // no-op handlers for other events the console may have subscribed (read/reaction/recall/mute),
 // so the SDK doesn't log "no handle" warnings for events we don't act on
 const _noop = async () => {};
