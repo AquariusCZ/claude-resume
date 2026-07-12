@@ -133,14 +133,21 @@ function discoverProjects() {
 // ---- per-chat active project (persisted) + a chat scratch session ----
 const SESSIONS_PATH = path.join(APP_DIR, 'feishu-sessions.json');
 const CHAT_DIR = path.join(APP_DIR, 'feishu-chat');
-function readSessions() { try { return JSON.parse(fs.readFileSync(SESSIONS_PATH, 'utf8')); } catch (e) { return {}; } }
+function readSessions() { try { return JSON.parse(fs.readFileSync(SESSIONS_PATH, 'utf8').replace(/^﻿/, '')); } catch (e) { return {}; } }
 function writeSessions(o) { try { fs.writeFileSync(SESSIONS_PATH, JSON.stringify(o, null, 2), 'utf8'); } catch (e) {} }
-function getActivePath(chatId) { const s = readSessions(); return (s[chatId] && s[chatId].project) || null; }
-function setActivePath(chatId, projPath) { const s = readSessions(); s[chatId] = s[chatId] || {}; s[chatId].project = projPath || null; writeSessions(s); }
+// three modes: 'idle' (default — do nothing until the user picks via the card), 'chat', 'project'
+function getSession(chatId) {
+  const s = readSessions(); const v = s[chatId];
+  if (!v) return { mode: 'idle' };
+  if (typeof v === 'string') return v ? { mode: 'project', project: v } : { mode: 'idle' };   // legacy
+  return { mode: v.mode || (v.project ? 'project' : 'idle'), project: v.project };
+}
+function setSession(chatId, sess) { const s = readSessions(); s[chatId] = sess; writeSessions(s); }
 function activeProject(chatId) {
-  const p = getActivePath(chatId); if (!p) return null;
-  const found = discoverProjects().find(x => x.path.toLowerCase() === p.toLowerCase());
-  return found || { name: path.basename(p), path: p };
+  const sess = getSession(chatId);
+  if (sess.mode !== 'project' || !sess.project) return null;
+  const found = discoverProjects().find(x => x.path.toLowerCase() === sess.project.toLowerCase());
+  return found || { name: path.basename(sess.project), path: sess.project };
 }
 function chatStarted() { try { fs.mkdirSync(CHAT_DIR, { recursive: true }); return fs.existsSync(path.join(CHAT_DIR, '.started')); } catch (e) { return false; } }
 function markChatStarted() { try { fs.writeFileSync(path.join(CHAT_DIR, '.started'), '1'); } catch (e) {} }
@@ -238,24 +245,37 @@ async function sendCard(chatId, card) {
     await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(card) } });
   } catch (e) { logLine('发送卡片失败: ' + (e && e.message)); }
 }
-// Telegram-style menu: buttons to enter a project / chat / status (click -> card.action.trigger)
+// Telegram-style menu: buttons to enter a project / chat / status / switch model.
+// Default 'idle' mode does nothing until the user taps a button here.
 function buildMenuCard(chatId) {
+  const sess = getSession(chatId);
   const ap = activeProject(chatId);
   const projects = discoverProjects();
-  const modeLine = ap
-    ? `**当前:📂 项目「${ap.name}」** — 直接发消息就在这里续跑,或点下方切换:`
-    : '**当前:💬 闲聊模式** — 直接说话即聊天。点一个项目进入后再发问题即在该项目里跑:';
+  const curModel = String(readConfig().feishuChatModel || '').toLowerCase();
+  const modelLabel = { sonnet: 'Sonnet', opus: 'Opus', haiku: 'Haiku' }[curModel] || '默认';
+  let modeLine;
+  if (ap) modeLine = `**当前:📂 项目「${ap.name}」** — 直接发消息就在这里续跑。`;
+  else if (sess.mode === 'chat') modeLine = '**当前:💬 闲聊模式** — 直接说话就是和我聊天。';
+  else modeLine = '**请选择 👇** 点「闲聊模式」开始聊天,或点一个项目进入。选之前我不处理任何消息。';
+  const eq = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
   const elements = [{ tag: 'div', text: { tag: 'lark_md', content: modeLine } }];
   elements.push({ tag: 'action', actions: [
-    { tag: 'button', text: { tag: 'plain_text', content: '💬 闲聊模式' }, type: ap ? 'default' : 'primary', value: { do: 'chat' } },
+    { tag: 'button', text: { tag: 'plain_text', content: (sess.mode === 'chat' ? '✅ ' : '💬 ') + '闲聊模式' }, type: sess.mode === 'chat' ? 'primary' : 'default', value: { do: 'chat' } },
     { tag: 'button', text: { tag: 'plain_text', content: 'ℹ️ 状态' }, type: 'default', value: { do: 'status' } },
   ] });
+  // chat-model switch buttons (no typing needed)
+  elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**闲聊模型:${modelLabel}** — 点下面切换(与软件同步):` } });
+  const models = [['默认', ''], ['Sonnet', 'sonnet'], ['Opus', 'opus'], ['Haiku', 'haiku']];
+  elements.push({ tag: 'action', actions: models.map(([lbl, v]) => ({
+    tag: 'button', text: { tag: 'plain_text', content: (eq(curModel, v) ? '✅ ' : '') + lbl },
+    type: eq(curModel, v) ? 'primary' : 'default', value: { do: 'model', m: v },
+  })) });
   if (projects.length) {
     elements.push({ tag: 'hr' });
     const btns = projects.slice(0, 15).map(p => ({
       tag: 'button',
-      text: { tag: 'plain_text', content: ((ap && ap.path.toLowerCase() === p.path.toLowerCase()) ? '✅ ' : '📂 ') + p.name },
-      type: (ap && ap.path.toLowerCase() === p.path.toLowerCase()) ? 'primary' : 'default',
+      text: { tag: 'plain_text', content: ((ap && eq(ap.path, p.path)) ? '✅ ' : '📂 ') + p.name },
+      type: (ap && eq(ap.path, p.path)) ? 'primary' : 'default',
       value: { do: 'enter', p: p.path },
     }));
     for (let i = 0; i < btns.length; i += 3) elements.push({ tag: 'action', actions: btns.slice(i, i + 3) });
@@ -283,7 +303,7 @@ function statusText(chatId) {
     }
   }
   const ap = activeProject(chatId);
-  const mode = ap ? `📂 当前项目:「${ap.name}」` : '💬 当前:闲聊模式(不碰项目)';
+  const mode = ap ? `📂 当前项目:「${ap.name}」` : (getSession(chatId).mode === 'chat' ? '💬 当前:闲聊模式' : '🅾️ 当前:待选(发「菜单」选择)');
   return `${mode}\n布防:${cfg.enabled ? '● 已布防' : '○ 未布防'} · 引擎 ${st.phase || 'idle'}\n${reset} · 实探间隔 ${cfg.probeIntervalMinutes || 15}m`;
 }
 function listText() {
@@ -357,9 +377,14 @@ async function onMessage(data) {
     if (['帮助', 'help', '?', '？', '菜单'].indexOf(low) !== -1) { await sendText(chatId, helpText(chatId)); return; }
     if (['状态', 'status', 'zt'].indexOf(low) !== -1) { await sendText(chatId, statusText(chatId)); return; }
     if (['项目', 'list', '项目列表', '列出项目', '所有项目', '菜单', 'menu', '选择', '操作'].indexOf(low) !== -1) { await sendCard(chatId, buildMenuCard(chatId)); return; }
-    if (['退出', '返回', 'exit', 'quit', '闲聊', '退出项目'].indexOf(low) !== -1) {
-      setActivePath(chatId, null);
-      await sendText(chatId, '已回到 💬 闲聊模式(不碰任何项目)。发「项目」查看项目,「进入 X」开始操作。');
+    if (['退出', '返回', 'exit', 'quit', '退出项目', '主菜单'].indexOf(low) !== -1) {
+      setSession(chatId, { mode: 'idle' });
+      await sendCard(chatId, buildMenuCard(chatId));   // back to the main menu (idle)
+      return;
+    }
+    if (['闲聊', '闲聊模式', 'chat'].indexOf(low) !== -1) {
+      setSession(chatId, { mode: 'chat' });
+      await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。发「退出」回主菜单。');
       return;
     }
     // chat model: show (模型) or set (模型 opus) — shared with the GUI chip
@@ -399,12 +424,10 @@ async function onMessage(data) {
     const m = text.match(/^(进入|选择|选|切换|打开|进|use|open)\s+(.+)$/i);
     if (m) {
       const p = findProject(m[2]);
-      if (p) { setActivePath(chatId, p.path); await sendText(chatId, `已进入 📂「${p.name}」。之后消息都会在这里续跑;发「退出」回到闲聊,「进入 X」换项目。`); }
+      if (p) { setSession(chatId, { mode: 'project', project: p.path }); await sendText(chatId, `已进入 📂「${p.name}」。之后消息都会在这里续跑;发「退出」回主菜单,「进入 X」换项目。`); }
       else await sendText(chatId, `没找到项目「${m[2]}」。\n\n` + listText());
       return;
     }
-
-    const active = activeProject(chatId);
 
     // greetings: show the button menu (Telegram-style) so it's easy to pick chat vs a project
     if (/^(你好|您好|hi|hello|hey|哈喽|在吗|在么|在不在|在|你好呀|嗨|yo|start|开始)$/i.test(text)) {
@@ -412,20 +435,11 @@ async function onMessage(data) {
       return;
     }
 
-    // ---- in an active project: everything runs there ----
-    if (active) {
-      if (running.has(active.path.toLowerCase())) { await sendText(chatId, `「${active.name}」正在执行中,请稍候,或发「停止」取消。`); return; }
-      await sendText(chatId, `📂 在「${active.name}」执行:${text}`);
-      const r = await runClaude(active.path, active.name, text, { useContinue: true });
-      await sendText(chatId, (r.ok ? `✅ 「${active.name}」完成:\n\n` : `⚠️ 「${active.name}」:\n\n`) + (r.text || '(无输出)'));
-      logLine(`完成 ${active.name} ok=${r.ok}`);
-      return;
-    }
-
-    // ---- chat mode ----
-    const bare = projectIfBareName(text);            // bare project name/number -> enter it
-    if (bare) { setActivePath(chatId, bare.path); await sendText(chatId, `已进入 📂「${bare.name}」。直接发指令即可;发「退出」回到闲聊。`); return; }
-    const oneoff = oneOffTarget(text);               // "<project> <command>" -> one-off, no switch
+    // bare project name/number -> enter it (works from any mode)
+    const bare = projectIfBareName(text);
+    if (bare) { setSession(chatId, { mode: 'project', project: bare.path }); await sendText(chatId, `已进入 📂「${bare.name}」。直接发指令即可;发「退出」回主菜单。`); return; }
+    // "<project> <command>" -> one-off run, doesn't change the current mode
+    const oneoff = oneOffTarget(text);
     if (oneoff.project) {
       if (running.has(oneoff.project.path.toLowerCase())) { await sendText(chatId, `「${oneoff.project.name}」正在执行中,请稍候。`); return; }
       await sendText(chatId, `📂 一次性在「${oneoff.project.name}」执行:${oneoff.prompt}`);
@@ -434,14 +448,29 @@ async function onMessage(data) {
       logLine(`一次性完成 ${oneoff.project.name} ok=${r.ok}`);
       return;
     }
-    // real chat with Claude, no project touched
-    if (running.has(CHAT_DIR.toLowerCase())) { await sendText(chatId, '上一句还在想,请稍候…'); return; }
-    await sendText(chatId, '🤔 正在思考…');
-    logLine(`闲聊 思考中: ${text}`);
-    const r = await runClaude(CHAT_DIR, '闲聊', text, { useContinue: chatStarted(), skipPermissions: false, model: cfg.feishuChatModel });
-    if (r.ok) markChatStarted();
-    await sendText(chatId, (r.text || '(无输出)') + '\n\n———\n💬 闲聊模式 · 发「菜单」用按钮进项目');
-    logLine(`闲聊 完成 ok=${r.ok}`);
+
+    // ---- mode dispatch ----
+    const active = activeProject(chatId);
+    if (active) {   // project mode: run in the active project
+      if (running.has(active.path.toLowerCase())) { await sendText(chatId, `「${active.name}」正在执行中,请稍候,或发「停止」取消。`); return; }
+      await sendText(chatId, `📂 在「${active.name}」执行:${text}`);
+      const r = await runClaude(active.path, active.name, text, { useContinue: true });
+      await sendText(chatId, (r.ok ? `✅ 「${active.name}」完成:\n\n` : `⚠️ 「${active.name}」:\n\n`) + (r.text || '(无输出)'));
+      logLine(`完成 ${active.name} ok=${r.ok}`);
+      return;
+    }
+    if (getSession(chatId).mode === 'chat') {   // chat mode: talk to Claude
+      if (running.has(CHAT_DIR.toLowerCase())) { await sendText(chatId, '上一句还在想,请稍候…'); return; }
+      await sendText(chatId, '🤔 正在思考…');
+      logLine(`闲聊 思考中: ${text}`);
+      const r = await runClaude(CHAT_DIR, '闲聊', text, { useContinue: chatStarted(), skipPermissions: false, model: cfg.feishuChatModel });
+      if (r.ok) markChatStarted();
+      await sendText(chatId, (r.text || '(无输出)') + '\n\n———\n💬 闲聊模式 · 发「菜单」切换');
+      logLine(`闲聊 完成 ok=${r.ok}`);
+      return;
+    }
+    // idle mode: don't run anything — show the menu so the user picks a mode first
+    await sendCard(chatId, buildMenuCard(chatId));
   } catch (e) { logLine('处理消息异常: ' + (e && e.stack || e)); }
 }
 
@@ -464,11 +493,19 @@ async function onCardAction(ev) {
     try { if (chatId && cfg.feishuChatId !== chatId) { cfg.feishuChatId = chatId; fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 4), 'utf8'); } } catch (e) {}
     logLine(`卡片点击 chat=${chatId}: ${JSON.stringify(val)}`);
 
-    if (val.do === 'chat') { setActivePath(chatId, null); await sendText(chatId, '已切到 💬 闲聊模式,直接说话就是和我聊天。'); return; }
+    if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。发「退出」回主菜单。'); return; }
     if (val.do === 'status') { await sendText(chatId, statusText(chatId)); return; }
+    if (val.do === 'model') {
+      const mm = String(val.m || '').toLowerCase();
+      const v = (['opus', 'sonnet', 'haiku'].indexOf(mm) !== -1) ? mm : '';
+      try { const c = readConfig(); c.feishuChatModel = v; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
+      const label = { sonnet: 'Sonnet', opus: 'Opus', haiku: 'Haiku' }[v] || '默认';
+      await sendText(chatId, `闲聊模型已切到:${label}(下一句闲聊生效;软件已同步)。`);
+      return;
+    }
     if (val.do === 'enter') {
       const p = discoverProjects().find(x => x.path.toLowerCase() === String(val.p).toLowerCase()) || (val.p ? { name: path.basename(val.p), path: val.p } : null);
-      if (p) { setActivePath(chatId, p.path); await sendText(chatId, `已进入 📂「${p.name}」✅\n现在直接发你的问题/指令,就会在这个项目里跑。发「菜单」可切换或回闲聊。`); }
+      if (p) { setSession(chatId, { mode: 'project', project: p.path }); await sendText(chatId, `已进入 📂「${p.name}」✅\n现在直接发你的问题/指令,就会在这个项目里跑。发「菜单」可切换,「退出」回主菜单。`); }
       else await sendText(chatId, '项目未找到(可能已变化)。发「菜单」重新选。');
       return;
     }
