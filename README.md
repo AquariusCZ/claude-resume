@@ -36,13 +36,17 @@ This copies the program to `%LOCALAPPDATA%\ClaudeResume`, creates the Desktop sh
 
 > **About the numbers:** there is **no estimation** — every reset time / percentage is read *live* from Claude. The probe runs `claude -p` as `stream-json`; Claude emits a `rate_limit_event` carrying the server's `resetsAt` and `utilization` (the same values the `/usage` screen shows). Firing is driven by the same live probe, so the tool resumes at the real reset regardless of what's on screen.
 
-## Feishu (飞书) integration — optional
+## Feishu (飞书) integration — optional (one bot does everything)
 
-Two independent channels, both configured in `%LOCALAPPDATA%\ClaudeResume\config.json`:
+Configure a Feishu **自建应用** and a single bot handles **both** notifications and two-way commands, in the same chat.
 
-1. **Notifications (one-way).** Set `feishuWebhook` to a group's **custom-bot** webhook URL (and `feishuSecret` if you enabled 签名校验). The checker pushes key events — limited detected / resume started / per-project ✅❌ / all done.
-2. **Two-way assistant.** Set `feishuAppId` + `feishuAppSecret` from a Feishu **自建应用**, then re-run `install.ps1`. A background agent (`feishu-agent.js`, Node long-connection — **no public IP needed**) lets you DM the bot to run commands: send `<项目名> <指令>` (or just `<指令>` for the single armed project) and it runs `claude --continue` there and replies with the result. `帮助` / `状态` / `项目` / `停止 <项目>` are also understood. It continues the **same** conversation your VS Code session shows (reopen the session to see it — the panel doesn't live-refresh external appends).
-   - App setup: enable the **bot**, add scope `im:message` (send + receive), subscribe event `接收消息 im.message.receive_v1`, set 订阅方式 to **长连接**, then **发布版本**. Add the bot to a chat (or DM it).
+1. **Set up the app** (developer console): enable the **bot**; grant scope `im:message` (send + receive); under 事件与回调 set 订阅方式 to **长连接** and subscribe the **接收消息 `im.message.receive_v1`** event (a "v2.0" badge on it is fine — the event name still ends `_v1`); then **发布版本**.
+2. Put `feishuAppId` + `feishuAppSecret` into `%LOCALAPPDATA%\ClaudeResume\config.json` and re-run `install.ps1`. A background agent (`feishu-agent.js`, Node long-connection — **no public IP needed**) starts at logon.
+3. **DM the bot once** (say `帮助`). That registers the chat, so from then on the checker's notifications (limited / resume started / per-project ✅❌ / all done) come from this same bot.
+
+Commands: `<项目名> <指令>` runs in that project, or just `<指令>` for the single armed project; `帮助` / `状态` / `项目` / `停止 <项目>` are understood. It continues the **same** conversation your VS Code session shows (reopen the session to see it — the panel doesn't live-refresh external appends).
+
+> Prefer not to set up an app? Set `feishuWebhook` (a group **custom-bot** webhook, `feishuSecret` if 签名校验 is on) for **one-way notifications only**.
 
 ## Safety
 

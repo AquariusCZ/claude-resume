@@ -128,7 +128,7 @@ if(-not $script:instanceOwned -and -not $RenderTo -and -not $SelfTest){
           <Border x:Name="IntervalChip" Cursor="Hand" ToolTip="布防后每隔多久自动实探一次额度(点击切换 5 / 15 / 30 分钟);被限流后自动加密到 4 分钟。" CornerRadius="9" Background="{StaticResource Card}" BorderBrush="{StaticResource Border0}" BorderThickness="1" Padding="13,7" Margin="0,0,8,0">
             <TextBlock x:Name="IntervalText" Text="间隔 15m" Foreground="{StaticResource Ink2}" FontSize="12.5" FontWeight="SemiBold"/>
           </Border>
-          <Border x:Name="ResetChip" Cursor="Hand" ToolTip="当前额度用量与精确重置时间(实探读到)。点击立即重新实探。" VerticalAlignment="Center" CornerRadius="9" Background="{StaticResource AccentSoft}" BorderBrush="{StaticResource Border0}" BorderThickness="1" Padding="13,7">
+          <Border x:Name="ResetChip" Cursor="Hand" ToolTip="5h / 7d 两个额度窗口的实时用量(实探读到)。5h「低」表示还远未接近上限(此时服务器不下发具体百分比);接近或被限流时显示精确倒计时。点击立即重新实探。" VerticalAlignment="Center" CornerRadius="9" Background="{StaticResource AccentSoft}" BorderBrush="{StaticResource Border0}" BorderThickness="1" Padding="13,7">
             <StackPanel Orientation="Horizontal">
               <TextBlock Text="&#xE72C;" FontFamily="Segoe MDL2 Assets" Foreground="{StaticResource Muted}" FontSize="12" Margin="0,0,7,0" VerticalAlignment="Center"/>
               <TextBlock x:Name="ResetText" Text="实探中…" Foreground="{StaticResource Accent}" FontSize="12.5" FontWeight="SemiBold" VerticalAlignment="Center"/>
@@ -452,18 +452,18 @@ $timer.Add_Tick({
   if($sync.probing){
     $els.ResetText.Text='实探中…'
   } else {
-    # show the binding window as a percentage; add a precise countdown once limited/near.
-    # priority: 5h limited > 5h % > 7d % > checker cache > 点击实探
-    $t=$null
-    if($sync.limited -and $sync.fhReset -and $sync.fhReset -gt $nowU){ $t='5h 限流 · '+(Format-Countdown ($sync.fhReset-$nowU).TotalSeconds) }
-    elseif($null -ne $sync.fhUtil){
-      $t='5h '+[int][Math]::Round([double]$sync.fhUtil*100)+'%'
-      if($sync.fhReset -and $sync.fhReset -gt $nowU){ $t+=' · '+(Format-Countdown ($sync.fhReset-$nowU).TotalSeconds) }
-    }
-    elseif($null -ne $sync.sdUtil){
-      if($sync.limited -and $sync.sdReset -and $sync.sdReset -gt $nowU){ $t='7d 限流 · '+(Format-Countdown ($sync.sdReset-$nowU).TotalSeconds) }
-      else { $t='7d '+[int][Math]::Round([double]$sync.sdUtil*100)+'%' }
-    }
+    # show BOTH windows (5h first): a percentage when the server reports one, a precise
+    # countdown once limited, and '低' for the 5h window while it's well below its limit
+    # (the server only reports a window's number as it approaches, so no number yet = low).
+    $probed = ($sync.probedAt -ne [datetime]::MinValue)
+    $fh=''
+    if($sync.limited -and $sync.fhReset -and $sync.fhReset -gt $nowU){ $fh='5h 限流 '+(Format-Countdown ($sync.fhReset-$nowU).TotalSeconds) }
+    elseif($null -ne $sync.fhUtil){ $fh='5h '+[int][Math]::Round([double]$sync.fhUtil*100)+'%' }
+    elseif($probed -and $sync.ready){ $fh='5h 低' }
+    $sd=''
+    if($sync.limited -and $sync.sdReset -and $sync.sdReset -gt $nowU){ $sd='7d 限流 '+(Format-Countdown ($sync.sdReset-$nowU).TotalSeconds) }
+    elseif($null -ne $sync.sdUtil){ $sd='7d '+[int][Math]::Round([double]$sync.sdUtil*100)+'%' }
+    $t = (@($fh,$sd) | Where-Object { $_ }) -join ' · '
     if(-not $t){
       try { $st=Get-CcuState
         if($st.realFiveHourResetUtc -and $st.realResetProbedUtc){
@@ -472,7 +472,7 @@ $timer.Add_Tick({
         }
       } catch {}
     }
-    if(-not $t){ $t = if($sync.probedAt -ne [datetime]::MinValue){ '空闲' } else { '点击实探' } }
+    if(-not $t){ $t = if($probed){ '空闲' } else { '点击实探' } }
     $els.ResetText.Text=$t
   }
   $lt = Read-LogTail

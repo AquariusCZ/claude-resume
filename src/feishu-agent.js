@@ -260,6 +260,16 @@ async function onMessage(data) {
     const chatId = msg.chat_id;
     const senderOpen = data.sender && data.sender.sender_id && data.sender.sender_id.open_id;
 
+    // single-bot mode: remember this chat so the checker's notifications go here too
+    try {
+      const c = readConfig();
+      if (chatId && c.feishuChatId !== chatId) {
+        c.feishuChatId = chatId;
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8');
+        logLine('已记录通知 chatId: ' + chatId);
+      }
+    } catch (e) {}
+
     const cfg = readConfig();
     const allow = Array.isArray(cfg.feishuAllowOpenIds) ? cfg.feishuAllowOpenIds.filter(Boolean) : [];
     if (allow.length && senderOpen && allow.indexOf(senderOpen) === -1) {
@@ -273,6 +283,11 @@ async function onMessage(data) {
     logLine(`收到指令 chat=${chatId} sender=${senderOpen}: ${text}`);
 
     const low = text.toLowerCase();
+    // greetings: answer, don't run a project (so a casual 你好 never burns quota)
+    if (/^(你好|您好|hi|hello|hey|哈喽|在吗|在么|在不在|在|你好呀|嗨)$/i.test(text)) {
+      await sendText(chatId, '在的 👋 发「项目名 指令」我就去对应项目跑,例如:OCS1x1 data viewer APP 继续。发「帮助」看全部用法。');
+      return;
+    }
     if (['帮助', 'help', '?', '？'].indexOf(low) !== -1) { await sendText(chatId, helpText()); return; }
     if (['状态', 'status', 'zt'].indexOf(low) !== -1) { await sendText(chatId, statusText()); return; }
     if (['项目', 'list', '项目列表'].indexOf(low) !== -1) { await sendText(chatId, listText()); return; }
@@ -302,9 +317,20 @@ async function onMessage(data) {
 
 // ---- boot ----
 const wsClient = new lark.WSClient({ appId: APP_ID, appSecret: APP_SECRET });
-const eventDispatcher = new lark.EventDispatcher({}).register({
-  'im.message.receive_v1': async (data) => { await onMessage(data); },
-});
+// register both v1 and v2 of the receive-message event so whichever the console offers works
+const handlers = { 'im.message.receive_v1': async (data) => { await onMessage(data); } };
+try { handlers['im.message.receive_v2'] = async (data) => { await onMessage(data); }; } catch (e) {}
+// no-op handlers for other events the console may have subscribed (read/reaction/recall/mute),
+// so the SDK doesn't log "no handle" warnings for events we don't act on
+const _noop = async () => {};
+for (const k of ['im.message.message_read_v1', 'im.message.reaction.created_v1', 'im.message.reaction.deleted_v1', 'im.message.recalled_v1', 'im.message.bot_muted_v1']) { handlers[k] = _noop; }
+let eventDispatcher;
+try {
+  eventDispatcher = new lark.EventDispatcher({}).register(handlers);
+} catch (e) {
+  logLine('注册 v2 事件失败,回退仅 v1: ' + (e && e.message));
+  eventDispatcher = new lark.EventDispatcher({}).register({ 'im.message.receive_v1': async (data) => { await onMessage(data); } });
+}
 logLine('feishu-agent 启动,连接飞书长连接…  claude=' + CLAUDE_CMD);
 wsClient.start({ eventDispatcher });
 // keep the process alive

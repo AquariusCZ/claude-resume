@@ -49,7 +49,7 @@ function Get-CcuConfig {
     resumePrompt='continue'; skipPermissions=$true; dirtyGuard='stash'; perProjectTimeoutMinutes=30;
     safetyMarginSeconds=60; weeklyBackoffMinutes=45; probeModel='haiku'; resumeModel=''; projectHome='';
     feishuWebhook=''; feishuSecret=''; probeIntervalMinutes=15;
-    feishuAppId=''; feishuAppSecret=''; feishuDefaultProject=''; feishuAllowOpenIds=@()
+    feishuAppId=''; feishuAppSecret=''; feishuChatId=''; feishuDefaultProject=''; feishuAllowOpenIds=@()
   }
   if(Test-Path $script:ConfigPath){
     try {
@@ -200,28 +200,58 @@ function Test-ClaudeReady {
   return $r
 }
 
-function Send-FeishuNotify {
-  # Push one status line to a Feishu group via its custom-bot webhook (one-way, fire-and-forget).
-  # Empty/missing feishuWebhook in config.json = feature off. Never throws: a notification
-  # failure must never break the engine. If feishuSecret is set (bot "签名校验" enabled),
-  # sign per Feishu's spec: key = "<unix_ts>\n<secret>", HMAC-SHA256 over an EMPTY message,
-  # base64 -> send {timestamp, sign} alongside the payload.
-  param([string]$Text, [string]$Webhook = '', [string]$Secret = $null)
+function Get-FeishuTenantToken {
+  # tenant_access_token for the self-built app, cached in a file until ~2 min before expiry.
+  param([string]$AppId, [string]$AppSecret)
   try {
-    $cfg = $null
-    if(-not $Webhook){ $cfg = Get-CcuConfig; $Webhook = "$($cfg.feishuWebhook)" }
-    if(-not $Webhook){ return $false }
-    if($null -eq $Secret){ if($null -eq $cfg){ $cfg = Get-CcuConfig }; $Secret = "$($cfg.feishuSecret)" }
+    if(-not $AppId -or -not $AppSecret){ return $null }
+    $cachePath = Join-Path $script:AppDir 'feishu-token.json'
+    $nowUnix = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if(Test-Path $cachePath){
+      try {
+        $c = Get-Content $cachePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if("$($c.appId)" -eq $AppId -and "$($c.token)" -and [long]$c.expiresAt -gt $nowUnix){ return "$($c.token)" }
+      } catch {}
+    }
+    $r = Invoke-RestMethod -Uri 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal' -Method Post -TimeoutSec 10 `
+           -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes((@{ app_id=$AppId; app_secret=$AppSecret } | ConvertTo-Json -Compress)))
+    if($r.code -eq 0 -and $r.tenant_access_token){
+      try { (@{ appId=$AppId; token=$r.tenant_access_token; expiresAt=($nowUnix + [int]$r.expire - 120) } | ConvertTo-Json) | Set-Content -Path $cachePath -Encoding UTF8 } catch {}
+      return "$($r.tenant_access_token)"
+    }
+    return $null
+  } catch { return $null }
+}
+
+function Send-FeishuNotify {
+  # Push one status line to Feishu. Prefers the single self-built app bot (app API -> the chat you
+  # talk to it in, feishuChatId) so ONE bot does both notify + two-way; falls back to the custom-bot
+  # webhook (optionally 签名校验-signed) if the app isn't fully set up. Never throws.
+  param([string]$Text)
+  try {
+    $cfg = Get-CcuConfig
+    # 1) self-built app bot (im/v1/messages)
+    if("$($cfg.feishuAppId)" -and "$($cfg.feishuAppSecret)" -and "$($cfg.feishuChatId)"){
+      $token = Get-FeishuTenantToken -AppId "$($cfg.feishuAppId)" -AppSecret "$($cfg.feishuAppSecret)"
+      if($token){
+        $content = @{ text = $Text } | ConvertTo-Json -Compress
+        $body = @{ receive_id="$($cfg.feishuChatId)"; msg_type='text'; content=$content } | ConvertTo-Json -Compress
+        $resp = Invoke-RestMethod -Uri 'https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id' -Method Post -TimeoutSec 10 `
+                  -Headers @{ Authorization = "Bearer $token" } -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
+        if($resp.code -eq 0){ return $true }
+      }
+    }
+    # 2) custom-bot webhook (optionally signed)
+    $Webhook = "$($cfg.feishuWebhook)"; if(-not $Webhook){ return $false }
+    $Secret = "$($cfg.feishuSecret)"
     $payload = [ordered]@{ msg_type='text'; content=@{ text=$Text } }
     if($Secret){
-      $ts = [string][int][double]::Parse(([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()).ToString())
-      $strToSign = "$ts`n$Secret"
+      $ts = [string][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
       $hmac = New-Object System.Security.Cryptography.HMACSHA256
-      $hmac.Key = [System.Text.Encoding]::UTF8.GetBytes($strToSign)
-      $sign = [Convert]::ToBase64String($hmac.ComputeHash([byte[]]@()))
+      $hmac.Key = [System.Text.Encoding]::UTF8.GetBytes("$ts`n$Secret")
+      $payload['sign'] = [Convert]::ToBase64String($hmac.ComputeHash([byte[]]@()))
       $hmac.Dispose()
       $payload['timestamp'] = $ts
-      $payload['sign'] = $sign
     }
     $body = $payload | ConvertTo-Json -Depth 4 -Compress
     $null = Invoke-RestMethod -Uri $Webhook -Method Post -TimeoutSec 10 `

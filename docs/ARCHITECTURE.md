@@ -63,7 +63,7 @@ The probe (`Test-ClaudeReady`) runs `claude -p "ready" --max-turns 1` as `--outp
 {"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1783706400,"rateLimitType":"five_hour|seven_day","utilization":0.88,...}}
 ```
 
-`Test-ClaudeReady` parses `resetsAt` (Unix seconds) and `utilization` per `rateLimitType` (both `five_hour` and `seven_day`); `Save-RealResetFromProbe` caches the reset in `state.json` **as an integer** (ConvertFrom-Json rebases ISO strings to local `[DateTime]` but leaves integers untouched → timezone-safe). The GUI shows the binding window as a **percentage** (`5h 62%`, or `7d 53%` when the 5h window is fresh), switching to a precise countdown (`5h 限流 · 1h 04m`) once limited. Note the server only sends a window's `rate_limit_info` once it is **utilized enough** (and always when `blocked`), so early in a fresh 5h window only the 7-day figure may be present. `/usage` itself is interactive-only (no `claude usage` subcommand), so this stream-json event is the scriptable way to read the same data.
+`Test-ClaudeReady` parses `resetsAt` (Unix seconds) and `utilization` per `rateLimitType` (both `five_hour` and `seven_day`); `Save-RealResetFromProbe` caches the reset in `state.json` **as an integer** (ConvertFrom-Json rebases ISO strings to local `[DateTime]` but leaves integers untouched → timezone-safe). The GUI chip shows **both windows** (`5h 62% · 7d 53%`), each switching to a precise countdown (`5h 限流 · 1h 04m`) once limited. Note the server only sends a window's `rate_limit_info` once it is **utilized enough** (and always when `blocked`), so early in a fresh 5h window the server sends no 5h number — the chip shows `5h 低` for that window (well below its limit) alongside the 7-day figure. `/usage` itself is interactive-only (no `claude usage` subcommand), so this stream-json event is the scriptable way to read the same data.
 
 ### The GUI probes on demand, not on a loop
 
@@ -82,8 +82,9 @@ The probe (`Test-ClaudeReady`) runs `claude -p "ready" --max-turns 1` as `--outp
 
 ## Feishu integration (two channels)
 
-1. **One-way notifications (custom-bot webhook).** `Send-FeishuNotify` (in `lib.ps1`) POSTs key checker events (limited detected / resume started / per-project ✅❌ / all done) to a group's custom-bot webhook. If the bot has **签名校验** on, it signs per Feishu's spec: HMAC-SHA256 with key `"<timestamp>\n<secret>"` over an empty message, base64, sent as `{timestamp, sign}`. Empty `feishuWebhook` = off.
-2. **Two-way agent (`feishu-agent.js`, Node long-connection).** Uses the official `@larksuiteoapi/node-sdk` `WSClient` — a persistent WebSocket to Feishu, so **no public IP** is needed. It subscribes to `im.message.receive_v1`, maps each message to a project (prefix-match the project name, else the single armed default), runs `claude --continue -p "<text>"` there, and replies with the result. Because `--continue` appends to the project's most-recent conversation, this continues the **same** thread the VS Code extension shows (reopen the session there to see it; the panel doesn't live-refresh external appends). Single-instance via a pidfile with a liveness check (Windows lets two sockets share a loopback port, so a port lock is unreliable). Started at logon by a Startup-folder shortcut → `feishu-launch.vbs`, which auto-restarts node on exit. Requires the Feishu app to have: bot enabled, scopes `im:message` (+ send), event `im.message.receive_v1`, and **长连接** subscription mode — then a published version.
+**One bot does both.** With a self-built app configured, notifications and two-way commands both go through the single app bot, in the same chat. `Send-FeishuNotify` (in `lib.ps1`) prefers the **app API** (`im/v1/messages` with a cached `tenant_access_token`) sending to `feishuChatId` — the chat the agent last saw a message in, which it writes back to `config.json`. If the app isn't fully set up it falls back to a **custom-bot webhook** (optionally **签名校验**-signed: HMAC-SHA256 with key `"<timestamp>\n<secret>"` over an empty message, base64, as `{timestamp, sign}`).
+
+The **two-way agent** (`feishu-agent.js`, Node) uses the official `@larksuiteoapi/node-sdk` `WSClient` — a persistent WebSocket to Feishu, so **no public IP** is needed. It registers `im.message.receive_v1` (and `_v2` as a safety net), maps each message to a project (prefix-match the project name, else the single armed default; greetings just get a hint so they never burn quota), runs `claude --continue -p "<text>"` there, and replies with the result. Because `--continue` appends to the project's most-recent conversation, this continues the **same** thread the VS Code extension shows (reopen the session there; the panel doesn't live-refresh external appends). Single-instance via a pidfile with a liveness check (Windows lets two sockets share a loopback port, so a port lock is unreliable). Started at logon by a Startup-folder shortcut → `feishu-launch.vbs`, which auto-restarts node on exit and captures its stdout for diagnosis. Requires the app to have: bot enabled, scopes `im:message` (+ send), the **接收消息 `im.message.receive_v1`** event (a "v2.0" schema badge on it is fine — the event name still ends `_v1`), **长连接** subscription mode, and a published version.
 
 ## config.json (written by the GUI)
 
@@ -100,10 +101,11 @@ The probe (`Test-ClaudeReady`) runs `claude -p "ready" --max-turns 1` as `--outp
   "weeklyBackoffMinutes": 45,
   "probeModel": "haiku",
   "probeIntervalMinutes": 15, // probe cadence while usable (GUI chip cycles 5/15/30); limited = 4 min
-  "feishuWebhook": "",        // Feishu custom-bot webhook URL; empty = notifications off
-  "feishuSecret": "",         // custom-bot 签名校验 secret (optional)
-  "feishuAppId": "",          // 自建应用 App ID, for the two-way agent
+  "feishuAppId": "",          // 自建应用 App ID — one bot for notify + two-way (preferred)
   "feishuAppSecret": "",      // 自建应用 App Secret
+  "feishuChatId": "",         // auto-filled by the agent: the chat notifications are sent to
+  "feishuWebhook": "",        // fallback: custom-bot webhook URL (used only if the app isn't set up)
+  "feishuSecret": "",         // custom-bot 签名校验 secret (optional, for the webhook fallback)
   "feishuDefaultProject": "", // default project (name or path) for un-prefixed Feishu commands
   "feishuAllowOpenIds": [],   // optional allowlist of sender open_ids; empty = anyone in-chat
   "continuous": false,       // one-shot by default
