@@ -115,75 +115,90 @@ function discoverProjects() {
   return Array.from(map.values());
 }
 
-// ---- routing: split "<project> <command>" or fall back to default ----
-function resolveTarget(text) {
-  const projects = discoverProjects();
+// ---- per-chat active project (persisted) + a chat scratch session ----
+const SESSIONS_PATH = path.join(APP_DIR, 'feishu-sessions.json');
+const CHAT_DIR = path.join(APP_DIR, 'feishu-chat');
+function readSessions() { try { return JSON.parse(fs.readFileSync(SESSIONS_PATH, 'utf8')); } catch (e) { return {}; } }
+function writeSessions(o) { try { fs.writeFileSync(SESSIONS_PATH, JSON.stringify(o, null, 2), 'utf8'); } catch (e) {} }
+function getActivePath(chatId) { const s = readSessions(); return (s[chatId] && s[chatId].project) || null; }
+function setActivePath(chatId, projPath) { const s = readSessions(); s[chatId] = s[chatId] || {}; s[chatId].project = projPath || null; writeSessions(s); }
+function activeProject(chatId) {
+  const p = getActivePath(chatId); if (!p) return null;
+  const found = discoverProjects().find(x => x.path.toLowerCase() === p.toLowerCase());
+  return found || { name: path.basename(p), path: p };
+}
+function chatStarted() { try { fs.mkdirSync(CHAT_DIR, { recursive: true }); return fs.existsSync(path.join(CHAT_DIR, '.started')); } catch (e) { return false; } }
+function markChatStarted() { try { fs.writeFileSync(path.join(CHAT_DIR, '.started'), '1'); } catch (e) {} }
+
+// find a project by 1-based number, exact name, or fuzzy (startsWith/includes)
+function findProject(query) {
+  const ps = discoverProjects(); const q = String(query || '').trim(); if (!q) return null;
+  if (/^\d+$/.test(q)) { const i = parseInt(q, 10) - 1; return (i >= 0 && i < ps.length) ? ps[i] : null; }
+  const low = q.toLowerCase();
+  return ps.find(p => p.name.toLowerCase() === low)
+      || ps.find(p => p.name.toLowerCase().startsWith(low))
+      || ps.find(p => p.name.toLowerCase().includes(low)) || null;
+}
+// a bare message that is exactly a project number or full name -> that project (else null)
+function projectIfBareName(text) {
+  const ps = discoverProjects(); const q = text.trim();
+  if (/^\d+$/.test(q)) { const i = parseInt(q, 10) - 1; return (i >= 0 && i < ps.length) ? ps[i] : null; }
+  return ps.find(p => p.name.toLowerCase() === q.toLowerCase()) || null;
+}
+// "<project name> <command>" via longest-name-prefix (no default fallback)
+function oneOffTarget(text) {
   const t = text.trim();
-  // prefix match: longest project name that the text starts with (case-insensitive)
-  const byLen = projects.slice().sort((a, b) => b.name.length - a.name.length);
+  const byLen = discoverProjects().slice().sort((a, b) => b.name.length - a.name.length);
   for (const p of byLen) {
     const n = p.name.toLowerCase();
-    const low = t.toLowerCase();
-    if (low === n) return { project: p, prompt: 'continue' };
-    if (low.startsWith(n)) {
+    if (t.toLowerCase().startsWith(n)) {
       const rest = t.slice(p.name.length).replace(/^\s*[:：,，]?\s*/, '');
       if (rest) return { project: p, prompt: rest };
     }
   }
-  // default project
-  const cfg = readConfig();
-  let def = null;
-  if (cfg.feishuDefaultProject) {
-    def = projects.find(p => p.path.toLowerCase() === String(cfg.feishuDefaultProject).toLowerCase()
-      || p.name.toLowerCase() === String(cfg.feishuDefaultProject).toLowerCase());
-  }
-  if (!def && Array.isArray(cfg.selected) && cfg.selected.length === 1) {
-    const s = cfg.selected[0];
-    def = { name: s.name || path.basename(s.path), path: s.path };
-  }
-  if (def) return { project: def, prompt: t };
-  return { project: null, prompt: t, projects };
+  return { project: null };
 }
 
-// ---- run claude --continue in a project, return {ok, limited, text} ----
-const running = new Map(); // path(lower) -> child
-function runClaude(project, prompt) {
+// ---- run claude in a cwd (project or the chat scratch dir); return {ok, limited, text} ----
+const running = new Map(); // cwd(lower) -> child
+function runClaude(cwd, label, prompt, opts) {
+  opts = opts || {};
   return new Promise((resolve) => {
     const cfg = readConfig();
-    const args = ['/c', CLAUDE_CMD, '--continue', '-p', prompt, '--output-format', 'stream-json', '--verbose'];
+    try { fs.mkdirSync(cwd, { recursive: true }); } catch (e) {}
+    const args = ['/c', CLAUDE_CMD];
+    if (opts.useContinue !== false) args.push('--continue');
+    args.push('-p', prompt, '--output-format', 'stream-json', '--verbose');
     if (cfg.resumeModel) { args.push('--model', cfg.resumeModel); }
-    if (cfg.skipPermissions) { args.push('--dangerously-skip-permissions'); }
+    const skip = (opts.skipPermissions !== undefined) ? opts.skipPermissions : cfg.skipPermissions;
+    if (skip) { args.push('--dangerously-skip-permissions'); }
     const timeoutMs = Math.max(1, (parseInt(cfg.perProjectTimeoutMinutes, 10) || 30)) * 60000;
+    const key = cwd.toLowerCase();
 
     let child;
-    try { child = spawn(process.env.ComSpec || 'cmd.exe', args, { cwd: project.path, windowsHide: true }); }
+    try { child = spawn(process.env.ComSpec || 'cmd.exe', args, { cwd, windowsHide: true }); }
     catch (e) { resolve({ ok: false, limited: false, text: '启动 claude 失败: ' + e.message }); return; }
-    running.set(project.path.toLowerCase(), child);
+    running.set(key, child);
 
     let buf = '', resultText = null, isError = null, limited = false, killedForTimeout = false;
     const to = setTimeout(() => { killedForTimeout = true; try { child.kill(); } catch (e) {} }, timeoutMs);
-
     function scanLine(ln) {
       if (!ln) return;
       if (/"status"\s*:\s*"(blocked|rejected|limited|exceeded)"/.test(ln) ||
           /usage limit|rate limit|limit reached|weekly limit/i.test(ln)) limited = true;
-      const m = ln.indexOf('"type":"result"') !== -1 || /"type"\s*:\s*"result"/.test(ln);
-      if (m) {
-        try {
-          const j = JSON.parse(ln);
-          if (j.type === 'result') { if (typeof j.result === 'string') resultText = j.result; if (typeof j.is_error === 'boolean') isError = j.is_error; }
-        } catch (e) {}
+      if (ln.indexOf('"type":"result"') !== -1 || /"type"\s*:\s*"result"/.test(ln)) {
+        try { const j = JSON.parse(ln); if (j.type === 'result') { if (typeof j.result === 'string') resultText = j.result; if (typeof j.is_error === 'boolean') isError = j.is_error; } } catch (e) {}
       }
     }
     child.stdout.on('data', d => { buf += d.toString('utf8'); let i; while ((i = buf.indexOf('\n')) >= 0) { scanLine(buf.slice(0, i)); buf = buf.slice(i + 1); } });
     child.stderr.on('data', () => {});
     child.on('close', () => {
-      clearTimeout(to); running.delete(project.path.toLowerCase());
+      clearTimeout(to); running.delete(key);
       if (buf) scanLine(buf);
       if (killedForTimeout) { resolve({ ok: false, limited, text: `执行超时(> ${timeoutMs / 60000} 分钟),已终止。` }); return; }
       if (resultText !== null && isError !== true) { resolve({ ok: true, limited, text: resultText }); return; }
       if (limited) { resolve({ ok: false, limited: true, text: '又被限流了。可在「Claude续跑」里布防,额度恢复后自动续跑。' }); return; }
-      resolve({ ok: false, limited, text: resultText || '执行结束但未拿到成功结果(可能出错)。完整过程见 VS Code 该项目会话。' });
+      resolve({ ok: false, limited, text: resultText || '执行结束但未拿到成功结果(可能出错)。' });
     });
   });
 }
@@ -203,41 +218,43 @@ async function sendText(chatId, text) {
   }
 }
 
-// ---- status / list helpers ----
-function statusText() {
+// ---- status / list / help (mode-aware) ----
+function statusText(chatId) {
   const cfg = readConfig();
   let st = {};
   try { st = JSON.parse(fs.readFileSync(path.join(APP_DIR, 'state.json'), 'utf8')); } catch (e) {}
-  let reset = '额度充足(未接近上限)';
+  let reset = '额度未接近上限';
   if (st.realFiveHourResetUtc && st.realResetProbedUtc) {
     const rr = st.realFiveHourResetUtc * 1000, now = Date.now();
     if (rr > now && (now - st.realResetProbedUtc * 1000) < 5 * 3600e3) {
       const s = Math.floor((rr - now) / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
-      reset = `距重置 ${h}h ${String(m).padStart(2, '0')}m (精确)`;
+      reset = `5h 距重置 ${h}h ${String(m).padStart(2, '0')}m`;
     }
   }
-  let tail = '';
-  try {
-    const lf = path.join(LOG_DIR, 'run-' + new Date().toISOString().slice(0, 10).replace(/-/g, '') + '.log');
-    tail = fs.readFileSync(lf, 'utf8').trim().split(/\r?\n/).slice(-6).join('\n');
-  } catch (e) {}
-  return `状态:${cfg.enabled ? '● 已布防' : '○ 未布防'} · 引擎 ${st.phase || 'idle'}\n${reset}\n实探间隔 ${cfg.probeIntervalMinutes || 15}m\n\n最近日志:\n${tail || '(空)'}`;
+  const ap = activeProject(chatId);
+  const mode = ap ? `📂 当前项目:「${ap.name}」` : '💬 当前:闲聊模式(不碰项目)';
+  return `${mode}\n布防:${cfg.enabled ? '● 已布防' : '○ 未布防'} · 引擎 ${st.phase || 'idle'}\n${reset} · 实探间隔 ${cfg.probeIntervalMinutes || 15}m`;
 }
 function listText() {
   const ps = discoverProjects();
   if (!ps.length) return '未发现任何项目。先在「Claude续跑」里添加/勾选项目。';
-  return '已知项目(发指令时用名字开头即可):\n' + ps.map((p, i) => `${i + 1}. ${p.name}`).join('\n');
+  return '项目列表(回复「进入 编号」进入,例:进入 2):\n' + ps.map((p, i) => `${i + 1}. ${p.name}`).join('\n');
 }
-function helpText() {
+function helpText(chatId) {
+  const ap = activeProject(chatId);
+  const cur = ap
+    ? `📂 现在在项目「${ap.name}」——直接发消息就在这里续跑。`
+    : '💬 现在是闲聊模式——直接说话就是和我聊天,不碰任何项目。';
   return [
-    'Claude 服务器助手 · 用法:',
-    '· 直接发「<项目名> <指令>」在该项目继续对话,例如:Probe-Station-Suite 把剩下的组扫完',
-    '· 只发「<指令>」→ 发到默认项目(唯一布防的那个)',
-    '· 状态 / status → 布防状态、精确重置、最近日志',
-    '· 项目 / list → 已知项目列表',
-    '· 停止 <项目> → 取消该项目正在跑的指令',
+    'Claude 服务器助手', cur, '',
+    '· 项目 → 列出所有项目',
+    '· 进入 <编号或名字> → 进入某项目开始操作(例:进入 2)',
+    '· 退出 → 回到闲聊模式',
+    '· <项目名> <指令> → 不切换,一次性在该项目执行',
+    '· 状态 → 布防 / 额度 / 当前模式',
+    '· 停止 <项目> → 取消正在跑的指令',
     '',
-    '注:执行会继续 VS Code 里同一个会话,但扩展面板不会实时刷新,重开该会话即可看到完整内容。',
+    '注:项目执行会继续 VS Code 里同一个会话,面板不实时刷新,重开可见。',
   ].join('\n');
 }
 
@@ -280,38 +297,73 @@ async function onMessage(data) {
     try { text = JSON.parse(msg.content || '{}').text || ''; } catch (e) {}
     text = stripMentions(text, msg.mentions);
     if (!text) return;
-    logLine(`收到指令 chat=${chatId} sender=${senderOpen}: ${text}`);
-
+    logLine(`收到消息 chat=${chatId} sender=${senderOpen}: ${text}`);
     const low = text.toLowerCase();
-    // greetings: answer, don't run a project (so a casual 你好 never burns quota)
-    if (/^(你好|您好|hi|hello|hey|哈喽|在吗|在么|在不在|在|你好呀|嗨)$/i.test(text)) {
-      await sendText(chatId, '在的 👋 发「项目名 指令」我就去对应项目跑,例如:OCS1x1 data viewer APP 继续。发「帮助」看全部用法。');
+
+    // ---- global commands (work in any mode) ----
+    if (['帮助', 'help', '?', '？', '菜单'].indexOf(low) !== -1) { await sendText(chatId, helpText(chatId)); return; }
+    if (['状态', 'status', 'zt'].indexOf(low) !== -1) { await sendText(chatId, statusText(chatId)); return; }
+    if (['项目', 'list', '项目列表', '列出项目', '所有项目'].indexOf(low) !== -1) { await sendText(chatId, listText()); return; }
+    if (['退出', '返回', 'exit', 'quit', '闲聊', '退出项目'].indexOf(low) !== -1) {
+      setActivePath(chatId, null);
+      await sendText(chatId, '已回到 💬 闲聊模式(不碰任何项目)。发「项目」查看项目,「进入 X」开始操作。');
       return;
     }
-    if (['帮助', 'help', '?', '？'].indexOf(low) !== -1) { await sendText(chatId, helpText()); return; }
-    if (['状态', 'status', 'zt'].indexOf(low) !== -1) { await sendText(chatId, statusText()); return; }
-    if (['项目', 'list', '项目列表'].indexOf(low) !== -1) { await sendText(chatId, listText()); return; }
     if (/^(停止|stop)\b/i.test(text)) {
-      const rest = text.replace(/^(停止|stop)\s*/i, '');
-      const ps = discoverProjects();
-      const p = ps.find(x => rest && x.name.toLowerCase().startsWith(rest.toLowerCase()));
+      const rest = text.replace(/^(停止|stop)\s*/i, '').trim();
+      const p = rest ? findProject(rest) : activeProject(chatId);
       if (p && running.has(p.path.toLowerCase())) { try { running.get(p.path.toLowerCase()).kill(); } catch (e) {} await sendText(chatId, `已请求停止:${p.name}`); }
-      else await sendText(chatId, '没有匹配的正在运行的项目。');
+      else await sendText(chatId, '没有正在运行的项目。');
       return;
     }
 
-    const { project, prompt, projects } = resolveTarget(text);
-    if (!project) {
-      await sendText(chatId, '无法判断目标项目。请用「项目名 指令」的格式,或先在「Claude续跑」里只勾选一个项目作为默认。\n\n' + listText());
+    // ---- explicit enter/switch: 进入 / 选择 / 切换 <编号或名字> ----
+    const m = text.match(/^(进入|选择|选|切换|打开|进|use|open)\s+(.+)$/i);
+    if (m) {
+      const p = findProject(m[2]);
+      if (p) { setActivePath(chatId, p.path); await sendText(chatId, `已进入 📂「${p.name}」。之后消息都会在这里续跑;发「退出」回到闲聊,「进入 X」换项目。`); }
+      else await sendText(chatId, `没找到项目「${m[2]}」。\n\n` + listText());
       return;
     }
-    if (running.has(project.path.toLowerCase())) { await sendText(chatId, `「${project.name}」正在执行中,请稍候,或发「停止 ${project.name}」取消。`); return; }
 
-    await sendText(chatId, `收到,正在「${project.name}」执行:${prompt}\n(完成后回传结果;过程见 VS Code 该项目会话)`);
-    const r = await runClaude(project, prompt);
-    const head = r.ok ? `✅ 「${project.name}」完成:\n\n` : `⚠️ 「${project.name}」:\n\n`;
-    await sendText(chatId, head + (r.text || '(无输出)'));
-    logLine(`完成 ${project.name} ok=${r.ok} limited=${r.limited}`);
+    const active = activeProject(chatId);
+
+    // greetings: quick reply, never run
+    if (/^(你好|您好|hi|hello|hey|哈喽|在吗|在么|在不在|在|你好呀|嗨|yo)$/i.test(text)) {
+      await sendText(chatId, active
+        ? `在的 👋 你在项目「${active.name}」里,直接发指令即可。发「退出」回到闲聊。`
+        : '在的 👋 直接说话就是和我聊天;发「项目」选一个项目开始干活。');
+      return;
+    }
+
+    // ---- in an active project: everything runs there ----
+    if (active) {
+      if (running.has(active.path.toLowerCase())) { await sendText(chatId, `「${active.name}」正在执行中,请稍候,或发「停止」取消。`); return; }
+      await sendText(chatId, `📂 在「${active.name}」执行:${text}`);
+      const r = await runClaude(active.path, active.name, text, { useContinue: true });
+      await sendText(chatId, (r.ok ? `✅ 「${active.name}」完成:\n\n` : `⚠️ 「${active.name}」:\n\n`) + (r.text || '(无输出)'));
+      logLine(`完成 ${active.name} ok=${r.ok}`);
+      return;
+    }
+
+    // ---- chat mode ----
+    const bare = projectIfBareName(text);            // bare project name/number -> enter it
+    if (bare) { setActivePath(chatId, bare.path); await sendText(chatId, `已进入 📂「${bare.name}」。直接发指令即可;发「退出」回到闲聊。`); return; }
+    const oneoff = oneOffTarget(text);               // "<project> <command>" -> one-off, no switch
+    if (oneoff.project) {
+      if (running.has(oneoff.project.path.toLowerCase())) { await sendText(chatId, `「${oneoff.project.name}」正在执行中,请稍候。`); return; }
+      await sendText(chatId, `📂 一次性在「${oneoff.project.name}」执行:${oneoff.prompt}`);
+      const r = await runClaude(oneoff.project.path, oneoff.project.name, oneoff.prompt, { useContinue: true });
+      await sendText(chatId, (r.ok ? `✅ 「${oneoff.project.name}」完成:\n\n` : `⚠️ 「${oneoff.project.name}」:\n\n`) + (r.text || '(无输出)'));
+      logLine(`一次性完成 ${oneoff.project.name} ok=${r.ok}`);
+      return;
+    }
+    // real chat with Claude, no project touched
+    if (running.has(CHAT_DIR.toLowerCase())) { await sendText(chatId, '上一句还在想,请稍候…'); return; }
+    const r = await runClaude(CHAT_DIR, '闲聊', text, { useContinue: chatStarted(), skipPermissions: false });
+    if (r.ok) markChatStarted();
+    await sendText(chatId, (r.text || '(无输出)') + '\n\n———\n💬 闲聊模式 · 发「项目」选项目干活');
+    logLine(`闲聊 ok=${r.ok}`);
   } catch (e) { logLine('处理消息异常: ' + (e && e.stack || e)); }
 }
 
