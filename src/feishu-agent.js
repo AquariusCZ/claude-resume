@@ -245,6 +245,13 @@ async function sendCard(chatId, card) {
     await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(card) } });
   } catch (e) { logLine('发送卡片失败: ' + (e && e.message)); }
 }
+// update the clicked card in place so the ✅ (current project / model / mode) moves
+async function refreshCard(chatId, messageId) {
+  if (!messageId) return;
+  try {
+    await client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(buildMenuCard(chatId)) } });
+  } catch (e) { logLine('更新卡片失败: ' + (e && e.message)); }
+}
 // Telegram-style menu: buttons to enter a project / chat / status / switch model.
 // Default 'idle' mode does nothing until the user taps a button here.
 function buildMenuCard(chatId) {
@@ -262,6 +269,7 @@ function buildMenuCard(chatId) {
   elements.push({ tag: 'action', actions: [
     { tag: 'button', text: { tag: 'plain_text', content: (sess.mode === 'chat' ? '✅ ' : '💬 ') + '闲聊模式' }, type: sess.mode === 'chat' ? 'primary' : 'default', value: { do: 'chat' } },
     { tag: 'button', text: { tag: 'plain_text', content: 'ℹ️ 状态' }, type: 'default', value: { do: 'status' } },
+    { tag: 'button', text: { tag: 'plain_text', content: '🔑 权限' }, type: 'default', value: { do: 'perm' } },
   ] });
   // model switch buttons (applies to BOTH chat and project execution)
   elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**模型:${modelLabel}** — 聊天和项目执行都用它,点下面切换(被限流时可换个模型重试):` } });
@@ -342,10 +350,28 @@ function isAuthorized(openId) {
   if (!list.length) return true;                 // not locked yet
   return !!openId && list.indexOf(openId) !== -1;
 }
+const notifiedUnauth = new Set();   // notify the owner at most once per unauthorized open_id
 async function denyIfUnauthorized(openId, chatId) {
   if (isAuthorized(openId)) return false;
-  await sendText(chatId, `🔒 无权限:操作项目 / 改配置仅限已授权账号(你可以闲聊)。\n你的 open_id:${openId || '未知'}\n把它发给管理员,让他发「授权 ${openId || 'ou_xxx'}」即可。`);
+  await sendText(chatId, `🔒 无权限:操作项目 / 改配置仅限已授权账号(你可以闲聊)。\n你的 open_id:${openId || '未知'}`);
   logLine('拦截未授权操作: ' + openId);
+  try {
+    const owner = readConfig().feishuChatId;
+    if (owner && owner !== chatId && openId && !notifiedUnauth.has(openId)) {
+      notifiedUnauth.add(openId);
+      await sendCard(owner, {
+        config: { wide_screen_mode: true },
+        header: { template: 'red', title: { tag: 'plain_text', content: '🔔 有人请求操作项目' } },
+        elements: [
+          { tag: 'div', text: { tag: 'lark_md', content: `open_id:\`${openId}\`\n授权他操作你的项目?` } },
+          { tag: 'action', actions: [
+            { tag: 'button', text: { tag: 'plain_text', content: '✅ 授权此人' }, type: 'primary', value: { do: 'authorize', id: openId } },
+            { tag: 'button', text: { tag: 'plain_text', content: '忽略' }, type: 'default', value: { do: 'noop' } },
+          ] },
+        ],
+      });
+    }
+  } catch (e) {}
   return true;
 }
 
@@ -537,6 +563,7 @@ async function onCardAction(ev) {
     const chatId = (ev.context && ev.context.open_chat_id) || ev.open_chat_id;
     const val = (ev.action && ev.action.value) || {};
     const senderOpen = ev.operator && ev.operator.open_id;
+    const messageId = (ev.context && ev.context.open_message_id) || ev.open_message_id;
     if (!chatId || !val || !val.do) return;
     const key = chatId + ':' + JSON.stringify(val) + ':' + (senderOpen || '');
     const now = Date.now();
@@ -549,22 +576,42 @@ async function onCardAction(ev) {
     try { if (chatId && cfg.feishuChatId !== chatId) { cfg.feishuChatId = chatId; fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 4), 'utf8'); } } catch (e) {}
     logLine(`卡片点击 chat=${chatId}: ${JSON.stringify(val)}`);
 
-    if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。发「退出」回主菜单。'); return; }
+    if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); await refreshCard(chatId, messageId); await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。发「退出」回主菜单。'); return; }
     if (val.do === 'status') { if (await denyIfUnauthorized(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
+    if (val.do === 'perm') {
+      if (await denyIfUnauthorized(senderOpen, chatId)) return;
+      const list = (readConfig().feishuAuthOpenIds || []).filter(Boolean);
+      await sendText(chatId, '🔑 已授权账号:\n' + (list.length ? list.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无 — 当前对所有人开放)') + '\n\n加人:让对方给我发条消息 → 你会收到一张「授权此人」卡片,一键点即可(也可发「授权 ou_xxx」/「取消授权 ou_xxx」)。');
+      return;
+    }
+    if (val.do === 'noop') { return; }
     if (val.do === 'model') {
       if (await denyIfUnauthorized(senderOpen, chatId)) return;
       const mm = String(val.m || '').toLowerCase();
       const v = (['opus', 'sonnet', 'haiku'].indexOf(mm) !== -1) ? mm : '';
       try { const c = readConfig(); c.feishuChatModel = v; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
       const label = { sonnet: 'Sonnet', opus: 'Opus', haiku: 'Haiku' }[v] || '默认';
-      await sendText(chatId, `模型已切到:${label}(下一句闲聊生效;软件已同步)。`);
+      await refreshCard(chatId, messageId);
+      await sendText(chatId, `模型已切到:${label}(聊天和项目都用;软件已同步)。`);
       return;
     }
     if (val.do === 'enter') {
       if (await denyIfUnauthorized(senderOpen, chatId)) return;
       const p = discoverProjects().find(x => x.path.toLowerCase() === String(val.p).toLowerCase()) || (val.p ? { name: path.basename(val.p), path: val.p } : null);
-      if (p) { setSession(chatId, { mode: 'project', project: p.path }); await sendText(chatId, `已进入 📂「${p.name}」✅\n现在直接发你的问题/指令,就会在这个项目里跑。发「菜单」可切换,「退出」回主菜单。`); }
+      if (p) { setSession(chatId, { mode: 'project', project: p.path }); await refreshCard(chatId, messageId); await sendText(chatId, `已进入 📂「${p.name}」✅ 直接发问题/指令就在这里跑。`); }
       else await sendText(chatId, '项目未找到(可能已变化)。发「菜单」重新选。');
+      return;
+    }
+    // one-tap authorize/revoke (from the owner-notification card) — authorized users only
+    if (val.do === 'authorize' || val.do === 'revoke') {
+      if (await denyIfUnauthorized(senderOpen, chatId)) return;
+      const id = String(val.id || '');
+      if (/^ou_[A-Za-z0-9]+$/.test(id)) {
+        const c = readConfig(); let list = Array.isArray(c.feishuAuthOpenIds) ? c.feishuAuthOpenIds.filter(Boolean) : [];
+        if (val.do === 'revoke') list = list.filter(x => x !== id); else if (list.indexOf(id) === -1) list.push(id);
+        c.feishuAuthOpenIds = list; try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
+        await sendText(chatId, (val.do === 'revoke' ? '已移除授权:' : '✅ 已授权:') + id);
+      }
       return;
     }
   } catch (e) { logLine('卡片动作异常: ' + (e && (e.stack || e))); }
