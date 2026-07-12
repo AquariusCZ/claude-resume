@@ -43,9 +43,11 @@ function readConfig() {
   catch (e) { return {}; }
 }
 function logLine(msg) {
-  const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const d = new Date(), p = n => String(n).padStart(2, '0');   // LOCAL time (was UTC via toISOString)
+  const day = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`;
+  const ts = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
   const line = `[${ts}] ${msg}\r\n`;
-  try { fs.mkdirSync(LOG_DIR, { recursive: true }); fs.appendFileSync(path.join(LOG_DIR, 'feishu-' + ts.slice(0, 10).replace(/-/g, '') + '.log'), line, 'utf8'); } catch (e) {}
+  try { fs.mkdirSync(LOG_DIR, { recursive: true }); fs.appendFileSync(path.join(LOG_DIR, 'feishu-' + day + '.log'), line, 'utf8'); } catch (e) {}
   process.stdout.write(line);
 }
 
@@ -251,6 +253,13 @@ async function refreshCard(chatId, messageId) {
   try {
     await client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(buildMenuCard(chatId)) } });
   } catch (e) { logLine('更新卡片失败: ' + (e && e.message)); }
+}
+// long runs go silent while claude works; send a heartbeat so the user knows it's alive.
+// returns a stop() to clear it. First beat at 60s, so short runs produce no heartbeat.
+function startHeartbeat(chatId, label) {
+  let secs = 0;
+  const t = setInterval(() => { secs += 60; sendText(chatId, `⏳ 「${label}」仍在执行…(已 ${secs}s;复杂任务/Opus 常需 1-4 分钟,跑完自动回结果)`); }, 60000);
+  return () => { try { clearInterval(t); } catch (e) {} };
 }
 // Telegram-style menu: buttons to enter a project / chat / status / switch model.
 // Default 'idle' mode does nothing until the user taps a button here.
@@ -523,8 +532,10 @@ async function onMessage(data) {
     if (oneoff.project) {
       if (await denyIfUnauthorized(senderOpen, chatId)) return;
       if (running.has(oneoff.project.path.toLowerCase())) { await sendText(chatId, `「${oneoff.project.name}」正在执行中,请稍候。`); return; }
-      await sendText(chatId, `📂 一次性在「${oneoff.project.name}」执行:${oneoff.prompt}`);
+      await sendText(chatId, `📂 一次性在「${oneoff.project.name}」执行:${oneoff.prompt}\n(可能要 1-4 分钟,跑完自动回结果)`);
+      const stopHb = startHeartbeat(chatId, oneoff.project.name);
       const r = await runClaude(oneoff.project.path, oneoff.project.name, oneoff.prompt, { useContinue: true, model: cfg.feishuChatModel });
+      stopHb();
       await sendText(chatId, (r.ok ? `✅ 「${oneoff.project.name}」完成:\n\n` : `⚠️ 「${oneoff.project.name}」:\n\n`) + (r.text || '(无输出)'));
       logLine(`一次性完成 ${oneoff.project.name} ok=${r.ok}`);
       return;
@@ -535,8 +546,10 @@ async function onMessage(data) {
     if (active) {   // project mode: run in the active project
       if (await denyIfUnauthorized(senderOpen, chatId)) return;
       if (running.has(active.path.toLowerCase())) { await sendText(chatId, `「${active.name}」正在执行中,请稍候,或发「停止」取消。`); return; }
-      await sendText(chatId, `📂 在「${active.name}」执行:${text}`);
+      await sendText(chatId, `📂 在「${active.name}」执行:${text}\n(可能要 1-4 分钟,跑完自动回结果)`);
+      const stopHb = startHeartbeat(chatId, active.name);
       const r = await runClaude(active.path, active.name, text, { useContinue: true, model: cfg.feishuChatModel });
+      stopHb();
       await sendText(chatId, (r.ok ? `✅ 「${active.name}」完成:\n\n` : `⚠️ 「${active.name}」:\n\n`) + (r.text || '(无输出)'));
       logLine(`完成 ${active.name} ok=${r.ok}`);
       return;
@@ -545,7 +558,9 @@ async function onMessage(data) {
       if (running.has(CHAT_DIR.toLowerCase())) { await sendText(chatId, '上一句还在想,请稍候…'); return; }
       await sendText(chatId, '🤔 正在思考…');
       logLine(`闲聊 思考中: ${text}`);
+      const stopHb = startHeartbeat(chatId, '闲聊');
       const r = await runClaude(CHAT_DIR, '闲聊', text, { useContinue: chatStarted(), skipPermissions: false, model: cfg.feishuChatModel });
+      stopHb();
       if (r.ok) markChatStarted();
       await sendText(chatId, (r.text || '(无输出)') + '\n\n———\n💬 闲聊模式 · 发「菜单」切换');
       logLine(`闲聊 完成 ok=${r.ok}`);
