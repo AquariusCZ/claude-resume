@@ -11,11 +11,38 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
 
+# own taskbar identity (custom icon, no grouping under powershell.exe) + win32 helpers
+Add-Type -Namespace Win32 -Name Native -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+[DllImport("shell32.dll")] public static extern int SetCurrentProcessExplicitAppUserModelID(string id);
+'@
+try { [void][Win32.Native]::SetCurrentProcessExplicitAppUserModelID('ClaudeResume.Picker') } catch {}
+
+# single instance: opening it again focuses the existing window instead of stacking copies
+# (every extra window runs its own probes and races config.json writes). FindWindow is
+# unreliable for WPF layered/transparent windows, so locate the existing window by the
+# other picker process's MainWindowHandle instead.
+$script:instanceMutex = New-Object System.Threading.Mutex($false, 'Local\ClaudeResumePickerSingleton')
+$script:instanceOwned = $false
+try { $script:instanceOwned = $script:instanceMutex.WaitOne(0) }
+catch [System.Threading.AbandonedMutexException] { $script:instanceOwned = $true }
+if(-not $script:instanceOwned -and -not $RenderTo -and -not $SelfTest){
+  try {
+    $other = Get-Process -Name powershell,pwsh -ErrorAction SilentlyContinue |
+             Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -eq 'Claude Resume' -and $_.MainWindowHandle -ne 0 } |
+             Select-Object -First 1
+    if($other){ [void][Win32.Native]::ShowWindow($other.MainWindowHandle, 9); [void][Win32.Native]::SetForegroundWindow($other.MainWindowHandle) }  # 9 = SW_RESTORE
+  } catch {}
+  return
+}
+
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Claude Resume"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
-        ResizeMode="NoResize" Width="900" Height="650" WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize" Width="900" Height="700" WindowStartupLocation="CenterScreen"
         FontFamily="Segoe UI, Microsoft YaHei">
   <Window.Resources>
     <SolidColorBrush x:Key="Card" Color="#FF1F1F1D"/>
@@ -82,7 +109,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
     <Border.Effect><DropShadowEffect Color="#000000" Direction="270" ShadowDepth="10" BlurRadius="34" Opacity="0.5"/></Border.Effect>
     <Grid Margin="22">
       <Grid.RowDefinitions>
-        <RowDefinition Height="40"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="150"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+        <RowDefinition Height="40"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="140"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
       </Grid.RowDefinitions>
       <Grid x:Name="TitleBar" Grid.Row="0" Background="Transparent">
         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
@@ -97,9 +124,17 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
           <TextBlock Text="选择要自动续跑的项目" Foreground="{StaticResource Ink}" FontWeight="SemiBold" FontSize="20"/>
           <TextBlock x:Name="Subtitle" Text="勾选一个或多个,额度重置后自动继续" Foreground="{StaticResource Muted}" FontSize="12.5" Margin="0,3,0,0"/>
         </StackPanel>
-        <Border x:Name="ResetChip" ToolTip="估算值(基于本地记录),精确重置时间以 claude.ai / 扩展为准。工具靠实时探测触发续跑,不依赖此估算数字。" HorizontalAlignment="Right" VerticalAlignment="Center" CornerRadius="999" Background="{StaticResource AccentSoft}" Padding="14,7">
-          <TextBlock x:Name="ResetText" Text="读取中..." Foreground="{StaticResource Accent}" FontSize="12.5" FontWeight="SemiBold"/>
-        </Border>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+          <Border x:Name="IntervalChip" Cursor="Hand" ToolTip="布防后每隔多久自动实探一次额度(点击切换 5 / 15 / 30 分钟);被限流后自动加密到 4 分钟。" CornerRadius="9" Background="{StaticResource Card}" BorderBrush="{StaticResource Border0}" BorderThickness="1" Padding="13,7" Margin="0,0,8,0">
+            <TextBlock x:Name="IntervalText" Text="间隔 15m" Foreground="{StaticResource Ink2}" FontSize="12.5" FontWeight="SemiBold"/>
+          </Border>
+          <Border x:Name="ResetChip" Cursor="Hand" ToolTip="当前额度用量与精确重置时间(实探读到)。点击立即重新实探。" VerticalAlignment="Center" CornerRadius="9" Background="{StaticResource AccentSoft}" BorderBrush="{StaticResource Border0}" BorderThickness="1" Padding="13,7">
+            <StackPanel Orientation="Horizontal">
+              <TextBlock Text="&#xE72C;" FontFamily="Segoe MDL2 Assets" Foreground="{StaticResource Muted}" FontSize="12" Margin="0,0,7,0" VerticalAlignment="Center"/>
+              <TextBlock x:Name="ResetText" Text="实探中…" Foreground="{StaticResource Accent}" FontSize="12.5" FontWeight="SemiBold" VerticalAlignment="Center"/>
+            </StackPanel>
+          </Border>
+        </StackPanel>
       </Grid>
       <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto"><StackPanel x:Name="ProjectList"/></ScrollViewer>
       <Border Grid.Row="3" CornerRadius="16" Background="#FF141413" Margin="0,14,0,0" Padding="14,10">
@@ -123,10 +158,10 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
         <StackPanel Grid.Column="1" Orientation="Horizontal">
           <Button x:Name="BtnPreview" Style="{StaticResource BtnGhost}" Content="预演" Width="88"/>
           <Button x:Name="BtnDisarm" Style="{StaticResource BtnGhost}" Content="解除" Width="88" Margin="10,0,0,0"/>
-          <Button x:Name="BtnArm" Style="{StaticResource BtnPrimary}" Content="布防 (等重置续跑)" Width="180" Margin="10,0,0,0"/>
+          <Button x:Name="BtnArm" Style="{StaticResource BtnPrimary}" Content="布防续跑" Width="132" Margin="10,0,0,0"/>
         </StackPanel>
       </Grid>
-      <TextBlock x:Name="FooterPath" Grid.Row="5" Margin="2,12,2,0" FontSize="11" Foreground="{StaticResource Muted}"
+      <TextBlock x:Name="FooterPath" Grid.Row="5" Margin="2,10,2,2" FontSize="11" Foreground="{StaticResource Muted}"
                  TextTrimming="CharacterEllipsis" Cursor="Hand" ToolTip="点击打开项目文件夹"/>
     </Grid>
   </Border>
@@ -135,16 +170,23 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $win = [Windows.Markup.XamlReader]::Load($reader)
+# taskbar/alt-tab icon: the coral icon generated by install.ps1 (without this, the window
+# shows powershell.exe's icon)
+try {
+  $icoPath = Join-Path $script:AppDir 'icon.ico'
+  if(Test-Path $icoPath){ $win.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]$icoPath) }
+} catch {}
 $els = @{}
-foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','ProjectList','LogText','LogScroll','StatusText','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
+foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','IntervalChip','IntervalText','ProjectList','LogText','LogScroll','StatusText','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
 # global UI-thread exception guard: never let a handler bug close the window
 $win.Dispatcher.add_UnhandledException({ param($s,$e)
   try { [System.IO.File]::AppendAllText((Join-Path $env:LOCALAPPDATA 'ClaudeResume\logs\gui-error.log'), ((Get-Date).ToString('s') + "  " + $e.Exception.ToString() + "`r`n"), (New-Object System.Text.UTF8Encoding($false))) } catch {}
   $e.Handled = $true
 })
 
-$sync = [hashtable]::Synchronized(@{ resetUtc=$null; hasActivity=$false; ok=$false; realResetUtc=$null; probeLimited=$false })
 $script:cards = @()
+# shared with the probe runspace: req=please probe now, probing=in flight, results below
+$sync = [hashtable]::Synchronized(@{ req=$true; probing=$false; fhReset=$null; fhUtil=$null; sdReset=$null; sdUtil=$null; limited=$false; ready=$false; probedAt=[datetime]::MinValue; err=$null })
 $script:flash = @{ text=''; until=[datetime]::MinValue }
 function Set-Flash($t){ $script:flash.text = $t; $script:flash.until = (Get-Date).AddSeconds(6) }
 $script:logFile = Join-Path $script:LogDir ("run-" + (Get-Date).ToString('yyyyMMdd') + ".log")
@@ -278,6 +320,21 @@ $els.TitleBar.Add_MouseMove({
   } catch {}
 })
 $els.TitleBar.Add_MouseLeftButtonUp({ try { $script:dragging = $false; $els.TitleBar.ReleaseMouseCapture() } catch {} })
+# probe interval chip: click cycles 5m -> 15m -> 30m (persisted; checker reads it every tick)
+function Update-IntervalChip { $v = 15; try { $v = [int](Get-CcuConfig).probeIntervalMinutes } catch {}; if($v -lt 2){ $v = 15 }; $els.IntervalText.Text = "间隔 ${v}m" }
+Update-IntervalChip
+$els.IntervalChip.Add_MouseLeftButtonUp({
+  try {
+    $c = Get-CcuConfig
+    $cur = 15; try { $cur = [int]$c.probeIntervalMinutes } catch {}
+    $next = if($cur -lt 15){ 15 } elseif($cur -lt 30){ 30 } else { 5 }
+    $c.probeIntervalMinutes = $next; Set-CcuConfig $c
+    Update-IntervalChip
+    Set-Flash "实探间隔 ${next}m"
+  } catch { Set-Flash ('设置出错: ' + $_.Exception.Message) }
+})
+# clicking the quota chip triggers a fresh live probe (the display IS the refresh button)
+$els.ResetChip.Add_MouseLeftButtonUp({ if(-not $sync.probing){ $sync.req=$true; Set-Flash '正在实探…' } })
 $els.BtnAll.Add_Click({ foreach($c in $script:cards){ $c.check.IsChecked=$true } })
 $els.BtnNone.Add_Click({ foreach($c in $script:cards){ $c.check.IsChecked=$false } })
 $els.BtnAdd.Add_Click({
@@ -305,7 +362,7 @@ $els.BtnArm.Add_Click({
     $c = Get-CcuConfig; $c.enabled=$true; $c.armed=$true; $c.selected=$sel; $c.skipPermissions=$true; $c.dirtyGuard='stash'; Set-CcuConfig $c
     # fresh cycle: stale sawLimited would fire instantly, stale projectStatus would skip projects
     $st = Get-CcuState; $st.sawLimited=$false; $st.projectStatus=@{}; $st.phase='waiting'; $st.firedForId=$null; Set-CcuState $st
-    Set-Flash "已布防 · 监视 $($sel.Count) 个项目,重置后自动续跑"
+    Set-Flash "已布防 · $($sel.Count) 个项目"
   } catch { Set-Flash ('布防出错: ' + $_.Exception.Message) }
 })
 $els.BtnDisarm.Add_Click({
@@ -359,64 +416,65 @@ $els.BtnPreview.Add_Click({
   } catch { Set-Flash ('预演出错: ' + $_.Exception.Message) }
 })
 
-# ---- background runspace: only the slow ccusage read ----
+# ---- background probe runspace: runs a live probe on demand ($sync.req), never on a loop ----
+# One probe when the window opens, and one each time 实探/reset-chip is clicked. Off the UI thread
+# so the window never freezes during the (few-second) probe.
 $rs = [runspacefactory]::CreateRunspace(); $rs.ApartmentState='MTA'; $rs.ThreadOptions='ReuseThread'; $rs.Open()
 $rs.SessionStateProxy.SetVariable('sync',$sync)
 $rs.SessionStateProxy.SetVariable('libPath',(Join-Path $PSScriptRoot 'lib.ps1'))
 $ps = [powershell]::Create(); $ps.Runspace=$rs
 [void]$ps.AddScript({
   . $libPath
-  $lastProbe=[datetime]::MinValue; $myReset=$null; $myResetAt=[datetime]::MinValue
   while($true){
-    $nowU=[DateTimeOffset]::UtcNow
-    try { $sr=Get-SessionReset; $sync.ok=$sr.ok; $sync.hasActivity=$sr.hasActivity; $sync.resetUtc=$sr.resetUtc } catch { $sr=$null }
-    $estSecs=$null; if($sr -and $sr.ok -and $null -ne $sr.secondsUntilReset){ $estSecs=[double]$sr.secondsUntilReset }
-    # Own live probe for the EXACT reset: only worth it near reset (the server sends resetsAt once a
-    # window is >~75% used), once on open then every 5 min. Kept in memory -> no state write, no race
-    # with the checker. A probe is a quick haiku call: tiny quota, and free while actually rate-limited.
-    $worth = $sync.hasActivity -and (($null -eq $estSecs) -or ($estSecs -le 5400))
-    if($worth -and ((Get-Date)-$lastProbe).TotalMinutes -ge 5){
-      $lastProbe=Get-Date
+    if($sync.req -and -not $sync.probing){
+      $sync.req=$false; $sync.probing=$true; $sync.err=$null
       try {
         $cfg=Get-CcuConfig; $pr=Test-ClaudeReady -Model $cfg.probeModel
-        $sync.probeLimited=($pr.reason -eq 'limited')
-        if($pr.fiveHourResetUtc){ $myReset=$pr.fiveHourResetUtc; $myResetAt=Get-Date }
-      } catch {}
+        $sync.limited=($pr.reason -eq 'limited'); $sync.ready=[bool]$pr.ready
+        $sync.fhUtil=$pr.fiveHourUtil; $sync.sdUtil=$pr.sevenDayUtil
+        $sync.fhReset = if($pr.fiveHourResetUtc){ $pr.fiveHourResetUtc } else { $null }
+        $sync.sdReset = if($pr.sevenDayResetUtc){ $pr.sevenDayResetUtc } else { $null }
+        $sync.probedAt=Get-Date
+        try { $st=Get-CcuState; $st=Save-RealResetFromProbe -Probe $pr -State $st; Set-CcuState $st } catch {}
+      } catch { $sync.err=$_.Exception.Message }
+      $sync.probing=$false
     }
-    # exact reset the checker's own probes cached (free read), used when we have no fresher one
-    $stReset=$null
-    try {
-      $st=Get-CcuState
-      if($st.realFiveHourResetUtc -and $st.realResetProbedUtc){
-        $rr=[DateTimeOffset]::FromUnixTimeSeconds([long]$st.realFiveHourResetUtc)
-        $pb=[DateTimeOffset]::FromUnixTimeSeconds([long]$st.realResetProbedUtc)
-        if(($nowU-$pb).TotalHours -lt 5){ $stReset=$rr }
-      }
-    } catch {}
-    # prefer our own fresh probe, fall back to the checker's cache; drop any value already in the past
-    $best=$null
-    if($myReset -and ((Get-Date)-$myResetAt).TotalHours -lt 5 -and $myReset -gt $nowU){ $best=$myReset }
-    elseif($stReset -and $stReset -gt $nowU){ $best=$stReset }
-    $sync.realResetUtc=$best
-    Start-Sleep -Seconds 10
+    Start-Sleep -Milliseconds 400
   }
 })
 $hb = $ps.BeginInvoke()
 
-# ---- UI timer: repaint every second (fast local/file reads only) ----
+# ---- UI timer: repaint every second (fast reads only; probe runs in the runspace) ----
 $timer = New-Object Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(1)
 $timer.Add_Tick({
-  if($sync.realResetUtc){
-    $secs=($sync.realResetUtc-[DateTimeOffset]::UtcNow).TotalSeconds
-    $els.ResetText.Text='距重置 '+(Format-Countdown $secs)+' · 精确'
-    if($els.ResetChip){ $els.ResetChip.ToolTip='服务器返回的精确重置时间(与 claude 的 /usage 同源),运行时实时探测读到。' }
-  } elseif($sync.resetUtc){
-    $secs=($sync.resetUtc-[DateTimeOffset]::UtcNow).TotalSeconds
-    $els.ResetText.Text='≈ 距重置 '+(Format-Countdown $secs)
-    if($els.ResetChip){ $els.ResetChip.ToolTip='估算值(基于本地记录)。接近重置或被限流时会自动探测并切换为服务器精确值。触发续跑始终靠实时探测,不依赖此数字。' }
-  } elseif($sync.ok -and -not $sync.hasActivity){ $els.ResetText.Text='额度当前可用' }
-  else { $els.ResetText.Text='读取中...' }
+  $nowU=[DateTimeOffset]::UtcNow
+  if($sync.probing){
+    $els.ResetText.Text='实探中…'
+  } else {
+    # show the binding window as a percentage; add a precise countdown once limited/near.
+    # priority: 5h limited > 5h % > 7d % > checker cache > 点击实探
+    $t=$null
+    if($sync.limited -and $sync.fhReset -and $sync.fhReset -gt $nowU){ $t='5h 限流 · '+(Format-Countdown ($sync.fhReset-$nowU).TotalSeconds) }
+    elseif($null -ne $sync.fhUtil){
+      $t='5h '+[int][Math]::Round([double]$sync.fhUtil*100)+'%'
+      if($sync.fhReset -and $sync.fhReset -gt $nowU){ $t+=' · '+(Format-Countdown ($sync.fhReset-$nowU).TotalSeconds) }
+    }
+    elseif($null -ne $sync.sdUtil){
+      if($sync.limited -and $sync.sdReset -and $sync.sdReset -gt $nowU){ $t='7d 限流 · '+(Format-Countdown ($sync.sdReset-$nowU).TotalSeconds) }
+      else { $t='7d '+[int][Math]::Round([double]$sync.sdUtil*100)+'%' }
+    }
+    if(-not $t){
+      try { $st=Get-CcuState
+        if($st.realFiveHourResetUtc -and $st.realResetProbedUtc){
+          $a=[DateTimeOffset]::FromUnixTimeSeconds([long]$st.realFiveHourResetUtc); $b=[DateTimeOffset]::FromUnixTimeSeconds([long]$st.realResetProbedUtc)
+          if($a -gt $nowU -and ($nowU-$b).TotalHours -lt 5){ $t='5h 距重置 '+(Format-Countdown ($a-$nowU).TotalSeconds) }
+        }
+      } catch {}
+    }
+    if(-not $t){ $t = if($sync.probedAt -ne [datetime]::MinValue){ '空闲' } else { '点击实探' } }
+    $els.ResetText.Text=$t
+  }
   $lt = Read-LogTail
   if($lt -and $els.LogText.Text -ne $lt){ $els.LogText.Text=$lt; $els.LogScroll.ScrollToEnd() }
   if((Get-Date) -lt $script:flash.until){ Set-StatusLine $script:flash.text }
@@ -427,6 +485,6 @@ $timer.Add_Tick({
   }
 })
 $timer.Start()
-$win.Add_Closed({ try { $timer.Stop() } catch {}; try { $ps.Stop(); $rs.Close() } catch {} })
+$win.Add_Closed({ try { $timer.Stop() } catch {}; try { $ps.Stop(); $rs.Close() } catch {}; try { if($script:instanceOwned){ $script:instanceMutex.ReleaseMutex() } } catch {} })
 if($SelfTest){ $tt=New-Object Windows.Threading.DispatcherTimer; $tt.Interval=[TimeSpan]::FromMilliseconds(2500); $tt.Add_Tick({ $tt.Stop(); $win.Close() }); $tt.Start() }
 [void]$win.ShowDialog()

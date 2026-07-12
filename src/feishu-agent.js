@@ -1,0 +1,312 @@
+/*
+  feishu-agent.js  ---  Claude Resume 双向飞书助手 (long-connection, no public IP needed)
+
+  Receives messages from Feishu via the official SDK's WSClient (event subscription over a
+  persistent WebSocket), maps each message to a project, runs `claude --continue -p "<text>"`
+  in that project's folder, and replies with the result -- all continuing the SAME conversation
+  the VS Code extension shows (reopen the session there to see the full thread).
+
+  Config is read from %LOCALAPPDATA%\ClaudeResume\config.json:
+    feishuAppId, feishuAppSecret   (required -- from the Feishu 自建应用)
+    selected / customProjects      (project routing table, written by the GUI)
+    skipPermissions, resumeModel, perProjectTimeoutMinutes  (reused resume settings)
+    feishuAllowOpenIds  (optional string[]: only these sender open_ids may command; empty = allow all in-chat)
+
+  Commands (DM the bot, or @it in a group):
+    帮助 / help                 -> usage
+    状态 / status               -> armed state, engine phase, exact reset, recent log
+    项目 / list                 -> known projects
+    停止 <项目> / stop <项目>    -> cancel a running command for that project
+    <项目名> <指令>             -> run <指令> in that project (prefix match on name)
+    <指令>                      -> run in the default project (the single armed one, or feishuDefaultProject)
+*/
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+
+let lark;
+try { lark = require('@larksuiteoapi/node-sdk'); }
+catch (e) { console.error('缺少依赖 @larksuiteoapi/node-sdk,请在本目录运行: npm install'); process.exit(1); }
+
+const APP_DIR = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'ClaudeResume');
+const CONFIG_PATH = path.join(APP_DIR, 'config.json');
+const LOG_DIR = path.join(APP_DIR, 'logs');
+
+function readConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); }
+  catch (e) { return {}; }
+}
+function logLine(msg) {
+  const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const line = `[${ts}] ${msg}\r\n`;
+  try { fs.mkdirSync(LOG_DIR, { recursive: true }); fs.appendFileSync(path.join(LOG_DIR, 'feishu-' + ts.slice(0, 10).replace(/-/g, '') + '.log'), line, 'utf8'); } catch (e) {}
+  process.stdout.write(line);
+}
+
+// single instance via pidfile (Windows lets two sockets share a loopback port, so a port lock
+// is unreliable here). Two live agents would each receive every event and double-run commands.
+const PID_PATH = path.join(APP_DIR, 'feishu-agent.pid');
+function anotherInstanceAlive() {
+  try {
+    if (!fs.existsSync(PID_PATH)) return false;
+    const pid = parseInt(String(fs.readFileSync(PID_PATH, 'utf8')).trim(), 10);
+    if (!pid || pid === process.pid) return false;
+    try { process.kill(pid, 0); return true; }        // signal 0 = liveness probe
+    catch (e) { return e && e.code === 'EPERM'; }      // EPERM = alive but not ours; ESRCH = dead
+  } catch (e) { return false; }
+}
+if (anotherInstanceAlive()) { console.error('另一个 feishu-agent 已在运行,退出。'); process.exit(0); }
+try { fs.mkdirSync(APP_DIR, { recursive: true }); fs.writeFileSync(PID_PATH, String(process.pid)); } catch (e) {}
+process.on('exit', () => { try { if (parseInt(fs.readFileSync(PID_PATH, 'utf8'), 10) === process.pid) fs.unlinkSync(PID_PATH); } catch (e) {} });
+
+const cfg0 = readConfig();
+const APP_ID = cfg0.feishuAppId || '';
+const APP_SECRET = cfg0.feishuAppSecret || '';
+if (!APP_ID || !APP_SECRET) { logLine('config.json 缺少 feishuAppId / feishuAppSecret,退出。'); process.exit(1); }
+
+const client = new lark.Client({ appId: APP_ID, appSecret: APP_SECRET });
+
+// ---- claude launcher resolution (same locations lib.ps1 checks) ----
+function findClaudeCmd() {
+  const cands = [
+    path.join(process.env.APPDATA || '', 'npm', 'claude.cmd'),
+    path.join(process.env.ProgramFiles || '', 'nodejs', 'claude.cmd'),
+  ];
+  for (const c of cands) { try { if (c && fs.existsSync(c)) return c; } catch (e) {} }
+  return 'claude.cmd'; // rely on PATH
+}
+const CLAUDE_CMD = findClaudeCmd();
+
+// ---- project discovery: config table + ~/.claude/projects cwd scan ----
+function discoverProjects() {
+  const map = new Map(); // path(lower) -> {name, path}
+  const cfg = readConfig();
+  for (const key of ['selected', 'customProjects']) {
+    for (const p of (cfg[key] || [])) {
+      if (p && p.path) map.set(p.path.toLowerCase(), { name: p.name || path.basename(p.path), path: p.path });
+    }
+  }
+  try {
+    const root = path.join(os.homedir(), '.claude', 'projects');
+    for (const dir of fs.readdirSync(root)) {
+      const full = path.join(root, dir);
+      let jsonls;
+      try { jsonls = fs.readdirSync(full).filter(f => f.endsWith('.jsonl')); } catch (e) { continue; }
+      if (!jsonls.length) continue;
+      // newest jsonl
+      jsonls.sort((a, b) => fs.statSync(path.join(full, b)).mtimeMs - fs.statSync(path.join(full, a)).mtimeMs);
+      const file = path.join(full, jsonls[0]);
+      const head = fs.readFileSync(file, 'utf8').split(/\r?\n/).slice(0, 60);
+      for (const ln of head) {
+        if (ln.indexOf('"cwd"') === -1) continue;
+        try {
+          const j = JSON.parse(ln);
+          if (j.cwd && fs.existsSync(j.cwd) && !map.has(j.cwd.toLowerCase())) {
+            if (!/\\AppData\\Local\\ClaudeResume/i.test(j.cwd) && !/^[A-Za-z]:\\Windows/i.test(j.cwd))
+              map.set(j.cwd.toLowerCase(), { name: path.basename(j.cwd), path: j.cwd });
+          }
+          break;
+        } catch (e) {}
+      }
+    }
+  } catch (e) {}
+  return Array.from(map.values());
+}
+
+// ---- routing: split "<project> <command>" or fall back to default ----
+function resolveTarget(text) {
+  const projects = discoverProjects();
+  const t = text.trim();
+  // prefix match: longest project name that the text starts with (case-insensitive)
+  const byLen = projects.slice().sort((a, b) => b.name.length - a.name.length);
+  for (const p of byLen) {
+    const n = p.name.toLowerCase();
+    const low = t.toLowerCase();
+    if (low === n) return { project: p, prompt: 'continue' };
+    if (low.startsWith(n)) {
+      const rest = t.slice(p.name.length).replace(/^\s*[:：,，]?\s*/, '');
+      if (rest) return { project: p, prompt: rest };
+    }
+  }
+  // default project
+  const cfg = readConfig();
+  let def = null;
+  if (cfg.feishuDefaultProject) {
+    def = projects.find(p => p.path.toLowerCase() === String(cfg.feishuDefaultProject).toLowerCase()
+      || p.name.toLowerCase() === String(cfg.feishuDefaultProject).toLowerCase());
+  }
+  if (!def && Array.isArray(cfg.selected) && cfg.selected.length === 1) {
+    const s = cfg.selected[0];
+    def = { name: s.name || path.basename(s.path), path: s.path };
+  }
+  if (def) return { project: def, prompt: t };
+  return { project: null, prompt: t, projects };
+}
+
+// ---- run claude --continue in a project, return {ok, limited, text} ----
+const running = new Map(); // path(lower) -> child
+function runClaude(project, prompt) {
+  return new Promise((resolve) => {
+    const cfg = readConfig();
+    const args = ['/c', CLAUDE_CMD, '--continue', '-p', prompt, '--output-format', 'stream-json', '--verbose'];
+    if (cfg.resumeModel) { args.push('--model', cfg.resumeModel); }
+    if (cfg.skipPermissions) { args.push('--dangerously-skip-permissions'); }
+    const timeoutMs = Math.max(1, (parseInt(cfg.perProjectTimeoutMinutes, 10) || 30)) * 60000;
+
+    let child;
+    try { child = spawn(process.env.ComSpec || 'cmd.exe', args, { cwd: project.path, windowsHide: true }); }
+    catch (e) { resolve({ ok: false, limited: false, text: '启动 claude 失败: ' + e.message }); return; }
+    running.set(project.path.toLowerCase(), child);
+
+    let buf = '', resultText = null, isError = null, limited = false, killedForTimeout = false;
+    const to = setTimeout(() => { killedForTimeout = true; try { child.kill(); } catch (e) {} }, timeoutMs);
+
+    function scanLine(ln) {
+      if (!ln) return;
+      if (/"status"\s*:\s*"(blocked|rejected|limited|exceeded)"/.test(ln) ||
+          /usage limit|rate limit|limit reached|weekly limit/i.test(ln)) limited = true;
+      const m = ln.indexOf('"type":"result"') !== -1 || /"type"\s*:\s*"result"/.test(ln);
+      if (m) {
+        try {
+          const j = JSON.parse(ln);
+          if (j.type === 'result') { if (typeof j.result === 'string') resultText = j.result; if (typeof j.is_error === 'boolean') isError = j.is_error; }
+        } catch (e) {}
+      }
+    }
+    child.stdout.on('data', d => { buf += d.toString('utf8'); let i; while ((i = buf.indexOf('\n')) >= 0) { scanLine(buf.slice(0, i)); buf = buf.slice(i + 1); } });
+    child.stderr.on('data', () => {});
+    child.on('close', () => {
+      clearTimeout(to); running.delete(project.path.toLowerCase());
+      if (buf) scanLine(buf);
+      if (killedForTimeout) { resolve({ ok: false, limited, text: `执行超时(> ${timeoutMs / 60000} 分钟),已终止。` }); return; }
+      if (resultText !== null && isError !== true) { resolve({ ok: true, limited, text: resultText }); return; }
+      if (limited) { resolve({ ok: false, limited: true, text: '又被限流了。可在「Claude续跑」里布防,额度恢复后自动续跑。' }); return; }
+      resolve({ ok: false, limited, text: resultText || '执行结束但未拿到成功结果(可能出错)。完整过程见 VS Code 该项目会话。' });
+    });
+  });
+}
+
+// ---- Feishu send helpers ----
+async function sendText(chatId, text) {
+  // Feishu text messages get unwieldy past a few KB; chunk to <=3500 chars, cap 6 parts.
+  const MAX = 3500, PARTS = 6;
+  let parts = [];
+  let s = String(text);
+  while (s.length && parts.length < PARTS) { parts.push(s.slice(0, MAX)); s = s.slice(MAX); }
+  if (s.length) parts[parts.length - 1] += '\n…(内容过长已截断,完整结果见 VS Code 该项目会话)';
+  for (const p of parts) {
+    try {
+      await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: p }) } });
+    } catch (e) { logLine('发送失败: ' + (e && e.message)); }
+  }
+}
+
+// ---- status / list helpers ----
+function statusText() {
+  const cfg = readConfig();
+  let st = {};
+  try { st = JSON.parse(fs.readFileSync(path.join(APP_DIR, 'state.json'), 'utf8')); } catch (e) {}
+  let reset = '额度充足(未接近上限)';
+  if (st.realFiveHourResetUtc && st.realResetProbedUtc) {
+    const rr = st.realFiveHourResetUtc * 1000, now = Date.now();
+    if (rr > now && (now - st.realResetProbedUtc * 1000) < 5 * 3600e3) {
+      const s = Math.floor((rr - now) / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+      reset = `距重置 ${h}h ${String(m).padStart(2, '0')}m (精确)`;
+    }
+  }
+  let tail = '';
+  try {
+    const lf = path.join(LOG_DIR, 'run-' + new Date().toISOString().slice(0, 10).replace(/-/g, '') + '.log');
+    tail = fs.readFileSync(lf, 'utf8').trim().split(/\r?\n/).slice(-6).join('\n');
+  } catch (e) {}
+  return `状态:${cfg.enabled ? '● 已布防' : '○ 未布防'} · 引擎 ${st.phase || 'idle'}\n${reset}\n实探间隔 ${cfg.probeIntervalMinutes || 15}m\n\n最近日志:\n${tail || '(空)'}`;
+}
+function listText() {
+  const ps = discoverProjects();
+  if (!ps.length) return '未发现任何项目。先在「Claude续跑」里添加/勾选项目。';
+  return '已知项目(发指令时用名字开头即可):\n' + ps.map((p, i) => `${i + 1}. ${p.name}`).join('\n');
+}
+function helpText() {
+  return [
+    'Claude 服务器助手 · 用法:',
+    '· 直接发「<项目名> <指令>」在该项目继续对话,例如:Probe-Station-Suite 把剩下的组扫完',
+    '· 只发「<指令>」→ 发到默认项目(唯一布防的那个)',
+    '· 状态 / status → 布防状态、精确重置、最近日志',
+    '· 项目 / list → 已知项目列表',
+    '· 停止 <项目> → 取消该项目正在跑的指令',
+    '',
+    '注:执行会继续 VS Code 里同一个会话,但扩展面板不会实时刷新,重开该会话即可看到完整内容。',
+  ].join('\n');
+}
+
+// ---- message handling ----
+const seen = new Set(); // dedupe message_id (Feishu may redeliver)
+function stripMentions(text, mentions) {
+  let t = text || '';
+  t = t.replace(/@_user_\d+/g, ' ');           // mention placeholders
+  t = t.replace(/@[^\s]+/g, m => m);            // keep literal @ that aren't placeholders
+  return t.replace(/\s+/g, ' ').trim();
+}
+
+async function onMessage(data) {
+  try {
+    const msg = data.message || {};
+    const mid = msg.message_id;
+    if (!mid || seen.has(mid)) return;
+    seen.add(mid); if (seen.size > 500) seen.clear();
+    if (msg.message_type !== 'text') return;
+    const chatId = msg.chat_id;
+    const senderOpen = data.sender && data.sender.sender_id && data.sender.sender_id.open_id;
+
+    const cfg = readConfig();
+    const allow = Array.isArray(cfg.feishuAllowOpenIds) ? cfg.feishuAllowOpenIds.filter(Boolean) : [];
+    if (allow.length && senderOpen && allow.indexOf(senderOpen) === -1) {
+      logLine('拒绝未授权发送者: ' + senderOpen); return;
+    }
+
+    let text = '';
+    try { text = JSON.parse(msg.content || '{}').text || ''; } catch (e) {}
+    text = stripMentions(text, msg.mentions);
+    if (!text) return;
+    logLine(`收到指令 chat=${chatId} sender=${senderOpen}: ${text}`);
+
+    const low = text.toLowerCase();
+    if (['帮助', 'help', '?', '？'].indexOf(low) !== -1) { await sendText(chatId, helpText()); return; }
+    if (['状态', 'status', 'zt'].indexOf(low) !== -1) { await sendText(chatId, statusText()); return; }
+    if (['项目', 'list', '项目列表'].indexOf(low) !== -1) { await sendText(chatId, listText()); return; }
+    if (/^(停止|stop)\b/i.test(text)) {
+      const rest = text.replace(/^(停止|stop)\s*/i, '');
+      const ps = discoverProjects();
+      const p = ps.find(x => rest && x.name.toLowerCase().startsWith(rest.toLowerCase()));
+      if (p && running.has(p.path.toLowerCase())) { try { running.get(p.path.toLowerCase()).kill(); } catch (e) {} await sendText(chatId, `已请求停止:${p.name}`); }
+      else await sendText(chatId, '没有匹配的正在运行的项目。');
+      return;
+    }
+
+    const { project, prompt, projects } = resolveTarget(text);
+    if (!project) {
+      await sendText(chatId, '无法判断目标项目。请用「项目名 指令」的格式,或先在「Claude续跑」里只勾选一个项目作为默认。\n\n' + listText());
+      return;
+    }
+    if (running.has(project.path.toLowerCase())) { await sendText(chatId, `「${project.name}」正在执行中,请稍候,或发「停止 ${project.name}」取消。`); return; }
+
+    await sendText(chatId, `收到,正在「${project.name}」执行:${prompt}\n(完成后回传结果;过程见 VS Code 该项目会话)`);
+    const r = await runClaude(project, prompt);
+    const head = r.ok ? `✅ 「${project.name}」完成:\n\n` : `⚠️ 「${project.name}」:\n\n`;
+    await sendText(chatId, head + (r.text || '(无输出)'));
+    logLine(`完成 ${project.name} ok=${r.ok} limited=${r.limited}`);
+  } catch (e) { logLine('处理消息异常: ' + (e && e.stack || e)); }
+}
+
+// ---- boot ----
+const wsClient = new lark.WSClient({ appId: APP_ID, appSecret: APP_SECRET });
+const eventDispatcher = new lark.EventDispatcher({}).register({
+  'im.message.receive_v1': async (data) => { await onMessage(data); },
+});
+logLine('feishu-agent 启动,连接飞书长连接…  claude=' + CLAUDE_CMD);
+wsClient.start({ eventDispatcher });
+// keep the process alive
+process.on('uncaughtException', e => logLine('uncaughtException: ' + (e && e.stack || e)));
+process.on('unhandledRejection', e => logLine('unhandledRejection: ' + (e && (e.stack || e))));

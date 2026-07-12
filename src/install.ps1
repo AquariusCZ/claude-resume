@@ -7,9 +7,14 @@ $AppDir = Join-Path $env:LOCALAPPDATA 'ClaudeResume'
 
 # 0) deploy the program files from src/ to the runtime folder (this IS the redeploy step)
 if(-not (Test-Path $AppDir)){ New-Item -ItemType Directory -Force -Path $AppDir | Out-Null }
-foreach($f in 'lib.ps1','checker.ps1','picker.ps1','launcher.vbs','checker-launch.vbs'){
+foreach($f in 'lib.ps1','checker.ps1','picker.ps1','launcher.vbs','checker-launch.vbs','feishu-agent.js','feishu-launch.vbs','package.json'){
   $s = Join-Path $PSScriptRoot $f
   if(Test-Path $s){ Copy-Item $s (Join-Path $AppDir $f) -Force }
+}
+# install the Feishu agent's node deps (only if node is present and not already installed)
+if((Get-Command node -ErrorAction SilentlyContinue) -and (Test-Path (Join-Path $AppDir 'package.json')) -and -not (Test-Path (Join-Path $AppDir 'node_modules'))){
+  Write-Host 'Installing Feishu agent dependencies (npm install)...'
+  Push-Location $AppDir; try { & npm install --no-audit --no-fund 2>&1 | Out-Null } catch {} Pop-Location
 }
 
 # 1) allow local scripts (RemoteSigned) for both PowerShell editions if needed
@@ -52,9 +57,28 @@ $sc.Save()
 $tr = "wscript.exe $AppDir\checker-launch.vbs"
 & schtasks /Create /F /TN 'ClaudeResumeChecker' /SC MINUTE /MO 2 /TR $tr | Out-Null
 
-# 5) start disarmed (the GUI's "布防" button arms it)
+# 4b) Feishu two-way agent: start at logon via a Startup-folder shortcut (no admin needed;
+#     an ONLOGON scheduled task requires elevation). The vbs auto-restarts node, so this one
+#     entry keeps the long-connection listener alive. Only if credentials are configured.
 . (Join-Path $AppDir 'lib.ps1')
-$cfg = Get-CcuConfig; $cfg.enabled = $false; $cfg.armed = $false; Set-CcuConfig $cfg
+$cfg = Get-CcuConfig
+$startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'ClaudeResumeFeishu.lnk'
+if("$($cfg.feishuAppId)" -and (Test-Path (Join-Path $AppDir 'feishu-launch.vbs'))){
+  $fs = $wsh.CreateShortcut($startupLnk)
+  $fs.TargetPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
+  $fs.Arguments = '"' + (Join-Path $AppDir 'feishu-launch.vbs') + '"'
+  $fs.WorkingDirectory = $AppDir
+  $fs.WindowStyle = 7
+  $fs.Description = 'Claude Resume - Feishu two-way agent (long-connection listener)'
+  $fs.Save()
+  Write-Host "  Feishu agent    : starts at logon (Startup shortcut), auto-restart"
+} else {
+  if(Test-Path $startupLnk){ Remove-Item $startupLnk -Force -ErrorAction SilentlyContinue }
+  Write-Host "  Feishu agent    : skipped (set feishuAppId/feishuAppSecret in config.json, then re-run)"
+}
+
+# 5) start disarmed (the GUI's "布防" button arms it)
+$cfg.enabled = $false; $cfg.armed = $false; Set-CcuConfig $cfg
 
 Write-Host "Claude Resume installed." -ForegroundColor Green
 Write-Host ("  Desktop shortcut: " + $lnk)

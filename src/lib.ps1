@@ -1,15 +1,16 @@
 ﻿<#
   lib.ps1 - shared engine for "Claude Resume"
   Correctness rules (from adversarial review + live testing):
-   * Timezone: extract endTime from RAW ccusage json (ConvertFrom-Json rebases ISO-Z to local),
-     then [DateTimeOffset]::Parse(...RoundtripKind).ToUniversalTime() vs [DateTimeOffset]::UtcNow.
+   * NO reset-time estimation: the engine probes on a fixed interval and the only reset time
+     ever shown is the server-exact resetsAt a probe returns. (ccusage/jsonl estimates were
+     removed - they were display noise and once even mis-gated probing.)
    * Launch: claude.cmd via cmd.exe /c (UseShellExecute=false cannot exec a .cmd); tail the
      redirect file for live output; kill the WHOLE process tree on stop/timeout (verified).
    * ExitCode: PS 5.1's Start-Process -PassThru returns $null from .ExitCode after the process
      exits unless $p.Handle was read first (WaitForExit(ms) opens SYNCHRONIZE-only; HasExited
      polling has the same hole - both verified live). Cache the handle AND never rely on the
      exit code alone: a stream-json "type":"result","is_error":false line is the success signal.
-   * Fail-closed: bad ccusage/claude reads assume "still limited", never "clear".
+   * Fail-closed: bad claude reads assume "still limited", never "clear".
    * This file must be saved UTF-8 WITH BOM so Windows PowerShell 5.1 parses non-ASCII correctly.
 #>
 Set-StrictMode -Off
@@ -22,13 +23,6 @@ $script:StatePath  = Join-Path $script:AppDir 'state.json'
 # dev runs from src/ may predate install: the probe uses AppDir as -WorkingDirectory, which throws if missing
 try { if(-not (Test-Path $script:AppDir)){ New-Item -ItemType Directory -Force -Path $script:AppDir | Out-Null } } catch {}
 
-function Get-CcuCmd {
-  $c = Get-Command ccusage.cmd -ErrorAction SilentlyContinue
-  if(-not $c){ $c = Get-Command ccusage -ErrorAction SilentlyContinue }
-  if($c){ return $c.Source }
-  $p = Join-Path $env:APPDATA 'npm\ccusage.cmd'; if(Test-Path $p){ return $p }
-  return $null
-}
 function Get-ClaudeCmd {
   $c = Get-Command claude.cmd -ErrorAction SilentlyContinue
   if($c){ return $c.Source }
@@ -53,7 +47,9 @@ function Get-CcuConfig {
   $def = [ordered]@{
     enabled=$false; armed=$false; continuous=$false; selected=@(); customProjects=@(); hiddenProjects=@();
     resumePrompt='continue'; skipPermissions=$true; dirtyGuard='stash'; perProjectTimeoutMinutes=30;
-    safetyMarginSeconds=60; weeklyBackoffMinutes=45; probeModel='haiku'; resumeModel=''; projectHome=''
+    safetyMarginSeconds=60; weeklyBackoffMinutes=45; probeModel='haiku'; resumeModel=''; projectHome='';
+    feishuWebhook=''; feishuSecret=''; probeIntervalMinutes=15;
+    feishuAppId=''; feishuAppSecret=''; feishuDefaultProject=''; feishuAllowOpenIds=@()
   }
   if(Test-Path $script:ConfigPath){
     try {
@@ -83,65 +79,6 @@ function Get-CcuState {
 }
 function Set-CcuState { param($State)
   ($State | ConvertTo-Json -Depth 6) | Set-Content -Path $script:StatePath -Encoding UTF8
-}
-
-function Get-CcuResetInfo {
-  $r = @{ ok=$false; hasActive=$false; empty=$false; resetUtc=$null;
-          nowUtc=[DateTimeOffset]::UtcNow; secondsUntilReset=$null; blockId=$null }
-  $ccu = Get-CcuCmd; if(-not $ccu){ return $r }
-  try {
-    $out = (& $ccu blocks --active --json 2>$null | Out-String).Trim()
-    if($LASTEXITCODE -ne 0 -or -not $out){ return $r }
-    $o = $out | ConvertFrom-Json
-    $r.ok = $true
-    $active = @($o.blocks) | Where-Object { $_.isActive -and -not $_.isGap } | Select-Object -First 1
-    if(-not $active){ $r.empty = $true; return $r }
-    $r.hasActive = $true
-    # Extract endTime + id from RAW json: ConvertFrom-Json silently rebases ISO-Z to local (~8h error).
-    $mEnd = [regex]::Match($out, '"endTime"\s*:\s*"([^"]+)"')
-    $mId  = [regex]::Match($out, '"id"\s*:\s*"([^"]+)"')
-    $endRaw = if($mEnd.Success){ $mEnd.Groups[1].Value } else { "$($active.endTime)" }
-    $r.blockId = if($mId.Success){ $mId.Groups[1].Value } else { "$($active.id)" }
-    $reset = [DateTimeOffset]::Parse($endRaw, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
-    $r.resetUtc = $reset
-    $r.secondsUntilReset = ($reset - $r.nowUtc).TotalSeconds
-  } catch { $r.ok = $false }
-  return $r
-}
-
-function Get-SessionReset {
-  # Estimate the 5h session reset as (oldest message still within the last 5h) + 5h -- a rolling
-  # window that tracks Claude's real session limit far better than ccusage's gap-split blocks.
-  # Still an ESTIMATE (exact value is on claude.ai); the checker fires on a live probe, not this.
-  $r = @{ ok=$false; resetUtc=$null; secondsUntilReset=$null; hasActivity=$false; nowUtc=[DateTimeOffset]::UtcNow }
-  try {
-    $root = Join-Path $env:USERPROFILE '.claude\projects'
-    if(-not (Test-Path $root)){ return $r }
-    $nowU = $r.nowUtc; $cutoff = $nowU.AddHours(-11)
-    $ts = New-Object System.Collections.Generic.List[DateTimeOffset]
-    foreach($f in (Get-ChildItem $root -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTimeUtc -gt $cutoff.UtcDateTime })){
-      # skip the tool's own probe sessions (cwd=AppDir) and any legacy probes that ran from
-      # System32 (scheduled-task default cwd) -- they are not user activity
-      if($f.Directory.Name -like '*AppData-Local-ClaudeResume*' -or $f.Directory.Name -like 'C--Windows-System32*'){ continue }
-      $raw = [System.IO.File]::ReadAllText($f.FullName)
-      foreach($m in [regex]::Matches($raw, '"timestamp"\s*:\s*"([^"]+Z)"')){
-        try { $t=[DateTimeOffset]::Parse($m.Groups[1].Value,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime(); if($t -gt $cutoff -and $t -le $nowU.AddMinutes(2)){ $ts.Add($t) } } catch {}
-      }
-    }
-    $r.ok = $true
-    if($ts.Count -eq 0){ return $r }   # no recent activity
-    # Rolling 5h window: reset = (oldest message still within the last 5h) + 5h.
-    # Matches Claude's rolling session limit far better than gap-split blocks or window-chaining.
-    $sorted = $ts.ToArray(); [Array]::Sort($sorted)
-    $win5 = $nowU.AddHours(-5)
-    $oldest = $null
-    foreach($t in $sorted){ if($t -gt $win5){ $oldest = $t; break } }
-    if(-not $oldest){ return $r }      # activity exists but none in the last 5h -> window already clear
-    $r.hasActivity = $true
-    $reset = $oldest.AddHours(5)
-    $r.resetUtc = $reset; $r.secondsUntilReset = ($reset - $nowU).TotalSeconds
-  } catch { $r.ok = $false }
-  return $r
 }
 
 function Get-ClaudeProjects {
@@ -219,8 +156,8 @@ function Test-ClaudeReady {
   $tmpOut = [IO.Path]::GetTempFileName(); $tmpErr = [IO.Path]::GetTempFileName()
   try {
     $a = @('/c','"'+$claude+'"','-p','ready','--model',$Model,'--max-turns','1','--output-format','stream-json','--verbose')
-    # -WorkingDirectory AppDir: probe sessions land in one known .claude/projects folder that
-    # Get-SessionReset excludes, so probing can't feed back into the activity estimate.
+    # -WorkingDirectory AppDir: probe sessions land in one known .claude/projects folder,
+    # keeping them out of the discovered project list.
     $p = Start-Process -FilePath $env:ComSpec -ArgumentList $a -NoNewWindow -PassThru `
           -WorkingDirectory $script:AppDir -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
     $null = $p.Handle   # cache NOW or .ExitCode reads $null after exit (PS 5.1, verified)
@@ -261,6 +198,37 @@ function Test-ClaudeReady {
   } catch { $r.reason="err:$($_.Exception.Message)" }
   finally { try { [IO.File]::Delete($tmpOut) } catch {}; try { [IO.File]::Delete($tmpErr) } catch {} }
   return $r
+}
+
+function Send-FeishuNotify {
+  # Push one status line to a Feishu group via its custom-bot webhook (one-way, fire-and-forget).
+  # Empty/missing feishuWebhook in config.json = feature off. Never throws: a notification
+  # failure must never break the engine. If feishuSecret is set (bot "签名校验" enabled),
+  # sign per Feishu's spec: key = "<unix_ts>\n<secret>", HMAC-SHA256 over an EMPTY message,
+  # base64 -> send {timestamp, sign} alongside the payload.
+  param([string]$Text, [string]$Webhook = '', [string]$Secret = $null)
+  try {
+    $cfg = $null
+    if(-not $Webhook){ $cfg = Get-CcuConfig; $Webhook = "$($cfg.feishuWebhook)" }
+    if(-not $Webhook){ return $false }
+    if($null -eq $Secret){ if($null -eq $cfg){ $cfg = Get-CcuConfig }; $Secret = "$($cfg.feishuSecret)" }
+    $payload = [ordered]@{ msg_type='text'; content=@{ text=$Text } }
+    if($Secret){
+      $ts = [string][int][double]::Parse(([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()).ToString())
+      $strToSign = "$ts`n$Secret"
+      $hmac = New-Object System.Security.Cryptography.HMACSHA256
+      $hmac.Key = [System.Text.Encoding]::UTF8.GetBytes($strToSign)
+      $sign = [Convert]::ToBase64String($hmac.ComputeHash([byte[]]@()))
+      $hmac.Dispose()
+      $payload['timestamp'] = $ts
+      $payload['sign'] = $sign
+    }
+    $body = $payload | ConvertTo-Json -Depth 4 -Compress
+    $null = Invoke-RestMethod -Uri $Webhook -Method Post -TimeoutSec 10 `
+              -ContentType 'application/json; charset=utf-8' `
+              -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
+    return $true
+  } catch { return $false }
 }
 
 function Save-RealResetFromProbe {
