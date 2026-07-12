@@ -60,7 +60,9 @@ function Get-CcuConfig {
   return [pscustomobject]$def
 }
 function Set-CcuConfig { param($Config)
-  ($Config | ConvertTo-Json -Depth 6) | Set-Content -Path $script:ConfigPath -Encoding UTF8
+  # UTF-8 WITHOUT BOM: PS 5.1's `Set-Content -Encoding UTF8` prepends a BOM that makes Node's
+  # JSON.parse throw, which would kill the Feishu agent on its next restart. Write clean bytes.
+  [System.IO.File]::WriteAllText($script:ConfigPath, ($Config | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
 }
 function Get-CcuState {
   # merge loaded state over defaults so EVERY field always exists (new fields settable without throwing)
@@ -78,7 +80,8 @@ function Get-CcuState {
   return [pscustomobject]$def
 }
 function Set-CcuState { param($State)
-  ($State | ConvertTo-Json -Depth 6) | Set-Content -Path $script:StatePath -Encoding UTF8
+  # UTF-8 WITHOUT BOM (state.json is read by the Node agent too — see Set-CcuConfig)
+  [System.IO.File]::WriteAllText($script:StatePath, ($State | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
 }
 
 function Get-ClaudeProjects {

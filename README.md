@@ -44,7 +44,9 @@ Configure a Feishu **自建应用** and a single bot handles **both** notificati
 2. Put `feishuAppId` + `feishuAppSecret` into `%LOCALAPPDATA%\ClaudeResume\config.json` and re-run `install.ps1`. A background agent (`feishu-agent.js`, Node long-connection — **no public IP needed**) starts at logon.
 3. **DM the bot once** (say `帮助`). That registers the chat, so from then on the checker's notifications (limited / resume started / per-project ✅❌ / all done) come from this same bot.
 
-How it talks: by default you're in **chat mode** (just chatting with Claude, no project touched). Send **项目** to list projects, **进入 2** (or a project's name) to start operating on one — then every message runs `claude --continue` there — and **退出** to go back to chat. Also: **`<项目名> <指令>`** for a one-off without switching, plus **状态** / **停止** / **帮助**. A project run continues the **same** conversation your VS Code session shows (reopen the session to see it — the panel doesn't live-refresh external appends).
+How it talks: by default you're in **chat mode** (just chatting with Claude, no project touched). Send **项目** to list projects, **进入 2** (or a project's name) to start operating on one — then every message runs `claude --continue` there — and **退出** to go back to chat. Also: **`<项目名> <指令>`** for a one-off without switching, **模型** / **模型 opus** to view or switch the chat model, **忘记闲聊** to reset chat memory, plus **状态** / **停止** / **帮助**. A project run continues the **same** conversation your VS Code session shows (reopen the session to see it — the panel doesn't live-refresh external appends).
+
+The GUI mirrors two of these: a **闲聊模型 chip** (top-right, click to cycle 默认/Sonnet/Opus/Haiku) and a **忘记闲聊** button (bottom row) — both write the same `config.json` the agent reads, so the two stay in sync.
 
 > Prefer not to set up an app? Set `feishuWebhook` (a group **custom-bot** webhook, `feishuSecret` if 签名校验 is on) for **one-way notifications only**.
 

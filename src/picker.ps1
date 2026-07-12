@@ -125,6 +125,9 @@ if(-not $script:instanceOwned -and -not $RenderTo -and -not $SelfTest){
           <TextBlock x:Name="Subtitle" Text="勾选一个或多个,额度重置后自动继续" Foreground="{StaticResource Muted}" FontSize="12.5" Margin="0,3,0,0"/>
         </StackPanel>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+          <Border x:Name="ChatModelChip" Cursor="Hand" ToolTip="飞书「闲聊模式」使用的模型(点击切换 默认 / Sonnet / Opus / Haiku)。与飞书共享同一配置,两边实时同步。" CornerRadius="9" Background="{StaticResource Card}" BorderBrush="{StaticResource Border0}" BorderThickness="1" Padding="13,7" Margin="0,0,8,0">
+            <TextBlock x:Name="ChatModelText" Text="闲聊 默认" Foreground="{StaticResource Ink2}" FontSize="12.5" FontWeight="SemiBold"/>
+          </Border>
           <Border x:Name="IntervalChip" Cursor="Hand" ToolTip="布防后每隔多久自动实探一次额度(点击切换 5 / 15 / 30 分钟);被限流后自动加密到 4 分钟。" CornerRadius="9" Background="{StaticResource Card}" BorderBrush="{StaticResource Border0}" BorderThickness="1" Padding="13,7" Margin="0,0,8,0">
             <TextBlock x:Name="IntervalText" Text="间隔 15m" Foreground="{StaticResource Ink2}" FontSize="12.5" FontWeight="SemiBold"/>
           </Border>
@@ -153,6 +156,7 @@ if(-not $script:instanceOwned -and -not $RenderTo -and -not $SelfTest){
           <Button x:Name="BtnAdd" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="+ 文件夹" Margin="14,0,0,0" VerticalAlignment="Center"/>
           <Button x:Name="BtnClearLog" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="清空日志" Margin="14,0,0,0" VerticalAlignment="Center"/>
           <Button x:Name="BtnExportLog" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="导出日志" Margin="14,0,0,0" VerticalAlignment="Center"/>
+          <Button x:Name="BtnForgetChat" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="忘记闲聊" Margin="14,0,0,0" VerticalAlignment="Center"/>
           <TextBlock x:Name="StatusText" Text="待布防" Foreground="{StaticResource Muted}" FontSize="12.5" VerticalAlignment="Center" Margin="18,0,0,0" TextTrimming="CharacterEllipsis"/>
         </DockPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal">
@@ -177,7 +181,7 @@ try {
   if(Test-Path $icoPath){ $win.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]$icoPath) }
 } catch {}
 $els = @{}
-foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','IntervalChip','IntervalText','ProjectList','LogText','LogScroll','StatusText','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
+foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','ChatModelChip','ChatModelText','IntervalChip','IntervalText','ProjectList','LogText','LogScroll','StatusText','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnForgetChat','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
 # global UI-thread exception guard: never let a handler bug close the window
 $win.Dispatcher.add_UnhandledException({ param($s,$e)
   try { [System.IO.File]::AppendAllText((Join-Path $env:LOCALAPPDATA 'ClaudeResume\logs\gui-error.log'), ((Get-Date).ToString('s') + "  " + $e.Exception.ToString() + "`r`n"), (New-Object System.Text.UTF8Encoding($false))) } catch {}
@@ -323,6 +327,22 @@ $els.TitleBar.Add_MouseLeftButtonUp({ try { $script:dragging = $false; $els.Titl
 # probe interval chip: click cycles 5m -> 15m -> 30m (persisted; checker reads it every tick)
 function Update-IntervalChip { $v = 15; try { $v = [int](Get-CcuConfig).probeIntervalMinutes } catch {}; if($v -lt 2){ $v = 15 }; $els.IntervalText.Text = "间隔 ${v}m" }
 Update-IntervalChip
+
+# chat-model chip: click cycles 默认/Sonnet/Opus/Haiku (writes feishuChatModel — shared with the Feishu agent)
+$script:modelCycle = @('','sonnet','opus','haiku')
+function Get-ModelLabel($m){ switch("$m".ToLower()){ 'sonnet' { 'Sonnet' } 'opus' { 'Opus' } 'haiku' { 'Haiku' } default { '默认' } } }
+function Update-ChatModelChip { $m=''; try { $m="$((Get-CcuConfig).feishuChatModel)" } catch {}; $els.ChatModelText.Text = '闲聊 ' + (Get-ModelLabel $m) }
+Update-ChatModelChip
+$els.ChatModelChip.Add_MouseLeftButtonUp({
+  try {
+    $c = Get-CcuConfig; $cur = "$($c.feishuChatModel)"
+    $i = [Array]::IndexOf($script:modelCycle, $cur.ToLower()); if($i -lt 0){ $i = 0 }
+    $next = $script:modelCycle[($i + 1) % $script:modelCycle.Count]
+    $c.feishuChatModel = $next; Set-CcuConfig $c
+    Update-ChatModelChip
+    Set-Flash ('闲聊模型 → ' + (Get-ModelLabel $next) + '(飞书同步)')
+  } catch { Set-Flash ('设置出错: ' + $_.Exception.Message) }
+})
 $els.IntervalChip.Add_MouseLeftButtonUp({
   try {
     $c = Get-CcuConfig
@@ -374,6 +394,20 @@ $els.BtnClearLog.Add_Click({
     if(Test-Path $script:logFile){ [System.IO.File]::WriteAllText($script:logFile, '') }
     $els.LogText.Text = ''
     Set-Flash '日志已清空'
+  } catch { Set-Flash ('清空出错: ' + $_.Exception.Message) }
+})
+$els.BtnForgetChat.Add_Click({
+  try {
+    # forget the Feishu 闲聊 memory: drop the "started" flag AND the claude session for that cwd
+    $chatDir = Join-Path $script:AppDir 'feishu-chat'
+    Remove-Item (Join-Path $chatDir '.started') -Force -ErrorAction SilentlyContinue
+    $proot = Join-Path $env:USERPROFILE '.claude\projects'
+    if(Test-Path $proot){
+      Get-ChildItem $proot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like '*ClaudeResume-feishu-chat' } |
+        ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    Set-Flash '已清空闲聊记忆(下次闲聊从头开始)'
   } catch { Set-Flash ('清空出错: ' + $_.Exception.Message) }
 })
 $els.BtnExportLog.Add_Click({
@@ -483,6 +517,8 @@ $timer.Add_Tick({
     $ph='idle'; try { $ph="$((Get-CcuState).phase)" } catch {}
     Set-StatusLine (($(if($en){'● 已布防'}else{'○ 未布防'})) + ' · 引擎: ' + $ph)
   }
+  # keep the interval/model chips in sync if changed externally (e.g. from Feishu)
+  try { Update-IntervalChip; Update-ChatModelChip } catch {}
 })
 $timer.Start()
 $win.Add_Closed({ try { $timer.Stop() } catch {}; try { $ps.Stop(); $rs.Close() } catch {}; try { if($script:instanceOwned){ $script:instanceMutex.ReleaseMutex() } } catch {} })

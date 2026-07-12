@@ -34,8 +34,12 @@ const APP_DIR = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'A
 const CONFIG_PATH = path.join(APP_DIR, 'config.json');
 const LOG_DIR = path.join(APP_DIR, 'logs');
 
+function readJson(p) {
+  // strip a UTF-8 BOM: PowerShell may write config/state with one, which JSON.parse rejects
+  return JSON.parse(fs.readFileSync(p, 'utf8').replace(/^﻿/, ''));
+}
 function readConfig() {
-  try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); }
+  try { return readJson(CONFIG_PATH); }
   catch (e) { return {}; }
 }
 function logLine(msg) {
@@ -254,6 +258,8 @@ function helpText(chatId) {
     '· <项目名> <指令> → 不切换,一次性在该项目执行',
     '· 状态 → 布防 / 额度 / 当前模式',
     '· 停止 <项目> → 取消正在跑的指令',
+    '· 模型 / 模型 opus → 查看或切换闲聊模型(与软件同步)',
+    '· 忘记闲聊 → 清空闲聊记忆,从头开始',
     '',
     '注:项目执行会继续 VS Code 里同一个会话,面板不实时刷新,重开可见。',
   ].join('\n');
@@ -308,6 +314,31 @@ async function onMessage(data) {
     if (['退出', '返回', 'exit', 'quit', '闲聊', '退出项目'].indexOf(low) !== -1) {
       setActivePath(chatId, null);
       await sendText(chatId, '已回到 💬 闲聊模式(不碰任何项目)。发「项目」查看项目,「进入 X」开始操作。');
+      return;
+    }
+    // chat model: show (模型) or set (模型 opus) — shared with the GUI chip
+    if (['模型', 'model', '闲聊模型'].indexOf(low) !== -1) {
+      const cur = String(readConfig().feishuChatModel || '').toLowerCase();
+      const label = { sonnet: 'Sonnet', opus: 'Opus', haiku: 'Haiku' }[cur] || '默认';
+      await sendText(chatId, `闲聊模型:${label}\n改用:发「模型 opus / sonnet / haiku / 默认」;软件里也能切换,两边同步。`);
+      return;
+    }
+    const setm = text.match(/^(模型|闲聊模型|model)\s+(opus|sonnet|haiku|默认|default|清除|空|none)$/i);
+    if (setm) {
+      const a = setm[2].toLowerCase();
+      const val = (['opus', 'sonnet', 'haiku'].indexOf(a) !== -1) ? a : '';
+      try { const c = readConfig(); c.feishuChatModel = val; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
+      await sendText(chatId, `闲聊模型已设为:${val || '默认'}(下一句闲聊生效;软件已同步)。`);
+      return;
+    }
+    // forget chat memory (drop the started flag + the claude session for the chat cwd)
+    if (['忘记闲聊', '清空闲聊', '重置闲聊', '忘记记忆', 'forget', 'reset chat'].indexOf(low) !== -1) {
+      try { fs.rmSync(path.join(CHAT_DIR, '.started'), { force: true }); } catch (e) {}
+      try {
+        const proot = path.join(os.homedir(), '.claude', 'projects');
+        for (const d of fs.readdirSync(proot)) { if (/ClaudeResume-feishu-chat$/i.test(d)) fs.rmSync(path.join(proot, d), { recursive: true, force: true }); }
+      } catch (e) {}
+      await sendText(chatId, '已清空闲聊记忆,下次闲聊从头开始。');
       return;
     }
     if (/^(停止|stop)\b/i.test(text)) {
