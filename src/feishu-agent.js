@@ -83,15 +83,18 @@ function findClaudeCmd() {
 }
 const CLAUDE_CMD = findClaudeCmd();
 
-// ---- project discovery: config table + ~/.claude/projects cwd scan ----
+// ---- project discovery — mirrors the desktop GUI: ~/.claude/projects cwd scan (recency-sorted)
+// + customProjects, minus hiddenProjects and the tool's own dirs. Keep this in sync with
+// Get-ClaudeProjects/the picker so the Feishu 项目 list matches the desktop app exactly.
 function discoverProjects() {
-  const map = new Map(); // path(lower) -> {name, path}
   const cfg = readConfig();
-  for (const key of ['selected', 'customProjects']) {
-    for (const p of (cfg[key] || [])) {
-      if (p && p.path) map.set(p.path.toLowerCase(), { name: p.name || path.basename(p.path), path: p.path });
-    }
-  }
+  const hidden = new Set((Array.isArray(cfg.hiddenProjects) ? cfg.hiddenProjects : []).map(h => String(h).toLowerCase()));
+  const appDir = path.join(process.env.LOCALAPPDATA || '', 'ClaudeResume').toLowerCase();
+  const excluded = cwd => {
+    const l = String(cwd).toLowerCase();
+    return hidden.has(l) || l.startsWith(appDir) || /^[a-z]:\\windows/i.test(cwd);
+  };
+  const disc = []; // {name, path, mtime}
   try {
     const root = path.join(os.homedir(), '.claude', 'projects');
     for (const dir of fs.readdirSync(root)) {
@@ -99,24 +102,32 @@ function discoverProjects() {
       let jsonls;
       try { jsonls = fs.readdirSync(full).filter(f => f.endsWith('.jsonl')); } catch (e) { continue; }
       if (!jsonls.length) continue;
-      // newest jsonl
       jsonls.sort((a, b) => fs.statSync(path.join(full, b)).mtimeMs - fs.statSync(path.join(full, a)).mtimeMs);
       const file = path.join(full, jsonls[0]);
+      const mtime = fs.statSync(file).mtimeMs;
       const head = fs.readFileSync(file, 'utf8').split(/\r?\n/).slice(0, 60);
       for (const ln of head) {
         if (ln.indexOf('"cwd"') === -1) continue;
         try {
           const j = JSON.parse(ln);
-          if (j.cwd && fs.existsSync(j.cwd) && !map.has(j.cwd.toLowerCase())) {
-            if (!/\\AppData\\Local\\ClaudeResume/i.test(j.cwd) && !/^[A-Za-z]:\\Windows/i.test(j.cwd))
-              map.set(j.cwd.toLowerCase(), { name: path.basename(j.cwd), path: j.cwd });
-          }
+          if (j.cwd && fs.existsSync(j.cwd) && !excluded(j.cwd)) disc.push({ name: path.basename(j.cwd), path: j.cwd, mtime });
           break;
         } catch (e) {}
       }
     }
   } catch (e) {}
-  return Array.from(map.values());
+  // dedup by path (keep newest), sort by recency
+  const byPath = new Map();
+  for (const d of disc) { const k = d.path.toLowerCase(); const c = byPath.get(k); if (!c || d.mtime > c.mtime) byPath.set(k, d); }
+  const list = Array.from(byPath.values()).sort((a, b) => b.mtime - a.mtime).map(d => ({ name: d.name, path: d.path }));
+  const seen = new Set(list.map(p => p.path.toLowerCase()));
+  for (const p of (Array.isArray(cfg.customProjects) ? cfg.customProjects : [])) {
+    if (p && p.path && fs.existsSync(p.path) && !excluded(p.path) && !seen.has(p.path.toLowerCase())) {
+      list.push({ name: p.name || path.basename(p.path), path: p.path });
+      seen.add(p.path.toLowerCase());
+    }
+  }
+  return list;
 }
 
 // ---- per-chat active project (persisted) + a chat scratch session ----

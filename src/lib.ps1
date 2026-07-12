@@ -94,7 +94,8 @@ function Get-ClaudeProjects {
     if(-not $jsonl){ continue }
     $cwd = $null; $sid = [IO.Path]::GetFileNameWithoutExtension($jsonl.Name)
     try {
-      foreach($ln in (Get-Content $jsonl.FullName -TotalCount 60 -ErrorAction SilentlyContinue)){
+      # UTF-8: without it, PS 5.1 mis-decodes non-ASCII cwd paths (Chinese folder names) and drops them
+      foreach($ln in (Get-Content $jsonl.FullName -TotalCount 60 -Encoding UTF8 -ErrorAction SilentlyContinue)){
         if($ln -match '"cwd"'){
           try { $j = $ln | ConvertFrom-Json; if($j.cwd){ $cwd=$j.cwd; if($j.sessionId){ $sid=$j.sessionId }; break } } catch {}
         }
@@ -103,6 +104,7 @@ function Get-ClaudeProjects {
     if(-not $cwd){ continue }
     if(-not (Test-Path $cwd)){ continue }
     if($cwd -like "$env:WINDIR*"){ continue }
+    if($cwd -like "$script:AppDir*"){ continue }   # the tool's own dirs (probe / feishu-chat) are never projects
     $list += [pscustomobject]@{
       name = Split-Path $cwd -Leaf; path = $cwd; sessionId = $sid;
       lastUsedUtc = $jsonl.LastWriteTimeUtc; folder = $dir.Name;
