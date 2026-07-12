@@ -211,6 +211,10 @@ $script:logColors = @{
 function Set-LogColored($tb, $text){
   # rebuild the TextBlock inlines, coloring each line by its [level]. Cheap enough for the tail.
   $tb.Inlines.Clear()
+  if(-not $text -or $text.Trim().Length -eq 0){
+    $ph=New-Object Windows.Documents.Run('(暂无日志 · 布防或点「预演」后,这里会实时显示彩色运行日志)')
+    $ph.Foreground=$script:logColors['stream']; $tb.Inlines.Add($ph); return
+  }
   foreach($line in ($text -split "(`r`n|`n)")){
     if($line -eq "`r`n" -or $line -eq "`n" -or $line.Length -eq 0){ continue }
     $lvl='info'

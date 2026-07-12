@@ -512,12 +512,33 @@ async function onCardAction(ev) {
   } catch (e) { logLine('卡片动作异常: ' + (e && (e.stack || e))); }
 }
 
+// ---- persistent bottom menu (机器人自定义菜单) clicks: application.bot.menu_v6 ----
+async function onBotMenu(ev) {
+  try {
+    const key = ev.event_key || (ev.event && ev.event.event_key) || '';
+    const senderOpen = (ev.operator && ev.operator.operator_id && ev.operator.operator_id.open_id)
+      || (ev.operator && ev.operator.open_id);
+    const cfg = readConfig();
+    const chatId = cfg.feishuChatId;   // bot menu lives in the p2p chat; reply to the known chat
+    if (!chatId) { logLine('菜单点击但无 chatId(先随便发一句让我记录会话)'); return; }
+    const allow = Array.isArray(cfg.feishuAllowOpenIds) ? cfg.feishuAllowOpenIds.filter(Boolean) : [];
+    if (allow.length && senderOpen && allow.indexOf(senderOpen) === -1) return;
+    logLine(`底部菜单点击: ${key}`);
+    if (key === 'chat') { setSession(chatId, { mode: 'chat' }); await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。'); return; }
+    if (key === 'status') { await sendText(chatId, statusText(chatId)); return; }
+    if (key === 'idle' || key === 'exit') { setSession(chatId, { mode: 'idle' }); }
+    // default (menu / unknown) -> show the main menu card
+    await sendCard(chatId, buildMenuCard(chatId));
+  } catch (e) { logLine('底部菜单事件异常: ' + (e && (e.stack || e))); }
+}
+
 // ---- boot ----
 const wsClient = new lark.WSClient({ appId: APP_ID, appSecret: APP_SECRET });
 // register both v1 and v2 of the receive-message event so whichever the console offers works
 const handlers = { 'im.message.receive_v1': async (data) => { await onMessage(data); } };
 try { handlers['im.message.receive_v2'] = async (data) => { await onMessage(data); }; } catch (e) {}
-handlers['card.action.trigger'] = async (ev) => { await onCardAction(ev); };   // button clicks
+handlers['card.action.trigger'] = async (ev) => { await onCardAction(ev); };   // card button clicks
+handlers['application.bot.menu_v6'] = async (ev) => { await onBotMenu(ev); };   // bottom-menu clicks
 // no-op handlers for other events the console may have subscribed (read/reaction/recall/mute),
 // so the SDK doesn't log "no handle" warnings for events we don't act on
 const _noop = async () => {};
