@@ -103,6 +103,8 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 
 7. **WSClient 长连接不需要公网 IP**(相比 webhook 回调要公网),自建应用首选长连接。
 
+8. **卡片切换那 ~0.5s 延迟是飞书 API 往返的固有开销,不是本地代码卡**。实测 `im.message.patch` 单次往返 **~550ms**(首次含 tenant_access_token 获取 ~1.6s)。`onCardAction` 已经是 fire-and-forget(handler 不 await patch),本地开销(`discoverProjects` 22ms + 几次 `readConfig`)可忽略。**SDK 1.70 的长连接不支持卡片回调返回内联卡片/toast**(源码里 `yield h(evt)` 忽略 handler 返回值),所以省不掉这次 patch 往返。能做的:① 对**内容没变**的卡片**跳过 patch**(`cardHash` 记录每张卡上次的内容),让积压/重复的菜单事件变成 **0 往返**;② `apiRetry` 的重试等待从 700ms 降到 250ms。
+
 ---
 
 ## 四、部署 & 工程习惯
@@ -127,7 +129,9 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 
 4. **用量透明**:每条结果末尾报 `⏱ 耗时 · 输出 N tokens · ≈ $成本`,用户能感知每次问答的开销。位置:`runClaude` 采集 usage/cost、`fmtMeta` 拼接。
 
-5. **权限分级要给"看得见的名单"**:飞书后台看不到我们的 full/viewer 名单(那是我们 app 的逻辑,存 `config.json`),所以在 GUI 里做了「授权用户」窗口来查看/移除。**别让用户去一个根本没有该信息的地方找。**
+5. **权限分级要给"看得见的名单"**:飞书后台看不到我们的授权名单(那是我们 app 的逻辑,存 `config.json`),所以在 GUI 里做了「授权用户」窗口来查看/移除。**别让用户去一个根本没有该信息的地方找。**
+
+6. **权限模型别过度设计**:一开始做了 full/viewer/none 三级 + 逐个授权 viewer + owner 审批卡片。真实场景("把机器人开给同事,他们只能看不能改")其实只要**两档**:owner(在名单里)能改,**其他所有人自动只读**,不用逐个授权。简化后 `authLevel` 只判"是不是 owner",viewer 名单作废。教训:先问清真实使用场景,别先堆权限层级。（安全前提:owner 名单**非空**——空 = 未锁定 = 人人能改,GUI 会警告。）
 
 ---
 

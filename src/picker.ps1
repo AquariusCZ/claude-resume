@@ -278,7 +278,7 @@ function Show-AuthWindow {
     try { if($script:AppDir){ $ico=Join-Path $script:AppDir 'icon.ico'; if(Test-Path $ico){ $w.Icon=[Windows.Media.Imaging.BitmapFrame]::Create([Uri]$ico) } } } catch {}
     $root=New-Object Windows.Controls.DockPanel
     $hdr=New-Object Windows.Controls.TextBlock
-    $hdr.Text='这才是真正的授权名单(存在本机 config.json)。飞书开发者后台里看不到它 —— 后台只有『应用可用范围』,管的是谁能用机器人,不区分可改 / 只读。'
+    $hdr.Text='权限模型:名单里的人能『改项目』(通常只有你);其他所有人自动『只读浏览查询』,无需逐个授权。闲聊对所有人开放。名单存在本机 config.json,飞书后台看不到(后台只有『应用可用范围』,管谁能用机器人)。'
     $hdr.TextWrapping='Wrap'; $hdr.Foreground=(New-Brush '#FFB9B9B9'); $hdr.FontSize=12; $hdr.Margin='18,16,18,6'
     [Windows.Controls.DockPanel]::SetDock($hdr,'Top'); $root.Children.Add($hdr)|Out-Null
     $sv=New-Object Windows.Controls.ScrollViewer; $sv.VerticalScrollBarVisibility='Auto'; $sv.Padding='18,4,18,16'
@@ -290,8 +290,7 @@ function Show-AuthWindow {
       $script:authList.Children.Clear()
       $cfg=Get-CcuConfig
       $secs=@(
-        @{ title='✅ 可改项目(full) —— 能修改你的项目'; ids=@(@($cfg.feishuAuthOpenIds)|Where-Object{$_}) },
-        @{ title='👁 只读查询(viewer) —— 只能只读问答'; ids=@(@($cfg.feishuViewerOpenIds)|Where-Object{$_}) }
+        @{ title='✅ 可改项目 —— 只有这些人能改;其他所有人只读浏览'; ids=@(@($cfg.feishuAuthOpenIds)|Where-Object{$_}) }
       )
       foreach($sec in $secs){
         $t=New-Object Windows.Controls.TextBlock; $t.Text=$sec.title; $t.Foreground=(New-Brush '#FFEDEDED'); $t.FontWeight='SemiBold'; $t.FontSize=13; $t.Margin='0,10,0,6'
@@ -330,7 +329,7 @@ function Show-AuthWindow {
         }
       }
       $tip=New-Object Windows.Controls.TextBlock
-      $tip.Text='加人:让对方给机器人发一句话 → 你会收到卡片,点「可改项目 / 只读查询」;或在飞书发「授权 ou_xxx」/「只读授权 ou_xxx」。名单为空 = 未锁定(所有人可改)。'
+      $tip.Text='想让某人也能改:让他给机器人发一句话拿到 open_id,再在飞书发「授权 ou_xxx」(或从收到的卡片点「可改项目」)。⚠ 名单为空 = 未锁定(所有人都能改),至少留你自己。'
       $tip.TextWrapping='Wrap'; $tip.Foreground=(New-Brush '#FF8A8A8A'); $tip.FontSize=11.5; $tip.Margin='2,14,0,0'
       $script:authList.Children.Add($tip)|Out-Null
     }

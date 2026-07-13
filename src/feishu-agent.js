@@ -365,7 +365,7 @@ async function apiRetry(fn) {
   try { return await fn(); }
   catch (e) {
     if (/socket disconnected|handshake|TLS|ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|network/i.test(String(e && e.message))) {
-      await new Promise(r => setTimeout(r, 700));
+      await new Promise(r => setTimeout(r, 250));   // transient blip — retry fast (was 700ms, felt sluggish)
       return await fn();
     }
     throw e;
@@ -390,12 +390,15 @@ async function sendText(chatId, text) {
 // one "control card" per chat: all navigation (main menu <-> project sub-menu) updates THIS card
 // in place instead of sending a new one, so cards never pile up.
 const lastCard = new Map();   // chatId -> message_id of the live control card
+const cardHash = new Map();   // message_id -> last content string patched to it (skip no-op patches)
 async function sendCard(chatId, card, setLast) {
   try {
-    const res = await apiRetry(() => client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(card) } }));
+    const content = JSON.stringify(card);
+    const res = await apiRetry(() => client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content } }));
     const mid = res && res.data && res.data.message_id;
     // control cards (menu OR project) become the live lastCard; owner-notify cards pass setLast=falsey
     if (mid && setLast) lastCard.set(chatId, mid);
+    if (mid) { cardHash.set(mid, content); if (cardHash.size > 100) cardHash.clear(); }
     return mid;
   } catch (e) { logLine('发送卡片失败: ' + (e && e.message)); return null; }
 }
@@ -404,8 +407,10 @@ async function sendCard(chatId, card, setLast) {
 async function showCard(chatId, card) {
   const mid = lastCard.get(chatId);
   if (mid) {
-    try { await apiRetry(() => client.im.message.patch({ path: { message_id: mid }, data: { content: JSON.stringify(card) } })); return mid; }
-    catch (e) { lastCard.delete(chatId); }   // gone/too old -> fall through and send a new one
+    const content = JSON.stringify(card);
+    if (cardHash.get(mid) === content) return mid;   // already showing exactly this -> skip the ~550ms patch
+    try { await apiRetry(() => client.im.message.patch({ path: { message_id: mid }, data: { content } })); cardHash.set(mid, content); return mid; }
+    catch (e) { lastCard.delete(chatId); cardHash.delete(mid); }   // gone/too old -> fall through and send a new one
   }
   return await sendCard(chatId, card, true);
 }
@@ -418,9 +423,12 @@ function currentCard(chatId) {
 // pass an explicit card to navigate (e.g. project -> main menu); omit to re-render the current one.
 async function refreshCard(chatId, messageId, card) {
   if (!messageId) return;
+  const content = JSON.stringify(card || currentCard(chatId));
+  if (cardHash.get(messageId) === content) { lastCard.set(chatId, messageId); return; }   // no change -> skip patch
   try {
-    await apiRetry(() => client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(card || currentCard(chatId)) } }));
+    await apiRetry(() => client.im.message.patch({ path: { message_id: messageId }, data: { content } }));
     lastCard.set(chatId, messageId);   // the refreshed control card (menu OR project) is now the live card
+    cardHash.set(messageId, content); if (cardHash.size > 100) cardHash.clear();
   } catch (e) { logLine('更新卡片失败: ' + (e && e.message)); }
 }
 // a footer line with elapsed time / output tokens / cost, appended to a run's result
@@ -554,7 +562,8 @@ function helpText(chatId) {
     '· 状态 → 布防 / 额度 / 当前模式',
     '· 停止 <项目> → 取消正在跑的指令',
     '· 模型 / 模型 opus → 查看或切换模型(聊天+项目都用,与软件同步)',
-    '· 授权 ou_xxx(可改)/ 只读授权 ou_xxx(只查)/ 取消授权 / 授权列表 → 管理权限',
+    '· 权限:默认除机器人主人外,大家都只能只读浏览查询,不能改项目(无需配置)',
+    '· 授权 ou_xxx → 额外给某人「可改」权限;取消授权 / 授权列表 管理',
     '· 忘记闲聊 → 清空闲聊记忆;忘记查询 → 清空当前项目的只读查询记忆',
     '',
     '注:✏️修改会继续 VS Code 里同一会话(面板不实时刷新,重开可见);',
@@ -571,14 +580,15 @@ function helpText(chatId) {
 function authLevel(openId) {
   const cfg = readConfig();
   const full = (Array.isArray(cfg.feishuAuthOpenIds) ? cfg.feishuAuthOpenIds : []).filter(Boolean);
-  const view = (Array.isArray(cfg.feishuViewerOpenIds) ? cfg.feishuViewerOpenIds : []).filter(Boolean);
-  if (openId && full.indexOf(openId) !== -1) return 'full';
-  if (openId && view.indexOf(openId) !== -1) return 'viewer';
-  if (!full.length) return 'full';               // not locked yet
-  return 'none';
+  if (openId && full.indexOf(openId) !== -1) return 'full';   // owner(s): modify + config
+  if (!full.length) return 'full';               // not locked yet (bootstrap) — all full until you add yourself
+  // locked: everyone who isn't an owner is a read-only VIEWER — browse/query projects, never modify.
+  // No per-user grant needed. (feishuViewerOpenIds is no longer required; still honored if present is moot
+  // since non-owners are viewers anyway.) Chat stays open to all (authLevel doesn't gate chat).
+  return 'viewer';
 }
-const canProject = openId => authLevel(openId) !== 'none';   // enter/query a project (viewer=read-only)
-const canConfig  = openId => authLevel(openId) === 'full';   // modify projects / change config / authorize
+const canProject = openId => authLevel(openId) !== 'none';   // enter/query a project (viewer=read-only). now always true when locked
+const canConfig  = openId => authLevel(openId) === 'full';   // modify projects / change config / authorize — owner only
 
 const notifiedUnauth = new Set();   // notify the owner at most once per unknown open_id
 function notifyOwner(openId, chatId) {
@@ -611,7 +621,7 @@ async function denyConfig(openId, chatId) {
   if (canConfig(openId)) return false;
   const lvl = authLevel(openId);
   await sendText(chatId, lvl === 'viewer'
-    ? '🔒 只读账号:可以查询项目,但不能修改项目 / 改配置 / 授权他人。'
+    ? '🔒 只读:除机器人主人外,大家只能浏览/查询项目,不能修改。'
     : `🔒 无权限。你的 open_id:${openId || '未知'}`);
   logLine('拦截未授权(配置): ' + openId);
   if (lvl !== 'viewer') notifyOwner(openId, chatId);
@@ -678,9 +688,9 @@ async function onMessage(data) {
     if (/^(授权列表|权限列表|谁有权限)$/.test(text)) {
       if (await denyConfig(senderOpen, chatId)) return;
       const c = readConfig();
-      const full = (c.feishuAuthOpenIds || []).filter(Boolean), view = (c.feishuViewerOpenIds || []).filter(Boolean);
-      await sendText(chatId, '✅ 可改项目:\n' + (full.length ? full.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无 — 未锁定,所有人可改)') +
-        '\n\n👁 只读查询:\n' + (view.length ? view.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无)'));
+      const full = (c.feishuAuthOpenIds || []).filter(Boolean);
+      await sendText(chatId, '✅ 可改项目(仅以下人):\n' + (full.length ? full.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无 — 未锁定,所有人可改)') +
+        '\n\n👁 其他所有人 = 只读浏览(自动,无需授权)。');
       return;
     }
     // anchored: keyword alone -> usage, or keyword + ou_id. NOT a bare 只读 (that's the query prefix).
@@ -895,10 +905,9 @@ async function onCardAction(ev) {
     if (val.do === 'status') { sendText(chatId, statusText(chatId)); return; }
     if (val.do === 'perm') {
       const c = readConfig();
-      const full = (c.feishuAuthOpenIds || []).filter(Boolean), view = (c.feishuViewerOpenIds || []).filter(Boolean);
-      sendText(chatId, '✅ 可改项目:\n' + (full.length ? full.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无 — 未锁定)') +
-        '\n👁 只读查询:\n' + (view.length ? view.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无)') +
-        '\n\n加人:让对方给我发条消息 → 你会收到卡片,点「可改项目」或「只读查询」即可。');
+      const full = (c.feishuAuthOpenIds || []).filter(Boolean);
+      sendText(chatId, '✅ 可改项目(仅以下人):\n' + (full.length ? full.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无 — 未锁定,所有人可改!建议先发「授权 你的open_id」)') +
+        '\n\n👁 其他所有人 = 只读浏览查询(自动,无需授权)。\n\n想让某人也能改:发「授权 ou_xxx」(对方 open_id 会在他给我发消息时显示)。');
       return;
     }
     if (val.do === 'noop') { return; }
