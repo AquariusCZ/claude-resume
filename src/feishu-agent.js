@@ -90,7 +90,7 @@ function makeMockClient() {
     __reset() { calls.length = 0; },
     im: { message: {
       create: async o => { const id = 'msg_' + (++seq); calls.push({ op: 'create', type: o.data.msg_type, title: titleOf(o.data.content), text: textOf(o.data.content), id }); return { data: { message_id: id } }; },
-      patch: async o => { calls.push({ op: 'patch', id: o.path.message_id, title: titleOf(o.data.content) }); return {}; },
+      patch: async o => { if (String(o.path.message_id).indexOf('gone') !== -1) throw new Error('mock: message not found (deleted)'); calls.push({ op: 'patch', id: o.path.message_id, title: titleOf(o.data.content) }); return {}; },
     } },
   };
 }
@@ -407,10 +407,10 @@ async function sendCard(chatId, card, setLast) {
 async function showCard(chatId, card) {
   const mid = lastCard.get(chatId);
   if (mid) {
-    const content = JSON.stringify(card);
-    if (cardHash.get(mid) === content) return mid;   // already showing exactly this -> skip the ~550ms patch
-    try { await apiRetry(() => client.im.message.patch({ path: { message_id: mid }, data: { content } })); cardHash.set(mid, content); return mid; }
-    catch (e) { lastCard.delete(chatId); cardHash.delete(mid); }   // gone/too old -> fall through and send a new one
+    // NO content-skip here: the live card may have been deleted (user cleared the Feishu chat), so a
+    // menu tap MUST still produce visible output. Always try to patch; on ANY failure send a fresh card.
+    try { const content = JSON.stringify(card); await apiRetry(() => client.im.message.patch({ path: { message_id: mid }, data: { content } })); cardHash.set(mid, content); return mid; }
+    catch (e) { lastCard.delete(chatId); cardHash.delete(mid); }   // gone/too old/deleted -> send a new one
   }
   return await sendCard(chatId, card, true);
 }
@@ -874,6 +874,7 @@ async function onMessage(data) {
 // ---- interactive card button clicks (card.action.trigger) ----
 const cardSeen = new Map(); // dedup rapid Feishu re-deliveries of the same click
 const menuSeen = new Map(); // dedup rapid bottom-menu taps
+const seenEid = new Set();  // dedup by event_id (genuine Feishu re-deliveries), when the field is present
 async function onCardAction(ev) {
   try {
     const chatId = (ev.context && ev.context.open_chat_id) || ev.open_chat_id;
@@ -965,6 +966,12 @@ async function onBotMenu(ev) {
     const key = ev.event_key || (ev.event && ev.event.event_key) || '';
     const senderOpen = (ev.operator && ev.operator.operator_id && ev.operator.operator_id.open_id)
       || (ev.operator && ev.operator.open_id);
+    // defensive: Feishu v2 events carry header.event_id / header.create_time. Use them to drop genuine
+    // re-deliveries and stale backlog. Harmless no-op if the SDK doesn't pass these fields.
+    const evId = ev.event_id || (ev.header && ev.header.event_id) || '';
+    const evTime = parseInt((ev.header && ev.header.create_time) || ev.create_time || '0', 10);
+    if (evId) { if (seenEid.has(evId)) { logLine('忽略重复投递(eid)'); return; } seenEid.add(evId); if (seenEid.size > 3000) seenEid.clear(); }
+    if (evTime && Date.now() - evTime > 60000) { logLine('忽略过期底部菜单事件 age=' + Math.round((Date.now() - evTime) / 1000) + 's'); return; }
     const cfg = readConfig();
     const chatId = cfg.feishuChatId;   // bot menu lives in the p2p chat; reply to the known chat
     if (!chatId) { logLine('菜单点击但无 chatId(先随便发一句让我记录会话)'); return; }
@@ -974,15 +981,14 @@ async function onBotMenu(ev) {
     const mkey = (chatId || '') + ':' + key + ':' + (senderOpen || ''); const mnow = Date.now();
     if (menuSeen.get(mkey) && mnow - menuSeen.get(mkey) < 3000) { logLine('忽略重复底部菜单点击: ' + key); return; }
     menuSeen.set(mkey, mnow); if (menuSeen.size > 200) menuSeen.clear();
-    logLine(`底部菜单点击: ${key}`);
-    if (key === 'chat') { setSession(chatId, { mode: 'chat' }); await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。'); return; }
+    logLine('底部菜单点击: ' + key + (evId ? ' eid=…' + String(evId).slice(-6) : ' (无eid)') + (evTime ? ' age=' + Math.round((Date.now() - evTime) / 1000) + 's' : ' (无time)'));
+    if (key === 'chat') { setSession(chatId, { mode: 'chat' }); await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。随时点底部「主菜单」回来。'); return; }
     if (key === 'status') { if (await denyProject(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
-    if (key === 'idle' || key === 'exit') { setSession(chatId, { mode: 'idle' }); await showCard(chatId, buildMenuCard(chatId)); return; }
-    // 'menu' / 主菜单 / unknown: just re-show whatever card should CURRENTLY be visible, in place, and
-    // do NOT change the session. In a project this idempotently re-renders the project card, so the
-    // backlog of stale menu taps Feishu keeps re-delivering does nothing visible and can't pile up a
-    // new menu card or yank you out. To leave a project, use the card's ⬅主菜单 button.
-    await showCard(chatId, currentCard(chatId));
+    // 主菜单 / idle / exit / 未知 —— the ESCAPE HATCH: from ANY state, return to a clean main menu and
+    // ALWAYS emit a visible card. showCard patches the live card, or (if you cleared the chat / it was
+    // deleted) sends a fresh one. Resets the session so you're never stuck in a project/chat state.
+    setSession(chatId, { mode: 'idle' });
+    await showCard(chatId, buildMenuCard(chatId));
   } catch (e) { logLine('底部菜单事件异常: ' + (e && (e.stack || e))); }
 }
 
