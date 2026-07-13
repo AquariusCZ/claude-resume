@@ -298,7 +298,10 @@ function runClaude(cwd, label, prompt, opts) {
     if (opts.addDir) args.push('--add-dir', opts.addDir);   // grant read access when cwd != the project
     // block heavy tools for read-only queries (Task spins up a full-project sub-explore = big tokens)
     if (Array.isArray(opts.disallowedTools) && opts.disallowedTools.length) args.push('--disallowedTools', ...opts.disallowedTools);
-    args.push('-p', prompt, '--output-format', 'stream-json', '--verbose');
+    // NOTE: prompt is fed via STDIN (below), NOT as a -p argument. A -p arg with newlines gets
+    // truncated at the first newline by Windows cmd, so claude only saw the framing and missed the
+    // actual question. stdin carries the whole thing verbatim (and also stops the stdin-wait hang).
+    args.push('-p', '--output-format', 'stream-json', '--verbose');
     const model = opts.model || cfg.resumeModel;   // opts.model lets chat use its own model
     if (model) { args.push('--model', model); }
     if (opts.readOnly) {
@@ -311,21 +314,22 @@ function runClaude(cwd, label, prompt, opts) {
     const key = cwd.toLowerCase();
 
     let child;
-    // stdin='ignore': headless -p needs no stdin. Leaving it an open pipe makes recent claude wait
-    // for stdin ("no stdin data received in 3s") and then exit without running the -p prompt.
-    try { child = spawn(process.env.ComSpec || 'cmd.exe', args, { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }); }
+    try { child = spawn(process.env.ComSpec || 'cmd.exe', args, { cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }); }
     catch (e) { resolve({ ok: false, limited: false, text: '启动 claude 失败: ' + e.message }); return; }
     running.set(key, child);
+    // feed the prompt via stdin (whole thing, newlines preserved), then close stdin so claude runs.
+    try { child.stdin.on('error', () => {}); child.stdin.write(prompt, 'utf8'); child.stdin.end(); } catch (e) {}
 
     let buf = '', resultText = null, isError = null, limited = false, killedForTimeout = false;
-    let lastAssistant = null, errBuf = '';   // fallback answer (if no result event) + captured stderr
+    let lastAssistant = null, errBuf = '', usage = null, cost = null;   // + token usage / cost from result
+    const t0 = Date.now();
     const to = setTimeout(() => { killedForTimeout = true; try { child.kill(); } catch (e) {} }, timeoutMs);
     function scanLine(ln) {
       if (!ln) return;
       if (/"status"\s*:\s*"(blocked|rejected|limited|exceeded)"/.test(ln) ||
           /usage limit|rate limit|limit reached|weekly limit/i.test(ln)) limited = true;
       if (ln.indexOf('"type":"result"') !== -1 || /"type"\s*:\s*"result"/.test(ln)) {
-        try { const j = JSON.parse(ln); if (j.type === 'result') { if (typeof j.result === 'string') resultText = j.result; if (typeof j.is_error === 'boolean') isError = j.is_error; } } catch (e) {}
+        try { const j = JSON.parse(ln); if (j.type === 'result') { if (typeof j.result === 'string') resultText = j.result; if (typeof j.is_error === 'boolean') isError = j.is_error; if (j.usage) usage = j.usage; if (typeof j.total_cost_usd === 'number') cost = j.total_cost_usd; } } catch (e) {}
       } else if (ln.indexOf('"type":"assistant"') !== -1) {
         // remember the last non-empty assistant text — used as a fallback if no result event arrives
         try { const j = JSON.parse(ln); const c = j && j.message && j.message.content; if (Array.isArray(c)) { for (const p of c) { if (p && p.type === 'text' && typeof p.text === 'string' && p.text.trim()) lastAssistant = p.text; } } } catch (e) {}
@@ -336,15 +340,20 @@ function runClaude(cwd, label, prompt, opts) {
     child.on('close', (code) => {
       clearTimeout(to); running.delete(key);
       if (buf) scanLine(buf);
-      if (killedForTimeout) { resolve({ ok: false, limited, text: `执行超时(> ${timeoutMs / 60000} 分钟),已终止。` }); return; }
-      if (resultText !== null && isError !== true) { resolve({ ok: true, limited, text: resultText }); return; }
-      if (limited) { resolve({ ok: false, limited: true, text: '又被限流了。可在「Claude续跑」里布防,额度恢复后自动续跑。' }); return; }
+      const ms = Date.now() - t0;
+      const ot = usage && usage.output_tokens;
+      if (killedForTimeout) { resolve({ ok: false, limited, text: `执行超时(> ${timeoutMs / 60000} 分钟),已终止。`, ms }); return; }
+      if (resultText !== null && isError !== true) {
+        logLine(`完成 [${label}] ${Math.round(ms / 1000)}s${ot ? ' 输出' + ot + ' tokens' : ''}${typeof cost === 'number' ? ' ~$' + cost.toFixed(3) : ''}`);
+        resolve({ ok: true, limited, text: resultText, usage, cost, ms }); return;
+      }
+      if (limited) { resolve({ ok: false, limited: true, text: '又被限流了。可在「Claude续跑」里布防,额度恢复后自动续跑。', ms }); return; }
       // no clean result -> log why (claude's stderr was previously swallowed, leaving failures blind)
       const errTail = errBuf.trim().slice(-600).replace(/\s+/g, ' ');
-      logLine(`runClaude 未成功 [${label}] exit=${code} isError=${isError} assistant文本=${lastAssistant ? '有' : '无'}${errTail ? ' · stderr尾: ' + errTail : ''}`);
+      logLine(`runClaude 未成功 [${label}] exit=${code} isError=${isError} assistant文本=${lastAssistant ? '有' : '无'} ${Math.round(ms / 1000)}s${errTail ? ' · stderr尾: ' + errTail : ''}`);
       // claude answered but the final result event was missing/dropped -> return what it said
-      if (isError !== true && lastAssistant && lastAssistant.trim()) { resolve({ ok: true, limited, text: lastAssistant }); return; }
-      resolve({ ok: false, limited, text: resultText || lastAssistant || '执行结束但未拿到成功结果(可能出错)。' });
+      if (isError !== true && lastAssistant && lastAssistant.trim()) { resolve({ ok: true, limited, text: lastAssistant, usage, cost, ms }); return; }
+      resolve({ ok: false, limited, text: resultText || lastAssistant || '执行结束但未拿到成功结果(可能出错)。', ms });
     });
   });
 }
@@ -414,11 +423,21 @@ async function refreshCard(chatId, messageId, card) {
     lastCard.set(chatId, messageId);   // the refreshed control card (menu OR project) is now the live card
   } catch (e) { logLine('更新卡片失败: ' + (e && e.message)); }
 }
+// a footer line with elapsed time / output tokens / cost, appended to a run's result
+function fmtMeta(r) {
+  if (!r) return '';
+  const parts = [];
+  if (r.ms) parts.push('⏱ ' + Math.round(r.ms / 1000) + 's');
+  const ot = r.usage && r.usage.output_tokens;
+  if (ot) parts.push('输出 ' + ot + ' tokens');
+  if (typeof r.cost === 'number') parts.push('≈ $' + r.cost.toFixed(3));
+  return parts.length ? '\n\n———\n' + parts.join(' · ') : '';
+}
 // long runs go silent while claude works; send a heartbeat so the user knows it's alive.
-// returns a stop() to clear it. First beat at 60s, so short runs produce no heartbeat.
+// returns a stop() to clear it. First beat at 15s.
 function startHeartbeat(chatId, label) {
   let secs = 0;
-  const t = setInterval(() => { secs += 60; sendText(chatId, `⏳ 「${label}」仍在执行…(已 ${secs}s;复杂任务/Opus 常需 1-4 分钟,跑完自动回结果)`); }, 60000);
+  const t = setInterval(() => { secs += 15; sendText(chatId, `🤔 「${label}」思考中…(已 ${secs}s,后台没卡,跑完自动回结果)`); }, 15000);
   return () => { try { clearInterval(t); } catch (e) {} };
 }
 // Telegram-style menu: buttons to enter a project / chat / status / switch model.
@@ -776,7 +795,7 @@ async function onMessage(data) {
         try {
           await sendText(chatId, `🔍 只读查询「${oneoff.project.name}」:${q}\n(读代码/答疑,不改文件 · 项目专属查询会话)`);
           const r = await runProjectQuery(chatId, oneoff.project, q);
-          await sendText(chatId, (r.ok ? `✅ 查询结果:\n\n` : `⚠️ :\n\n`) + (r.text || '(无输出)'));
+          await sendText(chatId, (r.ok ? `✅ 查询结果:\n\n` : `⚠️ :\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
           logLine(`一次性查询 ${oneoff.project.name} ok=${r.ok}`);
         } finally { inflight.delete(qk); }
         return;
@@ -786,7 +805,7 @@ async function onMessage(data) {
       const stopHb = startHeartbeat(chatId, oneoff.project.name);
       const r = await runClaude(oneoff.project.path, oneoff.project.name, q, { useContinue: true, model: cfg.feishuChatModel });
       stopHb();
-      await sendText(chatId, (r.ok ? `✅ 「${oneoff.project.name}」完成:\n\n` : `⚠️ 「${oneoff.project.name}」:\n\n`) + (r.text || '(无输出)'));
+      await sendText(chatId, (r.ok ? `✅ 「${oneoff.project.name}」完成:\n\n` : `⚠️ 「${oneoff.project.name}」:\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
       logLine(`一次性完成 ${oneoff.project.name} ok=${r.ok}`);
       return;
     }
@@ -809,7 +828,7 @@ async function onMessage(data) {
           const q = qm ? qm[2] : text;
           await sendText(chatId, `🔍 只读查询「${active.name}」:${q}\n(读代码/答疑,不改文件 · 项目专属查询会话)`);
           const r = await runProjectQuery(chatId, active, q);
-          await sendText(chatId, (r.ok ? `✅ 查询结果:\n\n` : `⚠️ :\n\n`) + (r.text || '(无输出)'));
+          await sendText(chatId, (r.ok ? `✅ 查询结果:\n\n` : `⚠️ :\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
           logLine(`查询 ${active.name} ok=${r.ok}`);
         } finally { inflight.delete(qk); }
         return;
@@ -819,7 +838,7 @@ async function onMessage(data) {
       const stopHb = startHeartbeat(chatId, active.name);
       const r = await runClaude(active.path, active.name, text, { useContinue: true, model: cfg.feishuChatModel });
       stopHb();
-      await sendText(chatId, (r.ok ? `✅ 「${active.name}」完成:\n\n` : `⚠️ 「${active.name}」:\n\n`) + (r.text || '(无输出)'));
+      await sendText(chatId, (r.ok ? `✅ 「${active.name}」完成:\n\n` : `⚠️ 「${active.name}」:\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
       logLine(`完成 ${active.name} ok=${r.ok}`);
       return;
     }
@@ -833,7 +852,7 @@ async function onMessage(data) {
       const r = await runClaude(CHAT_DIR, '闲聊', text, { useContinue: chatStarted(), skipPermissions: true, model: cfg.feishuChatModel });
       stopHb();
       if (r.ok) markChatStarted();
-      await sendText(chatId, (r.text || '(无输出)') + '\n\n———\n💬 闲聊模式 · 发「菜单」切换');
+      await sendText(chatId, (r.text || '(无输出)') + fmtMeta(r) + '\n\n———\n💬 闲聊模式 · 发「菜单」切换');
       logLine(`闲聊 完成 ok=${r.ok}`);
       return;
     }
