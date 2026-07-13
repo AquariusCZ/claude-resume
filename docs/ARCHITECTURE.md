@@ -31,7 +31,7 @@ Claude Resume is split into a **GUI front-end** and a **headless engine**, on pu
 | `lib.ps1` | shared engine functions (discovery, probe, launch, git-guard, logging, Feishu notify). Dot-sourced by the PowerShell scripts. |
 | `checker.ps1` | the stateless state machine, run by the Scheduled Task every 2 min. `-DryRun` = preview. |
 | `picker.ps1` | WPF/XAML GUI (config + monitor + on-demand probe). `-RenderTo <png>` snapshots it headless; single-instance. |
-| `feishu-agent.js` | Node long-connection listener: receives Feishu messages → runs `claude --continue` in the target project → replies. |
+| `feishu-agent.js` | Node long-connection agent: Feishu messages/buttons → a conversation state machine (chat / project-modify / read-only-query) with 3-level auth → replies + carries the checker's notifications. See the Feishu section. Has an offline test mode (`FEISHU_TEST`). |
 | `launcher.vbs` / `checker-launch.vbs` / `feishu-launch.vbs` | hidden launchers (GUI / checker task / Feishu agent, the last auto-restarts node). |
 | `install.ps1` | deploy files, icon, Desktop shortcut, checker task, Feishu Startup entry + `npm install`. |
 
@@ -80,17 +80,45 @@ The probe (`Test-ClaudeReady`) runs `claude -p "ready" --max-turns 1` as `--outp
 - **Responsive UI.** The GUI's 1-second timer only does fast local/file reads (log tail, config/state, countdown from the cached probe result); the slow work — the on-demand probe — runs on a background runspace and publishes into a synchronized hashtable. Button actions show a 6-second "flash" status so the timer doesn't stomp their feedback.
 - **AV-safe.** Nothing uses the `.lnk → powershell -WindowStyle Hidden -ExecutionPolicy Bypass` pattern that Huorong (火绒) deletes; launches go through `wscript`-hidden `.vbs` and the Scheduled Task.
 
-## Feishu integration (two channels)
+## Feishu integration (one app bot: notify + two-way)
 
 **One bot does both.** With a self-built app configured, notifications and two-way commands both go through the single app bot, in the same chat. `Send-FeishuNotify` (in `lib.ps1`) prefers the **app API** (`im/v1/messages` with a cached `tenant_access_token`) sending to `feishuChatId` — the chat the agent last saw a message in, which it writes back to `config.json`. If the app isn't fully set up it falls back to a **custom-bot webhook** (optionally **签名校验**-signed: HMAC-SHA256 with key `"<timestamp>\n<secret>"` over an empty message, base64, as `{timestamp, sign}`).
 
-The **two-way agent** (`feishu-agent.js`, Node) uses the official `@larksuiteoapi/node-sdk` `WSClient` — a persistent WebSocket to Feishu, so **no public IP** is needed. It registers `im.message.receive_v1` (and `_v2` as a safety net) and runs a small **conversation state machine**, keyed by chat in `feishu-sessions.json`:
+The **two-way agent** (`feishu-agent.js`, Node) uses the official `@larksuiteoapi/node-sdk` `WSClient` — a persistent WebSocket to Feishu, so **no public IP** is needed. It registers `im.message.receive_v1`(+`_v2`), `card.action.trigger` (button clicks) and `application.bot.menu_v6` (the persistent bottom menu), and runs a small **conversation state machine**, keyed by chat in `feishu-sessions.json` as `{mode, project, sub}`.
 
-- **Chat mode** (default): a plain message is answered by Claude in a scratch session (`feishu-chat/`, no `--dangerously-skip-permissions`, kept out of project discovery) — it touches **no project**.
-- **进入 `<编号|名字>`** enters a project (persisted); from then every message runs `claude --continue -p "<text>"` in that project's cwd. **退出** returns to chat mode.
-- Shortcuts that work anywhere: **项目** (list), **状态**, **停止**, **帮助**; a bare project name/number enters it; **`<项目名> <指令>`** does a one-off run without switching; greetings get a quick reply (never burn quota).
+### Conversation state machine (two shallow levels)
 
-Because `--continue` appends to the cwd's most-recent conversation, a project run continues the **same** thread the VS Code extension shows (reopen the session there; the panel doesn't live-refresh external appends). Replies chunk to ≤6 parts. Single-instance via a pidfile with a liveness check (Windows lets two sockets share a loopback port, so a port lock is unreliable). Started at logon by a Startup-folder shortcut → `feishu-launch.vbs`, which auto-restarts node on exit and captures its stdout for diagnosis. Requires the app to have: bot enabled, scopes `im:message` (+ send), the **接收消息 `im.message.receive_v1`** event (a "v2.0" schema badge on it is fine — the event name still ends `_v1`), **长连接** subscription mode, and a published version.
+- **idle** (default): does **nothing** until you pick something — a plain message just shows the menu card. This prevents accidental quota spend / edits.
+- **chat**: talk to Claude in a scratch session (`feishu-chat/`, `--dangerously-skip-permissions` so tools like WebSearch work like the web app, kept out of project discovery) — touches **no project**.
+- **project**: entering a project shows a **project sub-menu card** where you first pick **👁 只读查询** or **✏️ 修改项目** (`sub`), then just type.
+  - **✏️ modify** → `claude --continue` in the project cwd → continues the **same** thread the VS Code extension shows (reopen there; the panel doesn't live-refresh external appends).
+  - **👁 query** → read-only (`--permission-mode plan`) in the project's **dedicated query session** (see below). Viewers are always forced here; a full user opts in per-message with the 查询/只读 prefix or by picking the mode.
+
+Text commands mirror the buttons: **项目/菜单**, **进入 `<编号|名字>`**, **查询 `<问题>`**, **`<项目名> <指令>`** (one-off), **退出**, **模型 opus**, **忘记闲聊/忘记查询**, **状态/停止/帮助**, plus auth (**授权/只读授权/取消… /授权列表**).
+
+### Cards: one control card, updated in place
+
+`buildMenuCard` (main) and `buildProjectCard` (sub-menu) are the two forms of a **single control card** tracked by `lastCard[chatId]`. All navigation goes through `showCard` (patch the live card) / `refreshCard` (patch the clicked card); a button re-renders the card it lives on. Crucially, a **bottom-menu tap re-renders `currentCard(chatId)`** (the card that *should* be showing) and does **not** change the session — so the backlog of stale menu taps Feishu keeps re-delivering is **idempotent** in a project (no pile-up, no snap-back, not kicked out). To leave a project you use the card's **⬅ 主菜单** button. Card callbacks return within seconds by doing only fast local work and firing every API call **without await**; all sends/patches are wrapped in `apiRetry` (one retry on transient TLS/socket blips).
+
+### Authorization (3 levels)
+
+`authLevel(openId)` → **full** (in `feishuAuthOpenIds`, or the list is empty = *not locked*), **viewer** (in `feishuViewerOpenIds`), or **none**. `canProject` = not-none (enter/query, viewers read-only); `canConfig` = full (modify, change config, authorize, clear query memory). Chat is open to everyone. When an unauthorized user messages the bot, the owner gets a one-tap grant card ([✅ 可改项目]/[👁 只读查询]); text `授权/只读授权 ou_xxx` do the same. Removing the last full user empties the list = **unlocks the bot for everyone** — both the GUI 授权用户 window and the 取消授权 command warn hard before that. The Feishu console never shows this roster (it only has 应用可用范围); it lives in `config.json` and is managed from the GUI 授权用户 window.
+
+### The dedicated per-project query session
+
+Every project has **one** read-only Q&A session shared by everyone, so follow-up questions accumulate context. Its id is a **fixed uuid derived from `sha1(projectPath)`** (`querySession`), and it runs in an **isolated cwd** (`feishu-query-cwd/<sha1>`) with **`--add-dir <projectPath>`** — this keeps its transcript out of the project's `--continue` pool (otherwise a modify run would resume the query session; verified bug). First query `--session-id <uuid>` (create), later `--resume <uuid>` (continue), gated by a `.started` flag whose filename *is* the sha1 (so the GUI can reconstruct the id to clear it). `--disallowedTools Task` + a "locate the doc first" prompt stop plan-mode from spinning up a token-heavy full-project sub-explore. Clearing deletes the `.jsonl` (not just the flag — `--session-id` on an existing id errors).
+
+### Prompt delivery, feedback, robustness
+
+- **Prompt goes via STDIN, not `-p "<text>"`** — Windows `cmd` truncates a `-p` argument at the first newline, so a multi-line prompt lost everything after the framing (the long-standing "query fails" bug). `runClaude` writes the prompt to `child.stdin` then closes it (which also avoids claude's stdin-wait hang). Success is judged from the stream-json `result` line, never the exit code; stderr is captured for diagnostics; if there's no result but claude produced assistant text, that text is returned instead of a blank failure.
+- **Heartbeat** every 15s ("🤔 思考中… 已 Ns") during long runs; every result ends with `⏱ Ns · 输出 N tokens · ≈ $X` (`fmtMeta` from the result's usage/cost).
+- Replies chunk to ≤6 parts. Single-instance via a pidfile + liveness check (Windows lets two sockets share a loopback port). Started at logon by a Startup-folder shortcut → `feishu-launch.vbs` (auto-restarts node, captures stdout). Logs use **local** time.
+
+### Offline self-test
+
+`FEISHU_TEST=1` makes `feishu-agent.js` use a recording **mock client** (no network, no WS, no single-instance lock) and export its handlers. `test/card-flow.js` drives idle→menu→enter→(backlogged menu)→home purely on logic (asserts no pile-up / no snap-back). `test/query-e2e.js` mocks only the Feishu API but **runs real claude** with a multi-line query and asserts the whole prompt arrived. Run these before shipping card/query changes instead of testing by hand in Feishu.
+
+Console requirements: bot enabled, scopes `im:message` (+ send); events `im.message.receive_v1`, `card.action.trigger`, `application.bot.menu_v6`; **长连接** subscription mode; a configured **机器人自定义菜单**; and a **published version**.
 
 ## config.json (written by the GUI)
 
@@ -114,7 +142,10 @@ Because `--continue` appends to the cwd's most-recent conversation, a project ru
   "feishuSecret": "",         // custom-bot 签名校验 secret (optional, for the webhook fallback)
   "feishuDefaultProject": "", // default project (name or path) for un-prefixed Feishu commands
   "feishuAllowOpenIds": [],   // optional allowlist of sender open_ids; empty = anyone in-chat
-  "feishuChatModel": "",      // model for chat mode (empty = CLI default; e.g. "sonnet" / "opus")
+  "feishuChatModel": "",      // model for chat + project + query (empty = CLI default; "sonnet"/"opus"/"haiku")
+  "feishuAuthOpenIds": [],    // FULL users (modify projects + config + authorize). empty = NOT locked (all full)
+  "feishuViewerOpenIds": [],  // VIEWER users (read-only query only, never modify)
+  "feishuAuthPassword": "",   // optional recovery hatch: 「解锁 <密码>」 self-authorizes an account
   "continuous": false,       // one-shot by default
   "projectHome": "C:\\Users\\23230\\Desktop\\claude-resume"
 }
@@ -137,6 +168,9 @@ Because `--continue` appends to the cwd's most-recent conversation, a project ru
 }
 ```
 
-## Not yet live-tested
+## Testing status
 
-Component-verified (discovery, launch+stream+tree-kill, probe returns exact reset + utilization, GUI layout + single-instance + on-open probe, Feishu one-way push signed, two-way agent long-connection handshake). The **end-to-end fire/resume** path and the **Feishu receive→run→reply** round-trip depend on live quota / your Feishu console setup, so validate them yourself: **预演** first, and DM the bot `帮助` once its app is published.
+- **Feishu two-way** (chat / project modify / read-only query / cards / auth) is **live-tested** and covered by offline tests (`test/card-flow.js`, `test/query-e2e.js` — the latter runs real claude). Run those before shipping card/query changes.
+- The **end-to-end fire/resume** path (checker → real reset → `claude --continue` across projects) still depends on live quota; **预演** first to preview, and validate a real reset yourself.
+
+See **[LESSONS.md](LESSONS.md)** for the bugs/pitfalls hit while building this (PS 5.1 exit-code/BOM/JSON, cmd newline-truncation of `-p`, `--continue` pool pollution, Feishu card pile-up/snap-back, etc.) and the development history.

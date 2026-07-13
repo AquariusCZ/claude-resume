@@ -160,6 +160,7 @@ if(-not $script:instanceOwned -and -not $RenderTo -and -not $SelfTest){
           <Button x:Name="BtnClearLog" Style="{StaticResource LinkBtn}" Content="清空日志" Margin="0,2,16,2"/>
           <Button x:Name="BtnExportLog" Style="{StaticResource LinkBtn}" Content="导出日志" Margin="0,2,16,2"/>
           <Button x:Name="BtnForgetChat" Style="{StaticResource LinkBtn}" Content="忘记闲聊" Margin="0,2,16,2"/>
+          <Button x:Name="BtnClearQuery" Style="{StaticResource LinkBtn}" Content="清空查询" Margin="0,2,16,2" ToolTip="清空所有项目的『只读查询』记忆(下次查询从头开始)"/>
           <Button x:Name="BtnAuthUsers" Style="{StaticResource LinkBtn}" Content="授权用户" Margin="0,2,16,2" ToolTip="查看 / 移除有权限的飞书用户(飞书后台看不到，这才是真正的授权名单)"/>
         </WrapPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -184,7 +185,7 @@ try {
   if(Test-Path $icoPath){ $win.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]$icoPath) }
 } catch {}
 $els = @{}
-foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','ChatModelChip','ChatModelText','IntervalChip','IntervalText','ProjectList','LogText','LogScroll','StatusText','BtnPopLog','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnForgetChat','BtnAuthUsers','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
+foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','ChatModelChip','ChatModelText','IntervalChip','IntervalText','ProjectList','LogText','LogScroll','StatusText','BtnPopLog','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnForgetChat','BtnClearQuery','BtnAuthUsers','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
 # global UI-thread exception guard: never let a handler bug close the window
 $win.Dispatcher.add_UnhandledException({ param($s,$e)
   try { [System.IO.File]::AppendAllText((Join-Path $env:LOCALAPPDATA 'ClaudeResume\logs\gui-error.log'), ((Get-Date).ToString('s') + "  " + $e.Exception.ToString() + "`r`n"), (New-Object System.Text.UTF8Encoding($false))) } catch {}
@@ -580,6 +581,32 @@ $els.BtnForgetChat.Add_Click({
     }
     Set-Flash '已清空闲聊记忆(下次闲聊从头开始)'
   } catch { Set-Flash ('清空出错: ' + $_.Exception.Message) }
+})
+$els.BtnClearQuery.Add_Click({
+  try {
+    # wipe every project's shared 只读查询 session. Each feishu-query flag is named <sha1(path)>.started;
+    # rebuild the session uuid from that filename exactly as the agent's querySession() does, then delete
+    # the matching claude session jsonl (must delete it — --session-id on an existing id errors), + the flag.
+    $qdir = Join-Path $script:AppDir 'feishu-query'
+    $proot = Join-Path $env:USERPROFILE '.claude\projects'
+    $sessions = 0; $projects = 0
+    if(Test-Path $qdir){
+      foreach($f in @(Get-ChildItem $qdir -File -ErrorAction SilentlyContinue)){
+        $h = $f.BaseName; $id = $null
+        if($h -match '^[0-9a-f]{40}$'){
+          $id = $h.Substring(0,8)+'-'+$h.Substring(8,4)+'-4'+$h.Substring(13,3)+'-8'+$h.Substring(17,3)+'-'+$h.Substring(20,12)
+        } else { try { $id = (Get-Content $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json).id } catch {} }
+        if($id -and (Test-Path $proot)){
+          foreach($d in @(Get-ChildItem $proot -Directory -ErrorAction SilentlyContinue)){
+            $jf = Join-Path $d.FullName ($id + '.jsonl')
+            if(Test-Path $jf){ Remove-Item $jf -Force -ErrorAction SilentlyContinue; $sessions++ }
+          }
+        }
+        Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue; $projects++
+      }
+    }
+    Set-Flash ("已清空只读查询记忆:" + $projects + " 个项目 / " + $sessions + " 个会话")
+  } catch { Set-Flash ('清空查询出错: ' + $_.Exception.Message) }
 })
 $els.BtnAuthUsers.Add_Click({ Show-AuthWindow })
 $els.BtnExportLog.Add_Click({
