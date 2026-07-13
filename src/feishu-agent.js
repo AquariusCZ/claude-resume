@@ -360,23 +360,26 @@ async function sendText(chatId, text) {
 // one "control card" per chat: all navigation (main menu <-> project sub-menu) updates THIS card
 // in place instead of sending a new one, so cards never pile up.
 const lastCard = new Map();   // chatId -> message_id of the live control card
-async function sendCard(chatId, card) {
+async function sendCard(chatId, card, isMenuCard) {
   try {
     const res = await apiRetry(() => client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(card) } }));
     const mid = res && res.data && res.data.message_id;
-    if (mid) lastCard.set(chatId, mid);
+    // only a MENU card becomes the reusable control card; a project card clears it; anything else
+    // (e.g. the owner-notification card) leaves lastCard untouched.
+    if (mid && isMenuCard === true) lastCard.set(chatId, mid);
+    else if (isMenuCard === false) lastCard.delete(chatId);
     return mid;
   } catch (e) { logLine('发送卡片失败: ' + (e && e.message)); return null; }
 }
-// show a control card: patch the existing one in place; only send a fresh card if there is none
-// (or the old one can no longer be patched). Prevents the "又蹦出一张主菜单卡" pile-up.
+// show the MENU control card: patch the existing menu card in place; only send a fresh one if there
+// is none (or it can no longer be patched). Never touches a project card. Prevents card pile-up.
 async function showCard(chatId, card) {
   const mid = lastCard.get(chatId);
   if (mid) {
     try { await apiRetry(() => client.im.message.patch({ path: { message_id: mid }, data: { content: JSON.stringify(card) } })); return mid; }
     catch (e) { lastCard.delete(chatId); }   // gone/too old -> fall through and send a new one
   }
-  return await sendCard(chatId, card);
+  return await sendCard(chatId, card, true);
 }
 // which card should this chat be looking at right now (main menu vs the project sub-menu)
 function currentCard(chatId) {
@@ -385,11 +388,13 @@ function currentCard(chatId) {
 }
 // update the clicked card in place so the ✅ (current project / model / mode) moves.
 // pass an explicit card to navigate (e.g. project -> main menu); omit to re-render the current one.
-async function refreshCard(chatId, messageId, card) {
+async function refreshCard(chatId, messageId, card, isMenuCard) {
   if (!messageId) return;
   try {
     await apiRetry(() => client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(card || currentCard(chatId)) } }));
-    lastCard.set(chatId, messageId);   // the clicked card is now the live control card
+    // only a MAIN-MENU card is a reusable control card. A project card must NOT be registered as
+    // lastCard, else a stray bottom-menu event (showCard) would patch the project card back to menu.
+    if (isMenuCard) lastCard.set(chatId, messageId); else lastCard.delete(chatId);
   } catch (e) { logLine('更新卡片失败: ' + (e && e.message)); }
 }
 // long runs go silent while claude works; send a heartbeat so the user knows it's alive.
@@ -726,7 +731,7 @@ async function onMessage(data) {
     if (m) {
       if (await denyProject(senderOpen, chatId)) return;
       const p = findProject(m[2]);
-      if (p) { setSession(chatId, { mode: 'project', project: p.path, sub: undefined }); await showCard(chatId, buildProjectCard(chatId)); }
+      if (p) { setSession(chatId, { mode: 'project', project: p.path, sub: undefined }); await sendCard(chatId, buildProjectCard(chatId), false); }
       else await sendText(chatId, `没找到项目「${m[2]}」。\n\n` + listText());
       return;
     }
@@ -739,7 +744,7 @@ async function onMessage(data) {
 
     // bare project name/number -> enter it (works from any mode)
     const bare = projectIfBareName(text);
-    if (bare) { if (await denyProject(senderOpen, chatId)) return; setSession(chatId, { mode: 'project', project: bare.path, sub: undefined }); await showCard(chatId, buildProjectCard(chatId)); return; }
+    if (bare) { if (await denyProject(senderOpen, chatId)) return; setSession(chatId, { mode: 'project', project: bare.path, sub: undefined }); await sendCard(chatId, buildProjectCard(chatId), false); return; }
     // "<project> <command>" -> one-off run, doesn't change the current mode
     const oneoff = oneOffTarget(text);
     if (oneoff.project) {
@@ -778,7 +783,7 @@ async function onMessage(data) {
       if (level === 'viewer') sub = 'query';                 // viewers are always read-only
       const qm = text.match(QUERY_RE);                       // 查询/只读 prefix = one-off read-only override
       // no sub-mode chosen yet -> ask via the project card first (unless an explicit 查询 prefix)
-      if (!sub && !qm) { await showCard(chatId, buildProjectCard(chatId)); return; }
+      if (!sub && !qm) { await sendCard(chatId, buildProjectCard(chatId), false); return; }
       if (sub === 'query' || qm) {
         const qk = querySession(active.path).cwd.toLowerCase();   // query runs in its own cwd, not project.path
         if (running.has(qk) || inflight.has(qk)) { await sendText(chatId, `「${active.name}」查询进行中,请稍候。`); return; }
@@ -849,8 +854,8 @@ async function onCardAction(ev) {
     if (projectActs.indexOf(val.do) !== -1 && !canProject(senderOpen)) { denyProject(senderOpen, chatId); return; }
     if (configActs.indexOf(val.do) !== -1 && !canConfig(senderOpen)) { denyConfig(senderOpen, chatId); return; }
 
-    if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }
-    if (val.do === 'home') { setSession(chatId, { mode: 'idle' }); refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }   // leave project mode (avoid accidental typed-modify)
+    if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); refreshCard(chatId, messageId, buildMenuCard(chatId), true); return; }
+    if (val.do === 'home') { setSession(chatId, { mode: 'idle' }); refreshCard(chatId, messageId, buildMenuCard(chatId), true); return; }   // leave project mode (avoid accidental typed-modify)
     if (val.do === 'status') { sendText(chatId, statusText(chatId)); return; }
     if (val.do === 'perm') {
       const c = readConfig();
@@ -865,23 +870,23 @@ async function onCardAction(ev) {
       const mm = String(val.m || '').toLowerCase();
       const v = (['opus', 'sonnet', 'haiku'].indexOf(mm) !== -1) ? mm : '';
       try { const c = readConfig(); c.feishuChatModel = v; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
-      refreshCard(chatId, messageId, buildMenuCard(chatId));      // model lives on the main card; re-render it (feedback = ✅ moves)
+      refreshCard(chatId, messageId, buildMenuCard(chatId), true);      // model lives on the main card; re-render it (feedback = ✅ moves)
       return;
     }
     if (val.do === 'enter') {
       const p = discoverProjects().find(x => x.path.toLowerCase() === String(val.p).toLowerCase()) || (val.p ? { name: path.basename(val.p), path: val.p } : null);
       // enter -> project sub-menu (pick 只读/修改 first). sub reset so the user chooses each entry.
-      if (p) { setSession(chatId, { mode: 'project', project: p.path, sub: undefined }); refreshCard(chatId, messageId, buildProjectCard(chatId)); }
+      if (p) { setSession(chatId, { mode: 'project', project: p.path, sub: undefined }); refreshCard(chatId, messageId, buildProjectCard(chatId), false); }
       else sendText(chatId, '项目未找到(可能已变化)。发「菜单」重新选。');
       return;
     }
     if (val.do === 'submode') {
       const sess = getSession(chatId);
-      if (sess.mode !== 'project' || !sess.project) { refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }
+      if (sess.mode !== 'project' || !sess.project) { refreshCard(chatId, messageId, buildMenuCard(chatId), true); return; }
       let sm = (val.sm === 'modify') ? 'modify' : 'query';
       if (sm === 'modify' && authLevel(senderOpen) === 'viewer') { sm = 'query'; sendText(chatId, '👁 你是只读用户,只能查询,不能改项目。'); }
       setSession(chatId, { mode: 'project', project: sess.project, sub: sm });
-      refreshCard(chatId, messageId, buildProjectCard(chatId));   // ✅ moves to the chosen mode
+      refreshCard(chatId, messageId, buildProjectCard(chatId), false);   // ✅ moves to the chosen mode
       return;
     }
     if (val.do === 'clearq') {
@@ -927,9 +932,11 @@ async function onBotMenu(ev) {
     logLine(`底部菜单点击: ${key}`);
     if (key === 'chat') { setSession(chatId, { mode: 'chat' }); await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。'); return; }
     if (key === 'status') { if (await denyProject(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
-    // default (menu / 主菜单 / idle / exit / unknown) -> return to the main menu, updating the SAME
-    // control card in place (showCard) so tapping 主菜单 never piles up another card.
-    setSession(chatId, { mode: 'idle' });
+    if (key === 'idle' || key === 'exit') { setSession(chatId, { mode: 'idle' }); await showCard(chatId, buildMenuCard(chatId)); return; }
+    // 'menu' / 主菜单 / unknown: show the main menu, reusing the existing MENU card if any. lastCard
+    // now only ever points at a menu card (a project card deletes it), so showCard reuses/creates a
+    // menu card and NEVER patches the project card, and we don't reset the session — a delayed or
+    // duplicate bottom-menu delivery can no longer yank you out of a project ("进项目又跳回来").
     await showCard(chatId, buildMenuCard(chatId));
   } catch (e) { logLine('底部菜单事件异常: ' + (e && (e.stack || e))); }
 }
