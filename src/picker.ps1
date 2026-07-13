@@ -160,6 +160,8 @@ if(-not $script:instanceOwned -and -not $RenderTo -and -not $SelfTest){
           <Button x:Name="BtnClearLog" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="清空日志" Margin="14,0,0,0" VerticalAlignment="Center"/>
           <Button x:Name="BtnExportLog" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="导出日志" Margin="14,0,0,0" VerticalAlignment="Center"/>
           <Button x:Name="BtnForgetChat" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="忘记闲聊" Margin="14,0,0,0" VerticalAlignment="Center"/>
+          <Button x:Name="BtnClearQuery" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="清空查询" Margin="14,0,0,0" VerticalAlignment="Center" ToolTip="清空所有项目的『只读查询』记忆(下次查询从头开始)"/>
+          <Button x:Name="BtnAuthUsers" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="授权用户" Margin="14,0,0,0" VerticalAlignment="Center" ToolTip="查看 / 移除有权限的飞书用户(飞书后台看不到，这才是真正的授权名单)"/>
         </DockPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal">
           <Button x:Name="BtnPreview" Style="{StaticResource BtnGhost}" Content="预演" Width="88"/>
@@ -183,7 +185,7 @@ try {
   if(Test-Path $icoPath){ $win.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]$icoPath) }
 } catch {}
 $els = @{}
-foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','ChatModelChip','ChatModelText','IntervalChip','IntervalText','ProjectList','LogText','LogScroll','StatusText','BtnPopLog','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnForgetChat','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
+foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','ChatModelChip','ChatModelText','IntervalChip','IntervalText','ProjectList','LogText','LogScroll','StatusText','BtnPopLog','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnForgetChat','BtnClearQuery','BtnAuthUsers','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
 # global UI-thread exception guard: never let a handler bug close the window
 $win.Dispatcher.add_UnhandledException({ param($s,$e)
   try { [System.IO.File]::AppendAllText((Join-Path $env:LOCALAPPDATA 'ClaudeResume\logs\gui-error.log'), ((Get-Date).ToString('s') + "  " + $e.Exception.ToString() + "`r`n"), (New-Object System.Text.UTF8Encoding($false))) } catch {}
@@ -248,6 +250,78 @@ function Show-LogWindow {
     $script:logWin = $w
     $w.Show()
   } catch {}
+}
+
+function Show-AuthWindow {
+  try {
+    if($script:authWin -and $script:authWin.IsVisible){ $script:authWin.Activate(); return }
+    $w = New-Object Windows.Window
+    $w.Title='Claude续跑 · 授权用户'; $w.Width=660; $w.Height=560; $w.WindowStartupLocation='CenterScreen'
+    $w.Background=(New-Brush '#FF141414')
+    try { if($script:AppDir){ $ico=Join-Path $script:AppDir 'icon.ico'; if(Test-Path $ico){ $w.Icon=[Windows.Media.Imaging.BitmapFrame]::Create([Uri]$ico) } } } catch {}
+    $root=New-Object Windows.Controls.DockPanel
+    $hdr=New-Object Windows.Controls.TextBlock
+    $hdr.Text='这才是真正的授权名单(存在本机 config.json)。飞书开发者后台里看不到它 —— 后台只有『应用可用范围』,管的是谁能用机器人,不区分可改 / 只读。'
+    $hdr.TextWrapping='Wrap'; $hdr.Foreground=(New-Brush '#FFB9B9B9'); $hdr.FontSize=12; $hdr.Margin='18,16,18,6'
+    [Windows.Controls.DockPanel]::SetDock($hdr,'Top'); $root.Children.Add($hdr)|Out-Null
+    $sv=New-Object Windows.Controls.ScrollViewer; $sv.VerticalScrollBarVisibility='Auto'; $sv.Padding='18,4,18,16'
+    $script:authList=New-Object Windows.Controls.StackPanel; $sv.Content=$script:authList
+    $root.Children.Add($sv)|Out-Null; $w.Content=$root
+    # script-scoped so the remove handlers can re-invoke it (avoids the closure-captures-itself trap)
+    $script:authRender = {
+      $self = $script:authRender   # capture into locals so GetNewClosure'd handlers can re-invoke via $self
+      $script:authList.Children.Clear()
+      $cfg=Get-CcuConfig
+      $secs=@(
+        @{ title='✅ 可改项目(full) —— 能修改你的项目'; ids=@(@($cfg.feishuAuthOpenIds)|Where-Object{$_}) },
+        @{ title='👁 只读查询(viewer) —— 只能只读问答'; ids=@(@($cfg.feishuViewerOpenIds)|Where-Object{$_}) }
+      )
+      foreach($sec in $secs){
+        $t=New-Object Windows.Controls.TextBlock; $t.Text=$sec.title; $t.Foreground=(New-Brush '#FFEDEDED'); $t.FontWeight='SemiBold'; $t.FontSize=13; $t.Margin='0,10,0,6'
+        $script:authList.Children.Add($t)|Out-Null
+        if($sec.ids.Count -eq 0){
+          $e=New-Object Windows.Controls.TextBlock; $e.Text='(无)'; $e.Foreground=(New-Brush '#FF8A8A8A'); $e.FontSize=12; $e.Margin='2,0,0,4'
+          $script:authList.Children.Add($e)|Out-Null; continue
+        }
+        foreach($id in $sec.ids){
+          $b=New-Object Windows.Controls.Border; $b.CornerRadius='10'; $b.Padding='12,9'; $b.Margin='0,0,0,7'
+          $b.Background=(New-Brush '#FF1E1E1E'); $b.BorderBrush=(New-Brush '#FF2E2E2E'); $b.BorderThickness='1'
+          $dp=New-Object Windows.Controls.DockPanel
+          $rm=New-Object Windows.Controls.TextBlock; $rm.Text='移除'; $rm.Foreground=(New-Brush '#FFE06C6C'); $rm.FontSize=12.5; $rm.Cursor='Hand'; $rm.VerticalAlignment='Center'; $rm.Margin='12,0,2,0'; [Windows.Controls.DockPanel]::SetDock($rm,'Right')
+          $thisId=$id
+          $rm.Add_MouseLeftButtonUp({ param($s,$e) $e.Handled=$true
+            $ans=[System.Windows.MessageBox]::Show(("移除该用户的全部权限?`n" + $thisId), '确认', 'YesNo', 'Question')
+            if($ans -ne 'Yes'){ return }
+            try {
+              $c=Get-CcuConfig
+              $newFull=@(@($c.feishuAuthOpenIds)|Where-Object{ $_ -and $_ -ne $thisId })
+              $hadFull=@(@($c.feishuAuthOpenIds)|Where-Object{ $_ }).Count
+              # removing the LAST 可改 user empties the list, which unlocks the bot for EVERYONE — warn hard
+              if($hadFull -gt 0 -and $newFull.Count -eq 0){
+                $warn=[System.Windows.MessageBox]::Show('⚠ 这是最后一个『可改项目』用户。移除后名单为空 = 解除锁定,所有飞书用户都能改你的项目 / 改配置 / 授权他人。确定要解除锁定?','危险','YesNo','Warning')
+                if($warn -ne 'Yes'){ return }
+              }
+              $c.feishuAuthOpenIds=$newFull
+              $c.feishuViewerOpenIds=@(@($c.feishuViewerOpenIds)|Where-Object{ $_ -and $_ -ne $thisId })
+              Set-CcuConfig $c
+            } catch {}
+            & $self
+          }.GetNewClosure())
+          $tx=New-Object Windows.Controls.TextBlock; $tx.Text=$id; $tx.Foreground=(New-Brush '#FFEDEDED'); $tx.FontFamily='Cascadia Code, Consolas'; $tx.FontSize=12.5; $tx.VerticalAlignment='Center'; $tx.TextTrimming='CharacterEllipsis'
+          $dp.Children.Add($rm)|Out-Null; $dp.Children.Add($tx)|Out-Null
+          $b.Child=$dp; $script:authList.Children.Add($b)|Out-Null
+        }
+      }
+      $tip=New-Object Windows.Controls.TextBlock
+      $tip.Text='加人:让对方给机器人发一句话 → 你会收到卡片,点「可改项目 / 只读查询」;或在飞书发「授权 ou_xxx」/「只读授权 ou_xxx」。名单为空 = 未锁定(所有人可改)。'
+      $tip.TextWrapping='Wrap'; $tip.Foreground=(New-Brush '#FF8A8A8A'); $tip.FontSize=11.5; $tip.Margin='2,14,0,0'
+      $script:authList.Children.Add($tip)|Out-Null
+    }
+    & $script:authRender
+    $w.Add_Closed({ $script:authWin=$null })
+    $script:authWin=$w
+    $w.Show()
+  } catch { Set-Flash ('打开授权窗口出错: ' + $_.Exception.Message) }
 }
 
 function New-ProjectCard($proj){
@@ -465,6 +539,38 @@ $els.BtnForgetChat.Add_Click({
     Set-Flash '已清空闲聊记忆(下次闲聊从头开始)'
   } catch { Set-Flash ('清空出错: ' + $_.Exception.Message) }
 })
+$els.BtnClearQuery.Add_Click({
+  try {
+    # clear every project's shared "只读查询" session: each feishu-query flag records the session id;
+    # delete the matching claude session jsonl (must delete it — --session-id on an existing id errors)
+    # then drop the flag, so the next query re-creates a fresh session.
+    $qdir = Join-Path $script:AppDir 'feishu-query'
+    $proot = Join-Path $env:USERPROFILE '.claude\projects'
+    $sessions = 0; $projects = 0
+    if(Test-Path $qdir){
+      foreach($f in @(Get-ChildItem $qdir -File -ErrorAction SilentlyContinue)){
+        # the flag NAME is the full sha1(path) hex; reconstruct the session id the same way the
+        # agent's querySession() does (independent of flag content, which older flags lacked)
+        $id = $null
+        $h = $f.BaseName
+        if($h -match '^[0-9a-f]{40}$'){
+          $id = $h.Substring(0,8)+'-'+$h.Substring(8,4)+'-4'+$h.Substring(13,3)+'-8'+$h.Substring(17,3)+'-'+$h.Substring(20,12)
+        } else {
+          try { $id = (Get-Content $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json).id } catch {}
+        }
+        if($id -and (Test-Path $proot)){
+          foreach($d in @(Get-ChildItem $proot -Directory -ErrorAction SilentlyContinue)){
+            $jf = Join-Path $d.FullName ($id + '.jsonl')
+            if(Test-Path $jf){ Remove-Item $jf -Force -ErrorAction SilentlyContinue; $sessions++ }
+          }
+        }
+        Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue; $projects++
+      }
+    }
+    Set-Flash ("已清空只读查询记忆:" + $projects + " 个项目 / " + $sessions + " 个会话")
+  } catch { Set-Flash ('清空查询出错: ' + $_.Exception.Message) }
+})
+$els.BtnAuthUsers.Add_Click({ Show-AuthWindow })
 $els.BtnExportLog.Add_Click({
   try {
     # every run-*.log (oldest first) + the GUI error log, merged into one shareable file

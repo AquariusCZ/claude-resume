@@ -89,7 +89,16 @@ const CLAUDE_CMD = findClaudeCmd();
 // ---- project discovery — mirrors the desktop GUI: ~/.claude/projects cwd scan (recency-sorted)
 // + customProjects, minus hiddenProjects and the tool's own dirs. Keep this in sync with
 // Get-ClaudeProjects/the picker so the Feishu 项目 list matches the desktop app exactly.
+// read only the first N bytes (session jsonl can be many MB; the cwd line sits at the very top)
+function readHead(file, bytes) {
+  let fd;
+  try { fd = fs.openSync(file, 'r'); const buf = Buffer.alloc(bytes); const n = fs.readSync(fd, buf, 0, bytes, 0); return buf.toString('utf8', 0, n); }
+  catch (e) { return ''; }
+  finally { try { if (fd !== undefined) fs.closeSync(fd); } catch (e) {} }
+}
+let _discCache = null, _discAt = 0;   // memo: one card click may call this several times
 function discoverProjects() {
+  if (_discCache && (Date.now() - _discAt) < 3000) return _discCache;
   const cfg = readConfig();
   const hidden = new Set((Array.isArray(cfg.hiddenProjects) ? cfg.hiddenProjects : []).map(h => String(h).toLowerCase()));
   const appDir = path.join(process.env.LOCALAPPDATA || '', 'ClaudeResume').toLowerCase();
@@ -108,7 +117,7 @@ function discoverProjects() {
       jsonls.sort((a, b) => fs.statSync(path.join(full, b)).mtimeMs - fs.statSync(path.join(full, a)).mtimeMs);
       const file = path.join(full, jsonls[0]);
       const mtime = fs.statSync(file).mtimeMs;
-      const head = fs.readFileSync(file, 'utf8').split(/\r?\n/).slice(0, 60);
+      const head = readHead(file, 65536).split(/\r?\n/).slice(0, 60);
       for (const ln of head) {
         if (ln.indexOf('"cwd"') === -1) continue;
         try {
@@ -130,6 +139,7 @@ function discoverProjects() {
       seen.add(p.path.toLowerCase());
     }
   }
+  _discCache = list; _discAt = Date.now();
   return list;
 }
 
@@ -143,7 +153,8 @@ function getSession(chatId) {
   const s = readSessions(); const v = s[chatId];
   if (!v) return { mode: 'idle' };
   if (typeof v === 'string') return v ? { mode: 'project', project: v } : { mode: 'idle' };   // legacy
-  return { mode: v.mode || (v.project ? 'project' : 'idle'), project: v.project };
+  // sub (project sub-mode): 'query' | 'modify' | undefined (not chosen yet -> ask first)
+  return { mode: v.mode || (v.project ? 'project' : 'idle'), project: v.project, sub: v.sub };
 }
 function setSession(chatId, sess) { const s = readSessions(); s[chatId] = sess; writeSessions(s); }
 function activeProject(chatId) {
@@ -157,29 +168,61 @@ function markChatStarted() { try { fs.writeFileSync(path.join(CHAT_DIR, '.starte
 
 // each project has ONE dedicated read-only "query session" (fixed session id from the path),
 // shared by everyone: --session-id creates it, --resume continues it. Separate from work sessions.
-const QUERY_DIR = path.join(APP_DIR, 'feishu-query');   // per-project .started flags
+const QUERY_DIR = path.join(APP_DIR, 'feishu-query');        // per-project .started flags
+const QUERY_CWD_BASE = path.join(APP_DIR, 'feishu-query-cwd'); // queries run HERE, never in project.path
 function querySession(projectPath) {
   const h = crypto.createHash('sha1').update(String(projectPath).toLowerCase()).digest('hex');
   const id = `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
   const flag = path.join(QUERY_DIR, h + '.started');
-  return { id, flag, started: (() => { try { return fs.existsSync(flag); } catch (e) { return false; } })() };
+  // isolated cwd so the query transcript does NOT land in project.path's session folder — otherwise
+  // a later modify `--continue` would resume the query session instead of the VS Code work session.
+  const cwd = path.join(QUERY_CWD_BASE, h);
+  return { id, flag, cwd, started: (() => { try { return fs.existsSync(flag); } catch (e) { return false; } })() };
 }
-function markQueryStarted(flag) { try { fs.mkdirSync(QUERY_DIR, { recursive: true }); fs.writeFileSync(flag, '1'); } catch (e) {} }
+// did claude actually persist this session's jsonl? (so we only flip to --resume once it truly exists)
+function querySessionExists(id) {
+  try {
+    const base = path.join(os.homedir(), '.claude', 'projects');
+    return fs.readdirSync(base).some(d => { try { return fs.existsSync(path.join(base, d, id + '.jsonl')); } catch (e) { return false; } });
+  } catch (e) { return false; }
+}
+// flag content = {id, path, name} so the GUI's "清空查询记忆" can locate & delete the session jsonl
+function markQueryStarted(flag, meta) { try { fs.mkdirSync(QUERY_DIR, { recursive: true }); fs.writeFileSync(flag, JSON.stringify(meta || {}), 'utf8'); } catch (e) {} }
+// wipe one project's shared query session: remove the flag AND the claude session jsonl(s) with
+// that id (must delete the jsonl — --session-id on an existing id errors "already in use").
+function clearQuerySession(projectPath) {
+  const qs = querySession(projectPath);
+  let deleted = 0;
+  try { fs.unlinkSync(qs.flag); } catch (e) {}
+  try {
+    const base = path.join(os.homedir(), '.claude', 'projects');
+    for (const d of fs.readdirSync(base)) {
+      const f = path.join(base, d, qs.id + '.jsonl');
+      try { if (fs.existsSync(f)) { fs.unlinkSync(f); deleted++; } } catch (e) {}
+    }
+  } catch (e) {}
+  return deleted;
+}
 
 // prefix that makes a full user's message a READ-ONLY query (viewers are always read-only).
 // 查询/只读 are unambiguous so no separator is required; drop bare 问 (matches 问题/问一下).
 const QUERY_RE = /^\s*(查询|只读查询|只读|query)\s*[:：]?\s*([\s\S]+)$/i;
 
-// run one read-only query in the project's DEDICATED shared query session (any user/time -> same convo)
+// run one read-only query in the project's DEDICATED shared query session (any user/time -> same convo).
+// Runs in an ISOLATED cwd (qs.cwd) + --add-dir project.path so the transcript stays out of the
+// project's --continue pool; the prompt names the project so claude knows where to look.
 async function runProjectQuery(chatId, project, prompt) {
   const qs = querySession(project.path);
   const cfg = readConfig();
+  const framed = `[以下是对项目「${project.name}」(目录:${project.path})的只读提问。请只读代码/文档来回答,切勿修改任何文件。]\n\n${prompt}`;
   const stopHb = startHeartbeat(chatId, project.name + ' 查询');
-  const r = await runClaude(project.path, project.name, prompt, {
-    sessionId: qs.id, sessionExists: qs.started, readOnly: true, model: cfg.feishuChatModel
+  const r = await runClaude(qs.cwd, project.name + ' 查询', framed, {
+    sessionId: qs.id, sessionExists: qs.started, addDir: project.path, readOnly: true, model: cfg.feishuChatModel
   });
   stopHb();
-  markQueryStarted(qs.flag);   // session now exists -> subsequent queries --resume into it
+  // only flip to --resume once claude actually persisted the jsonl — else a failed first query
+  // (claude missing / bad flag / limited before write) would poison every later query into --resume.
+  if (querySessionExists(qs.id)) markQueryStarted(qs.flag, { id: qs.id, path: project.path, name: project.name });
   return r;
 }
 
@@ -214,6 +257,7 @@ function oneOffTarget(text) {
 
 // ---- run claude in a cwd (project or the chat scratch dir); return {ok, limited, text} ----
 const running = new Map(); // cwd(lower) -> child
+const inflight = new Set(); // cwd(lower) reserved synchronously to close the check->spawn race
 function runClaude(cwd, label, prompt, opts) {
   opts = opts || {};
   return new Promise((resolve) => {
@@ -226,6 +270,7 @@ function runClaude(cwd, label, prompt, opts) {
     } else if (opts.useContinue !== false) {
       args.push('--continue');
     }
+    if (opts.addDir) args.push('--add-dir', opts.addDir);   // grant read access when cwd != the project
     args.push('-p', prompt, '--output-format', 'stream-json', '--verbose');
     const model = opts.model || cfg.resumeModel;   // opts.model lets chat use its own model
     if (model) { args.push('--model', model); }
@@ -285,11 +330,17 @@ async function sendCard(chatId, card) {
     await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(card) } });
   } catch (e) { logLine('发送卡片失败: ' + (e && e.message)); }
 }
-// update the clicked card in place so the ✅ (current project / model / mode) moves
-async function refreshCard(chatId, messageId) {
+// which card should this chat be looking at right now (main menu vs the project sub-menu)
+function currentCard(chatId) {
+  const sess = getSession(chatId);
+  return (sess.mode === 'project' && sess.project) ? buildProjectCard(chatId) : buildMenuCard(chatId);
+}
+// update the clicked card in place so the ✅ (current project / model / mode) moves.
+// pass an explicit card to navigate (e.g. project -> main menu); omit to re-render the current one.
+async function refreshCard(chatId, messageId, card) {
   if (!messageId) return;
   try {
-    await client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(buildMenuCard(chatId)) } });
+    await client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(card || currentCard(chatId)) } });
   } catch (e) { logLine('更新卡片失败: ' + (e && e.message)); }
 }
 // long runs go silent while claude works; send a heartbeat so the user knows it's alive.
@@ -344,6 +395,35 @@ function buildMenuCard(chatId) {
   };
 }
 
+// project sub-menu (level 1): after entering a project you pick 只读查询 vs 修改项目 FIRST,
+// then just type. The chosen mode shows ✅; switching is one tap. Keeps the hierarchy shallow.
+function buildProjectCard(chatId) {
+  const ap = activeProject(chatId);
+  const sub = getSession(chatId).sub;
+  const name = ap ? ap.name : '项目';
+  let line, tmpl;
+  if (sub === 'query') { line = `**📂「${name}」· 👁 只读查询**\n直接提问即可 — 我只读代码/答疑,**绝不改文件**。所有查询共用本项目的专属会话。`; tmpl = 'blue'; }
+  else if (sub === 'modify') { line = `**📂「${name}」· ✏️ 修改项目**\n直接发指令即可 — 我会真正改动并继续你 VS Code 里的同一个会话。`; tmpl = 'red'; }
+  else { line = `**📂 已进入「${name}」**\n先选操作方式 👇 之后直接发消息即可。`; tmpl = 'grey'; }
+  const elements = [
+    { tag: 'div', text: { tag: 'lark_md', content: line } },
+    { tag: 'action', actions: [
+      { tag: 'button', text: { tag: 'plain_text', content: (sub === 'query' ? '✅ ' : '👁 ') + '只读查询' }, type: sub === 'query' ? 'primary' : 'default', value: { do: 'submode', sm: 'query' } },
+      { tag: 'button', text: { tag: 'plain_text', content: (sub === 'modify' ? '✅ ' : '✏️ ') + '修改项目' }, type: sub === 'modify' ? 'primary' : 'default', value: { do: 'submode', sm: 'modify' } },
+    ] },
+    { tag: 'action', actions: [
+      { tag: 'button', text: { tag: 'plain_text', content: '🧹 清空查询记忆' }, type: 'default', value: { do: 'clearq' } },
+      { tag: 'button', text: { tag: 'plain_text', content: 'ℹ️ 状态' }, type: 'default', value: { do: 'status' } },
+      { tag: 'button', text: { tag: 'plain_text', content: '⬅ 主菜单' }, type: 'default', value: { do: 'home' } },
+    ] },
+  ];
+  return {
+    config: { wide_screen_mode: true, update_multi: true },
+    header: { template: tmpl, title: { tag: 'plain_text', content: '项目操作 · ' + name } },
+    elements,
+  };
+}
+
 // ---- status / list / help (mode-aware) ----
 function statusText(chatId) {
   const cfg = readConfig();
@@ -368,24 +448,27 @@ function listText() {
 }
 function helpText(chatId) {
   const ap = activeProject(chatId);
+  const sub = getSession(chatId).sub;
   const cur = ap
-    ? `📂 现在在项目「${ap.name}」——直接发消息就在这里续跑。`
+    ? `📂 现在在项目「${ap.name}」·${sub === 'query' ? '👁 只读查询' : sub === 'modify' ? '✏️ 修改项目' : '未选模式(先点 只读/修改)'}`
     : '💬 现在是闲聊模式——直接说话就是和我聊天,不碰任何项目。';
   return [
     'Claude 服务器助手', cur, '',
-    '· 项目 → 列出所有项目',
-    '· 进入 <编号或名字> → 进入某项目开始操作(例:进入 2)',
-    '· 退出 → 回到闲聊模式',
-    '· <项目名> <指令> → 不切换,一次性在该项目执行',
-    '· 查询 <问题> → 只读问答,读代码/答疑但不改文件(如「查询 这模块怎么跑」)',
+    '用按钮最省事(发「菜单」调出):主菜单点项目 → 弹出「👁只读 / ✏️修改」→ 选一个 → 直接发消息。',
+    '',
+    '文字命令:',
+    '· 项目 / 菜单 → 列出项目(卡片)',
+    '· 进入 <编号或名字> → 进入项目,再选 只读/修改',
+    '· 查询 <问题> → 直接只读问答,不改文件(不用先选模式)',
+    '· 退出 → 回主菜单',
     '· 状态 → 布防 / 额度 / 当前模式',
     '· 停止 <项目> → 取消正在跑的指令',
     '· 模型 / 模型 opus → 查看或切换模型(聊天+项目都用,与软件同步)',
     '· 授权 ou_xxx(可改)/ 只读授权 ou_xxx(只查)/ 取消授权 / 授权列表 → 管理权限',
-    '· 忘记闲聊 → 清空闲聊记忆,从头开始',
+    '· 忘记闲聊 → 清空闲聊记忆;忘记查询 → 清空当前项目的只读查询记忆',
     '',
-    '注:改项目会继续 VS Code 里同一会话(面板不实时刷新,重开可见);',
-    '「查询」走每个项目专属的只读会话,不碰你的工作会话。',
+    '注:✏️修改会继续 VS Code 里同一会话(面板不实时刷新,重开可见);',
+    '👁只读走每个项目专属的查询会话,所有人共用,不碰你的工作会话。',
   ].join('\n');
 }
 
@@ -519,9 +602,14 @@ async function onMessage(data) {
       const c = readConfig();
       let full = (c.feishuAuthOpenIds || []).filter(Boolean), view = (c.feishuViewerOpenIds || []).filter(Boolean);
       const kind = am[1];
+      const hadFull = full.length;
       if (kind === '授权') { if (full.indexOf(id) === -1) full.push(id); view = view.filter(x => x !== id); await sendText(chatId, '✅ 已授权(可改):' + id); }
       else if (kind === '只读授权') { if (view.indexOf(id) === -1) view.push(id); full = full.filter(x => x !== id); await sendText(chatId, '👁 已授权(只读):' + id); }
-      else { full = full.filter(x => x !== id); view = view.filter(x => x !== id); await sendText(chatId, '已移除:' + id); }
+      else {
+        full = full.filter(x => x !== id); view = view.filter(x => x !== id);
+        await sendText(chatId, '已移除:' + id);
+        if (hadFull && !full.length) await sendText(chatId, '⚠️ 可改名单已空 = 解除锁定,现在所有人都能改你的项目/改配置/授权他人!要保持锁定,请「授权 ou_你自己」。');
+      }
       c.feishuAuthOpenIds = full; c.feishuViewerOpenIds = view;
       try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
       return;
@@ -568,7 +656,15 @@ async function onMessage(data) {
       await sendText(chatId, '已清空闲聊记忆,下次闲聊从头开始。');
       return;
     }
-    if (/^(停止|stop)\b/i.test(text)) {
+    if (['忘记查询', '清空查询', '重置查询'].indexOf(low) !== -1) {
+      if (await denyConfig(senderOpen, chatId)) return;
+      const ap = activeProject(chatId);
+      if (!ap) { await sendText(chatId, '先进入一个项目,再发「忘记查询」清空它的只读查询记忆。'); return; }
+      const n = clearQuerySession(ap.path);
+      await sendText(chatId, `🧹 已清空「${ap.name}」的只读查询记忆(删除会话 ${n} 个)。下次查询从头开始。`);
+      return;
+    }
+    if (/^(停止|stop)(\s|$)/i.test(text)) {   // \b never matches between 止 and a space/CJK char
       const rest = text.replace(/^(停止|stop)\s*/i, '').trim();
       const p = rest ? findProject(rest) : activeProject(chatId);
       if (p && running.has(p.path.toLowerCase())) { try { running.get(p.path.toLowerCase()).kill(); } catch (e) {} await sendText(chatId, `已请求停止:${p.name}`); }
@@ -581,7 +677,7 @@ async function onMessage(data) {
     if (m) {
       if (await denyProject(senderOpen, chatId)) return;
       const p = findProject(m[2]);
-      if (p) { setSession(chatId, { mode: 'project', project: p.path }); await sendText(chatId, `已进入 📂「${p.name}」。\n· 直接发指令 = 改项目\n· 前缀「查询」= 只读问答,不改文件(如「查询 这个模块怎么跑」)\n· 发「退出」回主菜单,「进入 X」换项目`); }
+      if (p) { setSession(chatId, { mode: 'project', project: p.path, sub: undefined }); await sendCard(chatId, buildProjectCard(chatId)); }
       else await sendText(chatId, `没找到项目「${m[2]}」。\n\n` + listText());
       return;
     }
@@ -594,22 +690,27 @@ async function onMessage(data) {
 
     // bare project name/number -> enter it (works from any mode)
     const bare = projectIfBareName(text);
-    if (bare) { if (await denyProject(senderOpen, chatId)) return; setSession(chatId, { mode: 'project', project: bare.path }); await sendText(chatId, `已进入 📂「${bare.name}」。\n· 直接发指令 = 改项目\n· 前缀「查询」= 只读问答,不改文件\n· 发「退出」回主菜单`); return; }
+    if (bare) { if (await denyProject(senderOpen, chatId)) return; setSession(chatId, { mode: 'project', project: bare.path, sub: undefined }); await sendCard(chatId, buildProjectCard(chatId)); return; }
     // "<project> <command>" -> one-off run, doesn't change the current mode
     const oneoff = oneOffTarget(text);
     if (oneoff.project) {
       if (await denyProject(senderOpen, chatId)) return;
-      if (running.has(oneoff.project.path.toLowerCase())) { await sendText(chatId, `「${oneoff.project.name}」正在执行中,请稍候。`); return; }
       const qm = oneoff.prompt.match(QUERY_RE);
       const isQuery = authLevel(senderOpen) === 'viewer' || !!qm;   // viewer forced RO; owner opts in via 查询/只读
       const q = qm ? qm[2] : oneoff.prompt;
       if (isQuery) {
-        await sendText(chatId, `🔍 只读查询「${oneoff.project.name}」:${q}\n(读代码/答疑,不改文件 · 项目专属查询会话)`);
-        const r = await runProjectQuery(chatId, oneoff.project, q);
-        await sendText(chatId, (r.ok ? `✅ 查询结果:\n\n` : `⚠️ :\n\n`) + (r.text || '(无输出)'));
-        logLine(`一次性查询 ${oneoff.project.name} ok=${r.ok}`);
+        const qk = querySession(oneoff.project.path).cwd.toLowerCase();
+        if (running.has(qk) || inflight.has(qk)) { await sendText(chatId, `「${oneoff.project.name}」查询进行中,请稍候。`); return; }
+        inflight.add(qk);
+        try {
+          await sendText(chatId, `🔍 只读查询「${oneoff.project.name}」:${q}\n(读代码/答疑,不改文件 · 项目专属查询会话)`);
+          const r = await runProjectQuery(chatId, oneoff.project, q);
+          await sendText(chatId, (r.ok ? `✅ 查询结果:\n\n` : `⚠️ :\n\n`) + (r.text || '(无输出)'));
+          logLine(`一次性查询 ${oneoff.project.name} ok=${r.ok}`);
+        } finally { inflight.delete(qk); }
         return;
       }
+      if (running.has(oneoff.project.path.toLowerCase())) { await sendText(chatId, `「${oneoff.project.name}」正在执行中,请稍候。`); return; }
       await sendText(chatId, `📂 一次性在「${oneoff.project.name}」执行:${q}\n(可能要 1-4 分钟,跑完自动回结果)`);
       const stopHb = startHeartbeat(chatId, oneoff.project.name);
       const r = await runClaude(oneoff.project.path, oneoff.project.name, q, { useContinue: true, model: cfg.feishuChatModel });
@@ -621,19 +722,28 @@ async function onMessage(data) {
 
     // ---- mode dispatch ----
     const active = activeProject(chatId);
-    if (active) {   // project mode: run in the active project
+    if (active) {   // project mode: route by the chosen sub-mode (只读查询 / 修改项目)
       if (await denyProject(senderOpen, chatId)) return;
-      if (running.has(active.path.toLowerCase())) { await sendText(chatId, `「${active.name}」正在执行中,请稍候,或发「停止」取消。`); return; }
-      const qm = text.match(QUERY_RE);
-      const isQuery = authLevel(senderOpen) === 'viewer' || !!qm;   // viewer forced RO; owner opts in via 查询/只读
-      if (isQuery) {
-        const q = qm ? qm[2] : text;
-        await sendText(chatId, `🔍 只读查询「${active.name}」:${q}\n(读代码/答疑,不改文件 · 项目专属查询会话)`);
-        const r = await runProjectQuery(chatId, active, q);
-        await sendText(chatId, (r.ok ? `✅ 查询结果:\n\n` : `⚠️ :\n\n`) + (r.text || '(无输出)'));
-        logLine(`查询 ${active.name} ok=${r.ok}`);
+      const level = authLevel(senderOpen);
+      let sub = getSession(chatId).sub;
+      if (level === 'viewer') sub = 'query';                 // viewers are always read-only
+      const qm = text.match(QUERY_RE);                       // 查询/只读 prefix = one-off read-only override
+      // no sub-mode chosen yet -> ask via the project card first (unless an explicit 查询 prefix)
+      if (!sub && !qm) { await sendCard(chatId, buildProjectCard(chatId)); return; }
+      if (sub === 'query' || qm) {
+        const qk = querySession(active.path).cwd.toLowerCase();   // query runs in its own cwd, not project.path
+        if (running.has(qk) || inflight.has(qk)) { await sendText(chatId, `「${active.name}」查询进行中,请稍候。`); return; }
+        inflight.add(qk);
+        try {
+          const q = qm ? qm[2] : text;
+          await sendText(chatId, `🔍 只读查询「${active.name}」:${q}\n(读代码/答疑,不改文件 · 项目专属查询会话)`);
+          const r = await runProjectQuery(chatId, active, q);
+          await sendText(chatId, (r.ok ? `✅ 查询结果:\n\n` : `⚠️ :\n\n`) + (r.text || '(无输出)'));
+          logLine(`查询 ${active.name} ok=${r.ok}`);
+        } finally { inflight.delete(qk); }
         return;
       }
+      if (running.has(active.path.toLowerCase())) { await sendText(chatId, `「${active.name}」正在执行中,请稍候,或发「停止」取消。`); return; }
       await sendText(chatId, `📂 在「${active.name}」执行:${text}\n(可能要 1-4 分钟,跑完自动回结果)`);
       const stopHb = startHeartbeat(chatId, active.name);
       const r = await runClaude(active.path, active.name, text, { useContinue: true, model: cfg.feishuChatModel });
@@ -685,12 +795,13 @@ async function onCardAction(ev) {
     // IMPORTANT: a card callback must respond within a few seconds or Feishu shows
     // "目标回调服务超时未响应". So do ONLY fast local work here (sync file writes) and fire every
     // API call (send/patch) WITHOUT await, then return immediately.
-    const projectActs = ['status', 'enter'];                                   // viewers allowed
-    const configActs = ['perm', 'model', 'authorize', 'revoke', 'viewauth', 'viewrevoke'];  // full only
+    const projectActs = ['status', 'enter', 'submode'];                        // viewers allowed
+    const configActs = ['perm', 'model', 'authorize', 'revoke', 'viewauth', 'viewrevoke', 'clearq'];  // full only
     if (projectActs.indexOf(val.do) !== -1 && !canProject(senderOpen)) { denyProject(senderOpen, chatId); return; }
     if (configActs.indexOf(val.do) !== -1 && !canConfig(senderOpen)) { denyConfig(senderOpen, chatId); return; }
 
-    if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); refreshCard(chatId, messageId); return; }
+    if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }
+    if (val.do === 'home') { setSession(chatId, { mode: 'idle' }); refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }   // leave project mode (avoid accidental typed-modify)
     if (val.do === 'status') { sendText(chatId, statusText(chatId)); return; }
     if (val.do === 'perm') {
       const c = readConfig();
@@ -705,13 +816,31 @@ async function onCardAction(ev) {
       const mm = String(val.m || '').toLowerCase();
       const v = (['opus', 'sonnet', 'haiku'].indexOf(mm) !== -1) ? mm : '';
       try { const c = readConfig(); c.feishuChatModel = v; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
-      refreshCard(chatId, messageId);      // card update is the feedback (no extra text)
+      refreshCard(chatId, messageId, buildMenuCard(chatId));      // model lives on the main card; re-render it (feedback = ✅ moves)
       return;
     }
     if (val.do === 'enter') {
       const p = discoverProjects().find(x => x.path.toLowerCase() === String(val.p).toLowerCase()) || (val.p ? { name: path.basename(val.p), path: val.p } : null);
-      if (p) { setSession(chatId, { mode: 'project', project: p.path }); refreshCard(chatId, messageId); }
+      // enter -> project sub-menu (pick 只读/修改 first). sub reset so the user chooses each entry.
+      if (p) { setSession(chatId, { mode: 'project', project: p.path, sub: undefined }); refreshCard(chatId, messageId, buildProjectCard(chatId)); }
       else sendText(chatId, '项目未找到(可能已变化)。发「菜单」重新选。');
+      return;
+    }
+    if (val.do === 'submode') {
+      const sess = getSession(chatId);
+      if (sess.mode !== 'project' || !sess.project) { refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }
+      let sm = (val.sm === 'modify') ? 'modify' : 'query';
+      if (sm === 'modify' && authLevel(senderOpen) === 'viewer') { sm = 'query'; sendText(chatId, '👁 你是只读用户,只能查询,不能改项目。'); }
+      setSession(chatId, { mode: 'project', project: sess.project, sub: sm });
+      refreshCard(chatId, messageId, buildProjectCard(chatId));   // ✅ moves to the chosen mode
+      return;
+    }
+    if (val.do === 'clearq') {
+      const p = getSession(chatId).project;
+      const proj = p ? (discoverProjects().find(x => x.path.toLowerCase() === p.toLowerCase()) || { name: path.basename(p), path: p }) : null;
+      if (!proj) { sendText(chatId, '当前不在项目里,无法清空查询记忆。'); return; }
+      const n = clearQuerySession(proj.path);
+      sendText(chatId, `🧹 已清空「${proj.name}」的只读查询记忆(删除会话 ${n} 个)。下次查询从头开始。`);
       return;
     }
     // one-tap grant from the owner-notification card
