@@ -1016,7 +1016,7 @@ async function onBotMenu(ev) {
 
 // ---- boot ----
 if (TEST_MODE) {
-  module.exports = { onMessage, onCardAction, onBotMenu, client, lastCard, setSession, getSession, discoverProjects, currentCard };
+  module.exports = { onMessage, onCardAction, onBotMenu, client, lastCard, setSession, getSession, discoverProjects, currentCard, querySession, clearQuerySession };
   return;   // don't connect to Feishu in tests
 }
 const wsClient = new lark.WSClient({ appId: APP_ID, appSecret: APP_SECRET });
