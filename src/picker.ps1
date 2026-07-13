@@ -198,7 +198,10 @@ $sync = [hashtable]::Synchronized(@{ req=$true; probing=$false; fhReset=$null; f
 $script:flash = @{ text=''; until=[datetime]::MinValue }
 function Set-Flash($t){ $script:flash.text = $t; $script:flash.until = (Get-Date).AddSeconds(6) }
 $script:logFile = Join-Path $script:LogDir ("run-" + (Get-Date).ToString('yyyyMMdd') + ".log")
-function Read-LogTail { param([int]$Tail=40) try { if(Test-Path $script:logFile){ return ((Get-Content $script:logFile -Tail $Tail -Encoding UTF8 -ErrorAction SilentlyContinue) -join "`r`n") } } catch {} return '' }
+# ALWAYS resolve the newest run-*.log (not the one from the day the GUI opened) — otherwise the log
+# goes blank after midnight because the checker writes run-<today>.log while we read run-<open-day>.log.
+function Get-CurLogFile { try { return (Get-ChildItem $script:LogDir -Filter 'run-*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1) } catch { return $null } }
+function Read-LogTail { param([int]$Tail=40) try { $f = Get-CurLogFile; if($f){ return ((Get-Content $f.FullName -Tail $Tail -Encoding UTF8 -ErrorAction SilentlyContinue) -join "`r`n") } } catch {} return '' }
 
 # ---- colored log rendering (per [level]) ----
 function New-Brush($hex){ New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($hex)) }
@@ -561,7 +564,7 @@ $els.BtnDisarm.Add_Click({
 })
 $els.BtnClearLog.Add_Click({
   try {
-    if(Test-Path $script:logFile){ [System.IO.File]::WriteAllText($script:logFile, '') }
+    $lf = Get-CurLogFile; if($lf){ [System.IO.File]::WriteAllText($lf.FullName, '') }
     $els.LogText.Inlines.Clear(); $script:lastLogText = $null
     Set-Flash '日志已清空'
   } catch { Set-Flash ('清空出错: ' + $_.Exception.Message) }

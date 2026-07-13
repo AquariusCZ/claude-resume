@@ -620,11 +620,11 @@ async function denyProject(openId, chatId) {
 async function denyConfig(openId, chatId) {
   if (canConfig(openId)) return false;
   const lvl = authLevel(openId);
-  await sendText(chatId, lvl === 'viewer'
+  await sendText(chatId, (lvl === 'viewer'
     ? '🔒 只读:除机器人主人外,大家只能浏览/查询项目,不能修改。'
-    : `🔒 无权限。你的 open_id:${openId || '未知'}`);
+    : '🔒 无权限。') + `\n(要「可改」权限,把这个 open_id 发给机器人主人)\n你的 open_id:${openId || '未知'}`);
   logLine('拦截未授权(配置): ' + openId);
-  if (lvl !== 'viewer') notifyOwner(openId, chatId);
+  notifyOwner(openId, chatId);   // owner gets a one-tap 授权 card (deduped per open_id); everyone is 'viewer' now
   return true;
 }
 
@@ -765,6 +765,7 @@ async function onMessage(data) {
       return;
     }
     if (/^(停止|stop)(\s|$)/i.test(text)) {   // \b never matches between 止 and a space/CJK char
+      if (await denyConfig(senderOpen, chatId)) return;   // owner-only: a viewer must not kill your run
       const rest = text.replace(/^(停止|stop)\s*/i, '').trim();
       const p = rest ? findProject(rest) : activeProject(chatId);
       if (p && running.has(p.path.toLowerCase())) { try { running.get(p.path.toLowerCase()).kill(); } catch (e) {} await sendText(chatId, `已请求停止:${p.name}`); }
@@ -857,9 +858,17 @@ async function onMessage(data) {
       await sendText(chatId, '🤔 正在思考…');
       logLine(`闲聊 思考中: ${text}`);
       const stopHb = startHeartbeat(chatId, '闲聊');
-      // full tools (WebSearch/WebFetch/etc.) like the web app — headless -p has no permission
-      // prompt, so tools are simply blocked without this. Runs in the isolated scratch dir.
-      const r = await runClaude(CHAT_DIR, '闲聊', text, { useContinue: chatStarted(), skipPermissions: true, model: cfg.feishuChatModel });
+      // SECURITY: chat is open to everyone, so only the OWNER gets full tools (skip-permissions —
+      // WebSearch/Bash/Read like the web app). A non-owner (viewer) gets a read-only chat: plan mode
+      // + no file/exec tools, so they can't Bash-modify files or Read the bot's ../config.json secrets.
+      const chatOwner = authLevel(senderOpen) === 'full';
+      const r = await runClaude(CHAT_DIR, '闲聊', text, {
+        useContinue: chatStarted(),
+        skipPermissions: chatOwner,
+        readOnly: !chatOwner,
+        disallowedTools: chatOwner ? undefined : ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'NotebookEdit'],
+        model: cfg.feishuChatModel,
+      });
       stopHb();
       if (r.ok) markChatStarted();
       await sendText(chatId, (r.text || '(无输出)') + fmtMeta(r) + '\n\n———\n💬 闲聊模式 · 发「菜单」切换');
@@ -977,17 +986,22 @@ async function onBotMenu(ev) {
     if (!chatId) { logLine('菜单点击但无 chatId(先随便发一句让我记录会话)'); return; }
     const allow = Array.isArray(cfg.feishuAllowOpenIds) ? cfg.feishuAllowOpenIds.filter(Boolean) : [];
     if (allow.length && senderOpen && allow.indexOf(senderOpen) === -1) return;
-    // dedup rapid repeat taps (the menu has round-trip latency; users tap again -> duplicates)
+    // dedup rapid repeat taps. The escape-hatch keys (menu/idle/exit/unknown) use a SHORT window so a
+    // deliberate 主菜单 tap a couple seconds later still responds; text keys (chat/status) dedup longer.
+    const escapeHatch = (key !== 'chat' && key !== 'status');
     const mkey = (chatId || '') + ':' + key + ':' + (senderOpen || ''); const mnow = Date.now();
-    if (menuSeen.get(mkey) && mnow - menuSeen.get(mkey) < 3000) { logLine('忽略重复底部菜单点击: ' + key); return; }
+    const dwin = escapeHatch ? 1500 : 3000;
+    if (menuSeen.get(mkey) && mnow - menuSeen.get(mkey) < dwin) { logLine('忽略重复底部菜单点击: ' + key); return; }
     menuSeen.set(mkey, mnow); if (menuSeen.size > 200) menuSeen.clear();
     logLine('底部菜单点击: ' + key + (evId ? ' eid=…' + String(evId).slice(-6) : ' (无eid)') + (evTime ? ' age=' + Math.round((Date.now() - evTime) / 1000) + 's' : ' (无time)'));
     if (key === 'chat') { setSession(chatId, { mode: 'chat' }); await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。随时点底部「主菜单」回来。'); return; }
     if (key === 'status') { if (await denyProject(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
-    // 主菜单 / idle / exit / 未知 —— the ESCAPE HATCH: from ANY state, return to a clean main menu and
-    // ALWAYS emit a visible card. showCard patches the live card, or (if you cleared the chat / it was
-    // deleted) sends a fresh one. Resets the session so you're never stuck in a project/chat state.
+    // 主菜单 / idle / exit / 未知 —— the ESCAPE HATCH: from ANY state, return to a clean main menu with a
+    // FRESH visible card at the bottom. Delete lastCard first so showCard sends a NEW card even when the
+    // old control card is still alive but scrolled up (pushed away by a checker/quota notification or the
+    // owner-notify card — those append without clearing lastCard). Resets the session so you're unstuck.
     setSession(chatId, { mode: 'idle' });
+    lastCard.delete(chatId);
     await showCard(chatId, buildMenuCard(chatId));
   } catch (e) { logLine('底部菜单事件异常: ' + (e && (e.stack || e))); }
 }
