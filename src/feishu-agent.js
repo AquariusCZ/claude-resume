@@ -235,10 +235,18 @@ const QUERY_RE = /^\s*(查询|只读查询|只读|query)\s*[:：]?\s*([\s\S]+)$/
 async function runProjectQuery(chatId, project, prompt) {
   const qs = querySession(project.path);
   const cfg = readConfig();
-  const framed = `[对项目「${project.name}」(目录:${project.path})的只读提问。请按此策略作答,尽量省 token:` +
-    `1) 先看该目录下的文档索引(如 docs/ 目录、README、目录树),定位与问题最相关的 1~2 篇文档;` +
-    `2) 只读这几篇文档、以及它们引用的关键代码文件;` +
-    `3) 在本轮内直接简要作答。不要通读整个项目,不要启动子任务/子代理,不要长时间规划,也不要修改任何文件。]\n\n${prompt}`;
+  // Preferred: a project's AI_GUIDE.md (generate it with the project-tour skill) — a dense, self-
+  // contained tour (架构/模块/测试流程/数据格式/FAQ/术语/文档索引). Inject it ONCE when the query
+  // session is first created; later --resume calls reuse it from the conversation's prompt cache
+  // (cheap). Falls back to "explore docs/" framing for projects that don't have a guide yet.
+  let guide = '';
+  if (!qs.started) { try { guide = fs.readFileSync(path.join(project.path, 'AI_GUIDE.md'), 'utf8'); } catch (e) {} }
+  const framed = (guide ? `[项目导览 AI_GUIDE.md,优先据此作答;不足时再按其文末「文档索引」读 1~2 篇文档:]\n${guide}\n\n———\n` : '') +
+    `[对项目「${project.name}」(目录:${project.path})的只读提问。请尽量省 token:` +
+    (guide
+      ? `先看上面的项目导览作答;导览不足时,再按其文档索引读最相关的 1~2 篇文档及关键代码;`
+      : `先看该目录下的文档索引(AI_GUIDE.md / docs/ / README / 目录树),定位并只读与问题最相关的 1~2 篇文档及它们引用的关键代码;`) +
+    `在本轮内直接简要作答。不要通读整个项目,不要启动子任务/子代理,也不要修改任何文件。]\n\n${prompt}`;
   const stopHb = startHeartbeat(chatId, project.name + ' 查询');
   const r = await runClaude(qs.cwd, project.name + ' 查询', framed, {
     sessionId: qs.id, sessionExists: qs.started, addDir: project.path, readOnly: true,
