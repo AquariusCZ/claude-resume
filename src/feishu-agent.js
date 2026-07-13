@@ -329,6 +329,18 @@ function runClaude(cwd, label, prompt, opts) {
 }
 
 // ---- Feishu send helpers ----
+// retry a Feishu API call once on transient network errors (the logs show frequent TLS-handshake /
+// socket-disconnect blips that make a click look like it did nothing).
+async function apiRetry(fn) {
+  try { return await fn(); }
+  catch (e) {
+    if (/socket disconnected|handshake|TLS|ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|network/i.test(String(e && e.message))) {
+      await new Promise(r => setTimeout(r, 700));
+      return await fn();
+    }
+    throw e;
+  }
+}
 async function sendText(chatId, text) {
   // Feishu text messages get unwieldy past a few KB; chunk to <=3500 chars, cap 6 parts.
   const MAX = 3500, PARTS = 6;
@@ -338,16 +350,19 @@ async function sendText(chatId, text) {
   if (s.length) parts[parts.length - 1] += '\n…(内容过长已截断,完整结果见 VS Code 该项目会话)';
   for (const p of parts) {
     try {
-      await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: p }) } });
+      await apiRetry(() => client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: p }) } }));
     } catch (e) { logLine('发送失败: ' + (e && e.message)); }
   }
+  // a text message pushes the control card up out of view -> invalidate it so the next menu tap
+  // sends a fresh card at the bottom (fixes "点了没反应" when the live card is scrolled away).
+  lastCard.delete(chatId);
 }
 // one "control card" per chat: all navigation (main menu <-> project sub-menu) updates THIS card
 // in place instead of sending a new one, so cards never pile up.
 const lastCard = new Map();   // chatId -> message_id of the live control card
 async function sendCard(chatId, card) {
   try {
-    const res = await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(card) } });
+    const res = await apiRetry(() => client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(card) } }));
     const mid = res && res.data && res.data.message_id;
     if (mid) lastCard.set(chatId, mid);
     return mid;
@@ -358,7 +373,7 @@ async function sendCard(chatId, card) {
 async function showCard(chatId, card) {
   const mid = lastCard.get(chatId);
   if (mid) {
-    try { await client.im.message.patch({ path: { message_id: mid }, data: { content: JSON.stringify(card) } }); return mid; }
+    try { await apiRetry(() => client.im.message.patch({ path: { message_id: mid }, data: { content: JSON.stringify(card) } })); return mid; }
     catch (e) { lastCard.delete(chatId); }   // gone/too old -> fall through and send a new one
   }
   return await sendCard(chatId, card);
@@ -373,7 +388,7 @@ function currentCard(chatId) {
 async function refreshCard(chatId, messageId, card) {
   if (!messageId) return;
   try {
-    await client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(card || currentCard(chatId)) } });
+    await apiRetry(() => client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(card || currentCard(chatId)) } }));
     lastCard.set(chatId, messageId);   // the clicked card is now the live control card
   } catch (e) { logLine('更新卡片失败: ' + (e && e.message)); }
 }
