@@ -92,8 +92,9 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 3. **★ 控制卡「堆叠」与「被抢」是一对相互矛盾的坑**,来回改了好几版才平衡:
    - 只用一张控制卡原地 patch → 延迟/重复的底部菜单事件会把**项目卡 patch 回主菜单卡**(被抢);
    - 让项目卡独立、菜单发新卡 → 菜单事件**堆一堆主菜单卡**(堆叠)。
-   - 最终解法:**底部菜单事件 = 重绘「当前该显示的那张卡」(`showCard(currentCard(chatId))`)且不改 session**。在项目里就是幂等重画项目卡 → 积压/重复的菜单投递**什么都不做**(不堆、不抢、不踢出);想回主菜单用项目卡上的「⬅ 主菜单」按钮。`lastCard` 只跟踪那一张控制卡。
-   - 位置:`feishu-agent.js` `showCard`/`refreshCard`/`onBotMenu`/`currentCard`。
+   - 中间方案:底部菜单事件 = 重绘「当前该显示的那张卡」且不改 session(项目里幂等重画,积压投递不堆不抢);想回主菜单用卡上的「⬅ 主菜单」。
+   - **最终方案(按用户"底部主菜单任何时候都能回主菜单"的要求)**:底部菜单做成**「逃生舱」**——任何状态(idle/chat/project、甚至清空了聊天)点它都 `setSession(idle)` 并**在底部补发一张可见的主菜单卡**。关键配套:① `showCard` **不再**"内容没变就跳过 patch"(否则清空聊天后卡被删、内容又没变 → 直接跳过 → 无反应);逃生舱先 `lastCard.delete` 再 `showCard`,保证即使旧卡被通知顶到屏幕外也会在底部补新卡。② 用事件的 `event_id`/`create_time`(存在时)挡真正的重复投递/过期积压,逃生舱键用更短(1.5s)去重窗以免吞掉主动点击。**卡片按钮**(进项目/选模式/⬅主菜单)仍是原地 `patch`(那张卡用户正看着,不堆)。
+   - 位置:`feishu-agent.js` `showCard`/`refreshCard`/`onBotMenu`/`currentCard`;回归全靠 `test/card-flow.js`(含"清空聊天/卡被顶走仍补发"用例)守住。
 
 4. **飞书会「补投」用户之前积压的点击**(用户狂点几十次,事件会陆续到达),3 秒时间窗去重挡不住。所以关键是让重复/延迟事件**幂等**(见上条),而不是单纯去重。
 
@@ -119,7 +120,34 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 
 ---
 
-## 五、交互设计上的经验
+## 五、日志系统(踩过的坑 + 现在的约定)
+
+日志被反复弄坏过好几次(空白、错日期、乱码、失败无信息)。这里一次讲清:**有哪些日志、写在哪、怎么读、踩过什么坑**,以后照这个来,别再弄错。
+
+### 有哪些日志(都在 `%LOCALAPPDATA%\ClaudeResume\logs\`)
+- `run-<yyyyMMdd>.log` —— 续跑引擎(`checker.ps1` / `lib.ps1` 的 `Write-CcuLog`),按**本地日期**每天一个。**GUI 主窗口 + 弹出大窗显示的就是它。**
+- `feishu-<yyyy-MM-dd>.log` —— 飞书 agent(`feishu-agent.js` 的 `logLine`),按**本地日期**每天一个。
+- `feishu-stdout.log` —— node 进程的 stdout/stderr(SDK 连接日志);`feishu-launch.vbs` 重定向,>1MB 时重启前删,`Clear-OldCaches` 另 cap 2MB。
+- `gui-error.log` —— GUI 自身异常。
+- 导出日志(导出按钮)= 合并所有 `run-*.log` + `gui-error.log` 成一个 **UTF-8 带 BOM** 文件(方便任意编辑器打开中文)。
+
+### 踩过的坑(按中招顺序)
+1. **★ 跨天日志空白(最坑,反复中招)**:GUI 启动时把 `$script:logFile` 固定成 `run-<开窗那天>.log`,但 checker 写的是 `run-<当天>.log`。**过了午夜**,GUI 还在读昨天那个(空)文件 → 日志区空白,"预演完成"却看不到内容。
+   - 修:GUI **永远读最新的** `run-*.log`(`Get-CurLogFile` = 按 `LastWriteTime` 取最新),清空日志也清最新那个。**绝不**在启动时把日志文件名固定死。位置:`picker.ps1` 的 `Get-CurLogFile` / `Read-LogTail` / `BtnClearLog`。
+2. **★ UTC 写错日期/差 8 小时**:agent 早期用 `new Date().toISOString()`(UTC)拼文件名/时间戳 → 写进**前一天**的文件、时间也差 8h。修:一律本地时间(从 `new Date()` 的 getFullYear/getMonth/getDate/... 拼)。位置:`feishu-agent.js` 的 `logLine`。
+3. **清空日志 + 解除布防后一片空白**:清空后 checker 已解除、不再写,GUI 显示空,像坏了。修:空日志时显示占位提示,别让用户以为崩了。
+4. **中文乱码**:读日志没指定编码 → PS 5.1 按本地代码页解码,中文乱。修:`Get-Content -Encoding UTF8`(及 `[IO.File]::ReadAllText(...,UTF8)`)。位置:`Read-LogTail` / 导出。
+5. **★ 外部进程 stderr 被吞,失败像黑盒**:`runClaude` 早期 `child.stderr.on('data',()=>{})` 完全忽略 claude 的 stderr,查询失败时日志毫无线索。修:收集 stderr,失败时把 **exit code + stderr 尾 + 是否有 assistant 文本** 写进日志——正是靠它才定位到"no stdin data received"和 cmd 换行截断。位置:`runClaude` 的 close 分支。
+6. **日志无限增长**:node 的 stdout 只涨不清。修:vbs 重启前 >1MB 删;`Clear-OldCaches` cap 2MB;`run/feishu-<date>.log` 保留 30 天。
+7. **彩色日志的坑**:GUI 用 TextBlock 的 `Inlines` 按级别(info/ok/warn/error/launch/stream)着色(`Set-LogColored`),不是纯文本。改日志**行格式**时,注意别破坏着色用的正则/前缀,否则颜色乱或整块变默认色。
+
+### 现在的约定(改日志前先看这条)
+- **写**:引擎用 `Write-CcuLog`(本地时间、`run-<当天>`),agent 用 `logLine`(本地时间、`feishu-<当天>`)。**绝不用 UTC**。
+- **读/显示**:一律经 `Read-LogTail`(读**最新** `run-*.log`、UTF-8)。**别再引用启动时固定的日期文件名。**
+- **失败必留证据**:任何外部进程(claude 等)失败,必须把 exit code + stderr 尾记进日志。
+- **新长期文件**要纳入 `Clear-OldCaches` 的清理与容量上限。
+
+## 六、交互设计上的经验
 
 1. **默认「什么都不做」(idle)**:机器人一进来不主动跑,等用户点卡片选模式,避免手滑乱花额度 / 误改项目。
 
@@ -135,7 +163,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 
 ---
 
-## 六、开发方法论(这次真正省时间的做法)
+## 七、开发方法论(这次真正省时间的做法)
 
 1. **★ 离线自测台,别每次让用户去飞书点**。
    - `FEISHU_TEST=1` 时:`feishu-agent.js` 用一个**记录型 mock client**(不联网、不启动长连接、不占单实例锁),导出 `onMessage/onCardAction/onBotMenu`。
@@ -151,7 +179,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 
 ---
 
-## 七、开发历程(这个项目是怎么长成现在这样的)
+## 八、开发历程(这个项目是怎么长成现在这样的)
 
 大致演进,记录"为什么会变成现在这样":
 
