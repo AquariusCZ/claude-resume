@@ -43,6 +43,10 @@ async function main() {
   } finally {
     fs.writeFileSync(CFG, cfgBackup);
     if (sessBackup) fs.writeFileSync(SESS, sessBackup); else { try { fs.unlinkSync(SESS); } catch (e) {} }
+    // this test ran REAL chat in the shared feishu-chat session — wipe it so its "read the secret"
+    // turns don't pollute the user's chat memory (--continue would otherwise surface them).
+    try { fs.rmSync(path.join(APP, 'feishu-chat', '.started'), { force: true }); } catch (e) {}
+    try { const pr = path.join(process.env.USERPROFILE || '', '.claude', 'projects'); for (const d of fs.readdirSync(pr)) { if (/ClaudeResume-feishu-chat$/i.test(d)) fs.rmSync(path.join(pr, d), { recursive: true, force: true }); } } catch (e) {}
   }
   console.log(failed ? `\nFAILED (${failed})` : '\nALL PASS');
   process.exit(failed ? 1 : 0);

@@ -1035,6 +1035,10 @@ if (TEST_MODE) {
   module.exports = { onMessage, onCardAction, onBotMenu, client, lastCard, setSession, getSession, discoverProjects, currentCard, querySession, clearQuerySession };
   return;   // don't connect to Feishu in tests
 }
+// on every (re)start — usually right after a deploy — reset all chat sessions to idle. The user often
+// clears the Feishu chat while testing, which deletes the old cards; a stale project/chat session +
+// deleted-card references would make the next taps look dead. Starting clean makes the first tap work.
+try { writeSessions({}); lastCard.clear(); cardHash.clear(); logLine('启动:已重置所有会话为初始状态(idle)'); } catch (e) {}
 const wsClient = new lark.WSClient({ appId: APP_ID, appSecret: APP_SECRET });
 // register both v1 and v2 of the receive-message event so whichever the console offers works
 const handlers = { 'im.message.receive_v1': async (data) => { await onMessage(data); } };
