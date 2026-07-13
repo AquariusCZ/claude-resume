@@ -195,8 +195,12 @@ function runClaude(cwd, label, prompt, opts) {
     args.push('-p', prompt, '--output-format', 'stream-json', '--verbose');
     const model = opts.model || cfg.resumeModel;   // opts.model lets chat use its own model
     if (model) { args.push('--model', model); }
-    const skip = (opts.skipPermissions !== undefined) ? opts.skipPermissions : cfg.skipPermissions;
-    if (skip) { args.push('--dangerously-skip-permissions'); }
+    if (opts.readOnly) {
+      args.push('--permission-mode', 'plan');       // viewer: analyze/answer, never modify
+    } else {
+      const skip = (opts.skipPermissions !== undefined) ? opts.skipPermissions : cfg.skipPermissions;
+      if (skip) { args.push('--dangerously-skip-permissions'); }
+    }
     const timeoutMs = Math.max(1, (parseInt(cfg.perProjectTimeoutMinutes, 10) || 30)) * 60000;
     const key = cwd.toLowerCase();
 
@@ -342,7 +346,7 @@ function helpText(chatId) {
     '· 状态 → 布防 / 额度 / 当前模式',
     '· 停止 <项目> → 取消正在跑的指令',
     '· 模型 / 模型 opus → 查看或切换模型(聊天+项目都用,与软件同步)',
-    '· 授权 ou_xxx / 取消授权 / 授权列表 → 管理谁能操作项目',
+    '· 授权 ou_xxx(可改)/ 只读授权 ou_xxx(只查)/ 取消授权 / 授权列表 → 管理权限',
     '· 忘记闲聊 → 清空闲聊记忆,从头开始',
     '',
     '注:项目执行会继续 VS Code 里同一个会话,面板不实时刷新,重开可见。',
@@ -353,34 +357,55 @@ function helpText(chatId) {
 // feishuAuthOpenIds empty = not locked (anyone). Once set, only listed open_ids may operate
 // on projects / change config; everyone else can still chat. A password (feishuAuthPassword)
 // lets a new account self-authorize via 「解锁 <密码>」.
-function isAuthorized(openId) {
+// three levels: 'full' (can modify projects + change config), 'viewer' (query projects
+// read-only, no modify/config), 'none' (chat only). feishuAuthOpenIds empty = not locked (all full).
+function authLevel(openId) {
   const cfg = readConfig();
-  const list = Array.isArray(cfg.feishuAuthOpenIds) ? cfg.feishuAuthOpenIds.filter(Boolean) : [];
-  if (!list.length) return true;                 // not locked yet
-  return !!openId && list.indexOf(openId) !== -1;
+  const full = (Array.isArray(cfg.feishuAuthOpenIds) ? cfg.feishuAuthOpenIds : []).filter(Boolean);
+  const view = (Array.isArray(cfg.feishuViewerOpenIds) ? cfg.feishuViewerOpenIds : []).filter(Boolean);
+  if (openId && full.indexOf(openId) !== -1) return 'full';
+  if (openId && view.indexOf(openId) !== -1) return 'viewer';
+  if (!full.length) return 'full';               // not locked yet
+  return 'none';
 }
-const notifiedUnauth = new Set();   // notify the owner at most once per unauthorized open_id
-async function denyIfUnauthorized(openId, chatId) {
-  if (isAuthorized(openId)) return false;
-  await sendText(chatId, `🔒 无权限:操作项目 / 改配置仅限已授权账号(你可以闲聊)。\n你的 open_id:${openId || '未知'}`);
-  logLine('拦截未授权操作: ' + openId);
+const canProject = openId => authLevel(openId) !== 'none';   // enter/query a project (viewer=read-only)
+const canConfig  = openId => authLevel(openId) === 'full';   // modify projects / change config / authorize
+
+const notifiedUnauth = new Set();   // notify the owner at most once per unknown open_id
+function notifyOwner(openId, chatId) {
   try {
     const owner = readConfig().feishuChatId;
-    if (owner && owner !== chatId && openId && !notifiedUnauth.has(openId)) {
-      notifiedUnauth.add(openId);
-      await sendCard(owner, {
-        config: { wide_screen_mode: true },
-        header: { template: 'red', title: { tag: 'plain_text', content: '🔔 有人请求操作项目' } },
-        elements: [
-          { tag: 'div', text: { tag: 'lark_md', content: `open_id:\`${openId}\`\n授权他操作你的项目?` } },
-          { tag: 'action', actions: [
-            { tag: 'button', text: { tag: 'plain_text', content: '✅ 授权此人' }, type: 'primary', value: { do: 'authorize', id: openId } },
-            { tag: 'button', text: { tag: 'plain_text', content: '忽略' }, type: 'default', value: { do: 'noop' } },
-          ] },
-        ],
-      });
-    }
+    if (!owner || owner === chatId || !openId || notifiedUnauth.has(openId)) return;
+    notifiedUnauth.add(openId);
+    sendCard(owner, {
+      config: { wide_screen_mode: true },
+      header: { template: 'red', title: { tag: 'plain_text', content: '🔔 有人请求使用机器人' } },
+      elements: [
+        { tag: 'div', text: { tag: 'lark_md', content: `open_id:\`${openId}\`\n给他什么权限?` } },
+        { tag: 'action', actions: [
+          { tag: 'button', text: { tag: 'plain_text', content: '✅ 可改项目' }, type: 'primary', value: { do: 'authorize', id: openId } },
+          { tag: 'button', text: { tag: 'plain_text', content: '👁 只读查询' }, type: 'default', value: { do: 'viewauth', id: openId } },
+          { tag: 'button', text: { tag: 'plain_text', content: '忽略' }, type: 'default', value: { do: 'noop' } },
+        ] },
+      ],
+    });
   } catch (e) {}
+}
+// gate for project entry/query/status (viewers allowed). returns true if denied.
+async function denyProject(openId, chatId) {
+  if (canProject(openId)) return false;
+  await sendText(chatId, `🔒 无权限:需授权才能查询项目(你可以闲聊)。\n你的 open_id:${openId || '未知'}`);
+  logLine('拦截未授权(项目): ' + openId); notifyOwner(openId, chatId); return true;
+}
+// gate for modify/config/authorize (full only). returns true if denied.
+async function denyConfig(openId, chatId) {
+  if (canConfig(openId)) return false;
+  const lvl = authLevel(openId);
+  await sendText(chatId, lvl === 'viewer'
+    ? '🔒 只读账号:可以查询项目,但不能修改项目 / 改配置 / 授权他人。'
+    : `🔒 无权限。你的 open_id:${openId || '未知'}`);
+  logLine('拦截未授权(配置): ' + openId);
+  if (lvl !== 'viewer') notifyOwner(openId, chatId);
   return true;
 }
 
@@ -440,28 +465,34 @@ async function onMessage(data) {
       return;
     }
 
-    // authorize other people (authorized users only): 授权 ou_xxx / 取消授权 ou_xxx / 授权列表
+    // permission management (owners only): 授权 / 取消授权 / 只读授权 / 取消只读 / 授权列表
     if (/^(授权列表|权限列表|谁有权限)$/.test(text)) {
-      if (await denyIfUnauthorized(senderOpen, chatId)) return;
-      const list = (readConfig().feishuAuthOpenIds || []).filter(Boolean);
-      await sendText(chatId, '已授权账号:\n' + (list.length ? list.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无 — 当前对所有人开放)'));
+      if (await denyConfig(senderOpen, chatId)) return;
+      const c = readConfig();
+      const full = (c.feishuAuthOpenIds || []).filter(Boolean), view = (c.feishuViewerOpenIds || []).filter(Boolean);
+      await sendText(chatId, '✅ 可改项目:\n' + (full.length ? full.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无 — 未锁定,所有人可改)') +
+        '\n\n👁 只读查询:\n' + (view.length ? view.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无)'));
       return;
     }
-    if (/^(授权|取消授权|解除授权)\b/.test(text)) {
-      if (await denyIfUnauthorized(senderOpen, chatId)) return;
-      const idm = text.match(/(ou_[A-Za-z0-9]+)/);
-      if (!idm) { await sendText(chatId, '用法:「授权 ou_xxxx」添加,「取消授权 ou_xxxx」移除,「授权列表」查看。\n让对方给机器人发条消息,他会收到自己的 open_id,发给你即可。'); return; }
-      const c2 = readConfig(); let list = Array.isArray(c2.feishuAuthOpenIds) ? c2.feishuAuthOpenIds.filter(Boolean) : [];
-      const id = idm[1];
-      if (/^(取消授权|解除授权)/.test(text)) { list = list.filter(x => x !== id); await sendText(chatId, '已移除授权:' + id); }
-      else { if (list.indexOf(id) === -1) list.push(id); await sendText(chatId, '✅ 已授权:' + id); }
-      c2.feishuAuthOpenIds = list; try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(c2, null, 4), 'utf8'); } catch (e) {}
+    const am = text.match(/^(授权|取消授权|解除授权|只读授权|取消只读|只读)\s*(ou_[A-Za-z0-9]+)?/);
+    if (am) {
+      if (await denyConfig(senderOpen, chatId)) return;
+      const id = am[2];
+      if (!id) { await sendText(chatId, '用法:\n「授权 ou_xxx」= 可改项目\n「只读授权 ou_xxx」= 只能查询\n「取消授权 / 取消只读 ou_xxx」= 移除\n「授权列表」查看。\n让对方给我发条消息,他会看到自己的 open_id。'); return; }
+      const c = readConfig();
+      let full = (c.feishuAuthOpenIds || []).filter(Boolean), view = (c.feishuViewerOpenIds || []).filter(Boolean);
+      const kind = am[1];
+      if (kind === '授权') { if (full.indexOf(id) === -1) full.push(id); view = view.filter(x => x !== id); await sendText(chatId, '✅ 已授权(可改):' + id); }
+      else if (kind === '只读授权' || kind === '只读') { if (view.indexOf(id) === -1) view.push(id); full = full.filter(x => x !== id); await sendText(chatId, '👁 已授权(只读):' + id); }
+      else { full = full.filter(x => x !== id); view = view.filter(x => x !== id); await sendText(chatId, '已移除:' + id); }
+      c.feishuAuthOpenIds = full; c.feishuViewerOpenIds = view;
+      try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
       return;
     }
 
     // ---- global commands (work in any mode) ----
     if (['帮助', 'help', '?', '？'].indexOf(low) !== -1) { await sendText(chatId, helpText(chatId)); return; }
-    if (['状态', 'status', 'zt'].indexOf(low) !== -1) { if (await denyIfUnauthorized(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
+    if (['状态', 'status', 'zt'].indexOf(low) !== -1) { if (await denyProject(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
     if (['项目', 'list', '项目列表', '列出项目', '所有项目', '菜单', 'menu', '选择', '操作'].indexOf(low) !== -1) { await sendCard(chatId, buildMenuCard(chatId)); return; }
     if (['退出', '返回', 'exit', 'quit', '退出项目', '主菜单'].indexOf(low) !== -1) {
       setSession(chatId, { mode: 'idle' });
@@ -482,7 +513,7 @@ async function onMessage(data) {
     }
     const setm = text.match(/^(模型|闲聊模型|model)\s+(opus|sonnet|haiku|默认|default|清除|空|none)$/i);
     if (setm) {
-      if (await denyIfUnauthorized(senderOpen, chatId)) return;
+      if (await denyConfig(senderOpen, chatId)) return;
       const a = setm[2].toLowerCase();
       const val = (['opus', 'sonnet', 'haiku'].indexOf(a) !== -1) ? a : '';
       try { const c = readConfig(); c.feishuChatModel = val; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
@@ -491,7 +522,7 @@ async function onMessage(data) {
     }
     // forget chat memory (drop the started flag + the claude session for the chat cwd)
     if (['忘记闲聊', '清空闲聊', '重置闲聊', '忘记记忆', 'forget', 'reset chat'].indexOf(low) !== -1) {
-      if (await denyIfUnauthorized(senderOpen, chatId)) return;
+      if (await denyConfig(senderOpen, chatId)) return;
       try { fs.rmSync(path.join(CHAT_DIR, '.started'), { force: true }); } catch (e) {}
       try {
         const proot = path.join(os.homedir(), '.claude', 'projects');
@@ -511,7 +542,7 @@ async function onMessage(data) {
     // ---- explicit enter/switch: 进入 / 选择 / 切换 <编号或名字> ----
     const m = text.match(/^(进入|选择|选|切换|打开|进|use|open)\s+(.+)$/i);
     if (m) {
-      if (await denyIfUnauthorized(senderOpen, chatId)) return;
+      if (await denyProject(senderOpen, chatId)) return;
       const p = findProject(m[2]);
       if (p) { setSession(chatId, { mode: 'project', project: p.path }); await sendText(chatId, `已进入 📂「${p.name}」。之后消息都会在这里续跑;发「退出」回主菜单,「进入 X」换项目。`); }
       else await sendText(chatId, `没找到项目「${m[2]}」。\n\n` + listText());
@@ -526,15 +557,16 @@ async function onMessage(data) {
 
     // bare project name/number -> enter it (works from any mode)
     const bare = projectIfBareName(text);
-    if (bare) { if (await denyIfUnauthorized(senderOpen, chatId)) return; setSession(chatId, { mode: 'project', project: bare.path }); await sendText(chatId, `已进入 📂「${bare.name}」。直接发指令即可;发「退出」回主菜单。`); return; }
+    if (bare) { if (await denyProject(senderOpen, chatId)) return; setSession(chatId, { mode: 'project', project: bare.path }); await sendText(chatId, `已进入 📂「${bare.name}」。直接发指令即可;发「退出」回主菜单。`); return; }
     // "<project> <command>" -> one-off run, doesn't change the current mode
     const oneoff = oneOffTarget(text);
     if (oneoff.project) {
-      if (await denyIfUnauthorized(senderOpen, chatId)) return;
+      if (await denyProject(senderOpen, chatId)) return;
+      const ro = authLevel(senderOpen) === 'viewer';
       if (running.has(oneoff.project.path.toLowerCase())) { await sendText(chatId, `「${oneoff.project.name}」正在执行中,请稍候。`); return; }
-      await sendText(chatId, `📂 一次性在「${oneoff.project.name}」执行:${oneoff.prompt}\n(可能要 1-4 分钟,跑完自动回结果)`);
+      await sendText(chatId, `📂 ${ro ? '(只读查询)' : '一次性'}在「${oneoff.project.name}」执行:${oneoff.prompt}\n(可能要 1-4 分钟,跑完自动回结果)`);
       const stopHb = startHeartbeat(chatId, oneoff.project.name);
-      const r = await runClaude(oneoff.project.path, oneoff.project.name, oneoff.prompt, { useContinue: true, model: cfg.feishuChatModel });
+      const r = await runClaude(oneoff.project.path, oneoff.project.name, oneoff.prompt, { useContinue: true, model: cfg.feishuChatModel, readOnly: ro });
       stopHb();
       await sendText(chatId, (r.ok ? `✅ 「${oneoff.project.name}」完成:\n\n` : `⚠️ 「${oneoff.project.name}」:\n\n`) + (r.text || '(无输出)'));
       logLine(`一次性完成 ${oneoff.project.name} ok=${r.ok}`);
@@ -544,11 +576,12 @@ async function onMessage(data) {
     // ---- mode dispatch ----
     const active = activeProject(chatId);
     if (active) {   // project mode: run in the active project
-      if (await denyIfUnauthorized(senderOpen, chatId)) return;
+      if (await denyProject(senderOpen, chatId)) return;
+      const ro = authLevel(senderOpen) === 'viewer';
       if (running.has(active.path.toLowerCase())) { await sendText(chatId, `「${active.name}」正在执行中,请稍候,或发「停止」取消。`); return; }
-      await sendText(chatId, `📂 在「${active.name}」执行:${text}\n(可能要 1-4 分钟,跑完自动回结果)`);
+      await sendText(chatId, `📂 ${ro ? '(只读查询)' : ''}在「${active.name}」执行:${text}\n(可能要 1-4 分钟,跑完自动回结果)`);
       const stopHb = startHeartbeat(chatId, active.name);
-      const r = await runClaude(active.path, active.name, text, { useContinue: true, model: cfg.feishuChatModel });
+      const r = await runClaude(active.path, active.name, text, { useContinue: true, model: cfg.feishuChatModel, readOnly: ro });
       stopHb();
       await sendText(chatId, (r.ok ? `✅ 「${active.name}」完成:\n\n` : `⚠️ 「${active.name}」:\n\n`) + (r.text || '(无输出)'));
       logLine(`完成 ${active.name} ok=${r.ok}`);
@@ -575,6 +608,7 @@ async function onMessage(data) {
 
 // ---- interactive card button clicks (card.action.trigger) ----
 const cardSeen = new Map(); // dedup rapid Feishu re-deliveries of the same click
+const menuSeen = new Map(); // dedup rapid bottom-menu taps
 async function onCardAction(ev) {
   try {
     const chatId = (ev.context && ev.context.open_chat_id) || ev.open_chat_id;
@@ -596,14 +630,19 @@ async function onCardAction(ev) {
     // IMPORTANT: a card callback must respond within a few seconds or Feishu shows
     // "目标回调服务超时未响应". So do ONLY fast local work here (sync file writes) and fire every
     // API call (send/patch) WITHOUT await, then return immediately.
-    const gated = ['status', 'perm', 'model', 'enter', 'authorize', 'revoke'].indexOf(val.do) !== -1;
-    if (gated && !isAuthorized(senderOpen)) { denyIfUnauthorized(senderOpen, chatId); return; }
+    const projectActs = ['status', 'enter'];                                   // viewers allowed
+    const configActs = ['perm', 'model', 'authorize', 'revoke', 'viewauth', 'viewrevoke'];  // full only
+    if (projectActs.indexOf(val.do) !== -1 && !canProject(senderOpen)) { denyProject(senderOpen, chatId); return; }
+    if (configActs.indexOf(val.do) !== -1 && !canConfig(senderOpen)) { denyConfig(senderOpen, chatId); return; }
 
     if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); refreshCard(chatId, messageId); return; }
     if (val.do === 'status') { sendText(chatId, statusText(chatId)); return; }
     if (val.do === 'perm') {
-      const list = (readConfig().feishuAuthOpenIds || []).filter(Boolean);
-      sendText(chatId, '🔑 已授权账号:\n' + (list.length ? list.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无 — 当前对所有人开放)') + '\n\n加人:让对方给我发条消息 → 你会收到「授权此人」卡片,一键点即可(也可发「授权 ou_xxx」/「取消授权 ou_xxx」)。');
+      const c = readConfig();
+      const full = (c.feishuAuthOpenIds || []).filter(Boolean), view = (c.feishuViewerOpenIds || []).filter(Boolean);
+      sendText(chatId, '✅ 可改项目:\n' + (full.length ? full.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无 — 未锁定)') +
+        '\n👁 只读查询:\n' + (view.length ? view.map((x, i) => `${i + 1}. ${x}`).join('\n') : '(无)') +
+        '\n\n加人:让对方给我发条消息 → 你会收到卡片,点「可改项目」或「只读查询」即可。');
       return;
     }
     if (val.do === 'noop') { return; }
@@ -620,13 +659,17 @@ async function onCardAction(ev) {
       else sendText(chatId, '项目未找到(可能已变化)。发「菜单」重新选。');
       return;
     }
-    if (val.do === 'authorize' || val.do === 'revoke') {   // one-tap from the owner-notification card
+    // one-tap grant from the owner-notification card
+    if (['authorize', 'revoke', 'viewauth', 'viewrevoke'].indexOf(val.do) !== -1) {
       const id = String(val.id || '');
       if (/^ou_[A-Za-z0-9]+$/.test(id)) {
-        const c = readConfig(); let list = Array.isArray(c.feishuAuthOpenIds) ? c.feishuAuthOpenIds.filter(Boolean) : [];
-        if (val.do === 'revoke') list = list.filter(x => x !== id); else if (list.indexOf(id) === -1) list.push(id);
-        c.feishuAuthOpenIds = list; try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
-        sendText(chatId, (val.do === 'revoke' ? '已移除授权:' : '✅ 已授权:') + id);
+        const c = readConfig();
+        let full = (c.feishuAuthOpenIds || []).filter(Boolean), view = (c.feishuViewerOpenIds || []).filter(Boolean);
+        if (val.do === 'authorize') { if (full.indexOf(id) === -1) full.push(id); view = view.filter(x => x !== id); sendText(chatId, '✅ 已授权(可改):' + id); }
+        else if (val.do === 'viewauth') { if (view.indexOf(id) === -1) view.push(id); full = full.filter(x => x !== id); sendText(chatId, '👁 已授权(只读):' + id); }
+        else { full = full.filter(x => x !== id); view = view.filter(x => x !== id); sendText(chatId, '已移除:' + id); }
+        c.feishuAuthOpenIds = full; c.feishuViewerOpenIds = view;
+        try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
       }
       return;
     }
@@ -644,9 +687,13 @@ async function onBotMenu(ev) {
     if (!chatId) { logLine('菜单点击但无 chatId(先随便发一句让我记录会话)'); return; }
     const allow = Array.isArray(cfg.feishuAllowOpenIds) ? cfg.feishuAllowOpenIds.filter(Boolean) : [];
     if (allow.length && senderOpen && allow.indexOf(senderOpen) === -1) return;
+    // dedup rapid repeat taps (the menu has round-trip latency; users tap again -> duplicates)
+    const mkey = (chatId || '') + ':' + key + ':' + (senderOpen || ''); const mnow = Date.now();
+    if (menuSeen.get(mkey) && mnow - menuSeen.get(mkey) < 3000) { logLine('忽略重复底部菜单点击: ' + key); return; }
+    menuSeen.set(mkey, mnow); if (menuSeen.size > 200) menuSeen.clear();
     logLine(`底部菜单点击: ${key}`);
     if (key === 'chat') { setSession(chatId, { mode: 'chat' }); await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。'); return; }
-    if (key === 'status') { if (await denyIfUnauthorized(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
+    if (key === 'status') { if (await denyProject(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
     if (key === 'idle' || key === 'exit') { setSession(chatId, { mode: 'idle' }); }
     // default (menu / unknown) -> show the main menu card
     await sendCard(chatId, buildMenuCard(chatId));
