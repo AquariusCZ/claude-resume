@@ -214,7 +214,7 @@ const QUERY_RE = /^\s*(查询|只读查询|只读|query)\s*[:：]?\s*([\s\S]+)$/
 async function runProjectQuery(chatId, project, prompt) {
   const qs = querySession(project.path);
   const cfg = readConfig();
-  const framed = `[以下是对项目「${project.name}」(目录:${project.path})的只读提问。请只读代码/文档来回答,切勿修改任何文件。]\n\n${prompt}`;
+  const framed = `[以下是对项目「${project.name}」(目录:${project.path})的只读提问。请直接阅读该目录下相关的代码/文档后,在本轮内简要作答;不要启动子任务或长时间规划,也不要修改任何文件。]\n\n${prompt}`;
   const stopHb = startHeartbeat(chatId, project.name + ' 查询');
   const r = await runClaude(qs.cwd, project.name + ' 查询', framed, {
     sessionId: qs.id, sessionExists: qs.started, addDir: project.path, readOnly: true, model: cfg.feishuChatModel
@@ -289,6 +289,7 @@ function runClaude(cwd, label, prompt, opts) {
     running.set(key, child);
 
     let buf = '', resultText = null, isError = null, limited = false, killedForTimeout = false;
+    let lastAssistant = null, errBuf = '';   // fallback answer (if no result event) + captured stderr
     const to = setTimeout(() => { killedForTimeout = true; try { child.kill(); } catch (e) {} }, timeoutMs);
     function scanLine(ln) {
       if (!ln) return;
@@ -296,17 +297,25 @@ function runClaude(cwd, label, prompt, opts) {
           /usage limit|rate limit|limit reached|weekly limit/i.test(ln)) limited = true;
       if (ln.indexOf('"type":"result"') !== -1 || /"type"\s*:\s*"result"/.test(ln)) {
         try { const j = JSON.parse(ln); if (j.type === 'result') { if (typeof j.result === 'string') resultText = j.result; if (typeof j.is_error === 'boolean') isError = j.is_error; } } catch (e) {}
+      } else if (ln.indexOf('"type":"assistant"') !== -1) {
+        // remember the last non-empty assistant text — used as a fallback if no result event arrives
+        try { const j = JSON.parse(ln); const c = j && j.message && j.message.content; if (Array.isArray(c)) { for (const p of c) { if (p && p.type === 'text' && typeof p.text === 'string' && p.text.trim()) lastAssistant = p.text; } } } catch (e) {}
       }
     }
     child.stdout.on('data', d => { buf += d.toString('utf8'); let i; while ((i = buf.indexOf('\n')) >= 0) { scanLine(buf.slice(0, i)); buf = buf.slice(i + 1); } });
-    child.stderr.on('data', () => {});
-    child.on('close', () => {
+    child.stderr.on('data', d => { errBuf += d.toString('utf8'); if (errBuf.length > 4000) errBuf = errBuf.slice(-4000); });
+    child.on('close', (code) => {
       clearTimeout(to); running.delete(key);
       if (buf) scanLine(buf);
       if (killedForTimeout) { resolve({ ok: false, limited, text: `执行超时(> ${timeoutMs / 60000} 分钟),已终止。` }); return; }
       if (resultText !== null && isError !== true) { resolve({ ok: true, limited, text: resultText }); return; }
       if (limited) { resolve({ ok: false, limited: true, text: '又被限流了。可在「Claude续跑」里布防,额度恢复后自动续跑。' }); return; }
-      resolve({ ok: false, limited, text: resultText || '执行结束但未拿到成功结果(可能出错)。' });
+      // no clean result -> log why (claude's stderr was previously swallowed, leaving failures blind)
+      const errTail = errBuf.trim().slice(-600).replace(/\s+/g, ' ');
+      logLine(`runClaude 未成功 [${label}] exit=${code} isError=${isError} assistant文本=${lastAssistant ? '有' : '无'}${errTail ? ' · stderr尾: ' + errTail : ''}`);
+      // claude answered but the final result event was missing/dropped -> return what it said
+      if (isError !== true && lastAssistant && lastAssistant.trim()) { resolve({ ok: true, limited, text: lastAssistant }); return; }
+      resolve({ ok: false, limited, text: resultText || lastAssistant || '执行结束但未拿到成功结果(可能出错)。' });
     });
   });
 }
