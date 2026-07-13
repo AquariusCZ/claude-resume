@@ -232,6 +232,14 @@ const QUERY_RE = /^\s*(查询|只读查询|只读|query)\s*[:：]?\s*([\s\S]+)$/
 // run one read-only query in the project's DEDICATED shared query session (any user/time -> same convo).
 // Runs in an ISOLATED cwd (qs.cwd) + --add-dir project.path so the transcript stays out of the
 // project's --continue pool; the prompt names the project so claude knows where to look.
+// current short git HEAD of a project (for AI_GUIDE freshness), '' if not a git repo / no git
+function projectGitHash(projectPath) {
+  try {
+    const r = require('child_process').spawnSync('git', ['-C', projectPath, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8', timeout: 3000, windowsHide: true });
+    if (r && r.status === 0) return String(r.stdout).trim();
+  } catch (e) {}
+  return '';
+}
 async function runProjectQuery(chatId, project, prompt) {
   const qs = querySession(project.path);
   const cfg = readConfig();
@@ -239,9 +247,17 @@ async function runProjectQuery(chatId, project, prompt) {
   // contained tour (架构/模块/测试流程/数据格式/FAQ/术语/文档索引). Inject it ONCE when the query
   // session is first created; later --resume calls reuse it from the conversation's prompt cache
   // (cheap). Falls back to "explore docs/" framing for projects that don't have a guide yet.
-  let guide = '';
-  if (!qs.started) { try { guide = fs.readFileSync(path.join(project.path, 'AI_GUIDE.md'), 'utf8'); } catch (e) {} }
-  const framed = (guide ? `[项目导览 AI_GUIDE.md,优先据此作答;不足时再按其文末「文档索引」读 1~2 篇文档:]\n${guide}\n\n———\n` : '') +
+  let guide = '', staleNote = '';
+  if (!qs.started) {
+    try {
+      guide = fs.readFileSync(path.join(project.path, 'AI_GUIDE.md'), 'utf8');
+      // freshness: the guide records the git hash it was built at; warn if the project moved on.
+      const rec = (guide.match(/project-tour[^\n]*git\s+([0-9a-f]{6,40})/i) || [])[1];
+      const cur = projectGitHash(project.path);
+      if (rec && cur && rec !== cur) staleNote = `⚠️ 提示:本导览生成于较早的提交(git ${rec}),项目现已到 ${cur}——架构/模块/数据格式/术语等大框架通常仍准,但**具体实现细节请以实际代码为准**,不确定处务必读相关源码后再答。\n\n`;
+    } catch (e) {}
+  }
+  const framed = (guide ? `[项目导览 AI_GUIDE.md,优先据此作答;不足时再按其文末「文档索引」读 1~2 篇文档:]\n${staleNote}${guide}\n\n———\n` : '') +
     `[对项目「${project.name}」(目录:${project.path})的只读提问。请尽量省 token:` +
     (guide
       ? `先看上面的项目导览作答;导览不足时,再按其文档索引读最相关的 1~2 篇文档及关键代码;`

@@ -1,3 +1,4 @@
+<!-- project-tour · generated <本地日期 时:分> · git <当前short-hash或nogit> -->
 # <项目名> — AI 导览(AI_GUIDE.md)
 
 > 一句话:<这个项目做什么、给谁用、解决什么问题>。
