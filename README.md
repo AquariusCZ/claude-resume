@@ -46,6 +46,10 @@ Configure a Feishu **自建应用** and a single bot handles **both** notificati
 
 How it talks: by default you're in **chat mode** (just chatting with Claude, no project touched). Send **项目** to list projects, **进入 2** (or a project's name) to start operating on one — then every message runs `claude --continue` there — and **退出** to go back to chat. Also: **`<项目名> <指令>`** for a one-off without switching, **模型** / **模型 opus** to view or switch the chat model, **忘记闲聊** to reset chat memory, plus **状态** / **停止** / **帮助**. A project run continues the **same** conversation your VS Code session shows (reopen the session to see it — the panel doesn't live-refresh external appends).
 
+**Read-only queries** — prefix any project message with **查询** (or **只读**), e.g. `查询 这个模块怎么跑`, to ask *about* a project without changing a single file (runs `--permission-mode plan`). Every read-only query for a project — from anyone, at any time — lands in **one dedicated per-project query session** (a fixed session id), so the Q&A builds up its own shared context separate from your VS Code work session.
+
+**Authorization (3 levels).** Chat is open to everyone; touching projects is gated. `feishuAuthOpenIds` empty = not locked (anyone can do anything). Once you add yourself, others are **none** (chat only) until you grant them — when an unauthorized user messages the bot you get a card with **[✅ 可改项目]** / **[👁 只读查询]** buttons, or type **`授权 ou_xxx`** (full: modify) / **`只读授权 ou_xxx`** (viewer: read-only queries only). A viewer's every project message is forced read-only into that dedicated query session; only **full** users can modify. Manage with **取消授权** / **取消只读** / **授权列表**. (A user's `ou_…` open_id is shown to them the first time they message the bot.)
+
 The GUI mirrors two of these: a **闲聊模型 chip** (top-right, click to cycle 默认/Sonnet/Opus/Haiku) and a **忘记闲聊** button (bottom row) — both write the same `config.json` the agent reads, so the two stay in sync.
 
 > Prefer not to set up an app? Set `feishuWebhook` (a group **custom-bot** webhook, `feishuSecret` if 签名校验 is on) for **one-way notifications only**.
