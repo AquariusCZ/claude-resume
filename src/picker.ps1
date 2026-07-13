@@ -162,6 +162,7 @@ if(-not $script:instanceOwned -and -not $RenderTo -and -not $SelfTest){
           <Button x:Name="BtnForgetChat" Style="{StaticResource LinkBtn}" Content="忘记闲聊" Margin="0,2,16,2"/>
           <Button x:Name="BtnClearQuery" Style="{StaticResource LinkBtn}" Content="清空查询" Margin="0,2,16,2" ToolTip="清空所有项目的『只读查询』记忆(下次查询从头开始)"/>
           <Button x:Name="BtnAuthUsers" Style="{StaticResource LinkBtn}" Content="授权用户" Margin="0,2,16,2" ToolTip="查看 / 移除有权限的飞书用户(飞书后台看不到，这才是真正的授权名单)"/>
+          <Button x:Name="BtnTour" Style="{StaticResource LinkBtn}" Content="更新导览" Margin="0,2,16,2" ToolTip="为勾选的项目生成/刷新 AI 导览 AI_GUIDE.md(供飞书只读查询更快更准更省);每个项目需 1-3 分钟，进度看运行日志"/>
         </WrapPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
           <Button x:Name="BtnPreview" Style="{StaticResource BtnGhost}" Content="预演" Width="88"/>
@@ -185,7 +186,7 @@ try {
   if(Test-Path $icoPath){ $win.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]$icoPath) }
 } catch {}
 $els = @{}
-foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','ChatModelChip','ChatModelText','IntervalChip','IntervalText','ProjectList','LogText','LogScroll','StatusText','BtnPopLog','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnForgetChat','BtnClearQuery','BtnAuthUsers','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
+foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','ChatModelChip','ChatModelText','IntervalChip','IntervalText','ProjectList','LogText','LogScroll','StatusText','BtnPopLog','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnForgetChat','BtnClearQuery','BtnAuthUsers','BtnTour','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
 # global UI-thread exception guard: never let a handler bug close the window
 $win.Dispatcher.add_UnhandledException({ param($s,$e)
   try { [System.IO.File]::AppendAllText((Join-Path $env:LOCALAPPDATA 'ClaudeResume\logs\gui-error.log'), ((Get-Date).ToString('s') + "  " + $e.Exception.ToString() + "`r`n"), (New-Object System.Text.UTF8Encoding($false))) } catch {}
@@ -611,6 +612,34 @@ $els.BtnClearQuery.Add_Click({
   } catch { Set-Flash ('清空查询出错: ' + $_.Exception.Message) }
 })
 $els.BtnAuthUsers.Add_Click({ Show-AuthWindow })
+$els.BtnTour.Add_Click({
+  try {
+    # generate/refresh AI_GUIDE.md for the checked projects, in a background runspace (each ~1-3 min,
+    # runs claude headless via Invoke-ProjectTour). Progress goes to the run log; UI stays responsive.
+    if($script:tourHandle -and -not $script:tourHandle.IsCompleted){ Set-Flash '导览更新进行中，请稍候…'; return }
+    if($script:tourPS){ try { $script:tourPS.EndInvoke($script:tourHandle) } catch {}; try { $script:tourPS.Dispose() } catch {}; try { $script:tourRs.Close() } catch {}; $script:tourPS=$null }
+    $sel = @(Get-Selected)
+    if($sel.Count -eq 0){ Set-Flash '先勾选要更新导览的项目'; return }
+    $model = 'sonnet'; try { $m=(Get-CcuConfig).resumeModel; if($m){ $model=$m } } catch {}
+    $rs = [RunspaceFactory]::CreateRunspace(); $rs.ApartmentState='STA'; $rs.Open()
+    $rs.SessionStateProxy.SetVariable('libPath', (Join-Path $PSScriptRoot 'lib.ps1'))
+    $rs.SessionStateProxy.SetVariable('projects', $sel)
+    $rs.SessionStateProxy.SetVariable('tourModel', $model)
+    $ps = [PowerShell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript({
+      . $libPath
+      Write-CcuLog ('开始更新 ' + $projects.Count + ' 个项目的 AI 导览(模型 ' + $tourModel + ')') 'info'
+      foreach($pr in $projects){
+        Write-CcuLog ('更新导览 -> ' + $pr.name) 'launch'
+        $r = Invoke-ProjectTour -Project $pr -Model $tourModel
+        Write-CcuLog ($pr.name + ' 导览 -> ' + $r.status) $(if($r.status -eq 'success'){'ok'}else{'warn'})
+      }
+      Write-CcuLog '导览更新全部结束' 'ok'
+    })
+    $script:tourRs = $rs; $script:tourPS = $ps; $script:tourHandle = $ps.BeginInvoke()
+    Set-Flash ('已开始更新 ' + $sel.Count + ' 个项目的导览(后台，看运行日志)')
+  } catch { Set-Flash ('更新导览出错: ' + $_.Exception.Message) }
+})
 $els.BtnExportLog.Add_Click({
   try {
     # every run-*.log (oldest first) + the GUI error log, merged into one shareable file

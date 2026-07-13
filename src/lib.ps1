@@ -383,6 +383,61 @@ function Invoke-ClaudeResume {
   return $res
 }
 
+# Generate/refresh a project's AI_GUIDE.md (the project-tour flow) by running claude headless in the
+# project. The multi-line instruction is fed via STDIN (a -p arg would be truncated at the first
+# newline by cmd — see LESSONS.md); success = AI_GUIDE.md's mtime advanced.
+function Invoke-ProjectTour {
+  param([pscustomobject]$Project, [string]$Model='sonnet', [int]$TimeoutMin=12, $CancelFlag=$null)
+  $claude = Get-ClaudeCmd
+  $res = @{ project=$Project.name; status='error'; wrote=$false }
+  if(-not $claude){ $res.status='no-claude'; return $res }
+  $guide = Join-Path $Project.path 'AI_GUIDE.md'
+  $before = if(Test-Path $guide){ (Get-Item $guide).LastWriteTimeUtc } else { [datetime]::MinValue }
+  $prompt = @'
+为当前目录的这个代码项目生成一份面向 AI 只读问答的导览文件 AI_GUIDE.md(写在项目根),让别人能快速理解项目并回答技术问题。
+
+步骤:
+1) 先看清项目结构;
+2) 生成符号级摘要(在 bash 里跑):npx --yes repomix --compress --style markdown --ignore "test_data/**,**/*.mat,**/RawData/**,**/__pycache__/**,*.png,*.jpg,*.csv,dist/**,build/**,node_modules/**,.git/**" -o ".repomix.md" —— 失败就用 ls / 读源码替代;
+3) 读 docs/、README、.repomix.md,理解架构/数据流/模块职责/测试运行流程/数据文件命名约定;
+4) 写 AI_GUIDE.md:第一行必须是 <!-- project-tour · generated <当前本地时间到分钟> · git <运行 git rev-parse --short HEAD 得到的短 hash;非 git 仓库写 nogit> -->;之后按 8 节写:①一句话定位 ②架构与数据流(ASCII 图)③模块职责表(路径→职责→关键函数)④测试/运行流程(入口/命令/参数/依赖)⑤数据格式与命名约定(逐字段解码一个真实数据文件名样例)⑥FAQ(同事最可能问的 5-10 个技术问题,直接给答案)⑦术语表(中英对照)⑧文档索引;
+5) 全文用中文、200-400 行、自足(常见问题不用打开别的文件就能答);
+6) 删除临时 .repomix.md。
+
+约束:只读分析代码、绝不修改任何源码,只新增/覆盖 AI_GUIDE.md 这一个文件。数据文件(成千上万的 .mat/.png 等)必须忽略、绝不逐个读。完成后简短说明写了哪几节。
+'@
+  # feed the multi-line prompt via STDIN (a -p arg would be truncated at the first newline by cmd;
+  # PS 5.1 has no Start-Process -RedirectStandardInput, and `cmd < file` breaks under -ArgumentList).
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $env:ComSpec
+  $psi.Arguments = '/c "' + $claude + '" -p --output-format stream-json --verbose --dangerously-skip-permissions' + $(if($Model){ ' --model ' + $Model } else { '' })
+  $psi.WorkingDirectory = $Project.path
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+  $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+  try {
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try { $null = $p.Handle } catch {}
+    $outTask = $p.StandardOutput.ReadToEndAsync()   # drain both streams so a full pipe never blocks claude
+    $errTask = $p.StandardError.ReadToEndAsync()
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($prompt)
+    $p.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length); $p.StandardInput.BaseStream.Flush(); $p.StandardInput.Close()
+    $deadline = (Get-Date).AddMinutes($TimeoutMin)
+    while(-not $p.HasExited){
+      Start-Sleep -Milliseconds 800
+      if($CancelFlag -and $CancelFlag.v){ Stop-ProcessTree -ProcessId $p.Id; $res.status='stopped'; break }
+      if((Get-Date) -gt $deadline){ Stop-ProcessTree -ProcessId $p.Id; $res.status='timeout'; break }
+    }
+  } catch { $res.status = 'error'; return $res }
+  Start-Sleep -Milliseconds 400
+  if(@('stopped','timeout') -notcontains $res.status){
+    $after = if(Test-Path $guide){ (Get-Item $guide).LastWriteTimeUtc } else { [datetime]::MinValue }
+    $res.wrote = ($after -gt $before)
+    $res.status = if($res.wrote){ 'success' } else { 'error' }
+  }
+  return $res
+}
+
 function Format-Countdown { param([double]$Seconds)
   if($null -eq $Seconds){ return '-' }
   if($Seconds -lt 0){ $Seconds = 0 }
