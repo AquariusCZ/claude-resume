@@ -18,6 +18,7 @@ try { $lock = [System.IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'No
 catch { Write-CcuLog 'checker: another instance running, skip tick' 'info'; return }
 
 try {
+  Clear-OldCaches   # safe housekeeping (probe sessions / stdout cap / old logs); runs even when idle
   $cfg = Get-CcuConfig
   if(-not $cfg.enabled -and -not $DryRun){ return }
   $selected = @($cfg.selected)

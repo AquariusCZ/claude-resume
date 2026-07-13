@@ -85,6 +85,31 @@ function Set-CcuState { param($State)
   [System.IO.File]::WriteAllText($script:StatePath, ($State | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Clear-OldCaches {
+  # Safe housekeeping (never touches real project conversations). Called each checker tick.
+  try {
+    # 1) throwaway probe sessions: every Test-ClaudeReady runs `claude -p "ready"` in AppDir, which
+    #    leaves a session in ~/.claude/projects/<AppDir-encoded>/ (observed 900+). Delete old ones.
+    #    Match the probe folder exactly (ends with 'ClaudeResume') — NOT '...-feishu-chat'.
+    $root = Join-Path $env:USERPROFILE '.claude\projects'
+    if(Test-Path $root){
+      foreach($d in (Get-ChildItem $root -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*AppData-Local-ClaudeResume' })){
+        Get-ChildItem $d.FullName -Filter *.jsonl -ErrorAction SilentlyContinue |
+          Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-20) } | Remove-Item -Force -ErrorAction SilentlyContinue
+      }
+    }
+    # 2) cap the Feishu agent stdout log (append-mode handle -> truncate is gap-safe; try/catch on lock)
+    $so = Join-Path $script:LogDir 'feishu-stdout.log'
+    if((Test-Path $so) -and ((Get-Item $so).Length -gt 2MB)){ try { [System.IO.File]::WriteAllText($so, '') } catch {} }
+    # 3) prune daily logs older than 30 days
+    if(Test-Path $script:LogDir){
+      Get-ChildItem $script:LogDir -Filter '*.log' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^(run|feishu)-\d{8}\.log$' -and $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+  } catch {}
+}
+
 function Get-ClaudeProjects {
   $root = Join-Path $env:USERPROFILE '.claude\projects'
   $list = @()
