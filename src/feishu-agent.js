@@ -29,7 +29,10 @@ const { spawn } = require('child_process');
 
 let lark;
 try { lark = require('@larksuiteoapi/node-sdk'); }
-catch (e) { console.error('缺少依赖 @larksuiteoapi/node-sdk,请在本目录运行: npm install'); process.exit(1); }
+catch (e) {
+  if (process.env.FEISHU_TEST) { lark = {}; }   // offline tests use a mock client, not the SDK
+  else { console.error('缺少依赖 @larksuiteoapi/node-sdk,请在本目录运行: npm install'); process.exit(1); }
+}
 
 const APP_DIR = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'ClaudeResume');
 const CONFIG_PATH = path.join(APP_DIR, 'config.json');
@@ -64,16 +67,34 @@ function anotherInstanceAlive() {
     catch (e) { return e && e.code === 'EPERM'; }      // EPERM = alive but not ours; ESRCH = dead
   } catch (e) { return false; }
 }
-if (anotherInstanceAlive()) { console.error('另一个 feishu-agent 已在运行,退出。'); process.exit(0); }
-try { fs.mkdirSync(APP_DIR, { recursive: true }); fs.writeFileSync(PID_PATH, String(process.pid)); } catch (e) {}
-process.on('exit', () => { try { if (parseInt(fs.readFileSync(PID_PATH, 'utf8'), 10) === process.pid) fs.unlinkSync(PID_PATH); } catch (e) {} });
+if (!process.env.FEISHU_TEST) {   // tests don't take the single-instance lock or touch the live pidfile
+  if (anotherInstanceAlive()) { console.error('另一个 feishu-agent 已在运行,退出。'); process.exit(0); }
+  try { fs.mkdirSync(APP_DIR, { recursive: true }); fs.writeFileSync(PID_PATH, String(process.pid)); } catch (e) {}
+  process.on('exit', () => { try { if (parseInt(fs.readFileSync(PID_PATH, 'utf8'), 10) === process.pid) fs.unlinkSync(PID_PATH); } catch (e) {} });
+}
 
 const cfg0 = readConfig();
 const APP_ID = cfg0.feishuAppId || '';
 const APP_SECRET = cfg0.feishuAppSecret || '';
-if (!APP_ID || !APP_SECRET) { logLine('config.json 缺少 feishuAppId / feishuAppSecret,退出。'); process.exit(1); }
+const TEST_MODE = !!process.env.FEISHU_TEST;   // offline unit tests: mock client, no WS, export handlers
+if (!TEST_MODE && (!APP_ID || !APP_SECRET)) { logLine('config.json 缺少 feishuAppId / feishuAppSecret,退出。'); process.exit(1); }
 
-const client = new lark.Client({ appId: APP_ID, appSecret: APP_SECRET });
+// a recording mock client so the card-flow logic can be tested without touching the network.
+// tests read client.__calls (each {op:'create'|'patch', type, title, id}) and client.__reset().
+function makeMockClient() {
+  let seq = 0; const calls = [];
+  const titleOf = c => { try { const j = JSON.parse(c); return (j.header && j.header.title && j.header.title.content) || null; } catch (e) { return null; } };
+  const textOf = c => { try { return JSON.parse(c).text || null; } catch (e) { return null; } };
+  return {
+    __calls: calls,
+    __reset() { calls.length = 0; },
+    im: { message: {
+      create: async o => { const id = 'msg_' + (++seq); calls.push({ op: 'create', type: o.data.msg_type, title: titleOf(o.data.content), text: textOf(o.data.content), id }); return { data: { message_id: id } }; },
+      patch: async o => { calls.push({ op: 'patch', id: o.path.message_id, title: titleOf(o.data.content) }); return {}; },
+    } },
+  };
+}
+const client = TEST_MODE ? makeMockClient() : new lark.Client({ appId: APP_ID, appSecret: APP_SECRET });
 
 // ---- claude launcher resolution (same locations lib.ps1 checks) ----
 function findClaudeCmd() {
@@ -360,19 +381,17 @@ async function sendText(chatId, text) {
 // one "control card" per chat: all navigation (main menu <-> project sub-menu) updates THIS card
 // in place instead of sending a new one, so cards never pile up.
 const lastCard = new Map();   // chatId -> message_id of the live control card
-async function sendCard(chatId, card, isMenuCard) {
+async function sendCard(chatId, card, setLast) {
   try {
     const res = await apiRetry(() => client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(card) } }));
     const mid = res && res.data && res.data.message_id;
-    // only a MENU card becomes the reusable control card; a project card clears it; anything else
-    // (e.g. the owner-notification card) leaves lastCard untouched.
-    if (mid && isMenuCard === true) lastCard.set(chatId, mid);
-    else if (isMenuCard === false) lastCard.delete(chatId);
+    // control cards (menu OR project) become the live lastCard; owner-notify cards pass setLast=falsey
+    if (mid && setLast) lastCard.set(chatId, mid);
     return mid;
   } catch (e) { logLine('发送卡片失败: ' + (e && e.message)); return null; }
 }
-// show the MENU control card: patch the existing menu card in place; only send a fresh one if there
-// is none (or it can no longer be patched). Never touches a project card. Prevents card pile-up.
+// show the ONE control card (menu or project): patch the live card in place; send a fresh one only
+// if there is none / it can't be patched. All navigation flows through here -> exactly one card.
 async function showCard(chatId, card) {
   const mid = lastCard.get(chatId);
   if (mid) {
@@ -388,13 +407,11 @@ function currentCard(chatId) {
 }
 // update the clicked card in place so the ✅ (current project / model / mode) moves.
 // pass an explicit card to navigate (e.g. project -> main menu); omit to re-render the current one.
-async function refreshCard(chatId, messageId, card, isMenuCard) {
+async function refreshCard(chatId, messageId, card) {
   if (!messageId) return;
   try {
     await apiRetry(() => client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(card || currentCard(chatId)) } }));
-    // only a MAIN-MENU card is a reusable control card. A project card must NOT be registered as
-    // lastCard, else a stray bottom-menu event (showCard) would patch the project card back to menu.
-    if (isMenuCard) lastCard.set(chatId, messageId); else lastCard.delete(chatId);
+    lastCard.set(chatId, messageId);   // the refreshed control card (menu OR project) is now the live card
   } catch (e) { logLine('更新卡片失败: ' + (e && e.message)); }
 }
 // long runs go silent while claude works; send a heartbeat so the user knows it's alive.
@@ -731,7 +748,7 @@ async function onMessage(data) {
     if (m) {
       if (await denyProject(senderOpen, chatId)) return;
       const p = findProject(m[2]);
-      if (p) { setSession(chatId, { mode: 'project', project: p.path, sub: undefined }); await sendCard(chatId, buildProjectCard(chatId), false); }
+      if (p) { setSession(chatId, { mode: 'project', project: p.path, sub: undefined }); await showCard(chatId, buildProjectCard(chatId)); }
       else await sendText(chatId, `没找到项目「${m[2]}」。\n\n` + listText());
       return;
     }
@@ -744,7 +761,7 @@ async function onMessage(data) {
 
     // bare project name/number -> enter it (works from any mode)
     const bare = projectIfBareName(text);
-    if (bare) { if (await denyProject(senderOpen, chatId)) return; setSession(chatId, { mode: 'project', project: bare.path, sub: undefined }); await sendCard(chatId, buildProjectCard(chatId), false); return; }
+    if (bare) { if (await denyProject(senderOpen, chatId)) return; setSession(chatId, { mode: 'project', project: bare.path, sub: undefined }); await showCard(chatId, buildProjectCard(chatId)); return; }
     // "<project> <command>" -> one-off run, doesn't change the current mode
     const oneoff = oneOffTarget(text);
     if (oneoff.project) {
@@ -783,7 +800,7 @@ async function onMessage(data) {
       if (level === 'viewer') sub = 'query';                 // viewers are always read-only
       const qm = text.match(QUERY_RE);                       // 查询/只读 prefix = one-off read-only override
       // no sub-mode chosen yet -> ask via the project card first (unless an explicit 查询 prefix)
-      if (!sub && !qm) { await sendCard(chatId, buildProjectCard(chatId), false); return; }
+      if (!sub && !qm) { await showCard(chatId, buildProjectCard(chatId)); return; }
       if (sub === 'query' || qm) {
         const qk = querySession(active.path).cwd.toLowerCase();   // query runs in its own cwd, not project.path
         if (running.has(qk) || inflight.has(qk)) { await sendText(chatId, `「${active.name}」查询进行中,请稍候。`); return; }
@@ -854,8 +871,8 @@ async function onCardAction(ev) {
     if (projectActs.indexOf(val.do) !== -1 && !canProject(senderOpen)) { denyProject(senderOpen, chatId); return; }
     if (configActs.indexOf(val.do) !== -1 && !canConfig(senderOpen)) { denyConfig(senderOpen, chatId); return; }
 
-    if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); refreshCard(chatId, messageId, buildMenuCard(chatId), true); return; }
-    if (val.do === 'home') { setSession(chatId, { mode: 'idle' }); refreshCard(chatId, messageId, buildMenuCard(chatId), true); return; }   // leave project mode (avoid accidental typed-modify)
+    if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }
+    if (val.do === 'home') { setSession(chatId, { mode: 'idle' }); refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }   // leave project mode (avoid accidental typed-modify)
     if (val.do === 'status') { sendText(chatId, statusText(chatId)); return; }
     if (val.do === 'perm') {
       const c = readConfig();
@@ -870,23 +887,23 @@ async function onCardAction(ev) {
       const mm = String(val.m || '').toLowerCase();
       const v = (['opus', 'sonnet', 'haiku'].indexOf(mm) !== -1) ? mm : '';
       try { const c = readConfig(); c.feishuChatModel = v; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
-      refreshCard(chatId, messageId, buildMenuCard(chatId), true);      // model lives on the main card; re-render it (feedback = ✅ moves)
+      refreshCard(chatId, messageId, buildMenuCard(chatId));      // model lives on the main card; re-render it (feedback = ✅ moves)
       return;
     }
     if (val.do === 'enter') {
       const p = discoverProjects().find(x => x.path.toLowerCase() === String(val.p).toLowerCase()) || (val.p ? { name: path.basename(val.p), path: val.p } : null);
       // enter -> project sub-menu (pick 只读/修改 first). sub reset so the user chooses each entry.
-      if (p) { setSession(chatId, { mode: 'project', project: p.path, sub: undefined }); refreshCard(chatId, messageId, buildProjectCard(chatId), false); }
+      if (p) { setSession(chatId, { mode: 'project', project: p.path, sub: undefined }); refreshCard(chatId, messageId, buildProjectCard(chatId)); }
       else sendText(chatId, '项目未找到(可能已变化)。发「菜单」重新选。');
       return;
     }
     if (val.do === 'submode') {
       const sess = getSession(chatId);
-      if (sess.mode !== 'project' || !sess.project) { refreshCard(chatId, messageId, buildMenuCard(chatId), true); return; }
+      if (sess.mode !== 'project' || !sess.project) { refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }
       let sm = (val.sm === 'modify') ? 'modify' : 'query';
       if (sm === 'modify' && authLevel(senderOpen) === 'viewer') { sm = 'query'; sendText(chatId, '👁 你是只读用户,只能查询,不能改项目。'); }
       setSession(chatId, { mode: 'project', project: sess.project, sub: sm });
-      refreshCard(chatId, messageId, buildProjectCard(chatId), false);   // ✅ moves to the chosen mode
+      refreshCard(chatId, messageId, buildProjectCard(chatId));   // ✅ moves to the chosen mode
       return;
     }
     if (val.do === 'clearq') {
@@ -933,15 +950,19 @@ async function onBotMenu(ev) {
     if (key === 'chat') { setSession(chatId, { mode: 'chat' }); await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。'); return; }
     if (key === 'status') { if (await denyProject(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
     if (key === 'idle' || key === 'exit') { setSession(chatId, { mode: 'idle' }); await showCard(chatId, buildMenuCard(chatId)); return; }
-    // 'menu' / 主菜单 / unknown: show the main menu, reusing the existing MENU card if any. lastCard
-    // now only ever points at a menu card (a project card deletes it), so showCard reuses/creates a
-    // menu card and NEVER patches the project card, and we don't reset the session — a delayed or
-    // duplicate bottom-menu delivery can no longer yank you out of a project ("进项目又跳回来").
-    await showCard(chatId, buildMenuCard(chatId));
+    // 'menu' / 主菜单 / unknown: just re-show whatever card should CURRENTLY be visible, in place, and
+    // do NOT change the session. In a project this idempotently re-renders the project card, so the
+    // backlog of stale menu taps Feishu keeps re-delivering does nothing visible and can't pile up a
+    // new menu card or yank you out. To leave a project, use the card's ⬅主菜单 button.
+    await showCard(chatId, currentCard(chatId));
   } catch (e) { logLine('底部菜单事件异常: ' + (e && (e.stack || e))); }
 }
 
 // ---- boot ----
+if (TEST_MODE) {
+  module.exports = { onMessage, onCardAction, onBotMenu, client, lastCard, setSession, getSession, discoverProjects, currentCard };
+  return;   // don't connect to Feishu in tests
+}
 const wsClient = new lark.WSClient({ appId: APP_ID, appSecret: APP_SECRET });
 // register both v1 and v2 of the receive-message event so whichever the console offers works
 const handlers = { 'im.message.receive_v1': async (data) => { await onMessage(data); } };

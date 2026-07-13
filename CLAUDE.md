@@ -12,6 +12,16 @@
 
 GUI(`src/picker.ps1`)同理复制到该目录,改动在**下次打开窗口**时生效。
 
+## 自测(飞书卡片交互)
+
+改动飞书卡片/菜单状态机后,先跑离线自测,别每次都让用户在飞书里试:
+
+```
+node test/card-flow.js
+```
+
+它设 `FEISHU_TEST=1`,让 `feishu-agent.js` 用一个记录型 mock client(不联网、不启动长连接、不占单实例锁),直接调用 `onBotMenu/onCardAction`,断言"进项目→积压菜单事件"不堆卡、不跳回主菜单。测试会备份/恢复 `feishu-sessions.json`。
+
 ## 安全约束
 
 - 只有 `feishuAuthOpenIds`(full)里的用户能**修改**项目;viewer 只能只读查询;闲聊对所有人开放。
