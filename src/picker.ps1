@@ -152,18 +152,17 @@ if(-not $script:instanceOwned -and -not $RenderTo -and -not $SelfTest){
       </Border>
       <Grid Grid.Row="4" Margin="0,16,0,0">
         <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-        <!-- status lives in the log header now, so this row only holds the action links -->
-        <DockPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,14,0" LastChildFill="False">
-          <Button x:Name="BtnAll" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="全选" VerticalAlignment="Center"/>
-          <Button x:Name="BtnNone" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="取消勾选" Margin="14,0,0,0" VerticalAlignment="Center"/>
-          <Button x:Name="BtnAdd" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="+ 文件夹" Margin="14,0,0,0" VerticalAlignment="Center"/>
-          <Button x:Name="BtnClearLog" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="清空日志" Margin="14,0,0,0" VerticalAlignment="Center"/>
-          <Button x:Name="BtnExportLog" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="导出日志" Margin="14,0,0,0" VerticalAlignment="Center"/>
-          <Button x:Name="BtnForgetChat" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="忘记闲聊" Margin="14,0,0,0" VerticalAlignment="Center"/>
-          <Button x:Name="BtnClearQuery" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="清空查询" Margin="14,0,0,0" VerticalAlignment="Center" ToolTip="清空所有项目的『只读查询』记忆(下次查询从头开始)"/>
-          <Button x:Name="BtnAuthUsers" DockPanel.Dock="Left" Style="{StaticResource LinkBtn}" Content="授权用户" Margin="14,0,0,0" VerticalAlignment="Center" ToolTip="查看 / 移除有权限的飞书用户(飞书后台看不到，这才是真正的授权名单)"/>
-        </DockPanel>
-        <StackPanel Grid.Column="1" Orientation="Horizontal">
+        <!-- WrapPanel so the links wrap to a new line instead of being hidden behind the big buttons -->
+        <WrapPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,14,0">
+          <Button x:Name="BtnAll" Style="{StaticResource LinkBtn}" Content="全选" Margin="0,2,16,2"/>
+          <Button x:Name="BtnNone" Style="{StaticResource LinkBtn}" Content="取消勾选" Margin="0,2,16,2"/>
+          <Button x:Name="BtnAdd" Style="{StaticResource LinkBtn}" Content="+ 文件夹" Margin="0,2,16,2"/>
+          <Button x:Name="BtnClearLog" Style="{StaticResource LinkBtn}" Content="清空日志" Margin="0,2,16,2"/>
+          <Button x:Name="BtnExportLog" Style="{StaticResource LinkBtn}" Content="导出日志" Margin="0,2,16,2"/>
+          <Button x:Name="BtnForgetChat" Style="{StaticResource LinkBtn}" Content="忘记闲聊" Margin="0,2,16,2"/>
+          <Button x:Name="BtnAuthUsers" Style="{StaticResource LinkBtn}" Content="授权用户" Margin="0,2,16,2" ToolTip="查看 / 移除有权限的飞书用户(飞书后台看不到，这才是真正的授权名单)"/>
+        </WrapPanel>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
           <Button x:Name="BtnPreview" Style="{StaticResource BtnGhost}" Content="预演" Width="88"/>
           <Button x:Name="BtnDisarm" Style="{StaticResource BtnGhost}" Content="解除" Width="88" Margin="10,0,0,0"/>
           <Button x:Name="BtnArm" Style="{StaticResource BtnPrimary}" Content="布防续跑" Width="132" Margin="10,0,0,0"/>
@@ -185,7 +184,7 @@ try {
   if(Test-Path $icoPath){ $win.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]$icoPath) }
 } catch {}
 $els = @{}
-foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','ChatModelChip','ChatModelText','IntervalChip','IntervalText','ProjectList','LogText','LogScroll','StatusText','BtnPopLog','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnForgetChat','BtnClearQuery','BtnAuthUsers','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
+foreach($n in 'TitleBar','BtnClose','BtnMin','Subtitle','ResetText','ResetChip','ChatModelChip','ChatModelText','IntervalChip','IntervalText','ProjectList','LogText','LogScroll','StatusText','BtnPopLog','BtnAll','BtnNone','BtnAdd','BtnClearLog','BtnExportLog','BtnForgetChat','BtnAuthUsers','BtnPreview','BtnDisarm','BtnArm','FooterPath'){ $els[$n] = $win.FindName($n) }
 # global UI-thread exception guard: never let a handler bug close the window
 $win.Dispatcher.add_UnhandledException({ param($s,$e)
   try { [System.IO.File]::AppendAllText((Join-Path $env:LOCALAPPDATA 'ClaudeResume\logs\gui-error.log'), ((Get-Date).ToString('s') + "  " + $e.Exception.ToString() + "`r`n"), (New-Object System.Text.UTF8Encoding($false))) } catch {}
@@ -202,16 +201,28 @@ function Read-LogTail { param([int]$Tail=40) try { if(Test-Path $script:logFile)
 
 # ---- colored log rendering (per [level]) ----
 function New-Brush($hex){ New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($hex)) }
+# level -> color for the [level] tag (info is a clear blue so even all-info logs look colored)
 $script:logColors = @{
-  info   = (New-Brush '#FFC3C2B7')   # Ink2
+  info   = (New-Brush '#FF58A6FF')   # blue
   ok     = (New-Brush '#FF3FB950')   # green
   launch = (New-Brush '#FFE8763F')   # coral
   warn   = (New-Brush '#FFE3B341')   # amber
   error  = (New-Brush '#FFF07070')   # red
   stream = (New-Brush '#FF8F8D86')   # muted
 }
+# level -> color for the message BODY (kept readable; warn/error echo the tag color)
+$script:logBodyColors = @{
+  info   = (New-Brush '#FFD8D7CF')
+  ok     = (New-Brush '#FF6FCF84')
+  launch = (New-Brush '#FFEDD3C4')
+  warn   = (New-Brush '#FFE3B341')
+  error  = (New-Brush '#FFF07070')
+  stream = (New-Brush '#FF9C9A92')
+}
+$script:logTsColor = (New-Brush '#FF6E7681')   # timestamp: dim gray
 function Set-LogColored($tb, $text){
-  # rebuild the TextBlock inlines, coloring each line by its [level]. Cheap enough for the tail.
+  # rebuild the TextBlock inlines. Each line is split into timestamp / [level] / body, colored
+  # separately so even an all-[info] tail reads as colored (gray time · blue tag · light body).
   $tb.Inlines.Clear()
   if(-not $text -or $text.Trim().Length -eq 0){
     $ph=New-Object Windows.Documents.Run('(暂无日志 · 布防或点「预演」后,这里会实时显示彩色运行日志)')
@@ -219,13 +230,18 @@ function Set-LogColored($tb, $text){
   }
   foreach($line in ($text -split "(`r`n|`n)")){
     if($line -eq "`r`n" -or $line -eq "`n" -or $line.Length -eq 0){ continue }
-    $lvl='info'
-    $m=[regex]::Match($line, '^\[[^\]]+\]\s+\[(\w+)\]')
-    if($m.Success){ $lvl=$m.Groups[1].Value.ToLower() }
-    $br=$script:logColors[$lvl]; if(-not $br){ $br=$script:logColors['info'] }
-    $run=New-Object Windows.Documents.Run($line)
-    $run.Foreground=$br
-    $tb.Inlines.Add($run)
+    $m=[regex]::Match($line, '^(\[[^\]]+\])\s+(\[(\w+)\])\s?([\s\S]*)$')
+    if($m.Success){
+      $lvl=$m.Groups[3].Value.ToLower()
+      $tag=$script:logColors[$lvl]; if(-not $tag){ $tag=$script:logColors['info'] }
+      $body=$script:logBodyColors[$lvl]; if(-not $body){ $body=$script:logBodyColors['info'] }
+      $r1=New-Object Windows.Documents.Run($m.Groups[1].Value); $r1.Foreground=$script:logTsColor
+      $r2=New-Object Windows.Documents.Run(' '+$m.Groups[2].Value); $r2.Foreground=$tag; $r2.FontWeight='Bold'
+      $r3=New-Object Windows.Documents.Run(' '+$m.Groups[4].Value); $r3.Foreground=$body
+      $tb.Inlines.Add($r1); $tb.Inlines.Add($r2); $tb.Inlines.Add($r3)
+    } else {
+      $r=New-Object Windows.Documents.Run($line); $r.Foreground=$script:logBodyColors['info']; $tb.Inlines.Add($r)
+    }
     $tb.Inlines.Add((New-Object Windows.Documents.LineBreak))
   }
 }
@@ -324,6 +340,22 @@ function Show-AuthWindow {
   } catch { Set-Flash ('打开授权窗口出错: ' + $_.Exception.Message) }
 }
 
+# wipe ONE project's read-only query session: session id = same sha1(path) formula as the agent's
+# querySession(); delete its session jsonl(s) + the started flag so the next query starts fresh.
+function Clear-ProjectQuery($projPath){
+  $sha1=[System.Security.Cryptography.SHA1]::Create()
+  $h=(($sha1.ComputeHash([Text.Encoding]::UTF8.GetBytes($projPath.ToLower())) | ForEach-Object { $_.ToString('x2') }) -join '')
+  $id=$h.Substring(0,8)+'-'+$h.Substring(8,4)+'-4'+$h.Substring(13,3)+'-8'+$h.Substring(17,3)+'-'+$h.Substring(20,12)
+  $n=0; $proot=Join-Path $env:USERPROFILE '.claude\projects'
+  if(Test-Path $proot){
+    foreach($d in @(Get-ChildItem $proot -Directory -ErrorAction SilentlyContinue)){
+      $jf=Join-Path $d.FullName ($id+'.jsonl')
+      if(Test-Path $jf){ Remove-Item $jf -Force -ErrorAction SilentlyContinue; $n++ }
+    }
+  }
+  Remove-Item (Join-Path (Join-Path $script:AppDir 'feishu-query') ($h+'.started')) -Force -ErrorAction SilentlyContinue
+  return $n
+}
 function New-ProjectCard($proj){
   $b = New-Object Windows.Controls.Border
   $b.CornerRadius='16'; $b.Padding='16,13'; $b.Margin='0,0,0,10'
@@ -340,6 +372,16 @@ function New-ProjectCard($proj){
   $rm.Add_MouseEnter({ $rm.Foreground=$win.FindResource('Danger') }.GetNewClosure())
   $rm.Add_MouseLeave({ $rm.Foreground=$win.FindResource('Muted') }.GetNewClosure())
   $rm.Add_MouseLeftButtonUp({ param($s,$e) $e.Handled=$true; Remove-ProjectCard $proj.path }.GetNewClosure())
+  # per-project "清空只读查询会话" (this project only)
+  $clr = New-Object Windows.Controls.TextBlock
+  $clr.Text='清查询'; $clr.Foreground=$win.FindResource('Muted'); $clr.FontSize=11.5; $clr.Cursor='Hand'; $clr.VerticalAlignment='Center'; $clr.Margin='16,0,0,0'; $clr.ToolTip='清空本项目的『只读查询』会话记忆(下次查询从头开始)'
+  [Windows.Controls.DockPanel]::SetDock($clr,'Right')
+  $clr.Add_MouseEnter({ $clr.Foreground=$win.FindResource('Accent') }.GetNewClosure())
+  $clr.Add_MouseLeave({ $clr.Foreground=$win.FindResource('Muted') }.GetNewClosure())
+  $clr.Add_MouseLeftButtonUp({ param($s,$e) $e.Handled=$true
+    $n = Clear-ProjectQuery $proj.path
+    Set-Flash ("已清空「" + $proj.name + "」的只读查询记忆(" + $n + " 个会话)")
+  }.GetNewClosure())
   $sp = New-Object Windows.Controls.StackPanel
   $nameRow = New-Object Windows.Controls.StackPanel; $nameRow.Orientation='Horizontal'
   $nm = New-Object Windows.Controls.TextBlock; $nm.Text=$proj.name; $nm.Foreground=$win.FindResource('Ink'); $nm.FontWeight='SemiBold'; $nm.FontSize=14
@@ -350,7 +392,7 @@ function New-ProjectCard($proj){
   }
   $pt = New-Object Windows.Controls.TextBlock; $pt.Text=$proj.path; $pt.Foreground=$win.FindResource('Muted'); $pt.FontSize=12; $pt.TextTrimming='CharacterEllipsis'; $pt.Margin='0,2,0,0'
   $sp.Children.Add($nameRow) | Out-Null; $sp.Children.Add($pt) | Out-Null
-  $dp.Children.Add($chk) | Out-Null; $dp.Children.Add($rm) | Out-Null; $dp.Children.Add($right) | Out-Null; $dp.Children.Add($sp) | Out-Null
+  $dp.Children.Add($chk) | Out-Null; $dp.Children.Add($rm) | Out-Null; $dp.Children.Add($right) | Out-Null; $dp.Children.Add($clr) | Out-Null; $dp.Children.Add($sp) | Out-Null
   $b.Child=$dp
   $b.Add_MouseLeftButtonUp({ $chk.IsChecked = -not $chk.IsChecked }.GetNewClosure())
   $b.Add_MouseEnter({ $b.Background = $win.FindResource('CardHover') }.GetNewClosure())
@@ -538,37 +580,6 @@ $els.BtnForgetChat.Add_Click({
     }
     Set-Flash '已清空闲聊记忆(下次闲聊从头开始)'
   } catch { Set-Flash ('清空出错: ' + $_.Exception.Message) }
-})
-$els.BtnClearQuery.Add_Click({
-  try {
-    # clear every project's shared "只读查询" session: each feishu-query flag records the session id;
-    # delete the matching claude session jsonl (must delete it — --session-id on an existing id errors)
-    # then drop the flag, so the next query re-creates a fresh session.
-    $qdir = Join-Path $script:AppDir 'feishu-query'
-    $proot = Join-Path $env:USERPROFILE '.claude\projects'
-    $sessions = 0; $projects = 0
-    if(Test-Path $qdir){
-      foreach($f in @(Get-ChildItem $qdir -File -ErrorAction SilentlyContinue)){
-        # the flag NAME is the full sha1(path) hex; reconstruct the session id the same way the
-        # agent's querySession() does (independent of flag content, which older flags lacked)
-        $id = $null
-        $h = $f.BaseName
-        if($h -match '^[0-9a-f]{40}$'){
-          $id = $h.Substring(0,8)+'-'+$h.Substring(8,4)+'-4'+$h.Substring(13,3)+'-8'+$h.Substring(17,3)+'-'+$h.Substring(20,12)
-        } else {
-          try { $id = (Get-Content $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json).id } catch {}
-        }
-        if($id -and (Test-Path $proot)){
-          foreach($d in @(Get-ChildItem $proot -Directory -ErrorAction SilentlyContinue)){
-            $jf = Join-Path $d.FullName ($id + '.jsonl')
-            if(Test-Path $jf){ Remove-Item $jf -Force -ErrorAction SilentlyContinue; $sessions++ }
-          }
-        }
-        Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue; $projects++
-      }
-    }
-    Set-Flash ("已清空只读查询记忆:" + $projects + " 个项目 / " + $sessions + " 个会话")
-  } catch { Set-Flash ('清空查询出错: ' + $_.Exception.Message) }
 })
 $els.BtnAuthUsers.Add_Click({ Show-AuthWindow })
 $els.BtnExportLog.Add_Click({
