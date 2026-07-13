@@ -214,10 +214,14 @@ const QUERY_RE = /^\s*(查询|只读查询|只读|query)\s*[:：]?\s*([\s\S]+)$/
 async function runProjectQuery(chatId, project, prompt) {
   const qs = querySession(project.path);
   const cfg = readConfig();
-  const framed = `[以下是对项目「${project.name}」(目录:${project.path})的只读提问。请直接阅读该目录下相关的代码/文档后,在本轮内简要作答;不要启动子任务或长时间规划,也不要修改任何文件。]\n\n${prompt}`;
+  const framed = `[对项目「${project.name}」(目录:${project.path})的只读提问。请按此策略作答,尽量省 token:` +
+    `1) 先看该目录下的文档索引(如 docs/ 目录、README、目录树),定位与问题最相关的 1~2 篇文档;` +
+    `2) 只读这几篇文档、以及它们引用的关键代码文件;` +
+    `3) 在本轮内直接简要作答。不要通读整个项目,不要启动子任务/子代理,不要长时间规划,也不要修改任何文件。]\n\n${prompt}`;
   const stopHb = startHeartbeat(chatId, project.name + ' 查询');
   const r = await runClaude(qs.cwd, project.name + ' 查询', framed, {
-    sessionId: qs.id, sessionExists: qs.started, addDir: project.path, readOnly: true, model: cfg.feishuChatModel
+    sessionId: qs.id, sessionExists: qs.started, addDir: project.path, readOnly: true,
+    disallowedTools: ['Task'], model: cfg.feishuChatModel   // no sub-agent explore -> far fewer tokens
   });
   stopHb();
   // only flip to --resume once claude actually persisted the jsonl — else a failed first query
@@ -271,6 +275,8 @@ function runClaude(cwd, label, prompt, opts) {
       args.push('--continue');
     }
     if (opts.addDir) args.push('--add-dir', opts.addDir);   // grant read access when cwd != the project
+    // block heavy tools for read-only queries (Task spins up a full-project sub-explore = big tokens)
+    if (Array.isArray(opts.disallowedTools) && opts.disallowedTools.length) args.push('--disallowedTools', ...opts.disallowedTools);
     args.push('-p', prompt, '--output-format', 'stream-json', '--verbose');
     const model = opts.model || cfg.resumeModel;   // opts.model lets chat use its own model
     if (model) { args.push('--model', model); }
@@ -284,7 +290,9 @@ function runClaude(cwd, label, prompt, opts) {
     const key = cwd.toLowerCase();
 
     let child;
-    try { child = spawn(process.env.ComSpec || 'cmd.exe', args, { cwd, windowsHide: true }); }
+    // stdin='ignore': headless -p needs no stdin. Leaving it an open pipe makes recent claude wait
+    // for stdin ("no stdin data received in 3s") and then exit without running the -p prompt.
+    try { child = spawn(process.env.ComSpec || 'cmd.exe', args, { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }); }
     catch (e) { resolve({ ok: false, limited: false, text: '启动 claude 失败: ' + e.message }); return; }
     running.set(key, child);
 
