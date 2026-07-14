@@ -104,7 +104,12 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 
 7. **WSClient 长连接不需要公网 IP**(相比 webhook 回调要公网),自建应用首选长连接。
 
-8. **卡片切换那 ~0.5s 延迟是飞书 API 往返的固有开销,不是本地代码卡**。实测 `im.message.patch` 单次往返 **~550ms**(首次含 tenant_access_token 获取 ~1.6s)。`onCardAction` 已经是 fire-and-forget(handler 不 await patch),本地开销(`discoverProjects` 22ms + 几次 `readConfig`)可忽略。**SDK 1.70 的长连接不支持卡片回调返回内联卡片/toast**(源码里 `yield h(evt)` 忽略 handler 返回值),所以省不掉这次 patch 往返。能做的:① 对**内容没变**的卡片**跳过 patch**(`cardHash` 记录每张卡上次的内容),让积压/重复的菜单事件变成 **0 往返**;② `apiRetry` 的重试等待从 700ms 降到 250ms。
+8. **★★★ 事件 handler 里 `await` 长任务 = 整个机器人"白天卡死"**。SDK 的 WS 层收到事件后 `await eventDispatcher.invoke(...)` **等 handler 完成才给飞书回 ACK**;`onMessage` 里 `await runClaude`(查询/修改/闲聊,1~4 分钟)→ ACK 几分钟不回 → 飞书停止推送/反复重投 → 期间点什么都没反应(还制造了此前的"事件重复投递")。卡片回调早就懂这个道理(秒回 + fire-and-forget),但消息路径漏了。
+   - 解法:**所有事件 handler 必须秒回**。长跑的 claude 工作包进 `bg(label, key, work)`(fire-and-forget + 错误日志);并发守卫(`running`/`inflight`)的检查和预留必须留在 **handler 的同步段**(任何 await 之前),否则两条快速连发的消息会双跑。顺带:`spawnSync` 会冻住整个 node 进程(连 WS ACK 一起冻),事件路径上一律用异步 `execFile`。
+   - 验证:`test/concurrency.js` —— 查询 handler 4ms 返回;查询进行中点菜单 2ms 响应、再发查询 2ms 回"进行中";原查询后台照常完成。**改了事件处理必跑它。**
+   - 教训之二:handler 改成秒回后,**旧的 e2e 测试会虚假通过**("await onMessage 后立刻断言"只能看到回显消息,断言撞上回显里的原话)。所有 e2e 都改成"轮询等待最终结果消息再断言"。
+
+9. **卡片切换那 ~0.5s 延迟是飞书 API 往返的固有开销,不是本地代码卡**。实测 `im.message.patch` 单次往返 **~550ms**(首次含 tenant_access_token 获取 ~1.6s)。`onCardAction` 已经是 fire-and-forget(handler 不 await patch),本地开销(`discoverProjects` 22ms + 几次 `readConfig`)可忽略。**SDK 1.70 的长连接不支持卡片回调返回内联卡片/toast**(源码里 `yield h(evt)` 忽略 handler 返回值),所以省不掉这次 patch 往返。能做的:① 对**内容没变**的卡片**跳过 patch**(`cardHash` 记录每张卡上次的内容),让积压/重复的菜单事件变成 **0 往返**;② `apiRetry` 的重试等待从 700ms 降到 250ms。
 
 ---
 

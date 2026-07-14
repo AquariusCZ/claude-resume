@@ -36,13 +36,18 @@ async function main() {
     const ev = { message: { message_id: 'm_guide_' + Date.now(), chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text: q }) }, sender: { sender_id: { open_id: OWNER } } };
     console.log('查询(首次,注入 AI_GUIDE.md)…');
     const t0 = Date.now();
-    await A.onMessage(ev);
+    await A.onMessage(ev);   // resolves fast; poll for the RESULT message (not the announce echo)
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const results = () => client.__calls.filter(c => c.op === 'create' && c.type === 'text')
+      .map(c => c.text || '').filter(t => /✅ 查询结果|⚠️/.test(t));
+    for (let i = 0; i < 60 && results().length === 0; i++) await sleep(2000);
     const secs = Math.round((Date.now() - t0) / 1000);
-    const reply = client.__calls.filter(c => c.op === 'create' && c.type === 'text').map(c => c.text || '').join('\n');
-    console.log('\n--- 回复(' + secs + 's)---\n' + reply.slice(0, 500) + '\n---');
+    const reply = results().join('\n');
+    console.log('\n--- 查询结果(' + secs + 's)---\n' + reply.slice(0, 500) + '\n---');
+    check('拿到了查询结果', results().length > 0, '120s 内无结果');
     check('w6000 解读为「宽度」(用了导览的纠正,而非误判为波长)', /宽度|width|µm|um|微米/i.test(reply) && !/w6000.{0,6}波长|波长.{0,6}6000/.test(reply), reply.slice(0, 200));
     check('bp120 解读为「偏置/bias」(mV,正)', /偏置|bias/i.test(reply), reply.slice(0, 200));
-    check('不是失败兜底', !/未拿到成功结果/.test(reply), reply.slice(0, 120));
+    check('不是失败兜底', reply.length > 0 && !/未拿到成功结果/.test(reply), reply.slice(0, 120));
   } finally {
     fs.writeFileSync(CFG, cfgBackup);
     if (sessBackup) fs.writeFileSync(SESS, sessBackup); else { try { fs.unlinkSync(SESS); } catch (e) {} }

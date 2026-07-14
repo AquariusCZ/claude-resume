@@ -40,16 +40,20 @@ async function main() {
     const ev = { message: { message_id: 'm_test_' + Date.now(), chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text: q }) }, sender: { sender_id: { open_id: OWNER } } };
 
     const t0 = Date.now();
-    await A.onMessage(ev);   // runs real claude, awaited
+    await A.onMessage(ev);   // resolves fast; the claude run continues in the background
+    // poll until the RESULT message (not the announce echo) arrives
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const results = () => client.__calls.filter(c => c.op === 'create' && c.type === 'text')
+      .map(c => c.text || '').filter(t => /✅ 查询结果|⚠️/.test(t));
+    for (let i = 0; i < 60 && results().length === 0; i++) await sleep(2000);
     const secs = Math.round((Date.now() - t0) / 1000);
+    const joined = results().join('\n---\n');
+    console.log('\n--- 查询结果(' + secs + 's)---\n' + joined.slice(0, 800) + '\n---');
 
-    const texts = client.__calls.filter(c => c.op === 'create' && c.type === 'text').map(c => c.text || '');
-    const joined = texts.join('\n---\n');
-    console.log('\n--- 机器人回复(' + secs + 's)---\n' + joined + '\n---');
-
-    check('claude 收到了完整问题(输出了换行后的暗号)', joined.indexOf(MARK) !== -1, '未见暗号,可能仍被换行截断');
-    check('不是"未拿到成功结果"', !/未拿到成功结果/.test(joined), '仍走到失败兜底');
-    check('不是"没看到具体问题"', !/没.{0,4}具体问题|只.{0,4}作答策略|补充.{0,4}问题/.test(joined), 'claude 只收到了框架、没收到问题');
+    check('拿到了查询结果消息', results().length > 0, '120s 内无结果');
+    check('claude 收到了完整问题(结果里输出了换行后的暗号)', joined.indexOf(MARK) !== -1, '结果中未见暗号,可能仍被换行截断');
+    check('不是"未拿到成功结果"', joined.length > 0 && !/未拿到成功结果/.test(joined), '仍走到失败兜底');
+    check('不是"没看到具体问题"', joined.length > 0 && !/没.{0,4}具体问题|只.{0,4}作答策略|补充.{0,4}问题/.test(joined), 'claude 只收到了框架、没收到问题');
   } finally {
     fs.writeFileSync(CFG, cfgBackup);
     if (sessBackup) fs.writeFileSync(SESS, sessBackup); else { try { fs.unlinkSync(SESS); } catch (e) {} }

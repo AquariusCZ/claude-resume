@@ -232,13 +232,15 @@ const QUERY_RE = /^\s*(查询|只读查询|只读|query)\s*[:：]?\s*([\s\S]+)$/
 // run one read-only query in the project's DEDICATED shared query session (any user/time -> same convo).
 // Runs in an ISOLATED cwd (qs.cwd) + --add-dir project.path so the transcript stays out of the
 // project's --continue pool; the prompt names the project so claude knows where to look.
-// current short git HEAD of a project (for AI_GUIDE freshness), '' if not a git repo / no git
+// current short git HEAD of a project (for AI_GUIDE freshness), '' if not a git repo / no git.
+// async — spawnSync would freeze the whole event loop (incl. the WS ACK) for up to its timeout.
 function projectGitHash(projectPath) {
-  try {
-    const r = require('child_process').spawnSync('git', ['-C', projectPath, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8', timeout: 3000, windowsHide: true });
-    if (r && r.status === 0) return String(r.stdout).trim();
-  } catch (e) {}
-  return '';
+  return new Promise((resolve) => {
+    try {
+      require('child_process').execFile('git', ['-C', projectPath, 'rev-parse', '--short', 'HEAD'],
+        { timeout: 3000, windowsHide: true }, (err, stdout) => resolve(err ? '' : String(stdout).trim()));
+    } catch (e) { resolve(''); }
+  });
 }
 async function runProjectQuery(chatId, project, prompt) {
   const qs = querySession(project.path);
@@ -253,7 +255,7 @@ async function runProjectQuery(chatId, project, prompt) {
       guide = fs.readFileSync(path.join(project.path, 'AI_GUIDE.md'), 'utf8');
       // freshness: the guide records the git hash it was built at; warn if the project moved on.
       const rec = (guide.match(/project-tour[^\n]*git\s+([0-9a-f]{6,40})/i) || [])[1];
-      const cur = projectGitHash(project.path);
+      const cur = rec ? await projectGitHash(project.path) : '';
       if (rec && cur && rec !== cur) staleNote = `⚠️ 提示:本导览生成于较早的提交(git ${rec}),项目现已到 ${cur}——架构/模块/数据格式/术语等大框架通常仍准,但**具体实现细节请以实际代码为准**,不确定处务必读相关源码后再答。\n\n`;
     } catch (e) {}
   }
@@ -307,6 +309,18 @@ function oneOffTarget(text) {
 // ---- run claude in a cwd (project or the chat scratch dir); return {ok, limited, text} ----
 const running = new Map(); // cwd(lower) -> child
 const inflight = new Set(); // cwd(lower) reserved synchronously to close the check->spawn race
+// Run long claude work in the BACKGROUND so the event handler returns immediately. The WS layer
+// awaits the handler before ACKing the event back to Feishu (sdk: `yield eventDispatcher.invoke`),
+// so an awaited 1-4 min claude run means no ACK for minutes -> Feishu stops delivering / re-delivers
+// and every tap in that chat looks dead (the "daytime freeze"). key is reserved in `inflight` by the
+// CALLER (synchronously, before any await) and released here when the work finishes.
+function bg(label, key, work) {
+  (async () => {
+    try { await work(); }
+    catch (e) { logLine(`后台任务异常 [${label}]: ` + (e && (e.stack || e))); }
+    finally { if (key) inflight.delete(key); }
+  })();
+}
 function runClaude(cwd, label, prompt, opts) {
   opts = opts || {};
   return new Promise((resolve) => {
@@ -826,22 +840,27 @@ async function onMessage(data) {
       if (isQuery) {
         const qk = querySession(oneoff.project.path).cwd.toLowerCase();
         if (running.has(qk) || inflight.has(qk)) { await sendText(chatId, `「${oneoff.project.name}」查询进行中,请稍候。`); return; }
-        inflight.add(qk);
-        try {
+        inflight.add(qk);   // reserve synchronously, then run in the background so the handler ACKs fast
+        bg('一次性查询', qk, async () => {
           await sendText(chatId, `🔍 只读查询「${oneoff.project.name}」:${q}\n(读代码/答疑,不改文件 · 项目专属查询会话)`);
           const r = await runProjectQuery(chatId, oneoff.project, q);
           await sendText(chatId, (r.ok ? `✅ 查询结果:\n\n` : `⚠️ :\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
           logLine(`一次性查询 ${oneoff.project.name} ok=${r.ok}`);
-        } finally { inflight.delete(qk); }
+        });
         return;
       }
-      if (running.has(oneoff.project.path.toLowerCase())) { await sendText(chatId, `「${oneoff.project.name}」正在执行中,请稍候。`); return; }
-      await sendText(chatId, `📂 一次性在「${oneoff.project.name}」执行:${q}\n(可能要 1-4 分钟,跑完自动回结果)`);
-      const stopHb = startHeartbeat(chatId, oneoff.project.name);
-      const r = await runClaude(oneoff.project.path, oneoff.project.name, q, { useContinue: true, model: cfg.feishuChatModel });
-      stopHb();
-      await sendText(chatId, (r.ok ? `✅ 「${oneoff.project.name}」完成:\n\n` : `⚠️ 「${oneoff.project.name}」:\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
-      logLine(`一次性完成 ${oneoff.project.name} ok=${r.ok}`);
+      const ok1 = oneoff.project.path.toLowerCase();
+      if (running.has(ok1) || inflight.has(ok1)) { await sendText(chatId, `「${oneoff.project.name}」正在执行中,请稍候。`); return; }
+      inflight.add(ok1);
+      bg('一次性执行', ok1, async () => {
+        await sendText(chatId, `📂 一次性在「${oneoff.project.name}」执行:${q}\n(可能要 1-4 分钟,跑完自动回结果)`);
+        const stopHb = startHeartbeat(chatId, oneoff.project.name);
+        try {
+          const r = await runClaude(oneoff.project.path, oneoff.project.name, q, { useContinue: true, model: cfg.feishuChatModel });
+          await sendText(chatId, (r.ok ? `✅ 「${oneoff.project.name}」完成:\n\n` : `⚠️ 「${oneoff.project.name}」:\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
+          logLine(`一次性完成 ${oneoff.project.name} ok=${r.ok}`);
+        } finally { stopHb(); }
+      });
       return;
     }
 
@@ -859,44 +878,55 @@ async function onMessage(data) {
         const qk = querySession(active.path).cwd.toLowerCase();   // query runs in its own cwd, not project.path
         if (running.has(qk) || inflight.has(qk)) { await sendText(chatId, `「${active.name}」查询进行中,请稍候。`); return; }
         inflight.add(qk);
-        try {
-          const q = qm ? qm[2] : text;
+        const q = qm ? qm[2] : text;
+        bg('查询', qk, async () => {
           await sendText(chatId, `🔍 只读查询「${active.name}」:${q}\n(读代码/答疑,不改文件 · 项目专属查询会话)`);
           const r = await runProjectQuery(chatId, active, q);
           await sendText(chatId, (r.ok ? `✅ 查询结果:\n\n` : `⚠️ :\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
           logLine(`查询 ${active.name} ok=${r.ok}`);
-        } finally { inflight.delete(qk); }
+        });
         return;
       }
-      if (running.has(active.path.toLowerCase())) { await sendText(chatId, `「${active.name}」正在执行中,请稍候,或发「停止」取消。`); return; }
-      await sendText(chatId, `📂 在「${active.name}」执行:${text}\n(可能要 1-4 分钟,跑完自动回结果)`);
-      const stopHb = startHeartbeat(chatId, active.name);
-      const r = await runClaude(active.path, active.name, text, { useContinue: true, model: cfg.feishuChatModel });
-      stopHb();
-      await sendText(chatId, (r.ok ? `✅ 「${active.name}」完成:\n\n` : `⚠️ 「${active.name}」:\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
-      logLine(`完成 ${active.name} ok=${r.ok}`);
+      const mk = active.path.toLowerCase();
+      if (running.has(mk) || inflight.has(mk)) { await sendText(chatId, `「${active.name}」正在执行中,请稍候,或发「停止」取消。`); return; }
+      inflight.add(mk);
+      bg('执行', mk, async () => {
+        await sendText(chatId, `📂 在「${active.name}」执行:${text}\n(可能要 1-4 分钟,跑完自动回结果)`);
+        const stopHb = startHeartbeat(chatId, active.name);
+        try {
+          const r = await runClaude(active.path, active.name, text, { useContinue: true, model: cfg.feishuChatModel });
+          await sendText(chatId, (r.ok ? `✅ 「${active.name}」完成:\n\n` : `⚠️ 「${active.name}」:\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
+          logLine(`完成 ${active.name} ok=${r.ok}`);
+        } finally { stopHb(); }
+      });
       return;
     }
     if (getSession(chatId).mode === 'chat') {   // chat mode: talk to Claude
-      if (running.has(CHAT_DIR.toLowerCase())) { await sendText(chatId, '上一句还在想,请稍候…'); return; }
-      await sendText(chatId, '🤔 正在思考…');
-      logLine(`闲聊 思考中: ${text}`);
-      const stopHb = startHeartbeat(chatId, '闲聊');
+      const ck = CHAT_DIR.toLowerCase();
+      if (running.has(ck) || inflight.has(ck)) { await sendText(chatId, '上一句还在想,请稍候…'); return; }
+      inflight.add(ck);
       // SECURITY: chat is open to everyone, so only the OWNER gets full tools (skip-permissions —
       // WebSearch/Bash/Read like the web app). A non-owner (viewer) gets a read-only chat: plan mode
       // + no file/exec tools, so they can't Bash-modify files or Read the bot's ../config.json secrets.
       const chatOwner = authLevel(senderOpen) === 'full';
-      const r = await runClaude(CHAT_DIR, '闲聊', text, {
-        useContinue: chatStarted(),
-        skipPermissions: chatOwner,
-        readOnly: !chatOwner,
-        disallowedTools: chatOwner ? undefined : ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'NotebookEdit'],
-        model: cfg.feishuChatModel,
+      const useCont = chatStarted();
+      bg('闲聊', ck, async () => {
+        await sendText(chatId, '🤔 正在思考…');
+        logLine(`闲聊 思考中: ${text}`);
+        const stopHb = startHeartbeat(chatId, '闲聊');
+        try {
+          const r = await runClaude(CHAT_DIR, '闲聊', text, {
+            useContinue: useCont,
+            skipPermissions: chatOwner,
+            readOnly: !chatOwner,
+            disallowedTools: chatOwner ? undefined : ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'NotebookEdit'],
+            model: cfg.feishuChatModel,
+          });
+          if (r.ok) markChatStarted();
+          await sendText(chatId, (r.text || '(无输出)') + fmtMeta(r) + '\n\n———\n💬 闲聊模式 · 发「菜单」切换');
+          logLine(`闲聊 完成 ok=${r.ok}`);
+        } finally { stopHb(); }
       });
-      stopHb();
-      if (r.ok) markChatStarted();
-      await sendText(chatId, (r.text || '(无输出)') + fmtMeta(r) + '\n\n———\n💬 闲聊模式 · 发「菜单」切换');
-      logLine(`闲聊 完成 ok=${r.ok}`);
       return;
     }
     // idle mode: don't run anything — show the menu so the user picks a mode first
