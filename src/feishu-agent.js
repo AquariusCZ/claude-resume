@@ -175,7 +175,9 @@ function getSession(chatId) {
   if (!v) return { mode: 'idle' };
   if (typeof v === 'string') return v ? { mode: 'project', project: v } : { mode: 'idle' };   // legacy
   // sub (project sub-mode): 'query' | 'modify' | undefined (not chosen yet -> ask first)
-  return { mode: v.mode || (v.project ? 'project' : 'idle'), project: v.project, sub: v.sub };
+  // work: the claude session id that ✏️修改 continues (picked from the session list, or a fresh uuid
+  //       for 新开会话); undefined -> the session list is shown before anything runs.
+  return { mode: v.mode || (v.project ? 'project' : 'idle'), project: v.project, sub: v.sub, work: v.work };
 }
 function setSession(chatId, sess) { const s = readSessions(); s[chatId] = sess; writeSessions(s); }
 function activeProject(chatId) {
@@ -228,6 +230,114 @@ function clearQuerySession(projectPath) {
 // prefix that makes a full user's message a READ-ONLY query (viewers are always read-only).
 // 查询/只读 are unambiguous so no separator is required; drop bare 问 (matches 问题/问一下).
 const QUERY_RE = /^\s*(查询|只读查询|只读|query)\s*[:：]?\s*([\s\S]+)$/i;
+
+// ---- a project's claude WORK sessions (what ✏️修改 continues) ----
+// Each *.jsonl in the project's ~/.claude/projects/<encoded-cwd>/ folder is one conversation (the
+// ones your VS Code sessions create). Read-only queries live in an isolated cwd, so they never show
+// up here. Folder names are lossy, so find the folder by reading each session's real cwd.
+const _sessDirCache = new Map();   // projectPath(lower) -> folder; the mapping never changes
+function projectSessionDir(projectPath) {
+  const ck = String(projectPath).toLowerCase();
+  if (_sessDirCache.has(ck)) return _sessDirCache.get(ck);
+  const found = findProjectSessionDir(projectPath);
+  if (found) _sessDirCache.set(ck, found);
+  return found;
+}
+function findProjectSessionDir(projectPath) {
+  try {
+    const base = path.join(os.homedir(), '.claude', 'projects');
+    const want = String(projectPath).toLowerCase();
+    for (const d of fs.readdirSync(base)) {
+      const full = path.join(base, d);
+      let files; try { files = fs.readdirSync(full).filter(f => f.endsWith('.jsonl')); } catch (e) { continue; }
+      if (!files.length) continue;
+      const head = readHead(path.join(full, files[0]), 65536).split(/\r?\n/).slice(0, 60);
+      for (const ln of head) {
+        if (ln.indexOf('"cwd"') === -1) continue;
+        try { const j = JSON.parse(ln); if (j.cwd && String(j.cwd).toLowerCase() === want) return full; } catch (e) {}
+        break;
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+// [{id, title, mtime}] newest first. Title prefers claude's own `ai-title`, else the first user line.
+function listProjectSessions(projectPath, limit) {
+  const dir = projectSessionDir(projectPath);
+  if (!dir) return [];
+  let out = [];
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.jsonl')) continue;
+      const full = path.join(dir, f);
+      let mtime = 0; try { mtime = fs.statSync(full).mtimeMs; } catch (e) { continue; }
+      out.push({ id: f.replace(/\.jsonl$/i, ''), title: '', mtime, file: full });
+    }
+  } catch (e) { return []; }
+  out.sort((a, b) => b.mtime - a.mtime);
+  out = out.slice(0, limit || 5);
+  for (const s of out) {
+    let aiTitle = '', firstUser = '';
+    // the ai-title line sits near the top (~line 8), so a bounded head read is enough even for a 27MB
+    // transcript — never read whole session files here, this runs while rendering a card.
+    for (const ln of readHead(s.file, 65536).split(/\r?\n/)) {
+      if (!ln) continue;
+      if (!aiTitle && ln.indexOf('"ai-title"') !== -1) { try { const j = JSON.parse(ln); if (j.aiTitle) aiTitle = String(j.aiTitle); } catch (e) {} }
+      if (!firstUser && ln.indexOf('"type":"user"') !== -1) { try { firstUser = msgText(JSON.parse(ln)); } catch (e) {} }
+      if (aiTitle) break;
+    }
+    s.title = (aiTitle || firstUser || '(无标题)').replace(/\s+/g, ' ').trim();
+  }
+  return out;
+}
+// plain text of a transcript line's message content ('' if none)
+function msgText(j) {
+  const c = j && j.message && j.message.content;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return c.filter(p => p && p.type === 'text' && typeof p.text === 'string').map(p => p.text).join(' ');
+  return '';
+}
+// read only the LAST n bytes (transcripts reach tens of MB; we only need the tail)
+function readTail(file, bytes) {
+  let fd;
+  try {
+    const size = fs.statSync(file).size;
+    const start = Math.max(0, size - bytes);
+    const len = size - start;
+    if (len <= 0) return '';
+    fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, start);
+    return buf.toString('utf8');
+  } catch (e) { return ''; }
+  finally { try { if (fd !== undefined) fs.closeSync(fd); } catch (e) {} }
+}
+// last N user→assistant turns of a session, as a short readable digest
+function sessionPreview(file, turns) {
+  const out = [];
+  try {
+    // tail-only: the first line of the slice may be cut mid-JSON — it just fails to parse and is skipped
+    const lines = readTail(file, 262144).split(/\r?\n/);
+    for (const ln of lines) {
+      if (!ln || (ln.indexOf('"type":"user"') === -1 && ln.indexOf('"type":"assistant"') === -1)) continue;
+      try {
+        const j = JSON.parse(ln); const t = msgText(j).replace(/\s+/g, ' ').trim();
+        if (!t) continue;
+        const who = j.type === 'user' ? 'you' : 'ai';
+        // collapse consecutive same-role lines (assistant often streams several text blocks)
+        if (out.length && out[out.length - 1].who === who) out[out.length - 1].t = t;
+        else out.push({ who, t });
+      } catch (e) {}
+    }
+  } catch (e) {}
+  const want = (turns || 2) * 2;
+  const tail = out.slice(-want);
+  const cut = s => (s.length > 100 ? s.slice(0, 100) + '…' : s);
+  const lines2 = [];
+  for (let i = 0; i < tail.length; i++) lines2.push((tail[i].who === 'you' ? '· 你:' : '  我:') + cut(tail[i].t));
+  return lines2.join('\n');
+}
+const shortTime = ms => { const d = new Date(ms); const p = n => String(n).padStart(2, '0'); return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; };
 
 // run one read-only query in the project's DEDICATED shared query session (any user/time -> same convo).
 // Runs in an ISOLATED cwd (qs.cwd) + --add-dir project.path so the transcript stays out of the
@@ -538,8 +648,15 @@ function buildProjectCard(chatId) {
   const sub = getSession(chatId).sub;
   const name = ap ? ap.name : '项目';
   let line, tmpl;
+  const work = getSession(chatId).work;
   if (sub === 'query') { line = `**📂「${name}」· 👁 只读查询**\n直接提问即可 — 我只读代码/答疑,**绝不改文件**。所有查询共用本项目的专属会话。`; tmpl = 'blue'; }
-  else if (sub === 'modify') { line = `**📂「${name}」· ✏️ 修改项目**\n直接发指令即可 — 我会真正改动并继续你 VS Code 里的同一个会话。`; tmpl = 'red'; }
+  else if (sub === 'modify') {
+    const wt = work ? (workTitle(chatId) || work.slice(0, 8)) : '';
+    line = work
+      ? `**📂「${name}」· ✏️ 修改项目**\n当前会话:**${wt}**\n直接发指令即可 — 我会真正改动并继续这个会话。想换会话点「🔀 切换会话」。`
+      : `**📂「${name}」· ✏️ 修改项目**\n先选一个要继续的会话 👇`;
+    tmpl = 'red';
+  }
   else { line = `**📂 已进入「${name}」**\n先选操作方式 👇 之后直接发消息即可。`; tmpl = 'grey'; }
   const elements = [
     { tag: 'div', text: { tag: 'lark_md', content: line } },
@@ -547,15 +664,61 @@ function buildProjectCard(chatId) {
       { tag: 'button', text: { tag: 'plain_text', content: (sub === 'query' ? '✅ ' : '👁 ') + '只读查询' }, type: sub === 'query' ? 'primary' : 'default', value: { do: 'submode', sm: 'query' } },
       { tag: 'button', text: { tag: 'plain_text', content: (sub === 'modify' ? '✅ ' : '✏️ ') + '修改项目' }, type: sub === 'modify' ? 'primary' : 'default', value: { do: 'submode', sm: 'modify' } },
     ] },
-    { tag: 'action', actions: [
-      { tag: 'button', text: { tag: 'plain_text', content: '🧹 清空查询记忆' }, type: 'default', value: { do: 'clearq' } },
-      { tag: 'button', text: { tag: 'plain_text', content: 'ℹ️ 状态' }, type: 'default', value: { do: 'status' } },
-      { tag: 'button', text: { tag: 'plain_text', content: '⬅ 主菜单' }, type: 'default', value: { do: 'home' } },
-    ] },
   ];
+  if (sub === 'modify' && work) {   // switching sessions only makes sense once you're in modify mode
+    elements.push({ tag: 'action', actions: [
+      { tag: 'button', text: { tag: 'plain_text', content: '🔀 切换会话' }, type: 'default', value: { do: 'sesslist' } },
+    ] });
+  }
+  elements.push({ tag: 'action', actions: [
+    { tag: 'button', text: { tag: 'plain_text', content: '🧹 清空查询记忆' }, type: 'default', value: { do: 'clearq' } },
+    { tag: 'button', text: { tag: 'plain_text', content: 'ℹ️ 状态' }, type: 'default', value: { do: 'status' } },
+    { tag: 'button', text: { tag: 'plain_text', content: '⬅ 主菜单' }, type: 'default', value: { do: 'home' } },
+  ] });
   return {
     config: { wide_screen_mode: true, update_multi: true },
     header: { template: tmpl, title: { tag: 'plain_text', content: '项目操作 · ' + name } },
+    elements,
+  };
+}
+// title of the currently picked work session (for the project card), '' if unknown/new
+function workTitle(chatId) {
+  const sess = getSession(chatId);
+  if (!sess.project || !sess.work) return '';
+  try {
+    const s = listProjectSessions(sess.project, 12).find(x => x.id === sess.work);
+    if (s) return s.title.length > 24 ? s.title.slice(0, 24) + '…' : s.title;
+  } catch (e) {}
+  return '🆕 新会话';   // a fresh uuid has no transcript yet, so it isn't in the list
+}
+// the session picker: which conversation should ✏️修改 continue?
+function buildSessionCard(chatId) {
+  const ap = activeProject(chatId);
+  const name = ap ? ap.name : '项目';
+  const cur = getSession(chatId).work;
+  const list = ap ? listProjectSessions(ap.path, 5) : [];
+  const elements = [{ tag: 'div', text: { tag: 'lark_md', content: `**✏️ 修改「${name}」— 选择要继续的会话**\n选一个继续(会给你最近对话摘要),或新开一个全新会话。` } }];
+  if (list.length) {
+    for (const s of list) {
+      const t = s.title.length > 20 ? s.title.slice(0, 20) + '…' : s.title;
+      const on = cur === s.id;
+      elements.push({ tag: 'action', actions: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: (on ? '✅ ' : '📝 ') + t + ' · ' + shortTime(s.mtime) },
+        type: on ? 'primary' : 'default',
+        value: { do: 'pick', s: s.id },
+      }] });
+    }
+  } else {
+    elements.push({ tag: 'div', text: { tag: 'lark_md', content: '_这个项目还没有历史会话 — 点「🆕 新开会话」开始第一个。_' } });
+  }
+  elements.push({ tag: 'action', actions: [
+    { tag: 'button', text: { tag: 'plain_text', content: '🆕 新开会话' }, type: 'default', value: { do: 'newsess' } },
+    { tag: 'button', text: { tag: 'plain_text', content: '⬅ 返回' }, type: 'default', value: { do: 'backproj' } },
+  ] });
+  return {
+    config: { wide_screen_mode: true, update_multi: true },
+    header: { template: 'orange', title: { tag: 'plain_text', content: '选择会话 · ' + name } },
     elements,
   };
 }
@@ -591,6 +754,7 @@ function helpText(chatId) {
   return [
     'Claude 服务器助手', cur, '',
     '用按钮最省事(发「菜单」调出):主菜单点项目 → 弹出「👁只读 / ✏️修改」→ 选一个 → 直接发消息。',
+    '(选「✏️修改」会先让你挑要继续哪个会话,并给你最近对话摘要;也可「🆕 新开会话」。)',
     '',
     '文字命令:',
     '· 项目 / 菜单 → 列出项目(卡片)',
@@ -604,7 +768,7 @@ function helpText(chatId) {
     '· 授权 ou_xxx → 额外给某人「可改」权限;取消授权 / 授权列表 管理',
     '· 忘记闲聊 → 清空闲聊记忆;忘记查询 → 清空当前项目的只读查询记忆',
     '',
-    '注:✏️修改会继续 VS Code 里同一会话(面板不实时刷新,重开可见);',
+    '注:✏️修改会继续你在列表里选的那个会话(通常就是 VS Code 里的会话,面板不实时刷新,重开可见);',
     '👁只读走每个项目专属的查询会话,所有人共用,不碰你的工作会话。',
   ].join('\n');
 }
@@ -887,6 +1051,10 @@ async function onMessage(data) {
         });
         return;
       }
+      // ✏️修改 continues a SPECIFIC conversation the user picked from the session list. No pick yet
+      // (or it's a fresh entry) -> show the picker instead of guessing.
+      const work = getSession(chatId).work;
+      if (!work) { await showCard(chatId, buildSessionCard(chatId)); return; }
       const mk = active.path.toLowerCase();
       if (running.has(mk) || inflight.has(mk)) { await sendText(chatId, `「${active.name}」正在执行中,请稍候,或发「停止」取消。`); return; }
       inflight.add(mk);
@@ -894,9 +1062,12 @@ async function onMessage(data) {
         await sendText(chatId, `📂 在「${active.name}」执行:${text}\n(可能要 1-4 分钟,跑完自动回结果)`);
         const stopHb = startHeartbeat(chatId, active.name);
         try {
-          const r = await runClaude(active.path, active.name, text, { useContinue: true, model: cfg.feishuChatModel });
+          // an existing session resumes; a freshly-made uuid has no transcript yet -> --session-id creates it
+          const r = await runClaude(active.path, active.name, text, {
+            sessionId: work, sessionExists: querySessionExists(work), model: cfg.feishuChatModel,
+          });
           await sendText(chatId, (r.ok ? `✅ 「${active.name}」完成:\n\n` : `⚠️ 「${active.name}」:\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
-          logLine(`完成 ${active.name} ok=${r.ok}`);
+          logLine(`完成 ${active.name} ok=${r.ok} session=${work.slice(0, 8)}`);
         } finally { stopHb(); }
       });
       return;
@@ -994,8 +1165,40 @@ async function onCardAction(ev) {
       if (sess.mode !== 'project' || !sess.project) { refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }
       let sm = (val.sm === 'modify') ? 'modify' : 'query';
       if (sm === 'modify' && authLevel(senderOpen) === 'viewer') { sm = 'query'; sendText(chatId, '👁 你是只读用户,只能查询,不能改项目。'); }
-      setSession(chatId, { mode: 'project', project: sess.project, sub: sm });
+      if (sm === 'modify') {
+        // 修改 = continue a specific conversation -> pick which one first (or start a fresh one)
+        setSession(chatId, { mode: 'project', project: sess.project, sub: 'modify', work: sess.work });
+        refreshCard(chatId, messageId, sess.work ? buildProjectCard(chatId) : buildSessionCard(chatId));
+        return;
+      }
+      setSession(chatId, { mode: 'project', project: sess.project, sub: sm, work: sess.work });
       refreshCard(chatId, messageId, buildProjectCard(chatId));   // ✅ moves to the chosen mode
+      return;
+    }
+    if (val.do === 'sesslist') {   // 🔀 切换会话
+      const sess = getSession(chatId);
+      if (sess.mode !== 'project' || !sess.project) { refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }
+      refreshCard(chatId, messageId, buildSessionCard(chatId));
+      return;
+    }
+    if (val.do === 'backproj') { refreshCard(chatId, messageId, buildProjectCard(chatId)); return; }
+    if (val.do === 'pick' || val.do === 'newsess') {
+      const sess = getSession(chatId);
+      if (sess.mode !== 'project' || !sess.project) { refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }
+      const isNew = val.do === 'newsess';
+      const id = isNew ? crypto.randomUUID() : String(val.s || '');
+      if (!id) { refreshCard(chatId, messageId, buildSessionCard(chatId)); return; }
+      setSession(chatId, { mode: 'project', project: sess.project, sub: 'modify', work: id });
+      refreshCard(chatId, messageId, buildProjectCard(chatId));   // back to the project card, session shown
+      // digest of the picked conversation so you know where you left off (fire-and-forget: keep the
+      // callback fast; reading a transcript is local but can be a few MB)
+      bg('会话摘要', null, async () => {
+        if (isNew) { await sendText(chatId, '🆕 已开一个**全新会话**,直接发指令即可(它不带任何历史)。'); return; }
+        const s = listProjectSessions(sess.project, 12).find(x => x.id === id);
+        const head = s ? `📝 已进入会话「${s.title}」(${shortTime(s.mtime)})` : `📝 已进入会话 ${id.slice(0, 8)}`;
+        const pv = s ? sessionPreview(s.file, 2) : '';
+        await sendText(chatId, head + (pv ? '\n\n最近的对话:\n' + pv : '') + '\n\n直接发指令继续这个会话。');
+      });
       return;
     }
     if (val.do === 'clearq') {
@@ -1062,7 +1265,7 @@ async function onBotMenu(ev) {
 
 // ---- boot ----
 if (TEST_MODE) {
-  module.exports = { onMessage, onCardAction, onBotMenu, client, lastCard, setSession, getSession, discoverProjects, currentCard, querySession, clearQuerySession };
+  module.exports = { onMessage, onCardAction, onBotMenu, client, lastCard, setSession, getSession, discoverProjects, currentCard, querySession, clearQuerySession, listProjectSessions, sessionPreview, buildSessionCard, shortTime };
   return;   // don't connect to Feishu in tests
 }
 // on every (re)start — usually right after a deploy — reset all chat sessions to idle. The user often

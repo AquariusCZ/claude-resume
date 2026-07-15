@@ -260,6 +260,9 @@ function Send-FeishuNotify {
   # webhook (optionally 签名校验-signed) if the app isn't fully set up. Never throws.
   param([string]$Text)
   try {
+    # stamp every push with the local time — a resume can land hours later (after a 5h reset) and
+    # Feishu only shows its own timestamp on some messages, so "when did this finish" must be in-line.
+    $Text = "$Text · $((Get-Date).ToString('HH:mm'))"
     $cfg = Get-CcuConfig
     # 1) self-built app bot (im/v1/messages)
     if("$($cfg.feishuAppId)" -and "$($cfg.feishuAppSecret)" -and "$($cfg.feishuChatId)"){

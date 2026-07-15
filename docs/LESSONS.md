@@ -68,17 +68,24 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
    - 解法:只读查询跑在**隔离 cwd**(`feishu-query-cwd/<sha1>`)+ `--add-dir <项目路径>` 授予读权限。查询记录落在独立文件夹,`--continue` 永远只续工作会话。实测:查询 jsonl 只在隔离文件夹,项目文件夹里只有工作会话。
    - 附带坑:隔离 cwd 命名要避开 `Clear-OldCaches` 的清理 glob(它只删名字**正好以 `ClaudeResume` 结尾**的探测文件夹,`...-feishu-query-cwd` 不匹配,安全)。
 
-5. **plan 模式 + 大项目,claude 会派 Task 子代理做「全项目探索」,巨费 token**(即使主模型是 haiku,子代理会用大模型)。
+5. **项目的"会话列表"就在 `~/.claude/projects/<编码cwd>/*.jsonl` 里,每个文件 = 一次对话**,可以直接做成"选会话继续"的 UI:
+   - **标题**:文件里有 claude 自己生成的 `{"type":"ai-title","aiTitle":"…"}` 行(在文件**前部**,~第 8 行),比首条 user 消息好用;首条 user 文本作兜底。
+   - **性能**:会话文件能到 **28MB**,渲染卡片时**绝不能整读**。取标题只读**头** 64KB(`readHead`);取"最近 2 轮"只读**尾** 256KB(`readTail`,首行可能被切断、parse 失败跳过即可)。实测:列 5 个会话 **5ms**、28MB 会话取摘要 **1ms**。
+   - **找项目的会话文件夹**:文件夹名是有损编码,别去反推 —— 读每个文件夹首个会话的真实 `cwd` 来匹配,并**缓存**(映射不会变),否则每次渲染卡片都要扫全部项目。
+   - **继续指定会话**用 `--resume <id>`;"新开会话"就生成一个新 uuid、首次用 `--session-id <uuid>` 创建(和只读查询会话同一套 create-vs-resume 逻辑,靠"jsonl 是否存在"判断)。
+   - 验证要害:测试必须挑一个**不是最新**的会话(否则 `--continue` 也能歪打正着),用它历史里的暗号验证 claude 确实恢复了**那一个**会话(`test/modify-resume.js`)。
+
+6. **plan 模式 + 大项目,claude 会派 Task 子代理做「全项目探索」,巨费 token**(即使主模型是 haiku,子代理会用大模型)。
    - 解法:只读查询加 `--disallowedTools Task` 禁子代理,并在提示词里引导"先看 docs/README 定位相关文档,只读相关文档+代码,本轮内简答,别通读全项目"。实测:0 次 Task,只用 Glob+Read 精准命中文档。
    - 位置:`feishu-agent.js` `runProjectQuery`(`disallowedTools:['Task']` + framed 提示词)。
 
-6. **成功判定只信结构化 result,别信 exit code / 也别只靠"最后一个 result"**。
+7. **成功判定只信结构化 result,别信 exit code / 也别只靠"最后一个 result"**。
    - stream-json 里可能有**多个 result 行**(plan 模式两段式:主对话先返回"已启动探索任务"、子任务完成再返回最终答案)。scanLine 逐行扫,取最后一个 result 的 `is_error`。
    - 兜底:没有 result 但有 assistant 文本时,把 assistant 文本返回(别给用户空的"未拿到结果")。位置:`runClaude` 的 close 分支。
 
-7. **claude 的 stderr 一开始被完全忽略,失败时一片空白无从诊断**。加上"失败时记录 exit code + stderr 尾 + 是否有 assistant 文本"后,才定位到"no stdin data received"。**教训:外部进程的 stderr 一定要留一份,失败日志才有线索。**
+8. **claude 的 stderr 一开始被完全忽略,失败时一片空白无从诊断**。加上"失败时记录 exit code + stderr 尾 + 是否有 assistant 文本"后,才定位到"no stdin data received"。**教训:外部进程的 stderr 一定要留一份,失败日志才有线索。**
 
-8. **`rate_limit_event` 只在窗口被用到一定程度才由服务器下发**(5h 窗口很空时根本不发 5h 数字)。所以额度显示要能处理"某个窗口暂时没数据"。位置:`Test-ClaudeReady` / GUI 额度 chip 显示 `5h 低`。
+9. **`rate_limit_event` 只在窗口被用到一定程度才由服务器下发**(5h 窗口很空时根本不发 5h 数字)。所以额度显示要能处理"某个窗口暂时没数据"。位置:`Test-ClaudeReady` / GUI 额度 chip 显示 `5h 低`。
 
 ---
 

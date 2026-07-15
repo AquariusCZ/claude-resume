@@ -93,7 +93,16 @@ async function main() {
     await A.onBotMenu(menuEv('menu')); const c8 = creates()[0].id;
     await A.onCardAction(cardEv({ do: 'enter', p: PROJ.path }, c8));
     await A.onCardAction(cardEv({ do: 'submode', sm: 'modify' }, c8));
-    check('进项目→选修改 → 项目卡修改模式', isProjectCard(last().title), JSON.stringify(last()));
+    check('进项目→选修改 → 弹出会话列表卡', /选择会话/.test(last().title || ''), JSON.stringify(last()));
+    const sl = A.listProjectSessions(PROJ.path, 5);
+    if (sl.length) {
+      client.__reset();
+      await A.onCardAction(cardEv({ do: 'pick', s: sl[0].id }, c8));
+      await sleep(250);   // the card patch and the history digest are both async
+      check('选一个会话 → 回项目卡(修改模式)',
+        client.__calls.some(c => c.op === 'patch' && isProjectCard(c.title)) && A.getSession(CHAT).work === sl[0].id,
+        JSON.stringify(client.__calls.map(c => c.op + ':' + (c.title || c.type))));
+    }
     await A.onCardAction(cardEv({ do: 'home' }, c8));
     check('卡片「⬅主菜单」→ 回主菜单卡(原地)+ session idle', isMenuCard(last().title) && A.getSession(CHAT).mode === 'idle', JSON.stringify(last()));
   } finally {
