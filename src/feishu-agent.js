@@ -657,6 +657,24 @@ function modelLabelOf(v) {
   const hit = MODELS.find(([, id]) => String(id).toLowerCase() === String(v || '').toLowerCase());
   return hit ? hit[0] : (v || '默认');   // unknown custom id -> show it verbatim
 }
+// standalone model picker — reached from the BOTTOM menu so you can switch models mid-conversation
+// (chat / query / modify) WITHOUT leaving your session. It never reads or writes session state, and
+// its buttons carry from:'m' so the model action re-renders THIS card, not the main menu.
+function buildModelCard(chatId, senderOpen) {
+  const cur = String(readConfig().feishuChatModel || '').toLowerCase();
+  const eq = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
+  const mbtns = MODELS.map(([lbl, v]) => ({
+    tag: 'button', text: { tag: 'plain_text', content: (eq(cur, v) ? '✅ ' : '') + lbl },
+    type: eq(cur, v) ? 'primary' : 'default', value: { do: 'model', m: v, from: 'm' },
+  }));
+  const elements = [{ tag: 'div', text: { tag: 'lark_md', content: `**当前模型:${modelLabelOf(cur)}** — 点一个切换,切完直接继续对话即可(不会打断当前会话)。` } }];
+  for (let i = 0; i < mbtns.length; i += 3) elements.push({ tag: 'action', actions: mbtns.slice(i, i + 3) });
+  return {
+    config: { wide_screen_mode: true, update_multi: true },
+    header: { template: 'turquoise', title: { tag: 'plain_text', content: '🤖 切换模型' } },
+    elements,
+  };
+}
 // Telegram-style menu: buttons to enter a project / chat / status / switch model.
 // Default 'idle' mode does nothing until the user taps a button here. Role-aware: viewers
 // (coworkers) only see what they can actually use — chat + projects (read-only query).
@@ -681,7 +699,7 @@ function buildMenuCard(chatId, senderOpen) {
   if (owner) row1.push({ tag: 'button', text: { tag: 'plain_text', content: '🔑 权限' }, type: 'default', value: { do: 'perm' } });
   elements.push({ tag: 'action', actions: row1 });
   if (owner) {   // model switching is a config op — viewers don't see dead buttons
-    elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**模型:${modelLabelOf(curModel)}** — 聊天和项目执行都用它;也可发「模型 <任意模型id>」用未列出的新模型:` } });
+    elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**模型:${modelLabelOf(curModel)}** — 聊天和项目执行都用它;对话中随时点底部「🤖 模型」也能切,或发「模型 <任意模型id>」用新模型:` } });
     const mbtns = MODELS.map(([lbl, v]) => ({
       tag: 'button', text: { tag: 'plain_text', content: (eq(curModel, v) ? '✅ ' : '') + lbl },
       type: eq(curModel, v) ? 'primary' : 'default', value: { do: 'model', m: v },
@@ -852,6 +870,7 @@ function helpText(chatId) {
     '· 状态 → 布防 / 额度 / 当前模式',
     '· 停止 <项目> → 取消正在跑的指令',
     '· 模型 / 模型 fable → 查看或切换模型;「模型 claude-xxx」可用任何新模型(聊天+项目都用,与软件同步)',
+    '· 对话中想换模型不必退出:点底部「🤖 模型」按钮,弹出即选,选完继续对话(不打断会话)',
     '· 权限:默认除机器人主人外,大家都只能只读浏览查询,不能改项目(无需配置)',
     '· 授权 ou_xxx → 额外给某人「可改」权限;取消授权 / 授权列表 管理',
     '· 忘记闲聊 → 清空闲聊记忆;忘记查询 → 清空当前项目的只读查询记忆',
@@ -1272,7 +1291,9 @@ async function onCardAction(ev) {
       // accept exactly what the registry buttons carry (incl. full ids like claude-fable-5)
       const v = MODELS.some(([, id]) => String(id).toLowerCase() === mm) ? mm : '';
       try { const c = readConfig(); c.feishuChatModel = v; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
-      refreshCard(chatId, messageId, buildMenuCard(chatId, senderOpen));      // model lives on the main card; re-render it (feedback = ✅ moves)
+      // re-render the SAME card so ✅ moves. from:'m' = the standalone bottom-menu model card — it must
+      // NOT fall back to the main menu (that would reset the view and hide the running conversation).
+      refreshCard(chatId, messageId, val.from === 'm' ? buildModelCard(chatId, senderOpen) : buildMenuCard(chatId, senderOpen));
       return;
     }
     if (val.do === 'enter') {
@@ -1380,6 +1401,14 @@ async function onBotMenu(ev) {
     logLine('底部菜单点击: ' + key + (evId ? ' eid=…' + String(evId).slice(-6) : ' (无eid)') + (evTime ? ' age=' + Math.round((Date.now() - evTime) / 1000) + 's' : ' (无time)'));
     if (key === 'chat') { setSession(chatId, { mode: 'chat' }); await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。随时点底部「主菜单」回来。'); return; }
     if (key === 'status') { if (await denyProject(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
+    // 🤖 switch model mid-conversation: post a STANDALONE model card (does not touch the session, so
+    // your chat/project/modify context is untouched). Owner-only (feishuChatModel is shared config).
+    // Match several plausible console event_keys so a config typo still works.
+    if (['model', 'models', '模型', 'switchmodel', 'switch_model', 'setmodel'].indexOf(key) !== -1) {
+      if (await denyConfig(senderOpen, chatId)) return;
+      await sendCard(chatId, buildModelCard(chatId, senderOpen), false);
+      return;
+    }
     // 主菜单 / idle / exit / 未知 —— the ESCAPE HATCH: from ANY state, return to a clean main menu with a
     // FRESH visible card at the bottom. Delete lastCard first so showCard sends a NEW card even when the
     // old control card is still alive but scrolled up (pushed away by a checker/quota notification or the
@@ -1392,7 +1421,7 @@ async function onBotMenu(ev) {
 
 // ---- boot ----
 if (TEST_MODE) {
-  module.exports = { onMessage, onCardAction, onBotMenu, client, lastCard, setSession, getSession, discoverProjects, currentCard, querySession, clearQuerySession, listProjectSessions, sessionPreview, buildSessionCard, shortTime };
+  module.exports = { onMessage, onCardAction, onBotMenu, client, lastCard, setSession, getSession, discoverProjects, currentCard, querySession, clearQuerySession, listProjectSessions, sessionPreview, buildSessionCard, buildModelCard, shortTime };
   return;   // don't connect to Feishu in tests
 }
 // on every (re)start — usually right after a deploy — reset all chat sessions to idle. The user often

@@ -143,6 +143,33 @@ async function main() {
     check('C3 非 claude id 被拒绝且模型不变', readCfg().feishuChatModel === 'claude-someday-7', 'model=' + readCfg().feishuChatModel);
     await A.onMessage(msgEv('模型 默认', OWNER, OWNER_CHAT));
     check('C4 「模型 默认」→ 清空回默认', readCfg().feishuChatModel === '', 'model=' + readCfg().feishuChatModel);
+
+    // ---------- D. bottom-menu model switch mid-conversation (must NOT disturb the session) ----------
+    // owner is deep in a modify conversation; tapping the bottom 🤖 model button must post a model
+    // card WITHOUT resetting mode/project/work
+    const before = { mode: 'project', project: PROJ.path, sub: 'modify', work: 'deaddead-dead-4dea-8dea-deaddeaddead' };
+    A.setSession(OWNER_CHAT, { ...before }); client.__reset();
+    await A.onBotMenu(menuEv('model', OWNER));
+    const modelCardSent = client.__calls.some(c => c.op === 'create' && c.type === 'interactive' && /切换模型/.test(c.title || ''));
+    const sAfter = A.getSession(OWNER_CHAT);
+    check('D1 对话中点底部「🤖模型」→ 弹独立模型卡', modelCardSent, JSON.stringify(client.__calls.map(c => c.op + ':' + (c.title || c.type))));
+    check('D2 弹模型卡不打断会话(mode/project/work 原样保留)',
+      sAfter.mode === before.mode && sAfter.project === before.project && sAfter.sub === before.sub && sAfter.work === before.work, JSON.stringify(sAfter));
+
+    // picking a model on that card updates config + re-renders the MODEL card (not the main menu), session still intact
+    client.__reset();
+    await A.onCardAction(cardEv({ do: 'model', m: 'opus', from: 'm' }, OWNER, OWNER_CHAT, 'msg_modelcard'));
+    const reRenderedModelCard = client.__calls.some(c => c.op === 'patch' && /切换模型/.test(c.title || ''));
+    const sAfter2 = A.getSession(OWNER_CHAT);
+    check('D3 在模型卡上选 Opus → 配置生效', readCfg().feishuChatModel === 'opus', 'model=' + readCfg().feishuChatModel);
+    check('D4 选完仍是模型卡(不回落主菜单)+ 会话仍未被打断',
+      reRenderedModelCard && sAfter2.mode === before.mode && sAfter2.work === before.work, JSON.stringify(client.__calls.map(c => c.op + ':' + (c.title || c.type))) + ' sess=' + JSON.stringify(sAfter2));
+
+    // a VIEWER tapping the bottom model button is denied (feishuChatModel is shared config)
+    client.__reset();
+    await A.onBotMenu(menuEv('model', MATE));
+    const viewerGotModelCard = client.__calls.some(c => c.op === 'create' && c.type === 'interactive' && /切换模型/.test(c.title || ''));
+    check('D5 viewer 点底部「🤖模型」→ 被拒,拿不到模型卡', !viewerGotModelCard, JSON.stringify(client.__calls.map(c => c.op + ':' + (c.title || c.type))));
   } finally {
     fs.writeFileSync(CFG, cfgBackup);
     if (sessBackup) fs.writeFileSync(SESS, sessBackup); else { try { fs.unlinkSync(SESS); } catch (e) {} }
