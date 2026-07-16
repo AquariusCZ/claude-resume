@@ -8,6 +8,7 @@
 // Run: node test/routing.js
 'use strict';
 process.env.FEISHU_TEST = '1';
+process.env.FEISHU_TEST_NO_CLAUDE = '1';   // dispatch-only test: NEVER spawn a real claude (see LESSONS 3b)
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
@@ -32,7 +33,7 @@ const A = require(path.join(__dirname, '..', 'src', 'feishu-agent.js'));
 const client = A.client;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let eid = 0;
-const msgEv = (t, open, chat) => ({ message: { message_id: 'm_rt_' + (++eid) + '_' + Date.now(), chat_id: chat, message_type: 'text', content: JSON.stringify({ text: t }) }, sender: { sender_id: { open_id: open } } });
+const msgEv = (t, open, chat, chatType) => ({ message: { message_id: 'm_rt_' + (++eid) + '_' + Date.now(), chat_id: chat, chat_type: chatType || 'p2p', message_type: 'text', content: JSON.stringify({ text: t }) }, sender: { sender_id: { open_id: open } } });
 const menuEv = (key, open) => ({ event_key: key, operator: { operator_id: { open_id: open } }, header: { event_id: 'ert' + (++eid), create_time: String(Date.now()) } });
 const cardEv = (val, open, chat, mid) => ({ action: { value: val }, context: { open_chat_id: chat, open_message_id: mid || 'msg_rt' }, operator: { open_id: open } });
 const readCfg = () => JSON.parse(fs.readFileSync(CFG, 'utf8').replace(/^﻿/, ''));
@@ -72,6 +73,34 @@ async function main() {
     await A.onCardAction(cardEv({ do: 'enter', p: PROJ.path }, MATE, MATE_CHAT));
     const mateSess = A.getSession(MATE_CHAT);
     check('A6 同事进项目 → 直接只读查询模式(无需选 只读/修改)', mateSess.mode === 'project' && mateSess.sub === 'query', JSON.stringify(mateSess));
+
+    // GROUP poisoning: an @-mention in a group must NOT change the user's p2p mapping — the next
+    // bottom-menu tap must still reply to their own chat, never into the group
+    await sleep(1600); client.__reset();
+    await A.onMessage(msgEv('帮助', MATE, 'oc_some_group_chat', 'group'));
+    await A.onBotMenu(menuEv('menu', MATE));
+    const toGroup = client.__calls.filter(c => c.op === 'create' && c.to === 'oc_some_group_chat' && c.type === 'interactive').length;
+    const toMate = client.__calls.filter(c => c.op === 'create' && c.to === MATE_CHAT && c.type === 'interactive').length;
+    check('A7 群里@机器人后点底部菜单 → 卡片仍发到本人私聊,绝不进群', toGroup === 0 && toMate >= 1, JSON.stringify(client.__calls.map(c => c.op + '->' + c.to)));
+
+    // owner in a group must not rebind the notification chat
+    await A.onMessage(msgEv('你好', OWNER, 'oc_some_group_chat', 'group'));
+    check('A8 owner 群发言不改通知 chat', readCfg().feishuChatId === OWNER_CHAT, 'now=' + readCfg().feishuChatId);
+
+    // menu-first NEW user: mode picked from the bottom menu must survive their first typed message
+    const FRESH = 'ou_fresh_user_routing_test';
+    await sleep(1600); client.__reset();
+    await A.onBotMenu(menuEv('chat', FRESH));            // no mapping yet -> od: pseudo target
+    await A.onMessage(msgEv('随便聊聊', FRESH, 'oc_fresh_user_chat'));   // first real message
+    await sleep(300);
+    const freshSess = A.getSession('oc_fresh_user_chat');
+    check('A9 新用户先点菜单再发消息 → 菜单选的闲聊模式不丢(od:状态已迁移)', freshSess.mode === 'chat', JSON.stringify(freshSess));
+
+    // viewer must not reach the modify-session flow buttons
+    client.__reset();
+    await A.onCardAction(cardEv({ do: 'sesslist' }, MATE, MATE_CHAT));
+    const gotList = client.__calls.some(c => c.op === 'patch' && /选择会话/.test(c.title || ''));
+    check('A10 viewer 点 sesslist(伪造)→ 被拒,看不到 owner 会话列表', !gotList, JSON.stringify(client.__calls));
 
     // ---------- B. conversation text is NOT hijacked ----------
     // owner in a project modify session: "选 A" must reach the conversation (announce appears), not
@@ -118,6 +147,11 @@ async function main() {
     fs.writeFileSync(CFG, cfgBackup);
     if (sessBackup) fs.writeFileSync(SESS, sessBackup); else { try { fs.unlinkSync(SESS); } catch (e) {} }
     if (uchBackup) fs.writeFileSync(UCH, uchBackup); else { try { fs.unlinkSync(UCH); } catch (e) {} }
+    // belt-and-braces: if any stray test session jsonl ever appears, remove it
+    try {
+      const base = path.join(process.env.USERPROFILE || '', '.claude', 'projects');
+      for (const d of fs.readdirSync(base)) { const f = path.join(base, d, 'deaddead-dead-4dea-8dea-deaddeaddead.jsonl'); if (fs.existsSync(f)) fs.unlinkSync(f); }
+    } catch (e) {}
   }
   console.log(failed ? `\nFAILED (${failed})` : '\nALL PASS');
   process.exit(failed ? 1 : 0);

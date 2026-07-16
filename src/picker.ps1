@@ -125,7 +125,7 @@ if(-not $script:instanceOwned -and -not $RenderTo -and -not $SelfTest){
           <TextBlock x:Name="Subtitle" Text="勾选一个或多个,额度重置后自动继续" Foreground="{StaticResource Muted}" FontSize="12.5" Margin="0,3,0,0"/>
         </StackPanel>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
-          <Border x:Name="ChatModelChip" Cursor="Hand" ToolTip="飞书机器人(聊天 + 项目执行)使用的模型(点击切换 默认 / Sonnet / Opus / Haiku)。与飞书共享同一配置,两边实时同步;被限流时可换个模型重试。" CornerRadius="9" Background="{StaticResource Card}" BorderBrush="{StaticResource Border0}" BorderThickness="1" Padding="13,7" Margin="0,0,8,0">
+          <Border x:Name="ChatModelChip" Cursor="Hand" ToolTip="飞书机器人(聊天 + 项目执行)使用的模型(点击切换 默认 / Fable 5 / Opus / Sonnet / Haiku)。与飞书共享同一配置,两边实时同步;被限流时可换个模型重试。" CornerRadius="9" Background="{StaticResource Card}" BorderBrush="{StaticResource Border0}" BorderThickness="1" Padding="13,7" Margin="0,0,8,0">
             <TextBlock x:Name="ChatModelText" Text="模型 默认" Foreground="{StaticResource Ink2}" FontSize="12.5" FontWeight="SemiBold"/>
           </Border>
           <Border x:Name="IntervalChip" Cursor="Hand" ToolTip="布防后每隔多久自动实探一次额度(点击切换 5 / 15 / 30 分钟);被限流后自动加密到 4 分钟。" CornerRadius="9" Background="{StaticResource Card}" BorderBrush="{StaticResource Border0}" BorderThickness="1" Padding="13,7" Margin="0,0,8,0">

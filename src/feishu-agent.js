@@ -176,6 +176,15 @@ function rememberUserChat(openId, chatId) {
   if (!openId || !chatId || userChats[openId] === chatId) return;
   userChats[openId] = chatId;
   try { fs.writeFileSync(USERCHATS_PATH, JSON.stringify(userChats, null, 2), 'utf8'); } catch (e) {}
+  // a brand-new user may have tapped the bottom menu BEFORE ever messaging: their session/card
+  // then lives under the 'od:<open_id>' pseudo-target. Migrate it to the real chat so the mode
+  // they picked from the menu survives their first typed message (instead of splitting state).
+  try {
+    const od = 'od:' + openId;
+    const s = readSessions();
+    if (s[od]) { if (!s[chatId]) s[chatId] = s[od]; delete s[od]; writeSessions(s); }
+    if (lastCard.has(od)) { lastCard.set(chatId, lastCard.get(od)); lastCard.delete(od); }
+  } catch (e) {}
 }
 // reply target for a user when no chat_id is on the event: their known chat, else send by open_id
 // (an 'od:ou_xxx' target — sendText/sendCard translate it to receive_id_type='open_id', which
@@ -242,8 +251,9 @@ function clearQuerySession(projectPath) {
 }
 
 // prefix that makes a full user's message a READ-ONLY query (viewers are always read-only).
-// 查询/只读 are unambiguous so no separator is required; drop bare 问 (matches 问题/问一下).
-const QUERY_RE = /^\s*(查询|只读查询|只读|query)\s*[:：]?\s*([\s\S]+)$/i;
+// requires a separator (space or colon) after the keyword so "只读xxx"-style prose in a modify
+// conversation is not silently rerouted into the shared query session.
+const QUERY_RE = /^\s*(查询|只读查询|只读|query)(?:\s+|[:：])\s*([\s\S]+)$/i;
 
 // ---- a project's claude WORK sessions (what ✏️修改 continues) ----
 // Each *.jsonl in the project's ~/.claude/projects/<encoded-cwd>/ folder is one conversation (the
@@ -433,6 +443,16 @@ function oneOffTarget(text) {
 // ---- run claude in a cwd (project or the chat scratch dir); return {ok, limited, text} ----
 const running = new Map(); // cwd(lower) -> child
 const inflight = new Set(); // cwd(lower) reserved synchronously to close the check->spawn race
+// kill the WHOLE tree: we spawn cmd.exe -> claude.cmd -> node; child.kill() only terminates the
+// cmd wrapper on Windows and the grandchild keeps running (verified — a "stopped" test run
+// finished anyway and committed). taskkill /T /F takes the tree down.
+function killTree(child) {
+  try {
+    if (process.platform === 'win32' && child && child.pid) {
+      spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, stdio: 'ignore' });
+    } else if (child) child.kill();
+  } catch (e) { try { child.kill(); } catch (e2) {} }
+}
 // Run long claude work in the BACKGROUND so the event handler returns immediately. The WS layer
 // awaits the handler before ACKing the event back to Feishu (sdk: `yield eventDispatcher.invoke`),
 // so an awaited 1-4 min claude run means no ACK for minutes -> Feishu stops delivering / re-delivers
@@ -447,6 +467,11 @@ function bg(label, key, work) {
 }
 function runClaude(cwd, label, prompt, opts) {
   opts = opts || {};
+  // offline-test stub: tests that only assert DISPATCH behavior must never spawn a real claude —
+  // a "harmless" run once resumed old context under skip-permissions and pushed a git commit.
+  if (TEST_MODE && process.env.FEISHU_TEST_NO_CLAUDE) {
+    return Promise.resolve({ ok: true, limited: false, text: '(测试桩:未真正执行)', ms: 1 });
+  }
   return new Promise((resolve) => {
     const cfg = readConfig();
     try { fs.mkdirSync(cwd, { recursive: true }); } catch (e) {}
@@ -485,7 +510,7 @@ function runClaude(cwd, label, prompt, opts) {
     let buf = '', resultText = null, isError = null, limited = false, killedForTimeout = false;
     let lastAssistant = null, errBuf = '', usage = null, cost = null;   // + token usage / cost from result
     const t0 = Date.now();
-    const to = setTimeout(() => { killedForTimeout = true; try { child.kill(); } catch (e) {} }, timeoutMs);
+    const to = setTimeout(() => { killedForTimeout = true; killTree(child); }, timeoutMs);
     function scanLine(ln) {
       if (!ln) return;
       if (/"status"\s*:\s*"(blocked|rejected|limited|exceeded)"/.test(ln) ||
@@ -819,11 +844,11 @@ function helpText(chatId) {
     '用按钮最省事(发「菜单」调出):主菜单点项目 → 弹出「👁只读 / ✏️修改」→ 选一个 → 直接发消息。',
     '(选「✏️修改」会先让你挑要继续哪个会话,并给你最近对话摘要;也可「🆕 新开会话」。)',
     '',
-    '文字命令:',
-    '· 项目 / 菜单 → 列出项目(卡片)',
-    '· 进入 <编号或名字> → 进入项目,再选 只读/修改',
-    '· 查询 <问题> → 直接只读问答,不改文件(不用先选模式)',
-    '· 退出 → 回主菜单',
+    '文字命令(标 ⌂ 的仅在主菜单/空闲状态生效;进入会话后你打的字都属于会话,发「退出」先回主菜单):',
+    '· 项目 / 菜单 → 列出项目(卡片,任何时候可用)',
+    '· ⌂ 进入 <编号或名字> / 直接发项目名或编号 → 进入项目',
+    '· ⌂ 查询 <问题> → 直接只读问答,不改文件',
+    '· 退出 → 回主菜单(任何时候可用)',
     '· 状态 → 布防 / 额度 / 当前模式',
     '· 停止 <项目> → 取消正在跑的指令',
     '· 模型 / 模型 fable → 查看或切换模型;「模型 claude-xxx」可用任何新模型(聊天+项目都用,与软件同步)',
@@ -913,13 +938,19 @@ async function onMessage(data) {
     const senderOpen = data.sender && data.sender.sender_id && data.sender.sender_id.open_id;
 
     // remember every user's own p2p chat (bot-menu events carry no chat_id, so replies need this).
-    rememberUserChat(senderOpen, chatId);
-    // feishuChatId is the OWNER's notification chat. Only an owner's message may set it — a
-    // coworker's event must never hijack it (that routed their menus into the owner's chat and
-    // would have leaked checker notifications to them).
+    // P2P ONLY: an @-mention in a GROUP must not poison the mapping, or the user's next bottom-menu
+    // tap would post the control card into the group and reset the group's session.
+    const isP2P = (msg.chat_type || 'p2p') === 'p2p';
+    if (isP2P) rememberUserChat(senderOpen, chatId);
+    // feishuChatId is the OWNER's notification chat. Rebind rules (each one load-bearing):
+    // - p2p only: an owner @-ing the bot in a group must not leak checker/authorize notifications there;
+    // - sender must be EXPLICITLY in feishuAuthOpenIds (bootstrap-unlocked strangers don't count);
+    // - bootstrap exception: while unlocked AND no chat is bound yet, the first p2p message binds it.
     try {
       const c = readConfig();
-      if (chatId && c.feishuChatId !== chatId && authLevel(senderOpen) === 'full') {
+      const fullList = (Array.isArray(c.feishuAuthOpenIds) ? c.feishuAuthOpenIds : []).filter(Boolean);
+      const mayBind = fullList.indexOf(senderOpen) !== -1 || (!c.feishuChatId && fullList.length === 0);
+      if (chatId && isP2P && c.feishuChatId !== chatId && mayBind) {
         c.feishuChatId = chatId;
         fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8');
         logLine('已记录通知 chatId(owner): ' + chatId);
@@ -939,8 +970,9 @@ async function onMessage(data) {
     logLine(`收到消息 chat=${chatId} sender=${senderOpen}: ${text}`);
     const low = text.toLowerCase();
 
-    // password unlock: authorize this account for project/config ops
-    const um = text.match(/^(解锁|认证|密码|auth|unlock)\s+(.+)$/i);
+    // password unlock: authorize this account for project/config ops (idle only — inside a
+    // conversation a sentence starting with these words belongs to the conversation)
+    const um = getSession(chatId).mode === 'idle' ? text.match(/^(解锁|认证|密码|auth|unlock)\s+(.+)$/i) : null;
     if (um) {
       const c2 = readConfig();
       if (c2.feishuAuthPassword && um[2].trim() === String(c2.feishuAuthPassword)) {
@@ -987,7 +1019,7 @@ async function onMessage(data) {
     // ---- global commands (work in any mode) ----
     if (['帮助', 'help', '?', '？'].indexOf(low) !== -1) { await sendText(chatId, helpText(chatId)); return; }
     if (['状态', 'status', 'zt'].indexOf(low) !== -1) { if (await denyProject(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
-    if (['项目', 'list', '项目列表', '列出项目', '所有项目', '菜单', 'menu', '选择', '操作'].indexOf(low) !== -1) { await showCard(chatId, buildMenuCard(chatId, senderOpen)); return; }
+    if (['项目', 'list', '项目列表', '列出项目', '所有项目', '菜单', 'menu'].indexOf(low) !== -1) { await showCard(chatId, buildMenuCard(chatId, senderOpen)); return; }
     if (['退出', '返回', 'exit', 'quit', '退出项目', '主菜单'].indexOf(low) !== -1) {
       setSession(chatId, { mode: 'idle' });
       await showCard(chatId, buildMenuCard(chatId, senderOpen));   // back to the main menu (idle)
@@ -1041,8 +1073,13 @@ async function onMessage(data) {
       if (await denyConfig(senderOpen, chatId)) return;   // owner-only: a viewer must not kill your run
       const rest = text.replace(/^(停止|stop)\s*/i, '').trim();
       const p = rest ? findProject(rest) : activeProject(chatId);
-      if (p && running.has(p.path.toLowerCase())) { try { running.get(p.path.toLowerCase()).kill(); } catch (e) {} await sendText(chatId, `已请求停止:${p.name}`); }
-      else await sendText(chatId, '没有正在运行的项目。');
+      // cover ALL run kinds: the project's modify run, its query run (isolated cwd), and chat
+      const keys = [];
+      if (p) { keys.push(p.path.toLowerCase(), querySession(p.path).cwd.toLowerCase()); }
+      keys.push(CHAT_DIR.toLowerCase());
+      const hit = keys.find(k => running.has(k));
+      if (hit) { killTree(running.get(hit)); await sendText(chatId, '已请求停止' + (p ? `:${p.name}` : '(闲聊)')); }
+      else await sendText(chatId, '没有正在运行的任务。');
       return;
     }
 
@@ -1202,17 +1239,20 @@ async function onCardAction(ev) {
     const cfg = readConfig();
     const allow = Array.isArray(cfg.feishuAllowOpenIds) ? cfg.feishuAllowOpenIds.filter(Boolean) : [];
     if (allow.length && senderOpen && allow.indexOf(senderOpen) === -1) { logLine('拒绝未授权点击: ' + senderOpen); return; }
-    rememberUserChat(senderOpen, chatId);
-    // owner-only: a coworker's click must never hijack the notification chat (it routed their
-    // menus into the owner's chat and pointed checker notifications at them)
-    try { if (chatId && cfg.feishuChatId !== chatId && authLevel(senderOpen) === 'full') { cfg.feishuChatId = chatId; fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 4), 'utf8'); } } catch (e) {}
+    // NO feishuChatId rebind and NO unconditional userChats write here: card events carry no
+    // chat_type, so a click in a group would poison both. The owner binds the notification chat
+    // with any p2p message; userChats learns only from p2p messages (od: migration covers the
+    // "tapped the menu before ever messaging" case). Only fill a MISSING mapping as a bootstrap.
+    if (senderOpen && !userChats[senderOpen]) rememberUserChat(senderOpen, chatId);
     logLine(`卡片点击 chat=${chatId} sender=${senderOpen}: ${JSON.stringify(val)}`);
 
     // IMPORTANT: a card callback must respond within a few seconds or Feishu shows
     // "目标回调服务超时未响应". So do ONLY fast local work here (sync file writes) and fire every
     // API call (send/patch) WITHOUT await, then return immediately.
     const projectActs = ['status', 'enter', 'submode'];                        // viewers allowed
-    const configActs = ['perm', 'model', 'authorize', 'revoke', 'viewauth', 'viewrevoke', 'clearq'];  // full only
+    // full only — incl. the modify-session flow (sesslist/pick/newsess/backproj): a viewer must not
+    // browse the owner's work-session titles/digests or flip a session's work pointer
+    const configActs = ['perm', 'model', 'authorize', 'revoke', 'viewauth', 'viewrevoke', 'clearq', 'sesslist', 'pick', 'newsess', 'backproj'];
     if (projectActs.indexOf(val.do) !== -1 && !canProject(senderOpen)) { denyProject(senderOpen, chatId); return; }
     if (configActs.indexOf(val.do) !== -1 && !canConfig(senderOpen)) { denyConfig(senderOpen, chatId); return; }
 
