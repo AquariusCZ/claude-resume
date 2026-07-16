@@ -22,7 +22,7 @@ const A = require(path.join(__dirname, '..', 'src', 'feishu-agent.js'));
 const client = A.client;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const msgEv = (t) => ({ message: { message_id: 'm_mr_' + Date.now(), chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text: t }) }, sender: { sender_id: { open_id: OWNER } } });
-const texts = () => client.__calls.filter(c => c.op === 'create' && c.type === 'text').map(c => c.text || '');
+const texts = () => client.__calls.filter(c => c.op === 'create').map(c => (c.title || '') + '\n' + (c.text || ''));
 
 let failed = 0;
 const check = (n, c, x) => { console.log((c ? '  ✓ ' : '  ✗ ') + n + (c ? '' : ' — ' + x)); if (!c) failed++; };
@@ -43,7 +43,7 @@ async function main() {
     client.__reset();
     await A.onMessage(msgEv('我们刚才对话里你原样输出过六个字,是哪六个字?只回答那六个字本身,不要做任何其他事,不要修改任何文件。'));
 
-    const results = () => texts().filter(t => /✅ 「|⚠️ 「/.test(t));
+    const results = () => texts().filter(t => /✅ 完成|⚠️ 未完成/.test(t));
     for (let i = 0; i < 60 && results().length === 0; i++) await sleep(2000);
     const reply = results().join('\n');
     console.log('\n--- 执行结果 ---\n' + reply.slice(0, 400) + '\n---');

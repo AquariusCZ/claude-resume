@@ -43,8 +43,9 @@ async function main() {
     await A.onMessage(ev);   // resolves fast; the claude run continues in the background
     // poll until the RESULT message (not the announce echo) arrives
     const sleep = ms => new Promise(r => setTimeout(r, ms));
-    const results = () => client.__calls.filter(c => c.op === 'create' && c.type === 'text')
-      .map(c => c.text || '').filter(t => /✅ 查询结果|⚠️/.test(t));
+    // results are rendered CARDS now (title + lark_md body); scan title+body
+    const results = () => client.__calls.filter(c => c.op === 'create')
+      .map(c => (c.title || '') + '\n' + (c.text || '')).filter(t => /✅ 查询结果|⚠️ 查询/.test(t));
     for (let i = 0; i < 60 && results().length === 0; i++) await sleep(2000);
     const secs = Math.round((Date.now() - t0) / 1000);
     const joined = results().join('\n---\n');

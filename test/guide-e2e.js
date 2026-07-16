@@ -38,8 +38,8 @@ async function main() {
     const t0 = Date.now();
     await A.onMessage(ev);   // resolves fast; poll for the RESULT message (not the announce echo)
     const sleep = ms => new Promise(r => setTimeout(r, ms));
-    const results = () => client.__calls.filter(c => c.op === 'create' && c.type === 'text')
-      .map(c => c.text || '').filter(t => /✅ 查询结果|⚠️/.test(t));
+    const results = () => client.__calls.filter(c => c.op === 'create')
+      .map(c => (c.title || '') + '\n' + (c.text || '')).filter(t => /✅ 查询结果|⚠️ 查询/.test(t));
     for (let i = 0; i < 60 && results().length === 0; i++) await sleep(2000);
     const secs = Math.round((Date.now() - t0) / 1000);
     const reply = results().join('\n');

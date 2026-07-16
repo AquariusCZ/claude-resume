@@ -84,7 +84,28 @@ if (!TEST_MODE && (!APP_ID || !APP_SECRET)) { logLine('config.json 缺少 feishu
 function makeMockClient() {
   let seq = 0; const calls = [];
   const titleOf = c => { try { const j = JSON.parse(c); return (j.header && j.header.title && j.header.title.content) || null; } catch (e) { return null; } };
-  const textOf = c => { try { return JSON.parse(c).text || null; } catch (e) { return null; } };
+  // text of a message: plain-text content, OR (for interactive cards) all lark_md/plain_text bodies
+  // concatenated — so tests can scan a result card's body just like a text message.
+  const textOf = c => {
+    try {
+      const j = JSON.parse(c);
+      if (j.text) return j.text;
+      if (j.elements) {
+        const out = [];
+        const walk = (el) => {
+          if (!el) return;
+          if (Array.isArray(el)) return el.forEach(walk);
+          if (el.text && typeof el.text.content === 'string') out.push(el.text.content);
+          if (typeof el.content === 'string') out.push(el.content);
+          if (el.elements) walk(el.elements);
+          if (el.actions) walk(el.actions);
+        };
+        walk(j.elements);
+        return out.join('\n') || null;
+      }
+      return null;
+    } catch (e) { return null; }
+  };
   return {
     __calls: calls,
     __reset() { calls.length = 0; },
@@ -216,8 +237,12 @@ function markChatStarted() { try { fs.writeFileSync(path.join(CHAT_DIR, '.starte
 // shared by everyone: --session-id creates it, --resume continues it. Separate from work sessions.
 const QUERY_DIR = path.join(APP_DIR, 'feishu-query');        // per-project .started flags
 const QUERY_CWD_BASE = path.join(APP_DIR, 'feishu-query-cwd'); // queries run HERE, never in project.path
-function querySession(projectPath) {
-  const h = crypto.createHash('sha1').update(String(projectPath).toLowerCase()).digest('hex');
+function querySession(projectPath, openId) {
+  // key by (project, USER) — each person's read-only queries are PRIVATE: a coworker resuming this
+  // project's query never sees your conversation (separate session + isolated cwd), and two people
+  // querying the same project run CONCURRENTLY instead of blocking each other. openId falls back to
+  // 'anon' only for degenerate callers (every real query path passes the sender).
+  const h = crypto.createHash('sha1').update(String(projectPath).toLowerCase() + '|' + String(openId || 'anon')).digest('hex');
   const id = `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
   const flag = path.join(QUERY_DIR, h + '.started');
   // isolated cwd so the query transcript does NOT land in project.path's session folder — otherwise
@@ -236,8 +261,8 @@ function querySessionExists(id) {
 function markQueryStarted(flag, meta) { try { fs.mkdirSync(QUERY_DIR, { recursive: true }); fs.writeFileSync(flag, JSON.stringify(meta || {}), 'utf8'); } catch (e) {} }
 // wipe one project's shared query session: remove the flag AND the claude session jsonl(s) with
 // that id (must delete the jsonl — --session-id on an existing id errors "already in use").
-function clearQuerySession(projectPath) {
-  const qs = querySession(projectPath);
+function clearQuerySession(projectPath, openId) {
+  const qs = querySession(projectPath, openId);
   let deleted = 0;
   try { fs.unlinkSync(qs.flag); } catch (e) {}
   try {
@@ -376,8 +401,8 @@ function projectGitHash(projectPath) {
     } catch (e) { resolve(''); }
   });
 }
-async function runProjectQuery(chatId, project, prompt) {
-  const qs = querySession(project.path);
+async function runProjectQuery(chatId, project, prompt, openId) {
+  const qs = querySession(project.path, openId);
   const cfg = readConfig();
   // Preferred: a project's AI_GUIDE.md (generate it with the project-tour skill) — a dense, self-
   // contained tour (架构/模块/测试流程/数据格式/FAQ/术语/文档索引). Inject it ONCE when the query
@@ -399,10 +424,22 @@ async function runProjectQuery(chatId, project, prompt) {
       ? `先看上面的项目导览作答;导览不足时,再按其文档索引读最相关的 1~2 篇文档及关键代码;`
       : `先看该目录下的文档索引(AI_GUIDE.md / docs/ / README / 目录树),定位并只读与问题最相关的 1~2 篇文档及它们引用的关键代码;`) +
     `在本轮内直接简要作答。不要通读整个项目,不要启动子任务/子代理,也不要修改任何文件。]\n\n${prompt}`;
+  // SECURITY: --permission-mode plan blocks WRITES but not READS, and reads are NOT confined to the
+  // workspace — a query can Read ../../config.json (feishuAppSecret / feishuAuthPassword) and a
+  // coworker could then 解锁 <password> to self-promote to owner. (Verified: plan-mode Read happily
+  // returns an ancestor file's contents with benign phrasing.) So only an EXPLICITLY-listed owner
+  // keeps file tools for queries (the secrets are theirs anyway); everyone else — coworkers, and
+  // everyone while the bot is unlocked — gets NO file/exec tools and answers from the injected
+  // AI_GUIDE.md only. Mirrors the chat-path defense (test/chat-security.js, test/query-security.js).
+  const fullList = (Array.isArray(cfg.feishuAuthOpenIds) ? cfg.feishuAuthOpenIds : []).filter(Boolean);
+  const trustedOwner = openId && fullList.indexOf(openId) !== -1;   // listed owner — NOT bootstrap-full
+  const disallowed = trustedOwner
+    ? ['Task']   // owner: full read tools, just no big sub-agent explore
+    : ['Task', 'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'NotebookEdit'];   // others: guide-only, no file access
   const stopHb = startHeartbeat(chatId, project.name + ' 查询');
   const r = await runClaude(qs.cwd, project.name + ' 查询', framed, {
     sessionId: qs.id, sessionExists: qs.started, addDir: project.path, readOnly: true,
-    disallowedTools: ['Task'], model: cfg.feishuChatModel   // no sub-agent explore -> far fewer tokens
+    disallowedTools: disallowed, model: runModelFor(openId)   // per-user model; non-owner never on Fable 5
   });
   stopHb();
   // only flip to --resume once claude actually persisted the jsonl — else a failed first query
@@ -628,13 +665,48 @@ async function refreshCard(chatId, messageId, card) {
 }
 // a footer line with elapsed time / output tokens / cost, appended to a run's result
 function fmtMeta(r) {
+  const m = fmtMetaLine(r);
+  return m ? '\n\n———\n' + m : '';
+}
+function fmtMetaLine(r) {
   if (!r) return '';
   const parts = [];
   if (r.ms) parts.push('⏱ ' + Math.round(r.ms / 1000) + 's');
   const ot = r.usage && r.usage.output_tokens;
   if (ot) parts.push('输出 ' + ot + ' tokens');
   if (typeof r.cost === 'number') parts.push('≈ $' + r.cost.toFixed(3));
-  return parts.length ? '\n\n———\n' + parts.join(' · ') : '';
+  return parts.join(' · ');
+}
+// Feishu PLAIN-TEXT messages don't render markdown — **bold**, ## headings and `code` show as raw
+// symbols (user-reported eyesore). Results go out as an interactive card with lark_md instead, and
+// we normalize the bits lark_md can't render (headings, bullets, code fences/ticks, tables).
+function mdToLark(s) {
+  return String(s || '')
+    .replace(/\r/g, '')
+    .replace(/```[\w-]*\n?([\s\S]*?)```/g, (_, c) => c.replace(/\n/g, '\n'))   // fenced blocks -> plain lines
+    .replace(/^\s{0,3}#{1,6}\s+(.*)$/gm, '**$1**')      // # headings -> bold (lark_md has no headings)
+    .replace(/^(\s*)[-*+]\s+/gm, '$1• ')                 // - / * bullets -> • (lark_md doesn't bullet them)
+    .replace(/^\s*\|(.+)\|\s*$/gm, (line, inner) =>      // table rows -> " a · b · c " (no table support)
+      /^[\s:|-]+$/.test(inner) ? '' : '• ' + inner.split('|').map(c => c.trim()).filter(Boolean).join(' · '))
+    .replace(/`([^`\n]+)`/g, '$1')                       // inline `code` -> plain (lark_md shows ticks raw)
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+// send a claude RESULT as a rendered card (title header + lark_md body + gray meta note)
+async function sendResult(chatId, title, body, r, template) {
+  const MAX = 9000;   // Feishu card JSON caps ~30KB; keep the lark_md body comfortably under
+  let b = mdToLark(body || '(无输出)');
+  if (b.length > MAX) b = b.slice(0, MAX) + '\n\n…(内容较长已截断,完整结果见 VS Code 该会话)';
+  const els = [{ tag: 'div', text: { tag: 'lark_md', content: b } }];
+  const meta = fmtMetaLine(r);
+  if (meta) els.push({ tag: 'note', elements: [{ tag: 'lark_md', content: meta }] });
+  const card = {
+    config: { wide_screen_mode: true, update_multi: true },
+    header: { template: template || 'green', title: { tag: 'plain_text', content: title } },
+    elements: els,
+  };
+  await sendCard(chatId, card, false);
+  lastCard.delete(chatId);   // a result card pushes the control card up — invalidate it (same as sendText)
 }
 // long runs go silent while claude works; send a heartbeat so the user knows it's alive.
 // returns a stop() to clear it. First beat at 15s.
@@ -661,13 +733,13 @@ function modelLabelOf(v) {
 // (chat / query / modify) WITHOUT leaving your session. It never reads or writes session state, and
 // its buttons carry from:'m' so the model action re-renders THIS card, not the main menu.
 function buildModelCard(chatId, senderOpen) {
-  const cur = String(readConfig().feishuChatModel || '').toLowerCase();
+  const cur = getUserModel(senderOpen).toLowerCase();   // YOUR own model (per-user)
   const eq = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
-  const mbtns = MODELS.map(([lbl, v]) => ({
+  const mbtns = modelsFor(senderOpen).map(([lbl, v]) => ({   // owner sees Fable 5; others don't
     tag: 'button', text: { tag: 'plain_text', content: (eq(cur, v) ? '✅ ' : '') + lbl },
     type: eq(cur, v) ? 'primary' : 'default', value: { do: 'model', m: v, from: 'm' },
   }));
-  const elements = [{ tag: 'div', text: { tag: 'lark_md', content: `**当前模型:${modelLabelOf(cur)}** — 点一个切换,切完直接继续对话即可(不会打断当前会话)。` } }];
+  const elements = [{ tag: 'div', text: { tag: 'lark_md', content: `**你当前的模型:${modelLabelOf(cur)}** — 点一个切换(只影响你自己),切完直接继续对话即可(不打断当前会话)。` } }];
   for (let i = 0; i < mbtns.length; i += 3) elements.push({ tag: 'action', actions: mbtns.slice(i, i + 3) });
   return {
     config: { wide_screen_mode: true, update_multi: true },
@@ -830,10 +902,11 @@ function buildSessionCard(chatId) {
 }
 
 // ---- status / list / help (mode-aware) ----
-function statusText(chatId) {
+function statusText(chatId, senderOpen) {
   const cfg = readConfig();
   let st = {};
   try { st = JSON.parse(fs.readFileSync(path.join(APP_DIR, 'state.json'), 'utf8')); } catch (e) {}
+  const myModel = modelLabelOf(getUserModel(senderOpen));
   let reset = '额度未接近上限';
   if (st.realFiveHourResetUtc && st.realResetProbedUtc) {
     const rr = st.realFiveHourResetUtc * 1000, now = Date.now();
@@ -844,7 +917,7 @@ function statusText(chatId) {
   }
   const ap = activeProject(chatId);
   const mode = ap ? `📂 当前项目:「${ap.name}」` : (getSession(chatId).mode === 'chat' ? '💬 当前:闲聊模式' : '🅾️ 当前:待选(发「菜单」选择)');
-  return `${mode}\n布防:${cfg.enabled ? '● 已布防' : '○ 未布防'} · 引擎 ${st.phase || 'idle'}\n${reset} · 实探间隔 ${cfg.probeIntervalMinutes || 15}m`;
+  return `${mode}\n你的模型:${myModel}\n布防:${cfg.enabled ? '● 已布防' : '○ 未布防'} · 引擎 ${st.phase || 'idle'}\n${reset} · 实探间隔 ${cfg.probeIntervalMinutes || 15}m`;
 }
 function listText() {
   const ps = discoverProjects();
@@ -898,6 +971,42 @@ function authLevel(openId) {
 }
 const canProject = openId => authLevel(openId) !== 'none';   // enter/query a project (viewer=read-only). now always true when locked
 const canConfig  = openId => authLevel(openId) === 'full';   // modify projects / change config / authorize — owner only
+
+// ---- PER-USER model preference ----
+// A single global model can't satisfy "I use Fable 5, my coworker uses Haiku" — so each person keeps
+// their OWN model. The OWNER's model lives in feishuChatModel (also what the GUI chip shows/sets);
+// every non-owner keeps theirs in feishuUserModels[openId] (default '' = CLI default). Runs use the
+// caller's own model, so your Fable 5 and a coworker's Haiku never collide.
+// Fable 5 is OWNER-ONLY: a non-owner can neither select it (button hidden + command rejected) nor be
+// billed for it (effectiveModel caps it defensively).
+function effectiveModel(openId, model) {
+  if (String(model || '').toLowerCase() === 'claude-fable-5' && authLevel(openId) !== 'full') return '';
+  return model;
+}
+function getUserModel(openId) {
+  const cfg = readConfig();
+  if (authLevel(openId) === 'full') return String(cfg.feishuChatModel || '');
+  const um = cfg.feishuUserModels && cfg.feishuUserModels[openId];
+  return String(um || '');
+}
+function setUserModel(openId, model) {
+  const cfg = readConfig();
+  if (authLevel(openId) === 'full') { cfg.feishuChatModel = model; }
+  else {
+    // non-owners can never store Fable 5
+    if (String(model || '').toLowerCase() === 'claude-fable-5') return false;
+    if (!cfg.feishuUserModels || typeof cfg.feishuUserModels !== 'object') cfg.feishuUserModels = {};
+    cfg.feishuUserModels[openId] = model;
+  }
+  try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 4), 'utf8'); } catch (e) {}
+  return true;
+}
+// the model a run should actually use for this caller (their own pick + the Fable-5 owner-only cap)
+function runModelFor(openId) { return effectiveModel(openId, getUserModel(openId)); }
+// which models a caller may SELECT: owner gets all; everyone else gets the lineup minus Fable 5
+function modelsFor(openId) {
+  return authLevel(openId) === 'full' ? MODELS : MODELS.filter(([, id]) => id !== 'claude-fable-5');
+}
 
 const notifiedUnauth = new Set();   // notify the owner at most once per unknown open_id
 function notifyOwner(openId, chatId) {
@@ -1037,7 +1146,7 @@ async function onMessage(data) {
 
     // ---- global commands (work in any mode) ----
     if (['帮助', 'help', '?', '？'].indexOf(low) !== -1) { await sendText(chatId, helpText(chatId)); return; }
-    if (['状态', 'status', 'zt'].indexOf(low) !== -1) { if (await denyProject(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
+    if (['状态', 'status', 'zt'].indexOf(low) !== -1) { if (await denyProject(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId, senderOpen)); return; }
     if (['项目', 'list', '项目列表', '列出项目', '所有项目', '菜单', 'menu'].indexOf(low) !== -1) { await showCard(chatId, buildMenuCard(chatId, senderOpen)); return; }
     if (['退出', '返回', 'exit', 'quit', '退出项目', '主菜单'].indexOf(low) !== -1) {
       setSession(chatId, { mode: 'idle' });
@@ -1051,22 +1160,30 @@ async function onMessage(data) {
     }
     // model: show (模型) or set (模型 <按钮里的名字 / 任意 claude-* 完整 id>) — shared with the GUI chip
     if (['模型', 'model', '闲聊模型'].indexOf(low) !== -1) {
-      const cur = String(readConfig().feishuChatModel || '');
-      await sendText(chatId, `当前模型:${modelLabelOf(cur)}${cur ? `(${cur})` : ''}\n` +
-        `改用:发「模型 fable / opus / sonnet / haiku / 默认」,或直接给完整 id(如「模型 claude-fable-5」)用任何新模型;主菜单卡上也有按钮。`);
+      const cur = getUserModel(senderOpen);   // YOUR own model (per-user)
+      const owner = authLevel(senderOpen) === 'full';
+      await sendText(chatId, `你当前的模型:${modelLabelOf(cur)}${cur ? `(${cur})` : ''}\n` +
+        (owner
+          ? '改用:发「模型 fable / opus / sonnet / haiku / 默认」,或完整 id(如「模型 claude-fable-5」);也可点底部「🤖 模型」。'
+          : '改用:发「模型 opus / sonnet / haiku / 默认」,或点底部「🤖 模型」。(Fable 5 仅机器人主人可用)'));
       return;
     }
     const setm = text.match(/^(模型|闲聊模型|model)\s+(\S+)$/i);
     if (setm) {
-      if (await denyConfig(senderOpen, chatId)) return;
+      const owner = authLevel(senderOpen) === 'full';
       const a = setm[2].toLowerCase();
       const alias = { 'fable': 'claude-fable-5', 'fable5': 'claude-fable-5', 'opus': 'opus', 'sonnet': 'sonnet', 'haiku': 'haiku', '默认': '', 'default': '', '清除': '', '空': '', 'none': '' };
       let val;
       if (alias[a] !== undefined) val = alias[a];
       else if (/^claude-[a-z0-9.-]+$/i.test(a)) val = a;   // any full model id — future models work day one
-      else { await sendText(chatId, `不认识「${setm[2]}」。可用:fable / opus / sonnet / haiku / 默认,或完整模型 id(claude- 开头)。`); return; }
-      try { const c = readConfig(); c.feishuChatModel = val; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
-      await sendText(chatId, `模型已设为:${modelLabelOf(val)}${val ? `(${val})` : ''}(下一句生效,聊天/查询/修改都用它;软件已同步)。`);
+      else { await sendText(chatId, `不认识「${setm[2]}」。可用:${owner ? 'fable / ' : ''}opus / sonnet / haiku / 默认${owner ? ',或完整模型 id(claude- 开头)' : ''}。`); return; }
+      // Fable 5 is OWNER-ONLY
+      if (String(val).toLowerCase() === 'claude-fable-5' && !owner) {
+        await sendText(chatId, '🔒 Fable 5 仅机器人主人可用。你可以选:opus / sonnet / haiku / 默认。');
+        return;
+      }
+      setUserModel(senderOpen, val);   // per-user (owner -> feishuChatModel, others -> feishuUserModels[open_id])
+      await sendText(chatId, `你的模型已设为:${modelLabelOf(val)}${val ? `(${val})` : ''}(只影响你自己,下一句生效)。`);
       return;
     }
     // forget chat memory (drop the started flag + the claude session for the chat cwd)
@@ -1084,8 +1201,8 @@ async function onMessage(data) {
       if (await denyConfig(senderOpen, chatId)) return;
       const ap = activeProject(chatId);
       if (!ap) { await sendText(chatId, '先进入一个项目,再发「忘记查询」清空它的只读查询记忆。'); return; }
-      const n = clearQuerySession(ap.path);
-      await sendText(chatId, `🧹 已清空「${ap.name}」的只读查询记忆(删除会话 ${n} 个)。下次查询从头开始。`);
+      const n = clearQuerySession(ap.path, senderOpen);   // clears YOUR OWN query session for this project (queries are per-user now)
+      await sendText(chatId, `🧹 已清空你在「${ap.name}」的只读查询记忆(删除会话 ${n} 个)。下次查询从头开始。`);
       return;
     }
     if (/^(停止|stop)(\s|$)/i.test(text)) {   // \b never matches between 止 and a space/CJK char
@@ -1094,7 +1211,7 @@ async function onMessage(data) {
       const p = rest ? findProject(rest) : activeProject(chatId);
       // cover ALL run kinds: the project's modify run, its query run (isolated cwd), and chat
       const keys = [];
-      if (p) { keys.push(p.path.toLowerCase(), querySession(p.path).cwd.toLowerCase()); }
+      if (p) { keys.push(p.path.toLowerCase(), querySession(p.path, senderOpen).cwd.toLowerCase()); }   // your own query run
       keys.push(CHAT_DIR.toLowerCase());
       const hit = keys.find(k => running.has(k));
       if (hit) { killTree(running.get(hit)); await sendText(chatId, '已请求停止' + (p ? `:${p.name}` : '(闲聊)')); }
@@ -1136,13 +1253,13 @@ async function onMessage(data) {
       const isQuery = authLevel(senderOpen) === 'viewer' || !!qm;   // viewer forced RO; owner opts in via 查询/只读
       const q = qm ? qm[2] : oneoff.prompt;
       if (isQuery) {
-        const qk = querySession(oneoff.project.path).cwd.toLowerCase();
-        if (running.has(qk) || inflight.has(qk)) { await sendText(chatId, `「${oneoff.project.name}」查询进行中,请稍候。`); return; }
+        const qk = querySession(oneoff.project.path, senderOpen).cwd.toLowerCase();
+        if (running.has(qk) || inflight.has(qk)) { await sendText(chatId, `你对「${oneoff.project.name}」的查询进行中,请稍候。`); return; }
         inflight.add(qk);   // reserve synchronously, then run in the background so the handler ACKs fast
         bg('一次性查询', qk, async () => {
-          await sendText(chatId, `🔍 只读查询「${oneoff.project.name}」:${q}\n(读代码/答疑,不改文件 · 项目专属查询会话)`);
-          const r = await runProjectQuery(chatId, oneoff.project, q);
-          await sendText(chatId, (r.ok ? `✅ 查询结果:\n\n` : `⚠️ :\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
+          await sendText(chatId, `🔍 只读查询「${oneoff.project.name}」:${q}\n(读代码/答疑,不改文件 · 你专属的查询会话,别人看不到)`);
+          const r = await runProjectQuery(chatId, oneoff.project, q, senderOpen);
+          await sendResult(chatId, (r.ok ? '✅ 查询结果 · ' + oneoff.project.name : '⚠️ 查询未完成 · ' + oneoff.project.name), r.text, r, r.ok ? 'blue' : 'red');
           logLine(`一次性查询 ${oneoff.project.name} ok=${r.ok}`);
         });
         return;
@@ -1154,8 +1271,8 @@ async function onMessage(data) {
         await sendText(chatId, `📂 一次性在「${oneoff.project.name}」执行:${q}\n(可能要 1-4 分钟,跑完自动回结果)`);
         const stopHb = startHeartbeat(chatId, oneoff.project.name);
         try {
-          const r = await runClaude(oneoff.project.path, oneoff.project.name, q, { useContinue: true, model: cfg.feishuChatModel });
-          await sendText(chatId, (r.ok ? `✅ 「${oneoff.project.name}」完成:\n\n` : `⚠️ 「${oneoff.project.name}」:\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
+          const r = await runClaude(oneoff.project.path, oneoff.project.name, q, { useContinue: true, model: runModelFor(senderOpen) });
+          await sendResult(chatId, (r.ok ? '✅ 完成 · ' + oneoff.project.name : '⚠️ 未完成 · ' + oneoff.project.name), r.text, r, r.ok ? 'green' : 'red');
           logLine(`一次性完成 ${oneoff.project.name} ok=${r.ok}`);
         } finally { stopHb(); }
       });
@@ -1173,14 +1290,14 @@ async function onMessage(data) {
       // no sub-mode chosen yet -> ask via the project card first (unless an explicit 查询 prefix)
       if (!sub && !qm) { await showCard(chatId, buildProjectCard(chatId, senderOpen)); return; }
       if (sub === 'query' || qm) {
-        const qk = querySession(active.path).cwd.toLowerCase();   // query runs in its own cwd, not project.path
-        if (running.has(qk) || inflight.has(qk)) { await sendText(chatId, `「${active.name}」查询进行中,请稍候。`); return; }
+        const qk = querySession(active.path, senderOpen).cwd.toLowerCase();   // per-user query cwd, not project.path
+        if (running.has(qk) || inflight.has(qk)) { await sendText(chatId, `你对「${active.name}」的查询进行中,请稍候。`); return; }
         inflight.add(qk);
         const q = qm ? qm[2] : text;
         bg('查询', qk, async () => {
-          await sendText(chatId, `🔍 只读查询「${active.name}」:${q}\n(读代码/答疑,不改文件 · 项目专属查询会话)`);
-          const r = await runProjectQuery(chatId, active, q);
-          await sendText(chatId, (r.ok ? `✅ 查询结果:\n\n` : `⚠️ :\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
+          await sendText(chatId, `🔍 只读查询「${active.name}」:${q}\n(读代码/答疑,不改文件 · 你专属的查询会话,别人看不到)`);
+          const r = await runProjectQuery(chatId, active, q, senderOpen);
+          await sendResult(chatId, (r.ok ? '✅ 查询结果 · ' + active.name : '⚠️ 查询未完成 · ' + active.name), r.text, r, r.ok ? 'blue' : 'red');
           logLine(`查询 ${active.name} ok=${r.ok}`);
         });
         return;
@@ -1198,9 +1315,9 @@ async function onMessage(data) {
         try {
           // an existing session resumes; a freshly-made uuid has no transcript yet -> --session-id creates it
           const r = await runClaude(active.path, active.name, text, {
-            sessionId: work, sessionExists: querySessionExists(work), model: cfg.feishuChatModel,
+            sessionId: work, sessionExists: querySessionExists(work), model: runModelFor(senderOpen),
           });
-          await sendText(chatId, (r.ok ? `✅ 「${active.name}」完成:\n\n` : `⚠️ 「${active.name}」:\n\n`) + (r.text || '(无输出)') + fmtMeta(r));
+          await sendResult(chatId, (r.ok ? '✅ 完成 · ' + active.name : '⚠️ 未完成 · ' + active.name), r.text, r, r.ok ? 'green' : 'red');
           logLine(`完成 ${active.name} ok=${r.ok} session=${work.slice(0, 8)}`);
         } finally { stopHb(); }
       });
@@ -1225,10 +1342,10 @@ async function onMessage(data) {
             skipPermissions: chatOwner,
             readOnly: !chatOwner,
             disallowedTools: chatOwner ? undefined : ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'NotebookEdit'],
-            model: cfg.feishuChatModel,
+            model: runModelFor(senderOpen),   // per-user model; non-owner never on Fable 5
           });
           if (r.ok) markChatStarted();
-          await sendText(chatId, (r.text || '(无输出)') + fmtMeta(r) + '\n\n———\n💬 闲聊模式 · 发「菜单」切换');
+          await sendResult(chatId, r.ok ? '💬 闲聊' : '⚠️ 闲聊', (r.text || '(无输出)') + '\n\n———\n💬 闲聊模式 · 发「菜单」切换', r, r.ok ? 'green' : 'red');
           logLine(`闲聊 完成 ok=${r.ok}`);
         } finally { stopHb(); }
       });
@@ -1258,11 +1375,10 @@ async function onCardAction(ev) {
     const cfg = readConfig();
     const allow = Array.isArray(cfg.feishuAllowOpenIds) ? cfg.feishuAllowOpenIds.filter(Boolean) : [];
     if (allow.length && senderOpen && allow.indexOf(senderOpen) === -1) { logLine('拒绝未授权点击: ' + senderOpen); return; }
-    // NO feishuChatId rebind and NO unconditional userChats write here: card events carry no
-    // chat_type, so a click in a group would poison both. The owner binds the notification chat
-    // with any p2p message; userChats learns only from p2p messages (od: migration covers the
-    // "tapped the menu before ever messaging" case). Only fill a MISSING mapping as a bootstrap.
-    if (senderOpen && !userChats[senderOpen]) rememberUserChat(senderOpen, chatId);
+    // Do NOT learn userChats here at all: card events carry no chat_type, so a click in a GROUP would
+    // bind userChats[open_id] = group-id and then route the user's private bottom-menu into the group
+    // (and reset the group session). userChats is learned ONLY from p2p messages (onMessage, isP2P);
+    // a user who has never messaged still gets replies via the 'od:'+open_id fallback in userTarget.
     logLine(`卡片点击 chat=${chatId} sender=${senderOpen}: ${JSON.stringify(val)}`);
 
     // IMPORTANT: a card callback must respond within a few seconds or Feishu shows
@@ -1271,13 +1387,15 @@ async function onCardAction(ev) {
     const projectActs = ['status', 'enter', 'submode'];                        // viewers allowed
     // full only — incl. the modify-session flow (sesslist/pick/newsess/backproj): a viewer must not
     // browse the owner's work-session titles/digests or flip a session's work pointer
-    const configActs = ['perm', 'model', 'authorize', 'revoke', 'viewauth', 'viewrevoke', 'clearq', 'sesslist', 'pick', 'newsess', 'backproj'];
+    // 'model' is NOT here: everyone may set THEIR OWN model (per-user); the action itself blocks a
+    // non-owner from selecting the owner-only Fable 5.
+    const configActs = ['perm', 'authorize', 'revoke', 'viewauth', 'viewrevoke', 'clearq', 'sesslist', 'pick', 'newsess', 'backproj'];
     if (projectActs.indexOf(val.do) !== -1 && !canProject(senderOpen)) { denyProject(senderOpen, chatId); return; }
     if (configActs.indexOf(val.do) !== -1 && !canConfig(senderOpen)) { denyConfig(senderOpen, chatId); return; }
 
     if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); refreshCard(chatId, messageId, buildMenuCard(chatId, senderOpen)); return; }
     if (val.do === 'home') { setSession(chatId, { mode: 'idle' }); refreshCard(chatId, messageId, buildMenuCard(chatId, senderOpen)); return; }   // leave project mode (avoid accidental typed-modify)
-    if (val.do === 'status') { sendText(chatId, statusText(chatId)); return; }
+    if (val.do === 'status') { sendText(chatId, statusText(chatId, senderOpen)); return; }
     if (val.do === 'perm') {
       const c = readConfig();
       const full = (c.feishuAuthOpenIds || []).filter(Boolean);
@@ -1288,9 +1406,11 @@ async function onCardAction(ev) {
     if (val.do === 'noop') { return; }
     if (val.do === 'model') {
       const mm = String(val.m || '').toLowerCase();
-      // accept exactly what the registry buttons carry (incl. full ids like claude-fable-5)
+      // only registry values; setUserModel writes it PER-USER (owner -> feishuChatModel, others ->
+      // feishuUserModels[open_id]) and refuses Fable 5 for non-owners (defense — the button is hidden
+      // for them anyway). Ignore an invalid/blocked pick (keep the current one).
       const v = MODELS.some(([, id]) => String(id).toLowerCase() === mm) ? mm : '';
-      try { const c = readConfig(); c.feishuChatModel = v; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
+      setUserModel(senderOpen, v);
       // re-render the SAME card so ✅ moves. from:'m' = the standalone bottom-menu model card — it must
       // NOT fall back to the main menu (that would reset the view and hide the running conversation).
       refreshCard(chatId, messageId, val.from === 'm' ? buildModelCard(chatId, senderOpen) : buildMenuCard(chatId, senderOpen));
@@ -1350,8 +1470,8 @@ async function onCardAction(ev) {
       const p = getSession(chatId).project;
       const proj = p ? (discoverProjects().find(x => x.path.toLowerCase() === p.toLowerCase()) || { name: path.basename(p), path: p }) : null;
       if (!proj) { sendText(chatId, '当前不在项目里,无法清空查询记忆。'); return; }
-      const n = clearQuerySession(proj.path);
-      sendText(chatId, `🧹 已清空「${proj.name}」的只读查询记忆(删除会话 ${n} 个)。下次查询从头开始。`);
+      const n = clearQuerySession(proj.path, senderOpen);   // your own per-user query session
+      sendText(chatId, `🧹 已清空你在「${proj.name}」的只读查询记忆(删除会话 ${n} 个)。下次查询从头开始。`);
       return;
     }
     // one-tap grant from the owner-notification card
@@ -1400,12 +1520,11 @@ async function onBotMenu(ev) {
     menuSeen.set(mkey, mnow); if (menuSeen.size > 200) menuSeen.clear();
     logLine('底部菜单点击: ' + key + (evId ? ' eid=…' + String(evId).slice(-6) : ' (无eid)') + (evTime ? ' age=' + Math.round((Date.now() - evTime) / 1000) + 's' : ' (无time)'));
     if (key === 'chat') { setSession(chatId, { mode: 'chat' }); await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。随时点底部「主菜单」回来。'); return; }
-    if (key === 'status') { if (await denyProject(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
+    if (key === 'status') { if (await denyProject(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId, senderOpen)); return; }
     // 🤖 switch model mid-conversation: post a STANDALONE model card (does not touch the session, so
-    // your chat/project/modify context is untouched). Owner-only (feishuChatModel is shared config).
-    // Match several plausible console event_keys so a config typo still works.
+    // your chat/project/modify context is untouched). Everyone may set THEIR OWN model — the card
+    // hides Fable 5 from non-owners. Match several plausible console event_keys so a typo still works.
     if (['model', 'models', '模型', 'switchmodel', 'switch_model', 'setmodel'].indexOf(key) !== -1) {
-      if (await denyConfig(senderOpen, chatId)) return;
       await sendCard(chatId, buildModelCard(chatId, senderOpen), false);
       return;
     }
@@ -1421,7 +1540,7 @@ async function onBotMenu(ev) {
 
 // ---- boot ----
 if (TEST_MODE) {
-  module.exports = { onMessage, onCardAction, onBotMenu, client, lastCard, setSession, getSession, discoverProjects, currentCard, querySession, clearQuerySession, listProjectSessions, sessionPreview, buildSessionCard, buildModelCard, shortTime };
+  module.exports = { onMessage, onCardAction, onBotMenu, client, lastCard, setSession, getSession, discoverProjects, currentCard, querySession, clearQuerySession, listProjectSessions, sessionPreview, buildSessionCard, buildModelCard, effectiveModel, getUserModel, setUserModel, runModelFor, modelsFor, mdToLark, authLevel, shortTime };
   return;   // don't connect to Feishu in tests
 }
 // on every (re)start — usually right after a deploy — reset all chat sessions to idle. The user often

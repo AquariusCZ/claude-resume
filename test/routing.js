@@ -121,8 +121,9 @@ async function main() {
     A.setSession(OWNER_CHAT, { mode: 'chat' }); await sleep(200); client.__reset();
     await A.onMessage(msgEv('在吗', OWNER, OWNER_CHAT));
     await sleep(300);
-    const popped = client.__calls.some(c => c.type === 'interactive');
-    check('B2 闲聊中发「在吗」→ 不弹菜单卡(进对话)', !popped, JSON.stringify(client.__calls.map(c => c.op + ':' + c.type)));
+    // the chat REPLY is a rendered card now, so "no card at all" is wrong — assert no MENU card popped
+    const menuPopped = client.__calls.some(c => c.type === 'interactive' && /选择操作/.test(c.title || ''));
+    check('B2 闲聊中发「在吗」→ 不弹菜单卡(进对话)', !menuPopped, JSON.stringify(client.__calls.map(c => c.op + ':' + (c.title || c.type))));
     await A.onMessage(msgEv('停止', OWNER, OWNER_CHAT)); await sleep(100);
     // stop chat claude if any: chat has no 停止 target; just clear session state
     A.setSession(OWNER_CHAT, { mode: 'idle' });
@@ -165,11 +166,55 @@ async function main() {
     check('D4 选完仍是模型卡(不回落主菜单)+ 会话仍未被打断',
       reRenderedModelCard && sAfter2.mode === before.mode && sAfter2.work === before.work, JSON.stringify(client.__calls.map(c => c.op + ':' + (c.title || c.type))) + ' sess=' + JSON.stringify(sAfter2));
 
-    // a VIEWER tapping the bottom model button is denied (feishuChatModel is shared config)
+    // a VIEWER tapping the bottom model button now GETS a model card — but WITHOUT Fable 5 (owner-only)
     client.__reset();
     await A.onBotMenu(menuEv('model', MATE));
-    const viewerGotModelCard = client.__calls.some(c => c.op === 'create' && c.type === 'interactive' && /切换模型/.test(c.title || ''));
-    check('D5 viewer 点底部「🤖模型」→ 被拒,拿不到模型卡', !viewerGotModelCard, JSON.stringify(client.__calls.map(c => c.op + ':' + (c.title || c.type))));
+    const viewerCard = client.__calls.find(c => c.op === 'create' && c.type === 'interactive' && /切换模型/.test(c.title || ''));
+    check('D5 viewer 点底部「🤖模型」→ 拿到模型卡(可选自己的模型)', !!viewerCard, JSON.stringify(client.__calls.map(c => c.op + ':' + (c.title || c.type))));
+    check('D5b viewer 的模型卡不含 Fable 5(owner 专属)', !!viewerCard && !/Fable 5/.test(viewerCard.text || ''), viewerCard && viewerCard.text);
+
+    // ---------- E. per-USER read-only query isolation (privacy + concurrency) ----------
+    // two people querying the SAME project get SEPARATE sessions & cwds -> a coworker can never see
+    // your query conversation, and the concurrency guard (keyed on cwd) no longer blocks across users.
+    const qOwner = A.querySession(PROJ.path, OWNER);
+    const qMate = A.querySession(PROJ.path, MATE);
+    check('E1 你和同事查同一项目 → 会话 id 不同(同事看不到你的内容)', qOwner.id !== qMate.id, qOwner.id + ' vs ' + qMate.id);
+    check('E2 你和同事查同一项目 → 隔离 cwd 不同(并发不互相阻塞)', qOwner.cwd.toLowerCase() !== qMate.cwd.toLowerCase(), qOwner.cwd + ' vs ' + qMate.cwd);
+    // same user + same project = SAME session (your own follow-ups still resume your context)
+    const qOwner2 = A.querySession(PROJ.path, OWNER);
+    check('E3 你自己再查同项目 → 同一会话(你的追问能续上上下文)', qOwner.id === qOwner2.id && qOwner.cwd === qOwner2.cwd, 'stable');
+    // different projects, same user = different sessions (pick by PATH, not index — discoverProjects
+    // is mtime-sorted so indices shift after we regenerate guides)
+    const other = A.discoverProjects().find(p => p.path.toLowerCase() !== PROJ.path.toLowerCase());
+    if (other) {
+      const qOther = A.querySession(other.path, OWNER);
+      check('E4 你查不同项目 → 不同会话', qOwner.id !== qOther.id, PROJ.name + ' vs ' + other.name);
+    }
+
+    // ---------- F. Fable 5 owner-only cap (defensive layer) ----------
+    check('F1 Fable 5 对同事降级到默认', A.effectiveModel(MATE, 'claude-fable-5') === '', A.effectiveModel(MATE, 'claude-fable-5'));
+    check('F2 Fable 5 对你(owner)保留', A.effectiveModel(OWNER, 'claude-fable-5') === 'claude-fable-5', A.effectiveModel(OWNER, 'claude-fable-5'));
+    check('F3 非 Fable 模型对同事不降级', A.effectiveModel(MATE, 'opus') === 'opus' && A.effectiveModel(MATE, '') === '', 'opus/default kept');
+
+    // ---------- G. PER-USER model: "我 Fable 5、同事 Haiku" 各存各的,互不影响 ----------
+    A.setUserModel(OWNER, 'claude-fable-5');   // owner picks Fable 5
+    A.setUserModel(MATE, 'haiku');             // coworker picks Haiku
+    check('G1 你的模型 = Fable 5', A.getUserModel(OWNER) === 'claude-fable-5', A.getUserModel(OWNER));
+    check('G2 同事的模型 = Haiku(与你独立)', A.getUserModel(MATE) === 'haiku', A.getUserModel(MATE));
+    check('G3 你的运行用 Fable 5', A.runModelFor(OWNER) === 'claude-fable-5', A.runModelFor(OWNER));
+    check('G4 同事的运行用 Haiku(不受你影响)', A.runModelFor(MATE) === 'haiku', A.runModelFor(MATE));
+    // coworker cannot set Fable 5 (owner-only) — the pick is refused, their model unchanged
+    const okSet = A.setUserModel(MATE, 'claude-fable-5');
+    check('G5 同事设 Fable 5 → 被拒(setUserModel 返回 false)', okSet === false, 'ret=' + okSet);
+    check('G6 同事被拒后模型仍是 Haiku', A.getUserModel(MATE) === 'haiku', A.getUserModel(MATE));
+    check('G7 同事的运行绝不会是 Fable 5', A.runModelFor(MATE) !== 'claude-fable-5', A.runModelFor(MATE));
+
+    // ---------- H. output rendering normalization (mdToLark) ----------
+    const md = A.mdToLark('## 标题\n- 一项\n- 两项\n用 `f0` 和 `κ0`\n**加粗**保留');
+    check('H1 ## 标题 → 去掉井号', !/^#/m.test(md) && /标题/.test(md), md);
+    check('H2 - 列表 → •', /•\s*一项/.test(md), md);
+    check('H3 反引号被去掉(飞书不渲染 inline code)', !md.includes('`') && /f0/.test(md), md);
+    check('H4 **加粗** 保留(lark_md 能渲染)', md.includes('**加粗**'), md);
   } finally {
     fs.writeFileSync(CFG, cfgBackup);
     if (sessBackup) fs.writeFileSync(SESS, sessBackup); else { try { fs.unlinkSync(SESS); } catch (e) {} }

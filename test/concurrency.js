@@ -30,7 +30,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 let eid = 0;
 const msgEv = (t) => ({ message: { message_id: 'm_cc_' + (++eid) + '_' + Date.now(), chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text: t }) }, sender: { sender_id: { open_id: OWNER } } });
 const menuEv = () => ({ event_key: 'menu', operator: { operator_id: { open_id: OWNER } }, header: { event_id: 'ecc' + (++eid), create_time: String(Date.now()) } });
-const texts = () => client.__calls.filter(c => c.op === 'create' && c.type === 'text').map(c => c.text || '');
+// results are rendered CARDS now; include title+body so result scans still work
+const texts = () => client.__calls.filter(c => c.op === 'create').map(c => (c.title || '') + '\n' + (c.text || ''));
 const cards = () => client.__calls.filter(c => c.op === 'create' && c.type === 'interactive');
 
 let failed = 0;
@@ -66,7 +67,7 @@ async function main() {
 
     // 4) the original query still completes and posts a result
     let done = false;
-    for (let i = 0; i < 60 && !done; i++) { await sleep(2000); done = texts().some(t => /✅ 查询结果|⚠️/.test(t)); }
+    for (let i = 0; i < 60 && !done; i++) { await sleep(2000); done = texts().some(t => /✅ 查询结果|⚠️ 查询/.test(t)); }
     check('原查询后台完成并回了结果', done, '120s 内未见查询结果');
     const resultText = texts().filter(t => /✅ 查询结果/.test(t)).join(' ').slice(0, 160);
     if (resultText) console.log('  (结果预览: ' + resultText.replace(/\n/g, ' ') + '…)');
