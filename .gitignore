@@ -8,3 +8,5 @@ config.json
 state.json
 *.lock
 .repomix.md
+out.txt
+stderr.txt
