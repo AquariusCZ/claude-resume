@@ -25,6 +25,9 @@ const OWNER = (cfg.feishuAuthOpenIds && cfg.feishuAuthOpenIds.filter(Boolean)[0]
 const MATE = 'ou_coworker_routing_test';
 const MATE_CHAT = 'oc_coworker_chat_routing_test';
 
+// pin the cheapest model for the one real (harmless, isolated-cwd) chat run B2 makes; restored in finally
+cfg.feishuChatModel = 'haiku'; fs.writeFileSync(CFG, JSON.stringify(cfg, null, 4));
+
 const A = require(path.join(__dirname, '..', 'src', 'feishu-agent.js'));
 const client = A.client;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -71,16 +74,19 @@ async function main() {
     check('A6 同事进项目 → 直接只读查询模式(无需选 只读/修改)', mateSess.mode === 'project' && mateSess.sub === 'query', JSON.stringify(mateSess));
 
     // ---------- B. conversation text is NOT hijacked ----------
-    // owner in a project modify session: "选 A" must reach the conversation (announce appears), not the menu
-    const sl = A.listProjectSessions(PROJ.path, 3);
-    A.setSession(OWNER_CHAT, { mode: 'project', project: PROJ.path, sub: 'modify', work: (sl[0] && sl[0].id) || '11111111-1111-4111-8111-111111111111' });
+    // owner in a project modify session: "选 A" must reach the conversation (announce appears), not
+    // the menu. SAFETY (learned the hard way): use a NON-EXISTENT work session id — claude's
+    // --resume then errors out instantly, so nothing actually executes against the real repo.
+    // (An earlier version resumed a REAL session here; the claude it woke up interpreted "选 A"
+    // against that session's old context and pushed a git commit. Murphy wins; never again.)
+    A.setSession(OWNER_CHAT, { mode: 'project', project: PROJ.path, sub: 'modify', work: 'deaddead-dead-4dea-8dea-deaddeaddead' });
     client.__reset();
     await A.onMessage(msgEv('选 A', OWNER, OWNER_CHAT));
     await sleep(400);
     const t1 = client.__calls.filter(c => c.type === 'text').map(c => c.text || '');
     check('B1 修改会话中回复「选 A」→ 进入会话执行(不再弹“没找到项目A”/菜单)',
       t1.some(t => /在「.*」执行:选 A/.test(t)) && !t1.some(t => /没找到项目/.test(t)), JSON.stringify(t1));
-    await A.onMessage(msgEv('停止', OWNER, OWNER_CHAT));   // kill the accidental run cheaply
+    await A.onMessage(msgEv('停止', OWNER, OWNER_CHAT));   // belt-and-braces
 
     // chat mode: a greeting goes to the chat, not the menu (it used to pop the menu card)
     A.setSession(OWNER_CHAT, { mode: 'chat' }); await sleep(200); client.__reset();

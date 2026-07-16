@@ -7,3 +7,4 @@ Desktop.ini
 config.json
 state.json
 *.lock
+.repomix.md
