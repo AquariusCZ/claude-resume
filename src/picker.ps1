@@ -503,8 +503,8 @@ function Update-IntervalChip { $v = 15; try { $v = [int](Get-CcuConfig).probeInt
 Update-IntervalChip
 
 # chat-model chip: click cycles 默认/Sonnet/Opus/Haiku (writes feishuChatModel — shared with the Feishu agent)
-$script:modelCycle = @('','sonnet','opus','haiku')
-function Get-ModelLabel($m){ switch("$m".ToLower()){ 'sonnet' { 'Sonnet' } 'opus' { 'Opus' } 'haiku' { 'Haiku' } default { '默认' } } }
+$script:modelCycle = @('','claude-fable-5','opus','sonnet','haiku')
+function Get-ModelLabel($m){ switch("$m".ToLower()){ 'claude-fable-5' { 'Fable 5' } 'sonnet' { 'Sonnet' } 'opus' { 'Opus' } 'haiku' { 'Haiku' } '' { '默认' } default { "$m" } } }
 function Update-ChatModelChip { $m=''; try { $m="$((Get-CcuConfig).feishuChatModel)" } catch {}; $els.ChatModelText.Text = '模型 ' + (Get-ModelLabel $m) }
 Update-ChatModelChip
 $els.ChatModelChip.Add_MouseLeftButtonUp({

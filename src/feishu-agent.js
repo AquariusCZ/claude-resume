@@ -89,7 +89,7 @@ function makeMockClient() {
     __calls: calls,
     __reset() { calls.length = 0; },
     im: { message: {
-      create: async o => { const id = 'msg_' + (++seq); calls.push({ op: 'create', type: o.data.msg_type, title: titleOf(o.data.content), text: textOf(o.data.content), id }); return { data: { message_id: id } }; },
+      create: async o => { const id = 'msg_' + (++seq); calls.push({ op: 'create', type: o.data.msg_type, to: o.data.receive_id, toType: o.params && o.params.receive_id_type, title: titleOf(o.data.content), text: textOf(o.data.content), id }); return { data: { message_id: id } }; },
       patch: async o => { if (String(o.path.message_id).indexOf('gone') !== -1) throw new Error('mock: message not found (deleted)'); calls.push({ op: 'patch', id: o.path.message_id, title: titleOf(o.data.content) }); return {}; },
     } },
   };
@@ -167,6 +167,20 @@ function discoverProjects() {
 // ---- per-chat active project (persisted) + a chat scratch session ----
 const SESSIONS_PATH = path.join(APP_DIR, 'feishu-sessions.json');
 const CHAT_DIR = path.join(APP_DIR, 'feishu-chat');
+// open_id -> that user's own p2p chat with the bot. Bot-menu events carry only the operator's
+// open_id, so replies MUST be routed via this map (previously they all went to the owner's chat).
+const USERCHATS_PATH = path.join(APP_DIR, 'feishu-userchats.json');
+let userChats = {};
+try { userChats = JSON.parse(fs.readFileSync(USERCHATS_PATH, 'utf8').replace(/^﻿/, '')) || {}; } catch (e) {}
+function rememberUserChat(openId, chatId) {
+  if (!openId || !chatId || userChats[openId] === chatId) return;
+  userChats[openId] = chatId;
+  try { fs.writeFileSync(USERCHATS_PATH, JSON.stringify(userChats, null, 2), 'utf8'); } catch (e) {}
+}
+// reply target for a user when no chat_id is on the event: their known chat, else send by open_id
+// (an 'od:ou_xxx' target — sendText/sendCard translate it to receive_id_type='open_id', which
+// delivers into that user's p2p chat with the bot).
+function userTarget(openId) { return userChats[openId] || (openId ? 'od:' + openId : null); }
 function readSessions() { try { return JSON.parse(fs.readFileSync(SESSIONS_PATH, 'utf8').replace(/^﻿/, '')); } catch (e) { return {}; } }
 function writeSessions(o) { try { fs.writeFileSync(SESSIONS_PATH, JSON.stringify(o, null, 2), 'utf8'); } catch (e) {} }
 // three modes: 'idle' (default — do nothing until the user picks via the card), 'chat', 'project'
@@ -519,6 +533,12 @@ async function apiRetry(fn) {
     throw e;
   }
 }
+// a target is a chat_id, or 'od:ou_xxx' to deliver into a user's p2p chat by open_id
+function sendParams(target) {
+  return String(target).startsWith('od:')
+    ? { type: 'open_id', id: String(target).slice(3) }
+    : { type: 'chat_id', id: target };
+}
 async function sendText(chatId, text) {
   // Feishu text messages get unwieldy past a few KB; chunk to <=3500 chars, cap 6 parts.
   const MAX = 3500, PARTS = 6;
@@ -526,9 +546,10 @@ async function sendText(chatId, text) {
   let s = String(text);
   while (s.length && parts.length < PARTS) { parts.push(s.slice(0, MAX)); s = s.slice(MAX); }
   if (s.length) parts[parts.length - 1] += '\n…(内容过长已截断,完整结果见 VS Code 该项目会话)';
+  const tgt = sendParams(chatId);
   for (const p of parts) {
     try {
-      await apiRetry(() => client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: p }) } }));
+      await apiRetry(() => client.im.message.create({ params: { receive_id_type: tgt.type }, data: { receive_id: tgt.id, msg_type: 'text', content: JSON.stringify({ text: p }) } }));
     } catch (e) { logLine('发送失败: ' + (e && e.message)); }
   }
   // a text message pushes the control card up out of view -> invalidate it so the next menu tap
@@ -542,7 +563,8 @@ const cardHash = new Map();   // message_id -> last content string patched to it
 async function sendCard(chatId, card, setLast) {
   try {
     const content = JSON.stringify(card);
-    const res = await apiRetry(() => client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content } }));
+    const tgt = sendParams(chatId);
+    const res = await apiRetry(() => client.im.message.create({ params: { receive_id_type: tgt.type }, data: { receive_id: tgt.id, msg_type: 'interactive', content } }));
     const mid = res && res.data && res.data.message_id;
     // control cards (menu OR project) become the live lastCard; owner-notify cards pass setLast=falsey
     if (mid && setLast) lastCard.set(chatId, mid);
@@ -563,15 +585,15 @@ async function showCard(chatId, card) {
   return await sendCard(chatId, card, true);
 }
 // which card should this chat be looking at right now (main menu vs the project sub-menu)
-function currentCard(chatId) {
+function currentCard(chatId, senderOpen) {
   const sess = getSession(chatId);
-  return (sess.mode === 'project' && sess.project) ? buildProjectCard(chatId) : buildMenuCard(chatId);
+  return (sess.mode === 'project' && sess.project) ? buildProjectCard(chatId, senderOpen) : buildMenuCard(chatId, senderOpen);
 }
 // update the clicked card in place so the ✅ (current project / model / mode) moves.
-// pass an explicit card to navigate (e.g. project -> main menu); omit to re-render the current one.
+// always pass the card explicitly (built with the operator's senderOpen for role-aware rendering).
 async function refreshCard(chatId, messageId, card) {
-  if (!messageId) return;
-  const content = JSON.stringify(card || currentCard(chatId));
+  if (!messageId || !card) return;
+  const content = JSON.stringify(card);
   if (cardHash.get(messageId) === content) { lastCard.set(chatId, messageId); return; }   // no change -> skip patch
   try {
     await apiRetry(() => client.im.message.patch({ path: { message_id: messageId }, data: { content } }));
@@ -596,32 +618,51 @@ function startHeartbeat(chatId, label) {
   const t = setInterval(() => { secs += 15; sendText(chatId, `🤔 「${label}」思考中…(已 ${secs}s,后台没卡,跑完自动回结果)`); }, 15000);
   return () => { try { clearInterval(t); } catch (e) {} };
 }
+// ---- model registry: keep the newest models one tap away, and NEVER hard-block new ids ----
+// buttons cover the current lineup; the text command 「模型 <任意 claude-* id>」 accepts anything,
+// so a brand-new model is usable the day it ships with zero code changes.
+const MODELS = [
+  ['默认', ''],
+  ['Fable 5', 'claude-fable-5'],   // newest tier (verified working headless)
+  ['Opus', 'opus'],                // CLI aliases always track the latest of each family
+  ['Sonnet', 'sonnet'],
+  ['Haiku', 'haiku'],
+];
+function modelLabelOf(v) {
+  const hit = MODELS.find(([, id]) => String(id).toLowerCase() === String(v || '').toLowerCase());
+  return hit ? hit[0] : (v || '默认');   // unknown custom id -> show it verbatim
+}
 // Telegram-style menu: buttons to enter a project / chat / status / switch model.
-// Default 'idle' mode does nothing until the user taps a button here.
-function buildMenuCard(chatId) {
+// Default 'idle' mode does nothing until the user taps a button here. Role-aware: viewers
+// (coworkers) only see what they can actually use — chat + projects (read-only query).
+function buildMenuCard(chatId, senderOpen) {
   const sess = getSession(chatId);
   const ap = activeProject(chatId);
   const projects = discoverProjects();
+  const owner = authLevel(senderOpen) === 'full';
   const curModel = String(readConfig().feishuChatModel || '').toLowerCase();
-  const modelLabel = { sonnet: 'Sonnet', opus: 'Opus', haiku: 'Haiku' }[curModel] || '默认';
   let modeLine;
   if (ap) modeLine = `**当前:📂 项目「${ap.name}」** — 直接发消息就在这里续跑。`;
   else if (sess.mode === 'chat') modeLine = '**当前:💬 闲聊模式** — 直接说话就是和我聊天。';
-  else modeLine = '**请选择 👇** 点「闲聊模式」开始聊天,或点一个项目进入。选之前我不处理任何消息。';
+  else modeLine = owner
+    ? '**请选择 👇** 点「闲聊模式」开始聊天,或点一个项目进入。选之前我不处理任何消息。'
+    : '**请选择 👇** 点一个项目可**只读查询**它的技术细节(不改任何文件),或点「闲聊模式」。';
   const eq = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
   const elements = [{ tag: 'div', text: { tag: 'lark_md', content: modeLine } }];
-  elements.push({ tag: 'action', actions: [
+  const row1 = [
     { tag: 'button', text: { tag: 'plain_text', content: (sess.mode === 'chat' ? '✅ ' : '💬 ') + '闲聊模式' }, type: sess.mode === 'chat' ? 'primary' : 'default', value: { do: 'chat' } },
     { tag: 'button', text: { tag: 'plain_text', content: 'ℹ️ 状态' }, type: 'default', value: { do: 'status' } },
-    { tag: 'button', text: { tag: 'plain_text', content: '🔑 权限' }, type: 'default', value: { do: 'perm' } },
-  ] });
-  // model switch buttons (applies to BOTH chat and project execution)
-  elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**模型:${modelLabel}** — 聊天和项目执行都用它,点下面切换(被限流时可换个模型重试):` } });
-  const models = [['默认', ''], ['Sonnet', 'sonnet'], ['Opus', 'opus'], ['Haiku', 'haiku']];
-  elements.push({ tag: 'action', actions: models.map(([lbl, v]) => ({
-    tag: 'button', text: { tag: 'plain_text', content: (eq(curModel, v) ? '✅ ' : '') + lbl },
-    type: eq(curModel, v) ? 'primary' : 'default', value: { do: 'model', m: v },
-  })) });
+  ];
+  if (owner) row1.push({ tag: 'button', text: { tag: 'plain_text', content: '🔑 权限' }, type: 'default', value: { do: 'perm' } });
+  elements.push({ tag: 'action', actions: row1 });
+  if (owner) {   // model switching is a config op — viewers don't see dead buttons
+    elements.push({ tag: 'div', text: { tag: 'lark_md', content: `**模型:${modelLabelOf(curModel)}** — 聊天和项目执行都用它;也可发「模型 <任意模型id>」用未列出的新模型:` } });
+    const mbtns = MODELS.map(([lbl, v]) => ({
+      tag: 'button', text: { tag: 'plain_text', content: (eq(curModel, v) ? '✅ ' : '') + lbl },
+      type: eq(curModel, v) ? 'primary' : 'default', value: { do: 'model', m: v },
+    }));
+    for (let i = 0; i < mbtns.length; i += 3) elements.push({ tag: 'action', actions: mbtns.slice(i, i + 3) });
+  }
   if (projects.length) {
     elements.push({ tag: 'hr' });
     const btns = projects.slice(0, 15).map(p => ({
@@ -643,12 +684,27 @@ function buildMenuCard(chatId) {
 
 // project sub-menu (level 1): after entering a project you pick 只读查询 vs 修改项目 FIRST,
 // then just type. The chosen mode shows ✅; switching is one tap. Keeps the hierarchy shallow.
-function buildProjectCard(chatId) {
+function buildProjectCard(chatId, senderOpen) {
   const ap = activeProject(chatId);
   const sub = getSession(chatId).sub;
   const name = ap ? ap.name : '项目';
+  const owner = authLevel(senderOpen) === 'full';
   let line, tmpl;
   const work = getSession(chatId).work;
+  if (!owner) {
+    // coworker view: query-only, no dead buttons. Just ask.
+    return {
+      config: { wide_screen_mode: true, update_multi: true },
+      header: { template: 'blue', title: { tag: 'plain_text', content: '只读查询 · ' + name } },
+      elements: [
+        { tag: 'div', text: { tag: 'lark_md', content: `**📂「${name}」· 👁 只读查询**\n直接提问即可 — 我读这个项目的代码/文档回答你的技术问题,**绝不改文件**。` } },
+        { tag: 'action', actions: [
+          { tag: 'button', text: { tag: 'plain_text', content: 'ℹ️ 状态' }, type: 'default', value: { do: 'status' } },
+          { tag: 'button', text: { tag: 'plain_text', content: '⬅ 主菜单' }, type: 'default', value: { do: 'home' } },
+        ] },
+      ],
+    };
+  }
   if (sub === 'query') { line = `**📂「${name}」· 👁 只读查询**\n直接提问即可 — 我只读代码/答疑,**绝不改文件**。所有查询共用本项目的专属会话。`; tmpl = 'blue'; }
   else if (sub === 'modify') {
     const wt = work ? (workTitle(chatId) || work.slice(0, 8)) : '';
@@ -680,6 +736,13 @@ function buildProjectCard(chatId) {
     header: { template: tmpl, title: { tag: 'plain_text', content: '项目操作 · ' + name } },
     elements,
   };
+}
+// enter a project from a TEXT command: owners get the 只读/修改 choice card; viewers go straight
+// into read-only query (their only capability — no dead sub-mode choice).
+async function enterProject(chatId, senderOpen, p) {
+  const viewer = authLevel(senderOpen) !== 'full';
+  setSession(chatId, { mode: 'project', project: p.path, sub: viewer ? 'query' : undefined });
+  await showCard(chatId, buildProjectCard(chatId, senderOpen));
 }
 // title of the currently picked work session (for the project card), '' if unknown/new
 function workTitle(chatId) {
@@ -763,7 +826,7 @@ function helpText(chatId) {
     '· 退出 → 回主菜单',
     '· 状态 → 布防 / 额度 / 当前模式',
     '· 停止 <项目> → 取消正在跑的指令',
-    '· 模型 / 模型 opus → 查看或切换模型(聊天+项目都用,与软件同步)',
+    '· 模型 / 模型 fable → 查看或切换模型;「模型 claude-xxx」可用任何新模型(聊天+项目都用,与软件同步)',
     '· 权限:默认除机器人主人外,大家都只能只读浏览查询,不能改项目(无需配置)',
     '· 授权 ou_xxx → 额外给某人「可改」权限;取消授权 / 授权列表 管理',
     '· 忘记闲聊 → 清空闲聊记忆;忘记查询 → 清空当前项目的只读查询记忆',
@@ -849,13 +912,17 @@ async function onMessage(data) {
     const chatId = msg.chat_id;
     const senderOpen = data.sender && data.sender.sender_id && data.sender.sender_id.open_id;
 
-    // single-bot mode: remember this chat so the checker's notifications go here too
+    // remember every user's own p2p chat (bot-menu events carry no chat_id, so replies need this).
+    rememberUserChat(senderOpen, chatId);
+    // feishuChatId is the OWNER's notification chat. Only an owner's message may set it — a
+    // coworker's event must never hijack it (that routed their menus into the owner's chat and
+    // would have leaked checker notifications to them).
     try {
       const c = readConfig();
-      if (chatId && c.feishuChatId !== chatId) {
+      if (chatId && c.feishuChatId !== chatId && authLevel(senderOpen) === 'full') {
         c.feishuChatId = chatId;
         fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8');
-        logLine('已记录通知 chatId: ' + chatId);
+        logLine('已记录通知 chatId(owner): ' + chatId);
       }
     } catch (e) {}
 
@@ -920,10 +987,10 @@ async function onMessage(data) {
     // ---- global commands (work in any mode) ----
     if (['帮助', 'help', '?', '？'].indexOf(low) !== -1) { await sendText(chatId, helpText(chatId)); return; }
     if (['状态', 'status', 'zt'].indexOf(low) !== -1) { if (await denyProject(senderOpen, chatId)) return; await sendText(chatId, statusText(chatId)); return; }
-    if (['项目', 'list', '项目列表', '列出项目', '所有项目', '菜单', 'menu', '选择', '操作'].indexOf(low) !== -1) { await showCard(chatId, buildMenuCard(chatId)); return; }
+    if (['项目', 'list', '项目列表', '列出项目', '所有项目', '菜单', 'menu', '选择', '操作'].indexOf(low) !== -1) { await showCard(chatId, buildMenuCard(chatId, senderOpen)); return; }
     if (['退出', '返回', 'exit', 'quit', '退出项目', '主菜单'].indexOf(low) !== -1) {
       setSession(chatId, { mode: 'idle' });
-      await showCard(chatId, buildMenuCard(chatId));   // back to the main menu (idle)
+      await showCard(chatId, buildMenuCard(chatId, senderOpen));   // back to the main menu (idle)
       return;
     }
     if (['闲聊', '闲聊模式', 'chat'].indexOf(low) !== -1) {
@@ -931,20 +998,24 @@ async function onMessage(data) {
       await sendText(chatId, '已进入 💬 闲聊模式,直接说话就是和我聊天。发「退出」回主菜单。');
       return;
     }
-    // chat model: show (模型) or set (模型 opus) — shared with the GUI chip
+    // model: show (模型) or set (模型 <按钮里的名字 / 任意 claude-* 完整 id>) — shared with the GUI chip
     if (['模型', 'model', '闲聊模型'].indexOf(low) !== -1) {
-      const cur = String(readConfig().feishuChatModel || '').toLowerCase();
-      const label = { sonnet: 'Sonnet', opus: 'Opus', haiku: 'Haiku' }[cur] || '默认';
-      await sendText(chatId, `当前模型:${label}\n改用:发「模型 opus / sonnet / haiku / 默认」;软件里也能切换,两边同步。`);
+      const cur = String(readConfig().feishuChatModel || '');
+      await sendText(chatId, `当前模型:${modelLabelOf(cur)}${cur ? `(${cur})` : ''}\n` +
+        `改用:发「模型 fable / opus / sonnet / haiku / 默认」,或直接给完整 id(如「模型 claude-fable-5」)用任何新模型;主菜单卡上也有按钮。`);
       return;
     }
-    const setm = text.match(/^(模型|闲聊模型|model)\s+(opus|sonnet|haiku|默认|default|清除|空|none)$/i);
+    const setm = text.match(/^(模型|闲聊模型|model)\s+(\S+)$/i);
     if (setm) {
       if (await denyConfig(senderOpen, chatId)) return;
       const a = setm[2].toLowerCase();
-      const val = (['opus', 'sonnet', 'haiku'].indexOf(a) !== -1) ? a : '';
+      const alias = { 'fable': 'claude-fable-5', 'fable5': 'claude-fable-5', 'opus': 'opus', 'sonnet': 'sonnet', 'haiku': 'haiku', '默认': '', 'default': '', '清除': '', '空': '', 'none': '' };
+      let val;
+      if (alias[a] !== undefined) val = alias[a];
+      else if (/^claude-[a-z0-9.-]+$/i.test(a)) val = a;   // any full model id — future models work day one
+      else { await sendText(chatId, `不认识「${setm[2]}」。可用:fable / opus / sonnet / haiku / 默认,或完整模型 id(claude- 开头)。`); return; }
       try { const c = readConfig(); c.feishuChatModel = val; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
-      await sendText(chatId, `模型已设为:${val || '默认'}(下一句闲聊生效;软件已同步)。`);
+      await sendText(chatId, `模型已设为:${modelLabelOf(val)}${val ? `(${val})` : ''}(下一句生效,聊天/查询/修改都用它;软件已同步)。`);
       return;
     }
     // forget chat memory (drop the started flag + the claude session for the chat cwd)
@@ -975,27 +1046,34 @@ async function onMessage(data) {
       return;
     }
 
-    // ---- explicit enter/switch: 进入 / 选择 / 切换 <编号或名字> ----
-    const m = text.match(/^(进入|选择|选|切换|打开|进|use|open)\s+(.+)$/i);
+    // ---- FUZZY commands: idle mode ONLY ----
+    // Inside a conversation (chat/project) free text BELONGS TO THE CONVERSATION. The old any-mode
+    // matching hijacked real answers: replying "选 A" to claude's multiple-choice question matched
+    // 「选 <名字>」and dumped the user back into the menu; "1" matched a bare project number; a
+    // greeting popped the menu mid-chat. Explicit commands (退出/菜单/停止/模型/帮助…) above still
+    // work in every mode.
+    const inIdle = getSession(chatId).mode === 'idle';
+    // explicit enter: 进入/打开 <编号或名字> (dropped the trigger-happy aliases 选/选择/切换/进)
+    const m = inIdle ? text.match(/^(进入|打开|open|use)\s+(.+)$/i) : null;
     if (m) {
       if (await denyProject(senderOpen, chatId)) return;
       const p = findProject(m[2]);
-      if (p) { setSession(chatId, { mode: 'project', project: p.path, sub: undefined }); await showCard(chatId, buildProjectCard(chatId)); }
+      if (p) { await enterProject(chatId, senderOpen, p); }
       else await sendText(chatId, `没找到项目「${m[2]}」。\n\n` + listText());
       return;
     }
 
     // greetings: show the button menu (Telegram-style) so it's easy to pick chat vs a project
-    if (/^(你好|您好|hi|hello|hey|哈喽|在吗|在么|在不在|在|你好呀|嗨|yo|start|开始)$/i.test(text)) {
-      await showCard(chatId, buildMenuCard(chatId));
+    if (inIdle && /^(你好|您好|hi|hello|hey|哈喽|在吗|在么|在不在|在|你好呀|嗨|yo|start|开始)$/i.test(text)) {
+      await showCard(chatId, buildMenuCard(chatId, senderOpen));
       return;
     }
 
-    // bare project name/number -> enter it (works from any mode)
-    const bare = projectIfBareName(text);
-    if (bare) { if (await denyProject(senderOpen, chatId)) return; setSession(chatId, { mode: 'project', project: bare.path, sub: undefined }); await showCard(chatId, buildProjectCard(chatId)); return; }
-    // "<project> <command>" -> one-off run, doesn't change the current mode
-    const oneoff = oneOffTarget(text);
+    // bare project name/number -> enter it (idle only)
+    const bare = inIdle ? projectIfBareName(text) : null;
+    if (bare) { if (await denyProject(senderOpen, chatId)) return; await enterProject(chatId, senderOpen, bare); return; }
+    // "<project> <command>" -> one-off run (idle only), doesn't change the current mode
+    const oneoff = inIdle ? oneOffTarget(text) : { project: null };
     if (oneoff.project) {
       if (await denyProject(senderOpen, chatId)) return;
       const qm = oneoff.prompt.match(QUERY_RE);
@@ -1037,7 +1115,7 @@ async function onMessage(data) {
       if (level === 'viewer') sub = 'query';                 // viewers are always read-only
       const qm = text.match(QUERY_RE);                       // 查询/只读 prefix = one-off read-only override
       // no sub-mode chosen yet -> ask via the project card first (unless an explicit 查询 prefix)
-      if (!sub && !qm) { await showCard(chatId, buildProjectCard(chatId)); return; }
+      if (!sub && !qm) { await showCard(chatId, buildProjectCard(chatId, senderOpen)); return; }
       if (sub === 'query' || qm) {
         const qk = querySession(active.path).cwd.toLowerCase();   // query runs in its own cwd, not project.path
         if (running.has(qk) || inflight.has(qk)) { await sendText(chatId, `「${active.name}」查询进行中,请稍候。`); return; }
@@ -1101,7 +1179,7 @@ async function onMessage(data) {
       return;
     }
     // idle mode: don't run anything — show the menu so the user picks a mode first
-    await showCard(chatId, buildMenuCard(chatId));
+    await showCard(chatId, buildMenuCard(chatId, senderOpen));
   } catch (e) { logLine('处理消息异常: ' + (e && e.stack || e)); }
 }
 
@@ -1124,8 +1202,11 @@ async function onCardAction(ev) {
     const cfg = readConfig();
     const allow = Array.isArray(cfg.feishuAllowOpenIds) ? cfg.feishuAllowOpenIds.filter(Boolean) : [];
     if (allow.length && senderOpen && allow.indexOf(senderOpen) === -1) { logLine('拒绝未授权点击: ' + senderOpen); return; }
-    try { if (chatId && cfg.feishuChatId !== chatId) { cfg.feishuChatId = chatId; fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 4), 'utf8'); } } catch (e) {}
-    logLine(`卡片点击 chat=${chatId}: ${JSON.stringify(val)}`);
+    rememberUserChat(senderOpen, chatId);
+    // owner-only: a coworker's click must never hijack the notification chat (it routed their
+    // menus into the owner's chat and pointed checker notifications at them)
+    try { if (chatId && cfg.feishuChatId !== chatId && authLevel(senderOpen) === 'full') { cfg.feishuChatId = chatId; fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 4), 'utf8'); } } catch (e) {}
+    logLine(`卡片点击 chat=${chatId} sender=${senderOpen}: ${JSON.stringify(val)}`);
 
     // IMPORTANT: a card callback must respond within a few seconds or Feishu shows
     // "目标回调服务超时未响应". So do ONLY fast local work here (sync file writes) and fire every
@@ -1135,8 +1216,8 @@ async function onCardAction(ev) {
     if (projectActs.indexOf(val.do) !== -1 && !canProject(senderOpen)) { denyProject(senderOpen, chatId); return; }
     if (configActs.indexOf(val.do) !== -1 && !canConfig(senderOpen)) { denyConfig(senderOpen, chatId); return; }
 
-    if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }
-    if (val.do === 'home') { setSession(chatId, { mode: 'idle' }); refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }   // leave project mode (avoid accidental typed-modify)
+    if (val.do === 'chat') { setSession(chatId, { mode: 'chat' }); refreshCard(chatId, messageId, buildMenuCard(chatId, senderOpen)); return; }
+    if (val.do === 'home') { setSession(chatId, { mode: 'idle' }); refreshCard(chatId, messageId, buildMenuCard(chatId, senderOpen)); return; }   // leave project mode (avoid accidental typed-modify)
     if (val.do === 'status') { sendText(chatId, statusText(chatId)); return; }
     if (val.do === 'perm') {
       const c = readConfig();
@@ -1148,48 +1229,51 @@ async function onCardAction(ev) {
     if (val.do === 'noop') { return; }
     if (val.do === 'model') {
       const mm = String(val.m || '').toLowerCase();
-      const v = (['opus', 'sonnet', 'haiku'].indexOf(mm) !== -1) ? mm : '';
+      // accept exactly what the registry buttons carry (incl. full ids like claude-fable-5)
+      const v = MODELS.some(([, id]) => String(id).toLowerCase() === mm) ? mm : '';
       try { const c = readConfig(); c.feishuChatModel = v; fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 4), 'utf8'); } catch (e) {}
-      refreshCard(chatId, messageId, buildMenuCard(chatId));      // model lives on the main card; re-render it (feedback = ✅ moves)
+      refreshCard(chatId, messageId, buildMenuCard(chatId, senderOpen));      // model lives on the main card; re-render it (feedback = ✅ moves)
       return;
     }
     if (val.do === 'enter') {
       const p = discoverProjects().find(x => x.path.toLowerCase() === String(val.p).toLowerCase()) || (val.p ? { name: path.basename(val.p), path: val.p } : null);
-      // enter -> project sub-menu (pick 只读/修改 first). sub reset so the user chooses each entry.
-      if (p) { setSession(chatId, { mode: 'project', project: p.path, sub: undefined }); refreshCard(chatId, messageId, buildProjectCard(chatId)); }
-      else sendText(chatId, '项目未找到(可能已变化)。发「菜单」重新选。');
+      if (!p) { sendText(chatId, '项目未找到(可能已变化)。发「菜单」重新选。'); return; }
+      // owners pick 只读/修改 next; viewers go STRAIGHT to read-only query (their only capability)
+      const viewer2 = authLevel(senderOpen) !== 'full';
+      setSession(chatId, { mode: 'project', project: p.path, sub: viewer2 ? 'query' : undefined });
+      refreshCard(chatId, messageId, buildProjectCard(chatId, senderOpen));
       return;
     }
     if (val.do === 'submode') {
       const sess = getSession(chatId);
-      if (sess.mode !== 'project' || !sess.project) { refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }
+      if (sess.mode !== 'project' || !sess.project) { refreshCard(chatId, messageId, buildMenuCard(chatId, senderOpen)); return; }
       let sm = (val.sm === 'modify') ? 'modify' : 'query';
       if (sm === 'modify' && authLevel(senderOpen) === 'viewer') { sm = 'query'; sendText(chatId, '👁 你是只读用户,只能查询,不能改项目。'); }
       if (sm === 'modify') {
         // 修改 = continue a specific conversation -> pick which one first (or start a fresh one)
         setSession(chatId, { mode: 'project', project: sess.project, sub: 'modify', work: sess.work });
-        refreshCard(chatId, messageId, sess.work ? buildProjectCard(chatId) : buildSessionCard(chatId));
+        refreshCard(chatId, messageId, sess.work ? buildProjectCard(chatId, senderOpen) : buildSessionCard(chatId));
         return;
       }
       setSession(chatId, { mode: 'project', project: sess.project, sub: sm, work: sess.work });
-      refreshCard(chatId, messageId, buildProjectCard(chatId));   // ✅ moves to the chosen mode
+      refreshCard(chatId, messageId, buildProjectCard(chatId, senderOpen));   // ✅ moves to the chosen mode
       return;
     }
     if (val.do === 'sesslist') {   // 🔀 切换会话
       const sess = getSession(chatId);
-      if (sess.mode !== 'project' || !sess.project) { refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }
+      if (sess.mode !== 'project' || !sess.project) { refreshCard(chatId, messageId, buildMenuCard(chatId, senderOpen)); return; }
       refreshCard(chatId, messageId, buildSessionCard(chatId));
       return;
     }
-    if (val.do === 'backproj') { refreshCard(chatId, messageId, buildProjectCard(chatId)); return; }
+    if (val.do === 'backproj') { refreshCard(chatId, messageId, buildProjectCard(chatId, senderOpen)); return; }
     if (val.do === 'pick' || val.do === 'newsess') {
       const sess = getSession(chatId);
-      if (sess.mode !== 'project' || !sess.project) { refreshCard(chatId, messageId, buildMenuCard(chatId)); return; }
+      if (sess.mode !== 'project' || !sess.project) { refreshCard(chatId, messageId, buildMenuCard(chatId, senderOpen)); return; }
       const isNew = val.do === 'newsess';
       const id = isNew ? crypto.randomUUID() : String(val.s || '');
       if (!id) { refreshCard(chatId, messageId, buildSessionCard(chatId)); return; }
       setSession(chatId, { mode: 'project', project: sess.project, sub: 'modify', work: id });
-      refreshCard(chatId, messageId, buildProjectCard(chatId));   // back to the project card, session shown
+      refreshCard(chatId, messageId, buildProjectCard(chatId, senderOpen));   // back to the project card, session shown
       // digest of the picked conversation so you know where you left off (fire-and-forget: keep the
       // callback fast; reading a transcript is local but can be a few MB)
       bg('会话摘要', null, async () => {
@@ -1239,8 +1323,11 @@ async function onBotMenu(ev) {
     if (evId) { if (seenEid.has(evId)) { logLine('忽略重复投递(eid)'); return; } seenEid.add(evId); if (seenEid.size > 3000) seenEid.clear(); }
     if (evTime && Date.now() - evTime > 60000) { logLine('忽略过期底部菜单事件 age=' + Math.round((Date.now() - evTime) / 1000) + 's'); return; }
     const cfg = readConfig();
-    const chatId = cfg.feishuChatId;   // bot menu lives in the p2p chat; reply to the known chat
-    if (!chatId) { logLine('菜单点击但无 chatId(先随便发一句让我记录会话)'); return; }
+    // reply to the OPERATOR's own p2p chat (from userChats, else by open_id). NEVER to feishuChatId
+    // — that's the owner's chat, and routing everyone's menus there was the "coworker clicks show up
+    // in my chat / coworkers see nothing" bug.
+    const chatId = userTarget(senderOpen) || cfg.feishuChatId;
+    if (!chatId) { logLine('菜单点击但无法确定回复目标(无 open_id)'); return; }
     const allow = Array.isArray(cfg.feishuAllowOpenIds) ? cfg.feishuAllowOpenIds.filter(Boolean) : [];
     if (allow.length && senderOpen && allow.indexOf(senderOpen) === -1) return;
     // dedup rapid repeat taps. The escape-hatch keys (menu/idle/exit/unknown) use a SHORT window so a
@@ -1259,7 +1346,7 @@ async function onBotMenu(ev) {
     // owner-notify card — those append without clearing lastCard). Resets the session so you're unstuck.
     setSession(chatId, { mode: 'idle' });
     lastCard.delete(chatId);
-    await showCard(chatId, buildMenuCard(chatId));
+    await showCard(chatId, buildMenuCard(chatId, senderOpen));
   } catch (e) { logLine('底部菜单事件异常: ' + (e && (e.stack || e))); }
 }
 
