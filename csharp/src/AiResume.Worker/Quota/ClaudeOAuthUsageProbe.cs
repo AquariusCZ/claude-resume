@@ -187,7 +187,11 @@ public sealed class ClaudeOAuthUsageProbe
         return (true, accessToken, null);
     }
 
-    /// <summary>把 oauth/usage 响应映射成 UsageSnapshot。只映射 five_hour 与 seven_day 两个主窗口。</summary>
+    /// <summary>
+    /// 把 oauth/usage 响应映射成 UsageSnapshot。
+    /// 两个主窗口(five_hour / seven_day)用于**显示**;
+    /// 是否被限流则由 <c>limits</c> 数组决定 —— 见 <see cref="IsLimitReached"/>。
+    /// </summary>
     private static UsageSnapshot MapToSnapshot(OAuthUsageResponse payload)
     {
         var now = DateTimeOffset.UtcNow;
@@ -196,7 +200,9 @@ public sealed class ClaudeOAuthUsageProbe
         AppendWindow(windows, "five_hour", UsageWindow.FiveHourSeconds, payload.FiveHour);
         AppendWindow(windows, "seven_day", UsageWindow.SevenDaySeconds, payload.SevenDay);
 
-        bool limitReached = windows.Any(w => w.UsedPercent is { } p && p >= 100);
+        bool limitReached = IsLimitReached(
+            windows.Select(w => w.UsedPercent).ToList(),
+            payload.Limits?.Select(l => l.Percent).ToList() ?? (IReadOnlyList<double?>)Array.Empty<double?>());
         var bucket = new UsageBucket("Usage", !limitReached, limitReached, windows);
 
         string? unavailable = windows.Count > 0 ? null : "oauth/usage 未返回任何限额窗口";
@@ -238,6 +244,44 @@ public sealed class ClaudeOAuthUsageProbe
             usedPercent));
     }
 
+    /// <summary>
+    /// 判断是否已被限流。**任意一条限额打满就算限流**,不只是两个主窗口。
+    ///
+    /// 2026-08-08 审计实测的反例:seven_day 93%(面板显示"正常、可运行"),
+    /// 而同一时刻 <c>weekly_scoped</c> 已是 100%,真实 Fable 任务直接被拒。
+    /// 这个产品存在的全部理由就是"知道什么时候被限流" ——
+    /// **漏判一条已经打满的限额,比多等一会儿严重得多**,所以这里取最保守的读法。
+    ///
+    /// 只认 percent >= 100,不认 <c>severity = "critical"</c>:
+    /// 实测 93% 也标 critical,那是"快满了"的预警,不是"已经不能跑"。
+    /// 拿它当限流会让引擎在还能跑的时候白等。
+    /// </summary>
+    /// <param name="windowPercents">两个主窗口的 used percent(null = 未报告)。</param>
+    /// <param name="limitPercents">
+    /// <c>limits</c> 数组里每条的 percent(null = 该条未报告,跳过而不是当 0 或 100)。
+    /// </param>
+    public static bool IsLimitReached(
+        IReadOnlyList<int?> windowPercents, IReadOnlyList<double?> limitPercents)
+    {
+        foreach (int? p in windowPercents)
+        {
+            if (p is { } v && v >= 100)
+            {
+                return true;
+            }
+        }
+
+        foreach (double? p in limitPercents)
+        {
+            if (p is { } v && v >= 100)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /// <summary>解析 resets_at:支持 ISO 8601 字符串与 epoch 秒数字。</summary>
     private static long? ParseResetAt(object? resetsAt)
     {
@@ -277,6 +321,30 @@ public sealed class ClaudeOAuthUsageProbe
         public object? ResetsAt { get; set; }
     }
 
+    /// <summary>
+    /// <c>limits</c> 数组里的一条。**这是判断"到底还能不能跑"的权威来源。**
+    ///
+    /// 服务端除了 five_hour / seven_day 两个总窗口,还会下发**按模型限定**的额度
+    /// (<c>kind = "weekly_scoped"</c>,带 <c>scope.model</c>)。两者可以差得很远。
+    /// </summary>
+    internal sealed class OAuthLimit
+    {
+        [JsonPropertyName("kind")]
+        public string? Kind { get; set; }
+
+        [JsonPropertyName("percent")]
+        public double? Percent { get; set; }
+
+        [JsonPropertyName("severity")]
+        public string? Severity { get; set; }
+
+        [JsonPropertyName("resets_at")]
+        public object? ResetsAt { get; set; }
+
+        [JsonPropertyName("scope")]
+        public JsonElement? Scope { get; set; }
+    }
+
     /// <summary>oauth/usage 响应整体形状。只映射本轮需要的字段。</summary>
     private sealed class OAuthUsageResponse
     {
@@ -285,6 +353,22 @@ public sealed class ClaudeOAuthUsageProbe
 
         [JsonPropertyName("seven_day")]
         public OAuthWindow? SevenDay { get; set; }
+
+        /// <summary>
+        /// **2026-08-08 审计实测:只看 five_hour / seven_day 会漏判限流。**
+        /// 当时 seven_day 报 93%、面板显示"正常、可运行",而同一时刻真实 Fable 任务
+        /// 直接返回 "You've hit your limit"。原因在这个数组里:
+        /// <code>
+        /// {"kind":"session",       "percent":4,   "severity":"normal"}
+        /// {"kind":"weekly_all",    "percent":93,  "severity":"critical"}
+        /// {"kind":"weekly_scoped", "percent":100, "severity":"critical", "scope":{"model":…}}
+        /// </code>
+        /// **weekly_scoped 已经 100%** —— 按模型限定的额度耗尽了,而总额度还有 7%。
+        /// 这个产品存在的全部理由就是"知道什么时候被限流",漏掉一条已经打满的限额
+        /// 是最不能接受的一类错误。
+        /// </summary>
+        [JsonPropertyName("limits")]
+        public List<OAuthLimit>? Limits { get; set; }
     }
 
     /// <summary>凭据文件形状。只读取 claudeAiOauth.accessToken 与 expiresAt。</summary>

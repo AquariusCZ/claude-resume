@@ -642,9 +642,11 @@ public sealed class ControlPlaneBridge
                 {
                     name = "Codex",
                     state = CodexState(codex, deep),
-                    text = codex.Readiness == CodexReadiness.Ok && !codex.DeepChecked
-                        ? "已就绪 · 未验证授权"
-                        : codex.Summary ?? "未探测",
+                    // **直接用 Summary,不要再拼一句固定文案。**
+                    // 原来这里把 Ok+未深检的情况一律写成"已就绪 · 未验证授权",
+                    // 于是断网时 Summary 里那句"网络不可达:…"被丢掉,
+                    // 用户看到的只有"未验证授权"——排查方向立刻跑偏(2026-08-08 审计实测)。
+                    text = codex.Summary ?? "未探测",
                 },
             },
         };
