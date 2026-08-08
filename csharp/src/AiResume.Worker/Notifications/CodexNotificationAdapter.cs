@@ -134,13 +134,25 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
     /// <inheritdoc />
     public void Enable(string hookCommand)
     {
-        // 解析 hookCommand,取 exe 路径部分
-        var parts = hookCommand.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length == 0)
-        {
-            throw new ArgumentException("hookCommand 不能为空", nameof(hookCommand));
-        }
-        var hookExe = parts[0];
+        // **不能按空格切。** hookCommand 是一条**路径**,不是命令行。
+        //
+        // 2026-08-08 实测事故:安装目录从 ClaudeResume 改名成含空格的 "AI Resume" 后,
+        // 原来的 `Split(' ')[0]` 把
+        //   C:\Users\…\AppData\Local\AI Resume\AiResume.Hook.exe
+        // 截成
+        //   C:\Users\…\AppData\Local\AI
+        // 写进了用户的 config.toml。截断后的条目不含标记 AiResume.Hook.exe,
+        // 于是下一次启用认不出它是自己写的,**再套一层而不是替换** ——
+        // 套到第 8 层撞上 MaxChainDepth,适配器彻底罢工,
+        // 界面只显示「notify 链深度超过上限」。整行长到 9909 字符。
+        // 这行代码写于目录名还没有空格的年代,改名那天它就静默失效了。
+        //
+        // 改按 **.exe 边界**切,不按空格、也不碰磁盘:
+        //   "C:\A B\hook.exe codex"  → "C:\A B\hook.exe"   (路径含空格 + 有参数)
+        //   "C:\A B\hook.exe"        → "C:\A B\hook.exe"   (路径含空格 + 无参数)
+        //   "C:\t\hook.exe codex"    → "C:\t\hook.exe"
+        // 确定性、不依赖文件是否存在,所以离线测试与真机行为一致。
+        var hookExe = ExtractHookExe(hookCommand);
 
         // 确保目录存在
         Directory.CreateDirectory(_configDir);
@@ -312,6 +324,19 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
     /// </summary>
     private static string[] MergeNotify(string[] existing, string hookExe)
     {
+        // 情况 0:先剪掉链子里**指向不存在可执行文件**的层。
+        //
+        // 2026-08-08 实测事故:安装目录改名成含空格的 "AI Resume" 之后,
+        // 写进去的钩子路径在空格处断成 `…\AppData\Local\AI`。断掉的条目不含标记
+        // AiResume.Hook.exe,于是 IsOwnCommand 认不出它是我们自己写的,
+        // **每次启用都再套一层而不是替换** —— 套到第 8 层撞上 MaxChainDepth,
+        // 适配器从此拒绝处理,界面只报"notify 链深度超过上限"。
+        // 用户看到的是"Codex 通知打不开了",而根因在七层之外。
+        //
+        // 判据取"可执行文件不存在":这样的层永远不可能被执行,留着只会让链子长大。
+        // 剪枝放在最前面,后面所有分支拿到的都是干净的链。
+        existing = PruneDeadLinks(existing);
+
         // 情况 1:刷新已托管链
         if (IsOwnCommand(existing) || HasOwnInChain(existing, 0))
         {
@@ -350,6 +375,88 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
         // 其余情况:用我方命令包装 existing
         var previousJson = JsonSerializer.Serialize(existing);
         return new[] { hookExe, "codex", "--previous-notify", previousJson };
+    }
+
+    /// <summary>
+    /// 从 hookCommand 里取出可执行文件路径。**按 <c>.exe</c> 边界切,不按空格。**
+    ///
+    /// 2026-08-08 实测事故:原实现是 <c>hookCommand.Split(' ')[0]</c>。
+    /// 安装目录从 <c>ClaudeResume</c> 改名成含空格的 <c>AI Resume</c> 之后,
+    /// <c>C:\Users\…\Local\AI Resume\AiResume.Hook.exe</c> 被截成
+    /// <c>C:\Users\…\Local\AI</c> 写进用户配置。截断后的条目不含标记,
+    /// 下一次启用认不出是自己写的,**再套一层而不是替换**,
+    /// 套到第 8 层撞上 MaxChainDepth 后适配器彻底罢工(实测那一行 9909 字符)。
+    /// 那行代码写于目录名还没有空格的年代,改名当天它就静默失效了。
+    ///
+    /// 不用 File.Exists 判断,是为了让离线测试与真机走同一条分支。
+    /// </summary>
+    public static string ExtractHookExe(string? hookCommand)
+    {
+        string s = hookCommand?.Trim() ?? string.Empty;
+        if (s.Length == 0)
+        {
+            throw new ArgumentException("hookCommand 不能为空", nameof(hookCommand));
+        }
+
+        const string ext = ".exe";
+        int i = s.IndexOf(ext, StringComparison.OrdinalIgnoreCase);
+        if (i < 0)
+        {
+            // 没有 .exe(如 node 脚本形式):整串就是命令,交给上层原样处理。
+            return s;
+        }
+
+        return s[..(i + ext.Length)].Trim();
+    }
+
+    /// <summary>
+    /// 剪掉链子里**我方写坏了的**层,逐层往里找第一个该保留的命令。
+    ///
+    /// 判据故意收得很紧,必须**同时**满足两条:
+    /// <list type="number">
+    /// <item>可执行文件不存在(这一层永远不可能被执行);</item>
+    /// <item>形状是我方的包装 —— <c>[exe, "codex", "--previous-notify", json]</c>。</item>
+    /// </list>
+    /// 只看第 1 条是不行的:用户自己配的 notify 可能指向网络盘上、或暂时没装的程序,
+    /// **那是他的配置,不是我们的**,不能因为此刻找不到就替他删掉。
+    /// 加上第 2 条之后,被剪掉的只可能是我们自己写出来的坏条目。
+    ///
+    /// 用 <paramref name="fileExists"/> 注入是为了能测;生产传 null 走 File.Exists。
+    /// 整条链都是坏条目时返回空数组(调用方当作"没有既有 notify")。
+    /// </summary>
+    public static string[] PruneDeadLinks(string[] array, Func<string, bool>? fileExists = null)
+    {
+        Func<string, bool> exists = fileExists ?? File.Exists;
+
+        for (int depth = 0; depth < MaxChainDepth && array.Length > 0; depth++)
+        {
+            string exe = array[0];
+            int i = Array.IndexOf(array, "--previous-notify");
+
+            // 不带路径分隔符的裸命令(PATH 上的 node、python 之类)判不了存在性,一律保留。
+            bool bare = !exe.Contains(Path.DirectorySeparatorChar) &&
+                        !exe.Contains(Path.AltDirectorySeparatorChar);
+            bool ourShape = i == 2 && array.Length > 3 &&
+                            string.Equals(array[1], "codex", StringComparison.OrdinalIgnoreCase);
+
+            if (bare || !ourShape || exists(exe))
+            {
+                return array;
+            }
+
+            // 确认是我方写坏的一层:把它包着的下一层提上来接着看。
+            try
+            {
+                array = JsonSerializer.Deserialize<string[]>(array[i + 1]) ?? Array.Empty<string>();
+            }
+            catch (JsonException)
+            {
+                // 内层解不开就停在这:不猜结构,交给上层按"没有既有 notify"处理。
+                return Array.Empty<string>();
+            }
+        }
+
+        return array;
     }
 
     /// <summary>判断数组是否为我方命令(含标记)。</summary>
