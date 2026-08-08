@@ -272,8 +272,14 @@ public sealed class ClaudeOAuthUsageProbe
             resetAfterSeconds = delta <= 0 ? 0 : (int)Math.Min(delta, int.MaxValue);
         }
 
+        // 把模型名带进窗口名:服务端在 scope.model.display_name 里给了具体是哪个
+        // (实测 "Fable")。**不带的话面板只能写"按模型额度"这种含糊话**,
+        // 用户还是不知道到底是哪个模型跑不动了。
+        string model = ReadScopeModel(scoped.Scope);
+        string name = model.Length > 0 ? "weekly_scoped:" + model : "weekly_scoped";
+
         windows.Add(new UsageWindow(
-            "weekly_scoped",
+            name,
             used >= 100 ? "blocked" : "allowed",
             UsageWindow.SevenDaySeconds,
             resetAtUnix,
@@ -317,6 +323,27 @@ public sealed class ClaudeOAuthUsageProbe
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// 从 <c>scope</c> 取模型显示名。实测形状:
+    /// <c>{"model":{"id":null,"display_name":"Fable"},"surface":null}</c>。
+    /// 取不到就返回空串,由调用方退回不带模型名的通用写法 —— 不猜。
+    /// </summary>
+    public static string ReadScopeModel(JsonElement? scope)
+    {
+        if (scope is not { ValueKind: JsonValueKind.Object } s ||
+            !s.TryGetProperty("model", out JsonElement m) ||
+            m.ValueKind != JsonValueKind.Object ||
+            !m.TryGetProperty("display_name", out JsonElement d) ||
+            d.ValueKind != JsonValueKind.String)
+        {
+            return string.Empty;
+        }
+
+        string? name = d.GetString();
+        // 冒号是我们拿来拼窗口名的分隔符,出现在模型名里会把解析弄乱。
+        return string.IsNullOrWhiteSpace(name) ? string.Empty : name.Replace(":", string.Empty).Trim();
     }
 
     /// <summary>解析 resets_at:支持 ISO 8601 字符串与 epoch 秒数字。</summary>

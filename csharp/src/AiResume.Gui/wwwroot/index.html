@@ -328,9 +328,13 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 
 :focus-visible{outline:2px solid var(--vermilion);outline-offset:2px}
 @keyframes spin{to{transform:rotate(360deg)}}
-.btn.busy::after,.lnk.busy::after{content:"";display:inline-block;width:10px;height:10px;
-  margin-left:7px;vertical-align:-1px;border:2px solid currentColor;border-right-color:transparent;
-  border-radius:50%;animation:spin .8s linear infinite}
+/* 转圈:原来用 currentColor + opacity:.45,在骨白面板上几乎看不见,
+   而刷新现在只要 1.3 秒 —— 一个看不见的、闪一下就没的转圈等于没有。
+   改成朱橙实色、加粗一档,并且把整个链接标成"进行中"而不是压暗。 */
+.btn.busy::after,.lnk.busy::after{content:"";display:inline-block;width:11px;height:11px;
+  margin-left:7px;vertical-align:-2px;border:2px solid var(--vermilion);
+  border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite}
+.lnk.busy{opacity:1;color:var(--vermilion-deep);border-color:var(--vermilion)}
 @supports not ((mask-image:linear-gradient(#000,#0000)) or (-webkit-mask-image:linear-gradient(#000,#0000))){
   .q,.side{-webkit-mask-image:none;mask-image:none}
 }
@@ -576,12 +580,16 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       const p = await call('quota.get', { force: !!force }, 100000);
       const by = new Map((p.windows || []).map(w => [w.name, w]));
       const w7 = by.get('seven_day'), w5 = by.get('five_hour');
-      // 按模型限定的额度(weekly_scoped)。服务端只在存在这种限额时才下发。
-      const ws = by.get('weekly_scoped');
+      // 按模型限定的额度。窗口名形如 weekly_scoped:Fable —— 冒号后是服务端
+      // 在 scope.model.display_name 里给的**具体模型名**,必须显示出来,
+      // 否则只能写"按模型额度"这种含糊话,用户还是不知道是哪个模型跑不动了。
+      const wsName = (p.windows || []).map(w => w.name).find(n => n.startsWith('weekly_scoped'));
+      const ws = wsName ? by.get(wsName) : null;
+      const wsModel = wsName && wsName.includes(':') ? wsName.split(':')[1] : '';
       scopedRow = ws ? {
-        nm: 'Claude 按模型',
+        nm: wsModel ? `Claude · ${wsModel}` : 'Claude 按模型',
         cls: ws.usedPercent >= 100 ? 'bad' : ws.usedPercent >= 90 ? 'wait' : 'ok',
-        txt: `${ws.usedPercent}% 已用`,
+        txt: ws.usedPercent >= 100 ? '额度已用尽' : `${ws.usedPercent}% 已用`,
       } : null;
 
       // **blocked 只标在真正打满的那一块上。**
@@ -597,7 +605,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
           // 否则面板显示 94% 可用而任务被拒,谁都会以为是别的毛病。
           extra: w7.usedPercent == null ? '服务端未下发用量百分比'
             : (ws && ws.usedPercent >= 100 && w7.usedPercent < 100)
-              ? '按模型额度已用尽(Fable/Opus 等),总额度尚有余量' : '',
+              ? `${wsModel || '按模型'} 额度已用尽,总额度尚有余量` : '',
           warn: !!(ws && ws.usedPercent >= 100),
         });
       } else {
@@ -633,14 +641,22 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   async function refreshQuota(force, deep) {
     if (quotaBusy) return;
     quotaBusy = true;
-    $('refreshBtn').classList.add('busy');
+    const btn = $('refreshBtn');
+    btn.classList.add('busy');
+    btn.textContent = '刷新中';        // 文案也换掉:只有一个转圈时,不确定它是否真在动
+    const t0 = Date.now();
     try {
       await loadLocal();
       await loadServer(force);
       await probeProviders(deep === true);
     } finally {
+      // 太快反而看不出发生过刷新。**至少让转圈转满 450ms**,
+      // 这不是为了好看 —— 是让"我点了"和"它做了"之间有可见的因果。
+      const rest = 450 - (Date.now() - t0);
+      if (rest > 0) { await new Promise(r => setTimeout(r, rest)); }
       quotaBusy = false;
-      $('refreshBtn').classList.remove('busy');
+      btn.classList.remove('busy');
+      btn.textContent = '刷新额度';
       nextRefreshAt = Date.now() / 1000 + refreshMinutes * 60;
     }
   }
