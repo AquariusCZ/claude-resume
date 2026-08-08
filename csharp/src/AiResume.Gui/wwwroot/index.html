@@ -6,6 +6,28 @@
    仪表盘不是装饰性复古,是对职责的直译:骨白金属面板、角上真螺丝、
    型号铭牌,以及唯一的亮点——两块磷光绿 CRT 额度表。
    除 CRT 外全部平涂 + 1px 硬边接缝;渐变只用在螺丝和 CRT 辉光上。 */
+
+/* ══ 字:方舟像素 12px ══
+   点阵字与这块面板本来就是一回事——CRT 上的字符本身就是点阵,
+   仪器面板的丝印也是网格上的。换成像素字之后,"屏幕"这个隐喻才落到实处。
+
+   选它的三个硬理由:
+   1. **有完整中日韩字形。** 绝大多数像素字只有拉丁,中文会逐字回退到雅黑,
+      一行里冒出两种字重两种字宽——那比不用像素字更难看。
+   2. **OFL-1.1**,可随仓库分发(许可证原文在 fonts/OFL.txt)。
+   3. 12px 是它的设计尺寸。
+
+   点阵字的纪律(违反任何一条,字就糊了,而糊掉的点阵字比普通字更难看):
+   · 字号只允许 12 / 24 —— 非整数倍会落在半个像素上;
+   · letter-spacing 用整数 px,不用 em;
+   · **font-synthesis:none** —— 合成粗体会把 1px 的笔画抹成 2px 的糊边。
+     所以这块面板上的强调靠颜色和大小写,不靠字重;
+   · **font-smoothing:none** —— 抗锯齿正是要关掉的那个东西。 */
+@font-face{
+  font-family:"ArkPixel";
+  src:url("fonts/ark-pixel-12px-monospaced-zh_cn.woff2") format("woff2");
+  font-weight:normal;font-style:normal;font-display:block;
+}
 :root{
   /* 面板:比原来的纸白更暗更黄,CRT 才压得住 */
   --panel:#DEDACB; --panel-hi:#EAE6D8; --panel-lo:#C7C1AE; --sunk:#CFC9B6;
@@ -23,18 +45,30 @@
      两个几乎一样的红,读者分不清哪个更严重,等于没有分级。已合并到朱橙。 */
   --ok:#2F7D4F; --alert:var(--vermilion-deep);
   --bevel-hi:rgba(255,255,255,.86); --bevel-lo:#B9B29D; --bevel-cast:rgba(90,80,60,.22);
-  --ui:"Microsoft YaHei UI","Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
-  /* 丝印字:只给铭牌上那一个词。Windows 11 自带 Segoe UI Variable Display,
-     专为大字号设计,不必引外部字体(WebView2 离线,也不该引)。 */
-  --display:"Segoe UI Variable Display","Segoe UI Semibold","Segoe UI",system-ui,sans-serif;
-  /* 等宽只用于拉丁字母/数字/路径/代号。**中文绝不放进 --mono**:
-     等宽字体没有中日韩字形,浏览器会逐字回退,一行里冒出两种字重和两种字宽。 */
-  --mono:"Cascadia Mono","Cascadia Code",ui-monospace,Consolas,monospace;
+  /* 三个角色现在指向同一份点阵字。原来分三支,是因为 --mono 没有中日韩字形、
+     中文必须避开它;方舟像素两边都有,那条限制随之消失,整页因此只剩一种字。
+     回退链留着:字文件万一没装出来,至少不是方块。 */
+  --ui:"ArkPixel","Microsoft YaHei UI","Segoe UI",system-ui,sans-serif;
+  --display:"ArkPixel","Microsoft YaHei UI","Segoe UI",system-ui,sans-serif;
+  --mono:"ArkPixel",ui-monospace,Consolas,monospace;
 }
-*{box-sizing:border-box;margin:0;padding:0}
+/* font-synthesis:none 是点阵字的**前提**,不是可选项:
+   浏览器合成粗体的办法是把字形往右描一遍,1px 的笔画会变成 2px 的糊边。
+   关掉之后 font-weight 不再产生视觉差异,强调改由颜色与大小写承担。 */
+*{box-sizing:border-box;margin:0;padding:0;font-synthesis:none}
+/* 全部字号/行高/字距都写成 rem,1rem = 点阵字的一个设计尺寸(12px)。
+   为什么不能直接写 12px:这台机器的显示缩放是 150%,12 个 CSS 像素会落在
+   18 个设备像素上 —— 1.5 倍不是整数倍,每个笔画都要重采样,点阵字立刻糊掉,
+   而糊掉的点阵字比普通字更难看(它的全部好看之处就是边缘是硬的)。
+   开机时由脚本把这个基准挪到「乘上缩放率正好是 12 的整数倍」的那个值上。
+   布局尺寸(内边距、间距、栏宽)仍用 px,不跟着变 —— 只让字对齐像素网格,
+   不让整块面板忽大忽小。 */
+html{font-size:12px}
 html,body{height:100%}
-body{background:var(--panel);color:var(--ink);font:13.5px/1.5 var(--ui);
-  display:flex;flex-direction:column;overflow:hidden;-webkit-font-smoothing:antialiased}
+body{background:var(--panel);color:var(--ink);font:1rem/1.5rem var(--ui);
+  display:flex;flex-direction:column;overflow:hidden;
+  /* 抗锯齿正是要关掉的那个东西。 */
+  -webkit-font-smoothing:none;font-smooth:never;text-rendering:geometricPrecision}
 /* 面板本体的细磨砂:极淡的斜向纹,让大片平涂不至于像未上色的稿子。 */
 body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;
   background:repeating-linear-gradient(135deg,rgba(255,255,255,.35) 0 1px,transparent 1px 4px)}
@@ -44,7 +78,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 ::-webkit-scrollbar-thumb:hover{background:#B9B29D}
 
 /* ── 通用:大写等宽标签 ── */
-.lbl{font:600 10px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--ink-3)}
+.lbl{font:1rem/1rem var(--mono);letter-spacing:0.0833333rem;text-transform:uppercase;color:var(--ink-3)}
 
 /* ── 顶部铭牌条:丝印型号 + 状态灯 ── */
 .plate{flex:none;display:flex;align-items:center;gap:14px;height:54px;
@@ -53,17 +87,17 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 /* 铭牌字:整页唯一的大字。此前全页除 CRT 读数外都是 10–13.5px,
    没有任何字号锚点——而一台真仪器的面板上,型号是丝印上去的,隔两步也认得出。
    负字距把字母挤成一个实心块,那正是丝印该有的样子。 */
-.plate h1{font:800 25px/1 var(--display);letter-spacing:-.035em;text-transform:uppercase;
+.plate h1{font:2rem/2rem var(--display);letter-spacing:0.166667rem;text-transform:uppercase;
   color:var(--ink);white-space:nowrap}
 /* 型号铭牌:真值。原来这里写死 "SN ————",JS 从不赋值——
    面板上挂一个永远填不上的序列号,比不挂更糟。改成版本号,是能核对的东西。 */
-.plate .sn{font:10px/1.5 var(--mono);letter-spacing:.1em;color:var(--ink-3);
+.plate .sn{font:1rem/1.5rem var(--mono);letter-spacing:0.0833333rem;color:var(--ink-3);
   border-left:1px solid var(--seam);padding-left:14px;white-space:nowrap}
 .plate .sn b{display:block;font-weight:600;color:var(--ink-2)}
 .plate .rt{margin-left:auto;display:flex;align-items:center;gap:12px;
-  font:10.5px/1 var(--mono);color:var(--ink-3);white-space:nowrap}
+  font:1rem/1rem var(--mono);color:var(--ink-3);white-space:nowrap}
 .lnk{color:var(--ink-2);cursor:pointer;border-bottom:1px solid var(--seam);padding-bottom:1px;
-  user-select:none;font-family:var(--ui);font-size:11.5px;transition:color .15s,border-color .15s}
+  user-select:none;font-family:var(--ui);font-size:1rem;transition:color .15s,border-color .15s}
 .lnk:hover{color:var(--vermilion-deep);border-color:var(--vermilion)}
 .lnk.busy{opacity:.45;cursor:default}
 
@@ -76,9 +110,9 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 .beacon .lamp{width:10px;height:10px;flex:none;border-radius:50%;
   background:var(--panel-lo);border:1px solid var(--seam);
   box-shadow:inset 0 1px 1px rgba(0,0,0,.18);transition:background .2s,box-shadow .2s}
-.beacon .txt{min-width:0;font-size:12px;line-height:1.35;color:var(--ink-2)}
+.beacon .txt{min-width:0;font-size:1rem;line-height:1.5rem;color:var(--ink-2)}
 .beacon .txt b{font-weight:600;color:var(--ink)}
-.beacon .txt .sub2{display:block;font-size:11px;color:var(--ink-3)}
+.beacon .txt .sub2{display:block;font-size:1rem;color:var(--ink-3)}
 .beacon.on   .lamp{background:var(--phos);border-color:#2F8A56;box-shadow:0 0 7px var(--phos-glow)}
 .beacon.wait .lamp{background:var(--amber);border-color:var(--amber-deep);box-shadow:0 0 7px rgba(224,160,46,.55)}
 .beacon.bad  .lamp{background:var(--vermilion);border-color:var(--vermilion-deep);
@@ -107,14 +141,14 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 .qc .scr::after{content:"";position:absolute;inset:0;pointer-events:none;
   background:repeating-linear-gradient(180deg,rgba(0,0,0,.28) 0 1px,transparent 1px 3px)}
 .qc .t{display:flex;align-items:baseline;gap:8px;margin-bottom:9px;position:relative;z-index:1}
-.qc .t .h{font:600 10px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--phos-dim)}
-.qc .t .src{font:9.5px/1 var(--mono);letter-spacing:.08em;color:#2C5C41;margin-left:auto}
+.qc .t .h{font:1rem/1rem var(--mono);letter-spacing:0.0833333rem;text-transform:uppercase;color:var(--phos-dim)}
+.qc .t .src{font:1rem/1rem var(--mono);letter-spacing:0;color:#2C5C41;margin-left:auto}
 /* 大读数:磷光绿 + 辉光。数字用等宽表格数字,每秒 tick 不抖。 */
-.qc .big{position:relative;z-index:1;font:600 26px/1 var(--mono);font-variant-numeric:tabular-nums;
-  letter-spacing:.01em;display:flex;align-items:baseline;gap:8px;
+.qc .big{position:relative;z-index:1;font:2rem/2rem var(--mono);font-variant-numeric:tabular-nums;
+  letter-spacing:0;display:flex;align-items:baseline;gap:8px;
   color:var(--phos);text-shadow:0 0 10px var(--phos-glow)}
-.qc .big .u{font:400 11px/1 var(--ui);color:#3E9C68;text-shadow:none}
-.qc .big.dim{color:#2C6A47;font-size:15px;font-weight:500;text-shadow:none}
+.qc .big .u{font:1rem/1rem var(--ui);color:#3E9C68;text-shadow:none}
+.qc .big.dim{color:#2C6A47;font-size:1rem;text-shadow:none}
 /* LED 光柱:mask 切格,与旧版同法(width 过渡照旧生效,tick 不用改几十个节点)。
    格子加高到 9px 才有灯柱感;间隙 3px 保持通透。 */
 .qc .bar{position:relative;z-index:1;margin-top:14px;height:9px;background:#0A2318;
@@ -133,7 +167,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 .qc.blocked .t .h{color:var(--vermilion)}
 .qc .chip{display:none}
 .qc.blocked .chip{display:inline-block;margin-left:8px;padding:1px 5px;
-  font:600 9px/1.4 var(--mono);letter-spacing:.1em;color:#FFD9CC;
+  font:1rem/1rem var(--mono);letter-spacing:0.0833333rem;color:#FFD9CC;
   background:rgba(226,81,43,.22);border:1px solid rgba(226,81,43,.6);border-radius:1px;
   animation:chipbeat 1.8s ease-in-out infinite}
 @keyframes chipbeat{0%,100%{opacity:1}50%{opacity:.45}}
@@ -159,22 +193,22 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 .qc .tl .nowmark{position:absolute;top:0;width:1px;height:5px;background:#3E9C68;
   transform:translateX(-.5px);transition:left .3s ease}
 .qc .ends{position:relative;z-index:1;display:flex;justify-content:space-between;margin-top:4px;
-  font:10px/1 var(--mono);letter-spacing:.06em;color:#3E9C68}
-.qc .ex{position:relative;z-index:1;margin-top:8px;font-size:11px;color:#4FA877}
+  font:1rem/1rem var(--mono);letter-spacing:0;color:#3E9C68}
+.qc .ex{position:relative;z-index:1;margin-top:8px;font-size:1rem;color:#4FA877}
 .qc .ex.warn{color:#FF7A55}
 
 /* ── 主体两栏 ── */
 /* minmax(0,1fr) 是必须的:默认 1fr 的最小尺寸是 auto,长路径会把左栏撑开,
    右栏就被挤出可视区——旧版右侧按钮被裁掉正是这个原因。 */
-.body{display:grid;grid-template-columns:minmax(0,1fr) clamp(232px,21vw,292px);
+.body{display:grid;grid-template-columns:minmax(0,1fr) clamp(276px,25vw,348px);
   gap:12px;padding:12px 20px 0;flex:1;min-height:0}
 .col{display:flex;flex-direction:column;min-height:0;min-width:0}
 .pad{padding:11px 13px;display:flex;flex-direction:column;min-height:0;flex:1}
 .ch{display:flex;align-items:baseline;gap:9px;padding-bottom:9px;margin-bottom:2px;
   border-bottom:1px solid var(--line);flex:none}
-.ch h2{font:600 10px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--ink-2)}
-.ch .n{font:600 10px/1 var(--mono);color:var(--ink-3)}
-.ch .act{margin-left:auto;white-space:nowrap;font-size:11.5px;color:var(--ink-2);cursor:pointer;transition:color .15s}
+.ch h2{font:1rem/1rem var(--mono);letter-spacing:0.0833333rem;text-transform:uppercase;color:var(--ink-2)}
+.ch .n{font:1rem/1rem var(--mono);color:var(--ink-3)}
+.ch .act{margin-left:auto;white-space:nowrap;font-size:1rem;color:var(--ink-2);cursor:pointer;transition:color .15s}
 .ch .act:hover{color:var(--vermilion-deep)}
 
 .q{overflow-y:auto;flex:1;min-height:0;margin:0 -3px;padding:6px 3px 10px;
@@ -183,7 +217,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 /* ── 队列行:数据表样式,名称与时间之间用虚线引导 ── */
 /* 台账横线:虚线下缘让每一行读成数据表的一条记录,而不是一张浮起的卡片。
    比给每行加边框和投影安静得多——十几行卡片会把注意力从内容上抢走。 */
-.r{display:flex;align-items:center;gap:9px;padding:6px 8px;margin-bottom:3px;
+.r{display:flex;align-items:center;gap:9px;padding:5px 8px;margin-bottom:3px;
   cursor:pointer;border:1px solid transparent;border-radius:2px;
   background-image:repeating-linear-gradient(90deg,var(--seam) 0 1px,transparent 1px 4px);
   background-size:100% 1px;background-position:0 100%;background-repeat:no-repeat;
@@ -193,29 +227,29 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   box-shadow:inset 2px 0 0 var(--vermilion)}
 .r:last-child{margin-bottom:0}
 /* 序号做成小铭牌 */
-.r .i{width:20px;height:18px;flex:none;display:grid;place-items:center;
-  font:600 9.5px/1 var(--mono);color:var(--ink-3);border:1px solid var(--seam);
+.r .i{width:22px;height:20px;flex:none;display:grid;place-items:center;
+  font:1rem/1rem var(--mono);color:var(--ink-3);border:1px solid var(--seam);
   background:var(--sunk);border-radius:1px}
 .r.on .i{background:var(--vermilion);border-color:var(--vermilion-deep);color:#fff}
 .r .m{min-width:0;flex:1}
-.r .nm{font-size:12.5px;font-weight:500;display:flex;align-items:center;gap:7px}
-.r .pa{font:10px/1.35 var(--mono);color:var(--ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.tag{font:600 9px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+.r .nm{font-size:1rem;display:flex;align-items:center;gap:7px}
+.r .pa{font:1rem/1.334rem var(--mono);color:var(--ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tag{font:1rem/1rem var(--mono);letter-spacing:0.0833333rem;text-transform:uppercase;
   color:#6B5A12;background:#E4D9A8;border:1px solid #BFAE68;border-radius:1px;padding:2px 5px}
-.r .rt{font:10.5px/1 var(--ui);color:var(--ink-3);flex:none}
+.r .rt{font:1rem/1rem var(--ui);color:var(--ink-3);flex:none}
 .r .rt.ok{color:var(--ok)}
 .r .rt.wait{color:var(--amber-deep)}
 .r .rt.bad{color:var(--alert)}
 .r .rm{flex:none;width:20px;height:20px;border-radius:1px;border:1px solid transparent;
-  background:transparent;color:var(--ink-3);font:13px/1 var(--ui);cursor:pointer;
+  background:transparent;color:var(--ink-3);font:1rem/1rem var(--ui);cursor:pointer;
   opacity:.3;transition:opacity .15s,background .15s,color .15s}
 .r:hover .rm,.r .rm:focus-visible{opacity:1}
 .r .rm:hover{background:var(--vermilion-wash);color:var(--vermilion-deep)}
 
 .hid{flex:none;margin-top:8px;padding-top:9px;border-top:1px solid var(--line);
-  font-size:11.5px;color:var(--ink-2);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  font-size:1rem;color:var(--ink-2);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .hid[hidden]{display:none}
-.hid .p{font:10.5px var(--mono);color:var(--ink-3);background:var(--sunk);
+.hid .p{font:1rem/1.334rem var(--mono);color:var(--ink-3);background:var(--sunk);
   border:1px solid var(--seam);border-radius:1px;padding:3px 7px;cursor:pointer}
 .hid .p:active{transform:translate(1px,1px)}
 .hid .p:hover{color:var(--vermilion-deep);background:var(--vermilion-wash)}
@@ -226,9 +260,9 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 
 /* ── 右栏:控制区 ── */
 .side{overflow-y:auto;padding-bottom:16px}
-.sect{padding-bottom:13px;margin-bottom:13px;border-bottom:1px solid var(--line)}
+.sect{padding-bottom:11px;margin-bottom:11px;border-bottom:1px solid var(--line)}
 .sect:last-child{border-bottom:0;margin-bottom:0;padding-bottom:0}
-.sl{font:600 10px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;
+.sl{font:1rem/1rem var(--mono);letter-spacing:0.0833333rem;text-transform:uppercase;
   color:var(--ink-3);margin-bottom:9px}
 
 /* 波段开关:一排互锁按钮,选中的那个亮灯并压下去。
@@ -236,9 +270,9 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 .bank{display:grid;grid-template-columns:1fr 1fr;gap:4px}
 /* nowrap + 省略号:两字词与「Claude Code」混排时,一旦有一格折行整排高度就参差,
    波段开关看着像坏了。宁可省略也要保持一排等高。 */
-.bank .k{display:flex;align-items:center;gap:5px;padding:0 7px;height:28px;cursor:pointer;
+.bank .k{display:flex;align-items:center;gap:5px;padding:0 6px;height:30px;cursor:pointer;
   white-space:nowrap;overflow:hidden;
-  font:10px/1 var(--mono);letter-spacing:.02em;color:var(--ink-2);
+  font:1rem/1rem var(--mono);letter-spacing:0;color:var(--ink-2);
   background:var(--panel-hi);border:1px solid var(--seam);border-radius:1px;
   box-shadow:inset 0 1px 0 var(--bevel-hi),1px 1px 0 var(--bevel-cast);
   transition:background .12s,color .12s}
@@ -253,7 +287,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 .bank .k.broken .d{background:var(--vermilion);border-color:var(--vermilion-deep);
   box-shadow:0 0 5px rgba(226,81,43,.6)}
 
-.btn{width:100%;padding:8px 10px;font:600 11px/1 var(--ui);letter-spacing:.04em;cursor:pointer;
+.btn{width:100%;padding:9px 10px;font:1rem/1rem var(--ui);letter-spacing:0;cursor:pointer;
   color:#fff;background:var(--vermilion);border:1px solid var(--vermilion-deep);border-radius:1px;
   box-shadow:inset 0 1px 0 rgba(255,255,255,.28),2px 2px 0 var(--bevel-cast);
   transition:background .12s}
@@ -264,17 +298,17 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   box-shadow:inset 0 1px 0 var(--bevel-hi),2px 2px 0 var(--bevel-cast)}
 .btn.line:hover:not(:disabled){background:#F2EEE1}
 .brow{display:flex;gap:6px;margin-top:6px}
-.note{margin-top:8px;font-size:11px;line-height:1.55;color:var(--ink-3)}
+.note{margin-top:8px;font-size:1rem;line-height:1.5rem;color:var(--ink-3)}
 
 /* 状态指示灯排 */
-.fs-state,.pv{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--ink-2);
+.fs-state,.pv{display:flex;align-items:center;gap:7px;font-size:1rem;color:var(--ink-2);
   padding:4px 0}
 .led,.fs-state .dot{width:7px;height:7px;flex:none;border-radius:50%;
   background:var(--sunk);border:1px solid var(--seam)}
 .led.ok,.fs-state.on .dot{background:var(--phos);border-color:#2F8A56;box-shadow:0 0 5px var(--phos-glow)}
 .led.wait{background:var(--amber);border-color:var(--amber-deep);box-shadow:0 0 5px rgba(224,160,46,.5)}
 .led.bad{background:var(--vermilion);border-color:var(--vermilion-deep);box-shadow:0 0 5px rgba(226,81,43,.6)}
-.fs-state .id{font:10.5px/1 var(--mono);color:var(--ink-3)}
+.fs-state .id{font:1rem/1rem var(--mono);color:var(--ink-3)}
 /* 未安装的通知源:压暗但仍列出来 —— 让人知道"支持它,只是本机没有"。
    开关另有 aria-disabled + tabindex=-1,这里只补视觉。 */
 .pv.off{opacity:.5}
@@ -283,7 +317,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 /* 小读数屏:与上方两块 CRT 同一套材质(内凹、扫描线、同色边框),
    这样整页只有「面板」和「屏幕」两种材质,而不是第三种随机的深色盒子。 */
 .fs-out{position:relative;margin-top:8px;padding:9px 10px;background:var(--crt);color:var(--phos);
-  border:1px solid #05100B;font:10.5px/1.55 var(--mono);white-space:pre-wrap;
+  border:1px solid #05100B;font:1rem/1.5rem var(--mono);white-space:pre-wrap;
   max-height:150px;overflow:auto;
   box-shadow:inset 0 0 14px rgba(0,0,0,.8),inset 0 0 0 1px rgba(70,232,136,.10)}
 /* 成功/失败此前**只在 JS 里加了 class,CSS 根本没有对应规则** ——
@@ -291,11 +325,21 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 .fs-out.good{color:var(--phos)}
 .fs-out.bad{color:#FF8A66;box-shadow:inset 0 0 14px rgba(0,0,0,.8),inset 0 0 0 1px rgba(226,81,43,.30)}
 
-.pv .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.pv .v{flex:none;font:10.5px/1 var(--mono);letter-spacing:.04em;color:var(--ink-3)}
+/* 名字是已知的短词,状态才是长度不可控的那一半("可用 · 凭据与推理权限均已验证"、
+   "已装好并可达,未验证授权(网络不可达:…)")。所以让**状态**去伸缩并省略,
+   而不是反过来把名字挤没——挤掉名字之后,那一行就不知道在说谁了。完整文本在 title 里。 */
+.pv .nm{flex:none;white-space:nowrap}
+.pv .v{flex:1;min-width:0;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font:1rem/1.334rem var(--mono);letter-spacing:0;color:var(--ink-3)}
 .pv .v.ok{color:var(--ok)}
 .pv .v.wait{color:var(--amber-deep)}
 .pv .v.bad{color:var(--alert)}
+/* 「已启用但送不到」:开关照旧是开的(配置里确实有这条),但整行标红并挂角标。
+   这一档必须和"关着"长得不一样 —— 关着是用户自己的选择,断链是坏了。 */
+.pv .brk{flex:none;margin-left:6px;padding:1px 4px;font:1rem/1.167rem var(--mono);
+  color:#fff;background:var(--vermilion);border:1px solid var(--vermilion-deep);border-radius:1px}
+.pv.broken .nm{color:var(--vermilion-deep)}
+.pv.broken .sw.on{background:var(--vermilion)}
 .sw{flex:none;width:30px;height:16px;border-radius:1px;background:var(--sunk);
   border:1px solid var(--seam);position:relative;cursor:pointer;transition:background .15s}
 .sw::after{content:"";position:absolute;top:1px;left:1px;width:12px;height:12px;
@@ -307,13 +351,13 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 .modal{position:fixed;inset:0;z-index:20;display:grid;place-items:center;background:rgba(30,26,18,.5)}
 .modal[hidden]{display:none}
 .sheet{width:min(460px,calc(100vw - 40px));padding:18px 20px}
-.sheet h3{font:600 12px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;margin-bottom:9px}
-.hint{font-size:11.5px;line-height:1.6;color:var(--ink-3);margin-bottom:12px}
+.sheet h3{font:1rem/1rem var(--mono);letter-spacing:0.0833333rem;text-transform:uppercase;margin-bottom:9px}
+.hint{font-size:1rem;line-height:1.5rem;color:var(--ink-3);margin-bottom:12px}
 .hint.warn{color:var(--vermilion-deep)}
 .fld{display:block;margin-bottom:11px}
-.fld span{display:block;font:600 10px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;
+.fld span{display:block;font:1rem/1rem var(--mono);letter-spacing:0.0833333rem;text-transform:uppercase;
   color:var(--ink-3);margin-bottom:5px}
-.fld input{width:100%;padding:7px 9px;font:12px var(--mono);color:var(--ink);
+.fld input{width:100%;padding:8px 9px;font:1rem/1.334rem var(--mono);color:var(--ink);
   background:var(--sunk);border:1px solid var(--seam);border-radius:1px;
   box-shadow:inset 0 1px 2px rgba(0,0,0,.10)}
 .fld input:focus{outline:none;border-color:var(--vermilion);background:#F5F2E7}
@@ -323,8 +367,17 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 .foot{flex:none;display:flex;align-items:center;gap:10px;padding:7px 20px;
   background:var(--panel-hi);border-top:1px solid var(--seam);
   box-shadow:inset 0 1px 0 var(--bevel-hi);
-  font:10px/1 var(--mono);letter-spacing:.08em;color:var(--ink-3)}
-.foot .r2{margin-left:auto}
+  font:1rem/1rem var(--mono);letter-spacing:0;color:var(--ink-3)}
+.foot span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.foot .r2{margin-left:auto;flex:none;max-width:52%}
+/* 飞书那一块的状态条:一个色点 + 一句话 + 一个可点的「验证」。
+   「已配置」只说明 DPAPI 里有值,所以默认那句必须写成「未验证」,
+   而验证要有地方去 —— 只说不验等于把问题丢回给用户。 */
+.fs-line{display:flex;align-items:center;gap:7px;padding:3px 0;font-size:1rem;color:var(--ink-2)}
+.fs-line .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fs-line .go{flex:none;color:var(--ink-2);cursor:pointer;border-bottom:1px solid var(--seam)}
+.fs-line .go:hover{color:var(--vermilion-deep);border-color:var(--vermilion)}
+.fs-line .go.busy{color:var(--vermilion-deep);border-color:var(--vermilion)}
 
 :focus-visible{outline:2px solid var(--vermilion);outline-offset:2px}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -345,6 +398,31 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   .r.in{opacity:1;transform:none}
 }
 </style>
+
+<script>
+/* 把字号基准挪到像素网格上。必须在首次绘制前跑,所以放在样式之后、内容之前。
+
+   点阵字只在**整数倍**下是清晰的。设备上的实际倍率 = CSS 字号 × devicePixelRatio,
+   所以要找一个 CSS 字号,让这个乘积正好是设计尺寸(12)的整数倍:
+     缩放 100% → 12px(12 设备像素,1 倍)
+     缩放 150% → 16px(24 设备像素,2 倍)   ← 本机
+     缩放 200% → 12px(24 设备像素,2 倍)
+     缩放 175% → 13.714px(24 设备像素,2 倍)
+   候选值必须落在可读区间内(11–17 CSS px),否则宁可保持 12 也不要为了清晰
+   把整块面板的字弄得过大或过小。125% 就属于这种情况:无解,老老实实糊着。 */
+(() => {
+  const DESIGN = 12;
+  const dpr = window.devicePixelRatio || 1;
+  // 从大往小试:同样清晰时取更大的那一档,读起来更舒服。
+  for (let k = 4; k >= 1; k--) {
+    const css = DESIGN * k / dpr;
+    if (css >= 11 && css <= 17) {
+      document.documentElement.style.fontSize = css + 'px';
+      break;
+    }
+  }
+})();
+</script>
 
 <div class="plate">
   <h1>AI&nbsp;Resume</h1>
@@ -404,6 +482,15 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     <div class="sect">
       <div class="sl">Feishu · 飞书接入</div>
       <div id="fsState" class="fs-state">读取中…</div>
+      <!-- 凭据与配置各自有"填过"和"能用"两层,界面必须分开说。
+           一行一件事,右侧挂它自己的动作。 -->
+      <div class="fs-line" id="fsCredLine" hidden>
+        <span class="led" id="fsCredLed"></span><span class="t" id="fsCredText">未验证</span>
+        <span class="go" id="fsVerify" role="button" tabindex="0">验证</span>
+      </div>
+      <div class="fs-line" id="fsCfgLine" hidden>
+        <span class="led" id="fsCfgLed"></span><span class="t" id="fsCfgText">—</span>
+      </div>
       <div class="brow"><button class="btn line" id="fsOpen">配置凭据与授权…</button></div>
       <div class="brow"><button class="btn line" id="fsGen" disabled>生成 cc-connect 配置</button></div>
       <div class="brow"><button class="btn line" id="fsPre">单消费者预检</button></div>
@@ -713,7 +800,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     renderHidden();
     const list = $('q');
     if (!p.items.length) {
-      list.innerHTML = '<div style="padding:8px;color:var(--ink-3);font-size:12.5px">队列为空。用「添加项目」手动加入目录。</div>';
+      list.innerHTML = '<div style="padding:8px;color:var(--ink-3)">队列为空。用「添加项目」手动加入目录。</div>';
       syncArm(); return;
     }
     // 只有列表内容真的变了才播入场:勾选走的是 toggleRow 改 class(不重渲染),
@@ -842,6 +929,25 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     const failed = ((arm && arm.projectStatus) || []).filter(s => s.status === 'error').length;
     const n = on ? arm.selected.length : 0;
     let cls = '', head, sub;
+    // **布防是意图,不是事实。** 引擎被杀掉之后面板照旧写「监视中」,
+    // 而用户会真的去睡觉(2026-08-08 审计 A4)。所以引擎不在时,
+    // 它压过下面所有阶段文案 —— 阶段是"它在做什么",这里说的是"根本没人在做"。
+    if (on && arm.engine === 'NotRunning') {
+      $('beacon').className = 'beacon bad';
+      $('armLine').textContent = '没有在监视';
+      $('phaseLine').textContent = `已布防 ${n} 个项目,但续跑引擎没在运行`;
+      $('armNote').textContent = '解除只停止自动续跑,不影响已在跑的任务。';
+      return;
+    }
+    if (on && arm.engine === 'Stalled') {
+      $('beacon').className = 'beacon wait';
+      $('armLine').textContent = '引擎无响应';
+      const mins = arm.probeAgeSeconds ? Math.floor(arm.probeAgeSeconds / 60) : null;
+      $('phaseLine').textContent = mins != null
+        ? `进程还在,但已 ${mins} 分钟没探过额度` : '进程还在,但久未探测额度';
+      $('armNote').textContent = '解除只停止自动续跑,不影响已在跑的任务。';
+      return;
+    }
     if (!on) {
       head = '未布防'; sub = '额度恢复后按队列顺序继续';
     } else if (failed) {
@@ -891,12 +997,19 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   function renderNotify(p) {
     const box = $('notify');
     if (!p.items.length) { box.innerHTML = '<div class="pv"><span class="nm" style="color:var(--ink-3)">无可用通知源</span></div>'; return; }
+    // 开关只能表达"开/关"两态,而实际有第三态:**开着,但送不到**
+    // (钩子指向的程序被删/被移走)。第三态如果继续显示成绿色的"开",
+    // 就是审计 A1 里那句"已启用=True"——配置还在,通知永远不会到。
     box.innerHTML = p.items.map(it => `
-      <div class="pv${it.isInstalled ? '' : ' off'}" title="${esc(it.isInstalled ? (it.detail || it.configPath || '') : '未检测到该工具')}">
+      <div class="pv${it.isInstalled ? '' : ' off'}${it.hookBroken ? ' broken' : ''}"
+           title="${esc(it.isInstalled ? (it.detail || it.configPath || '') : '未检测到该工具')}">
         <span class="nm">${esc(it.displayName)}</span>
+        ${it.hookBroken ? '<span class="brk">钩子断链</span>' : ''}
+        <span class="v"></span>
         <div class="sw${it.isEnabled ? ' on' : ''}" data-kind="${esc(it.kind)}" data-installed="${it.isInstalled}"
              role="switch" aria-checked="${it.isEnabled}" aria-disabled="${!it.isInstalled}"
-             aria-label="启用 ${esc(it.displayName)} 的完成通知" tabindex="${it.isInstalled ? 0 : -1}"></div>
+             aria-label="启用 ${esc(it.displayName)} 的完成通知${it.hookBroken ? '(当前已启用但钩子断链,通知收不到)' : ''}"
+             tabindex="${it.isInstalled ? 0 : -1}"></div>
       </div>`).join('');
     // 纯 CSS 绘制的开关必须自己补语义与键盘操作:它不是 <input>,读屏和 Tab 都不会自动认。
     box.querySelectorAll('.sw').forEach(el => {
@@ -919,6 +1032,10 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   // 所以界面永远拿不回它——保存后输入框立即清空,不做"回填已保存的值"这种事。
   let fsBusy = false;
 
+  // 凭据校验结果只在本次会话内记着:它是**一次探测**,不是配置。
+  // 存起来当状态,下次开窗就会拿一个旧结论冒充现状 —— 这正是要修的那类毛病。
+  let fsVerdict = null;
+
   function renderFeishu(p) {
     const st = $('fsState');
     st.classList.toggle('on', !!p.hasCredentials);
@@ -926,12 +1043,53 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       ? `<span class="dot"></span>已配置 <span class="id">${esc(p.appIdMasked || '')}</span>`
       : '<span class="dot"></span>未配置';
     $('fsGen').disabled = !p.hasCredentials || fsBusy;
+
+    // ── 凭据:填过 ≠ 能用 ──
+    // 「已配置」的全部含义是 DPAPI 里有值。secret 在开放平台被重置之后本机这份就永久失效,
+    // 而失效的表现是**机器人不理你** —— 和进程没起来、open_id 夹空格、钩子断链一模一样。
+    // 所以默认写「未验证」,并且给一个真的能验的入口(2026-08-08 审计 A2)。
+    $('fsCredLine').hidden = !p.hasCredentials;
+    if (p.hasCredentials) {
+      const v = fsVerdict;
+      $('fsCredLed').className = 'led' + (v ? (v.ok ? ' ok' : v.verdict === 'NetworkFailed' ? ' wait' : ' bad') : '');
+      $('fsCredText').textContent = v ? v.summary : '凭据未验证(点右侧验证)';
+      $('fsCredText').title = v ? v.summary : '「已配置」只说明本机存过这份凭据,不代表飞书现在还认它。';
+    }
+
+    // ── 配置:文件在 ≠ cc-connect 加载得了 ──
+    const cfg = p.configState || (p.configExists ? 'unknown' : 'missing');
+    $('fsCfgLine').hidden = cfg === 'missing';
+    if (cfg !== 'missing') {
+      $('fsCfgLed').className = 'led' + (cfg === 'ok' ? ' ok' : cfg === 'invalid' ? ' bad' : ' wait');
+      const problems = p.configProblems || [];
+      $('fsCfgText').textContent = p.configSummary || '';
+      // 具体哪一行坏了放 title:侧栏放不下,而它恰恰是唯一能用的线索。
+      $('fsCfgLine').title = [p.configPath, p.configSummary].concat(problems).filter(Boolean).join('\n');
+    }
+
     // 路径太长会把整段说明挤出侧栏可视区(实测被裁在"配置已存"处),
     // 改为短句 + 完整路径放 title。
-    $('fsNote').textContent = p.configExists
-      ? '凭据经 DPAPI 加密存本机;cc-connect 配置已生成。'
-      : '凭据经 DPAPI 按当前用户加密存本机,不写入仓库,也不回传界面。';
+    $('fsNote').textContent = '凭据经 DPAPI 按当前用户加密存本机,不写入仓库,也不回传界面。';
     $('fsNote').title = p.configPath || '';
+  }
+
+  // 真发一次请求去换 token。这是界面上唯一能把「凭据坏了」和其它三种
+  // 「机器人不理我」区分开的动作,所以它必须是用户点得到的。
+  async function verifyFeishu() {
+    if (fsBusy) return;
+    fsBusy = true; $('fsVerify').classList.add('busy');
+    const t0 = Date.now();
+    try {
+      fsVerdict = await call('feishu.verify', {}, 40000);
+    } catch (e) {
+      fsVerdict = { ok: false, verdict: 'NetworkFailed', summary: '验证未完成:' + e.message };
+    } finally {
+      // 同「刷新额度」:至少让转圈转满 450ms,让"我点了"和"它做了"之间有可见因果。
+      const rest = 450 - (Date.now() - t0);
+      if (rest > 0) { await new Promise(r => setTimeout(r, rest)); }
+      fsBusy = false; $('fsVerify').classList.remove('busy');
+      try { renderFeishu(await call('feishu.status')); } catch { /* 状态读不到不覆盖已得的结论 */ }
+    }
   }
 
   function fsShow(text, kind) {
@@ -999,8 +1157,19 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   }
 
   // ───────── 启动 ─────────
+  let quotaTimer = null, armTimer = null;
   renderProviders(null);
   if (!cardTimer) cardTimer = setInterval(tick, 1000);
+
+  // 状态灯必须一直跟着事实走,而不只是开窗那一刻的事实。
+  // 引擎可能在面板开着的时候被杀掉——那正是它最该变红的时刻(审计 A4)。
+  // 30 秒一拍:只读两个小文件加一次进程枚举,便宜到可以常跑。
+  if (!armTimer) {
+    armTimer = setInterval(async () => {
+      try { arm = await call('arm.get'); syncArm(); }
+      catch { /* 读不到就保持上一次显示,不把面板打成错误页 */ }
+    }, 30000);
+  }
 
   async function load() {
     refreshQuota(false, false);   // 不 await:本地块先画,服务端探测在后台补
@@ -1015,12 +1184,12 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     });
 
     call('notifications.list').then(renderNotify).catch(e => {
-      $('notify').innerHTML = `<div class="pv"><span class="nm" style="color:var(--alert);font-size:11.5px">探测失败:${esc(e.message)}</span></div>`;
+      $('notify').innerHTML = `<div class="pv"><span class="nm" style="color:var(--alert)">探测失败:${esc(e.message)}</span></div>`;
     });
 
     try { renderProjects(await call('projects.list')); }
     catch (e) {
-      $('q').innerHTML = `<div style="padding:8px;color:var(--alert);font-size:12.5px">项目发现失败:${esc(e.message)}</div>`;
+      $('q').innerHTML = `<div style="padding:8px;color:var(--alert)">项目发现失败:${esc(e.message)}</div>`;
       $('fl').textContent = '项目发现失败';
     }
 
@@ -1032,7 +1201,8 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       $('snPlate').innerHTML = `<b>MODEL AR-2</b>BUILD ${esc(i.version)}`;
       if (i.quotaRefreshMinutes >= 1) refreshMinutes = i.quotaRefreshMinutes;
       // 定时刷新(默认 15 分钟,可由 config 的 quotaRefreshMinutes 调整),对齐 ccusage 的监视节奏。
-      setInterval(() => refreshQuota(true, false), refreshMinutes * 60 * 1000);
+      // **只装一次**:load() 也被「重新扫描」调用,不设防会每点一次就多叠一个定时器。
+      if (!quotaTimer) quotaTimer = setInterval(() => refreshQuota(true, false), refreshMinutes * 60 * 1000);
       nextRefreshAt = Date.now() / 1000 + refreshMinutes * 60;
     } catch {
       // 版本读不到不阻断主流程,但铭牌不能一直停在"读取中"——那会被当成还在加载。
@@ -1053,6 +1223,10 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   $('fsSave').addEventListener('click', saveFeishu);
   $('fsGen').addEventListener('click', genCutover);
   $('fsPre').addEventListener('click', preflight);
+  $('fsVerify').addEventListener('click', verifyFeishu);
+  $('fsVerify').addEventListener('keydown', (ev) => {
+    if (ev.key === ' ' || ev.key === 'Enter') { ev.preventDefault(); verifyFeishu(); }
+  });
   $('armBtn').addEventListener('click', toggleArm);
   $('dryBtn').addEventListener('click', dryRun);
   $('rescanBtn').addEventListener('click', () => {

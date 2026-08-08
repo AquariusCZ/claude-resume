@@ -20,9 +20,14 @@ public sealed record NotificationProviderStatus(
     NotificationProviderKind Kind,
     string DisplayName,
     bool IsInstalled,        // 本机检测到该工具(配置目录存在)
-    bool IsEnabled,          // AI Resume 的通知钩子已安装
+    bool IsEnabled,          // 配置里有我方钩子条目 —— 注意这**不等于**通知能送达
     string? ConfigPath,      // 实际配置文件路径(不存在时为 null)
-    string? Detail);         // 人类可读说明/异常原因
+    string? Detail,          // 人类可读说明/异常原因
+    // 配置里那条命令的原文。由适配器在探到自己的条目时填,供 HookHealth 核对
+    // 「命令指向的程序还在不在」—— 光有 IsEnabled 回答不了"我收得到通知吗"。
+    string? HookCommand = null,
+    // 已启用、但命令指向的可执行文件确证不存在。此时通知永远不会到。
+    bool HookBroken = false);
 
 /// <summary>单个 provider 的适配器。所有实现必须满足安全要求。</summary>
 public interface INotificationAdapter
@@ -49,13 +54,19 @@ public sealed class NotificationRegistry
 {
     private readonly object _lock = new();
     private readonly IReadOnlyDictionary<NotificationProviderKind, INotificationAdapter> _adapters;
+    private readonly Func<string, bool> _fileExists;
 
     /// <summary>
     /// 初始化注册表。
     /// </summary>
     /// <param name="adapters">适配器集合;为 null 时使用内置默认集合。</param>
-    public NotificationRegistry(IEnumerable<INotificationAdapter>? adapters = null)
+    /// <param name="fileExists">核对钩子可执行文件是否存在;测试注入替身,默认查真实文件系统。</param>
+    public NotificationRegistry(
+        IEnumerable<INotificationAdapter>? adapters = null,
+        Func<string, bool>? fileExists = null)
     {
+        _fileExists = fileExists ?? File.Exists;
+
         // 默认集合装配全部已实现的适配器(均为无参可构造,内部各自解析默认配置路径)。
         // 5 个 provider 均已核实具备「整个 agent 任务结束」的可靠边界(ADR-0003 §3)。
         var adapterList = adapters?.ToList() ?? new List<INotificationAdapter>
@@ -74,6 +85,9 @@ public sealed class NotificationRegistry
     /// <summary>
     /// 逐个探测所有适配器。
     /// 任一适配器抛异常时,该项降级为 IsInstalled=false 且 Detail 记录异常消息,不影响其余适配器。
+    ///
+    /// 探完再统一过一遍 <see cref="HookHealth"/>:适配器只知道"配置里有没有我的条目",
+    /// 而用户问的是"我收得到通知吗" —— 后者还要求那条命令指向的程序真的在。
     /// </summary>
     /// <returns>所有适配器的探测结果列表。</returns>
     public IReadOnlyList<NotificationProviderStatus> ProbeAll()
@@ -85,7 +99,7 @@ public sealed class NotificationRegistry
             {
                 try
                 {
-                    results.Add(adapter.Probe());
+                    results.Add(WithHookHealth(adapter.Probe()));
                 }
                 catch (Exception ex)
                 {
@@ -101,6 +115,23 @@ public sealed class NotificationRegistry
             }
             return results;
         }
+    }
+
+    /// <summary>
+    /// 给一条探测结果补上「这条钩子还执行得了吗」。
+    ///
+    /// 只在**已启用**时核对:未启用本来就收不到通知,再标一次断链只会制造噪音。
+    /// 核对不出结论(命令不是 exe 形式、路径读不了)时保持原样 ——
+    /// 把未知说成故障和把故障说成正常一样是在骗人,只是方向相反。
+    /// </summary>
+    public NotificationProviderStatus WithHookHealth(NotificationProviderStatus s)
+    {
+        if (!s.IsEnabled || !HookHealth.IsBroken(s.HookCommand, _fileExists))
+        {
+            return s;
+        }
+
+        return s with { HookBroken = true, Detail = HookHealth.BrokenDetail(s.HookCommand) };
     }
 
     /// <summary>

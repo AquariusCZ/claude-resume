@@ -72,6 +72,20 @@ public sealed class ProductConfig
     /// <summary>cc-connect 项目绑定的 agent 类型。见 CcConnectAgents.Supported。</summary>
     public string CcConnectAgent { get; set; } = "claudecode";
 
+    /// <summary>
+    /// 用户想开着的完成通知源(NotificationProviderKind 的名字)。
+    ///
+    /// **这是"意图",不是"现状"。** 现状要去 <c>~/.claude</c>、<c>~/.codex</c> 这些
+    /// 别人家的配置里探;意图只能由我们自己记。
+    ///
+    /// 不记的后果实测过:<c>install → uninstall → install</c>,第二次安装返回成功、
+    /// 打印"入口已全部指向安装目录",而五个通知源全是关的 ——
+    /// 因为重指那一步的判据是"当前已启用的才重指",卸载刚把它们全关掉,
+    /// 于是循环体一次都没进,退出码 0(2026-08-08 第二轮审计 B3)。
+    /// 现状被自己的上一步清空了,就再也没有东西能告诉安装程序该恢复什么。
+    /// </summary>
+    public List<string> NotifySources { get; set; } = new();
+
     public string DirtyGuard { get; set; } = "stash";
 
     public static ProductConfig CreateDefault() => new();

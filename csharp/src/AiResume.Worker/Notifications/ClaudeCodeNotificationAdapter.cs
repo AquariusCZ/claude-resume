@@ -55,10 +55,12 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
 
             var json = File.ReadAllText(_settingsPath);
             using var doc = JsonDocument.Parse(json);
-            var isEnabled = ContainsOwnEntry(doc.RootElement);
+            var own = FindOwnCommand(doc.RootElement);
+            var isEnabled = own is not null;
             return new NotificationProviderStatus(
                 Kind, DisplayName, true, isEnabled, _settingsPath,
-                isEnabled ? "已安装 AI Resume 通知钩子" : "未安装 AI Resume 通知钩子");
+                isEnabled ? "已安装 AI Resume 通知钩子" : "未安装 AI Resume 通知钩子",
+                HookCommand: own);
         }
         catch (Exception ex)
         {
@@ -211,18 +213,21 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
     }
 
     /// <summary>
-    /// 检查 JSON 根节点中是否包含我方条目。
+    /// 找出我方条目的**命令原文**;没有则返回 null。
+    ///
+    /// 原来只返回 bool。但"配置里有这条命令"和"这条命令跑得起来"是两件事——
+    /// 把原文交出去,注册表才能再问一句文件在不在(见 <see cref="HookHealth"/>)。
     /// </summary>
-    private static bool ContainsOwnEntry(JsonElement root)
+    private static string? FindOwnCommand(JsonElement root)
     {
         if (root.ValueKind != JsonValueKind.Object)
-            return false;
+            return null;
 
         if (!root.TryGetProperty("hooks", out var hooks) || hooks.ValueKind != JsonValueKind.Object)
-            return false;
+            return null;
 
         if (!hooks.TryGetProperty("Stop", out var stop) || stop.ValueKind != JsonValueKind.Array)
-            return false;
+            return null;
 
         foreach (var entry in stop.EnumerateArray())
         {
@@ -239,14 +244,15 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
 
                 if (hook.TryGetProperty("command", out var cmd) &&
                     cmd.ValueKind == JsonValueKind.String &&
-                    cmd.GetString()?.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase) == true)
+                    cmd.GetString() is { } cmdStr &&
+                    cmdStr.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase))
                 {
-                    return true;
+                    return cmdStr;
                 }
             }
         }
 
-        return false;
+        return null;
     }
 
     /// <summary>

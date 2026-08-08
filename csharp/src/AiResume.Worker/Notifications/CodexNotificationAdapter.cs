@@ -116,11 +116,13 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
 
             var arrayText = match.Groups["array"].Value;
             var existing = ParseNotifyArray(arrayText);
-            var isEnabled = existing.Any(e => e.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase));
+            var marked = existing.FirstOrDefault(e => e.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase));
+            var isEnabled = marked is not null;
 
             return new NotificationProviderStatus(
                 Kind, DisplayName, IsInstalled: true, IsEnabled: isEnabled,
-                ConfigPath: _configPath, Detail: isEnabled ? "已安装 AI Resume 通知钩子" : "未安装 AI Resume 通知钩子");
+                ConfigPath: _configPath, Detail: isEnabled ? "已安装 AI Resume 通知钩子" : "未安装 AI Resume 通知钩子",
+                HookCommand: marked is null ? null : ResolveOwnCommand(marked));
         }
         catch (Exception ex)
         {
@@ -390,6 +392,54 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
     ///
     /// 不用 File.Exists 判断,是为了让离线测试与真机走同一条分支。
     /// </summary>
+    /// <summary>
+    /// 从 notify 数组里含标记的那一项,取出我方那条命令的**路径原文**。
+    ///
+    /// 不能直接把那一项当路径用:**我方条目可能被别人的 wrapper 包住**。
+    /// 实测本机(2026-08-08)是 Codex 自己的 <c>codex-computer-use.exe</c> 占了第 0 位,
+    /// 把我们整个塞进它的 <c>--previous-notify</c> 里;于是含标记的那一项
+    /// 是一段 <b>JSON 数组文本</b>,首元素才是我方 exe。
+    /// 直接拿它去 File.Exists,得到的是 <c>["C:\…\AiResume.Hook.exe</c> 这种带方括号的残缺路径,
+    /// 面板会红着说"钩子断链" —— 而钩子其实好好的。
+    /// **误判比漏判更糟:它让人去修一个没坏的东西。**
+    ///
+    /// 所以这里逐层往里剥,直到拿到不是数组的那一层。剥不动就返回 null
+    /// (交给上层按「核对不了」处理,不按「坏了」处理)。
+    /// </summary>
+    public static string? ResolveOwnCommand(string? element, int depth = 0)
+    {
+        string s = element?.Trim() ?? string.Empty;
+        if (s.Length == 0 || !s.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        // 不是数组形状 = 已经是命令本身。
+        if (!s.StartsWith('['))
+        {
+            return s;
+        }
+
+        // MaxChainDepth 同源的保险:链子理论上可以套很深,但不该无限递归。
+        if (depth >= MaxChainDepth)
+        {
+            return null;
+        }
+
+        try
+        {
+            string[]? inner = JsonSerializer.Deserialize<string[]>(s);
+            string? next = inner?.FirstOrDefault(
+                e => e.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase));
+            return next is null ? null : ResolveOwnCommand(next, depth + 1);
+        }
+        catch (JsonException)
+        {
+            // 形状认不出来:说"核对不了",不说"坏了"。
+            return null;
+        }
+    }
+
     public static string ExtractHookExe(string? hookCommand)
     {
         string s = hookCommand?.Trim() ?? string.Empty;

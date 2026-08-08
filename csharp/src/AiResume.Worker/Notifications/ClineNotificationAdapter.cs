@@ -56,7 +56,8 @@ public sealed class ClineNotificationAdapter : INotificationAdapter
                 ConfigPath: enabled ? hookPath : null,
                 Detail: installed
                     ? (enabled ? "已安装 AI Resume 通知钩子" : "Cline hooks 目录存在,但未安装 AI Resume 通知钩子")
-                    : "未检测到 Cline hooks 目录");
+                    : "未检测到 Cline hooks 目录",
+                HookCommand: enabled ? FindHookCommand(hookPath) : null);
         }
         catch (Exception ex)
         {
@@ -226,5 +227,37 @@ public sealed class ClineNotificationAdapter : INotificationAdapter
     private static string EscapePowerShellString(string value)
     {
         return value.Replace("'", "''");
+    }
+
+    /// <summary>
+    /// 从 wrapper 脚本里读回我方那条命令的原文;读不出返回 null。
+    ///
+    /// 脚本是本适配器自己写的,形状固定为 <c>&amp; '&lt;path&gt;' cline | Out-Null</c>,
+    /// 所以这里按同一份契约反解即可。取它是为了让注册表核对
+    /// "这个程序还在不在" —— Cline 的 wrapper 会把执行异常整个吞掉
+    /// (catch 块里写着"忽略我方处理器异常"),文件没了也不会有任何报错。
+    /// </summary>
+    public static string? FindHookCommand(string wrapperPath)
+    {
+        try
+        {
+            return ParseHookCommand(File.ReadAllText(wrapperPath));
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>反解 wrapper 脚本里的调用行。与 <see cref="BuildWrapperScript"/> 互为逆操作。</summary>
+    public static string? ParseHookCommand(string script)
+    {
+        var m = System.Text.RegularExpressions.Regex.Match(
+            script, @"^\s*&\s*'(?<cmd>(?:[^']|'')*)'\s+cline\b",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+
+        // 单引号在 PowerShell 里靠翻倍转义,读回来要还原;
+        // 不还原的话路径里带引号的用户会被误判成"文件不存在"。
+        return m.Success ? m.Groups["cmd"].Value.Replace("''", "'") : null;
     }
 }

@@ -63,7 +63,8 @@ public sealed class OpenCodeNotificationAdapter : INotificationAdapter
                 isInstalled,
                 isEnabled,
                 isInstalled ? configDirectory : null,
-                detail);
+                detail,
+                HookCommand: isEnabled ? FindHookCommand(pluginPath) : null);
         }
         catch (Exception ex)
         {
@@ -205,6 +206,43 @@ public sealed class OpenCodeNotificationAdapter : INotificationAdapter
     {
         var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         return Path.Combine(userProfile, ".config", "opencode", "plugins");
+    }
+
+    /// <summary>
+    /// 从插件源码里读回我方那条命令的原文;读不出返回 null。
+    ///
+    /// 插件是本适配器自己写的(<c>const cmd = "…";</c>),按同一份契约反解即可。
+    /// 取它是为了核对"这个程序还在不在" —— 插件的 catch 块把执行异常整个吞掉,
+    /// 文件没了 OpenCode 侧不会有任何可见迹象。
+    /// </summary>
+    public static string? FindHookCommand(string pluginPath)
+    {
+        try
+        {
+            return ParseHookCommand(File.ReadAllText(pluginPath, Encoding.UTF8));
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>反解插件源码里的命令常量。与 <see cref="QuoteForTs"/> 互为逆操作。</summary>
+    public static string? ParseHookCommand(string source)
+    {
+        var m = System.Text.RegularExpressions.Regex.Match(
+            source, @"const\s+cmd\s*=\s*""(?<cmd>(?:[^""\\]|\\.)*)""\s*;");
+        if (!m.Success)
+        {
+            return null;
+        }
+
+        // QuoteForTs 转义了 \ " \r \n,这里按相同顺序的逆序还原。
+        return m.Groups["cmd"].Value
+            .Replace("\\r", "\r")
+            .Replace("\\n", "\n")
+            .Replace("\\\"", "\"")
+            .Replace("\\\\", "\\");
     }
 
     /// <summary>

@@ -147,6 +147,121 @@ public sealed class CodexAuthProbeTests : IDisposable
     }
 
     [Fact]
+    public async Task 列得出模型还要再问一句跑不跑得动()
+    {
+        string home = NewCodexHome(RealisticConfig, """{"OPENAI_API_KEY":"sk-test"}""");
+        var handler = new CapturingHandler(HttpStatusCode.OK, HttpStatusCode.OK);
+
+        CodexAuthResult r = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        Assert.Equal(CodexAuthOutcome.Authorized, r.Outcome);
+        Assert.Equal(
+            new[] { "https://relay.example.invalid/v1/models", "https://relay.example.invalid/v1/chat/completions" },
+            handler.Uris);
+        Assert.Equal(new[] { "GET", "POST" }, handler.Methods);
+        // 用**用户配置里那个模型**,而不是随便挑一个能跑的。
+        Assert.Contains("gpt-5.6-sol", handler.Bodies[1]);
+        // 每次探测都要真发,所以必须便宜到可以忽略:1 个 token。
+        Assert.Contains("\"max_tokens\":1", handler.Bodies[1]);
+        Assert.Contains("推理", r.Detail);
+    }
+
+    [Fact]
+    public async Task 能列模型但不允许推理不得判成可用()
+    {
+        // 审计 A6 的原始注入条件:/v1/models 返 200,推理路由返 403。
+        // 原来这种组合界面绿着写"凭据已验证",而任务一跑就失败。
+        string home = NewCodexHome(RealisticConfig, """{"OPENAI_API_KEY":"sk-test"}""");
+        var handler = new CapturingHandler(HttpStatusCode.OK, HttpStatusCode.Forbidden);
+
+        CodexAuthResult r = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        Assert.Equal(CodexAuthOutcome.NoInference, r.Outcome);
+        Assert.Contains("不允许推理", r.Detail);
+    }
+
+    [Fact]
+    public async Task 列模型没过就不再打推理那一枪()
+    {
+        string home = NewCodexHome(RealisticConfig, """{"OPENAI_API_KEY":"sk-test"}""");
+        var handler = new CapturingHandler(HttpStatusCode.Unauthorized);
+
+        CodexAuthResult r = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        Assert.Equal(CodexAuthOutcome.Rejected, r.Outcome);
+        // 前提不成立时再问"允不允许干活"没有意义,还白费一次请求。
+        Assert.Single(handler.Uris);
+    }
+
+    [Fact]
+    public async Task 没写model时不猜一个模型去探()
+    {
+        string home = NewCodexHome(
+            "model_provider = \"X\"\n[model_providers.X]\nbase_url = \"https://x.example\"\n",
+            """{"OPENAI_API_KEY":"k"}""");
+        var handler = new CapturingHandler(HttpStatusCode.OK);
+
+        CodexAuthResult r = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        Assert.Equal(CodexAuthOutcome.Authorized, r.Outcome);
+        Assert.Single(handler.Uris);
+        // 说清"验到哪一步"比给一个漂亮但没依据的结论重要。
+        Assert.Contains("未核实", r.Detail);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.OK, CodexAuthOutcome.Authorized)]
+    [InlineData(HttpStatusCode.Unauthorized, CodexAuthOutcome.NoInference)]
+    [InlineData(HttpStatusCode.Forbidden, CodexAuthOutcome.NoInference)]
+    [InlineData(HttpStatusCode.TooManyRequests, CodexAuthOutcome.Limited)]
+    [InlineData(HttpStatusCode.InternalServerError, CodexAuthOutcome.ServerError)]
+    // 端点形状不支持 ≠ 没有推理权限。sub2api 各家路由不一,
+    // 把"这家不认识 chat/completions"标成红,是把好配置误判成坏的。
+    [InlineData(HttpStatusCode.NotFound, CodexAuthOutcome.Authorized)]
+    [InlineData(HttpStatusCode.BadRequest, CodexAuthOutcome.Authorized)]
+    public void 推理状态码映射(HttpStatusCode status, CodexAuthOutcome expected)
+    {
+        Assert.Equal(expected, CodexAuthProbe.ClassifyInference(status).Outcome);
+    }
+
+    [Fact]
+    public async Task 推理那一枪打不通不得反过来否定凭据()
+    {
+        string home = NewCodexHome(RealisticConfig, """{"OPENAI_API_KEY":"sk-test"}""");
+        var handler = new SequenceHandler(
+            _ => new HttpResponseMessage(HttpStatusCode.OK),
+            _ => throw new HttpRequestException("connection reset"));
+
+        CodexAuthResult r = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        // 凭据那一关已经过了。因为第二枪没打通就把凭据判成坏的,
+        // 会让人去换一把其实没问题的 key。
+        Assert.Equal(CodexAuthOutcome.Authorized, r.Outcome);
+        Assert.Contains("未核实", r.Detail);
+    }
+
+    private sealed class SequenceHandler : HttpMessageHandler
+    {
+        private readonly Func<HttpRequestMessage, HttpResponseMessage>[] _steps;
+        private int _i;
+
+        public SequenceHandler(params Func<HttpRequestMessage, HttpResponseMessage>[] steps) => _steps = steps;
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            Func<HttpRequestMessage, HttpResponseMessage> step = _steps[Math.Min(_i++, _steps.Length - 1)];
+            try
+            {
+                return Task.FromResult(step(request));
+            }
+            catch (Exception ex)
+            {
+                return Task.FromException<HttpResponseMessage>(ex);
+            }
+        }
+    }
+
+    [Fact]
     public async Task 网络失败不判成认证失败()
     {
         string home = NewCodexHome(RealisticConfig, """{"OPENAI_API_KEY":"sk-test"}""");
@@ -159,13 +274,31 @@ public sealed class CodexAuthProbeTests : IDisposable
         Assert.Equal(CodexAuthOutcome.NetworkFailed, r.Outcome);
     }
 
+    /// <summary>
+    /// 记录**每一次**请求。探测现在是两步(列模型 → 最小推理),
+    /// 只记最后一次会让"到底打了哪几个端点"无从断言。
+    /// </summary>
     private sealed class CapturingHandler : HttpMessageHandler
     {
-        private readonly HttpStatusCode _status;
+        private readonly HttpStatusCode _first;
+        private readonly HttpStatusCode? _second;
+        private int _count;
 
-        public CapturingHandler(HttpStatusCode status) => _status = status;
+        /// <param name="first">/v1/models 的状态码。</param>
+        /// <param name="second">最小推理请求的状态码;null 表示与 first 相同。</param>
+        public CapturingHandler(HttpStatusCode first, HttpStatusCode? second = null)
+        {
+            _first = first;
+            _second = second;
+        }
 
-        public string? Uri { get; private set; }
+        public List<string> Uris { get; } = new();
+
+        public List<string> Methods { get; } = new();
+
+        public List<string> Bodies { get; } = new();
+
+        public string? Uri => Uris.Count > 0 ? Uris[0] : null;
 
         public string? Authorization { get; private set; }
 
@@ -173,12 +306,18 @@ public sealed class CodexAuthProbeTests : IDisposable
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
-            Uri = request.RequestUri?.ToString();
+            Uris.Add(request.RequestUri?.ToString() ?? string.Empty);
+            Methods.Add(request.Method.Method);
+            Bodies.Add(request.Content is null
+                ? string.Empty
+                : request.Content.ReadAsStringAsync(ct).GetAwaiter().GetResult());
             Authorization = request.Headers.TryGetValues("Authorization", out IEnumerable<string>? a)
                 ? string.Join(",", a) : null;
             UserAgent = request.Headers.TryGetValues("User-Agent", out IEnumerable<string>? u)
                 ? string.Join(" ", u) : null;
-            return Task.FromResult(new HttpResponseMessage(_status));
+
+            HttpStatusCode status = _count++ == 0 ? _first : (_second ?? _first);
+            return Task.FromResult(new HttpResponseMessage(status));
         }
     }
 

@@ -26,6 +26,17 @@ public enum CodexAuthOutcome
     /// <summary>带凭据请求成功——key 确实有权限。</summary>
     Authorized,
 
+    /// <summary>
+    /// 能列模型,但不允许推理。
+    ///
+    /// 这一档是 2026-08-08 第二轮审计逼出来的(A6):审计方架了个假端点,
+    /// <c>/v1/models</c> 返 200、<c>/v1/responses</c> 返 403,界面照样绿着说"凭据已验证"。
+    /// 而列模型往往是**公开或低权限**的路由 —— 它证明的是"服务端认识这把 key",
+    /// 不是"这把 key 能跑活儿"。真实场景里 sub2api 的额度用尽、
+    /// 按模型授权收紧,表现正是这个组合。
+    /// </summary>
+    NoInference,
+
     /// <summary>凭据被拒。</summary>
     Rejected,
 
@@ -159,6 +170,48 @@ public static class CodexAuthProbe
         return false;
     }
 
+    /// <summary>
+    /// 取顶层 <c>model = "…"</c>。最小推理探测要指定模型,而**必须用用户真正在跑的那个** ——
+    /// 随便挑一个能跑的模型来证明"可以推理",证明的不是用户关心的那件事。
+    /// 读不到返回 null,由调用方跳过推理探测并如实说明。
+    /// </summary>
+    public static string? TryReadModel(string configPath)
+    {
+        if (!File.Exists(configPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            foreach (string raw in File.ReadAllLines(configPath))
+            {
+                string line = raw.Trim();
+                if (line.StartsWith('['))
+                {
+                    // 顶层键只出现在第一个小节之前。
+                    break;
+                }
+
+                if (line.StartsWith('#'))
+                {
+                    continue;
+                }
+
+                if (TryReadStringValue(line, "model", out string? v))
+                {
+                    return v;
+                }
+            }
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+
+        return null;
+    }
+
     private static string? TryReadApiKey(string authPath)
     {
         if (!File.Exists(authPath))
@@ -213,6 +266,45 @@ public static class CodexAuthProbe
         return new CodexAuthResult(CodexAuthOutcome.NetworkFailed, $"意外状态(HTTP {code})");
     }
 
+    /// <summary>
+    /// 把最小推理请求的状态码翻成结论。**前提是 /v1/models 已经 200** ——
+    /// 也就是说凭据已被服务端接受,这一步只回答"接受之后允不允许干活"。
+    ///
+    /// 400/404/422 单独一档:那是**端点形状不支持**,不是权限问题。
+    /// sub2api 各家路由不一,把"这家不认识 chat/completions"读成"你没有推理权限",
+    /// 会让一个好好的配置被标红 —— 误判和漏判一样是在骗人。
+    /// </summary>
+    public static CodexAuthResult ClassifyInference(HttpStatusCode status)
+    {
+        int code = (int)status;
+        if (code is >= 200 and < 300)
+        {
+            return new CodexAuthResult(CodexAuthOutcome.Authorized, "可用 · 凭据与推理已验证");
+        }
+
+        if (code is 401 or 403)
+        {
+            return new CodexAuthResult(
+                CodexAuthOutcome.NoInference,
+                $"只能列模型,不允许推理(HTTP {code})—— 凭据本身被接受,但跑不了任务");
+        }
+
+        if (code == 429)
+        {
+            return new CodexAuthResult(CodexAuthOutcome.Limited, "被限流(HTTP 429)");
+        }
+
+        if (code >= 500)
+        {
+            return new CodexAuthResult(CodexAuthOutcome.ServerError, $"服务端异常(HTTP {code})");
+        }
+
+        // 端点不支持这种最小探测:凭据结论保持"已验证",但必须说清没验证到推理。
+        return new CodexAuthResult(
+            CodexAuthOutcome.Authorized,
+            $"可用 · 凭据已验证(端点未接受最小推理探测 HTTP {code},推理权限未核实)");
+    }
+
     public static async Task<CodexAuthResult> ProbeAsync(
         string? codexHome = null, HttpMessageHandler? handler = null, CancellationToken ct = default)
     {
@@ -236,7 +328,19 @@ public static class CodexAuthProbe
             using HttpResponseMessage response = await client
                 .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct)
                 .ConfigureAwait(false);
-            return Classify(response.StatusCode);
+
+            CodexAuthResult models = Classify(response.StatusCode);
+
+            // 列模型没过就到此为止:后面那一步问的是"接受之后允不允许干活",
+            // 前提不成立时问它没有意义,还白费一次请求。
+            if (models.Outcome != CodexAuthOutcome.Authorized)
+            {
+                return models;
+            }
+
+            // **列得出模型 ≠ 跑得动模型。** 这一步是审计 A6 补上的:
+            // 列模型往往是低权限路由,真正决定"能不能干活"的是推理路由。
+            return await ProbeInferenceAsync(client, baseUrl, apiKey, codexHome, ct).ConfigureAwait(false);
         }
         catch (TaskCanceledException) when (!ct.IsCancellationRequested)
         {
@@ -251,6 +355,64 @@ public static class CodexAuthProbe
         finally
         {
             request.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// 最小推理探测:<c>max_tokens = 1</c>、一个字符的提示词。
+    ///
+    /// 为什么可以每次都跑:它是**个位数 token**。此前唯一能证明推理权限的办法是
+    /// <c>codex exec</c> —— 实测 10-12 秒、23,220 tokens,贵到只能当"深探测"偶尔用,
+    /// 结果就是平时那个绿灯什么也没验证。一次几 token 的请求让"每次探测都是真的"重新成立。
+    /// </summary>
+    private static async Task<CodexAuthResult> ProbeInferenceAsync(
+        HttpClient client, string baseUrl, string apiKey, string? codexHome, CancellationToken ct)
+    {
+        string home = codexHome ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
+        string? model = TryReadModel(Path.Combine(home, "config.toml"));
+
+        if (string.IsNullOrWhiteSpace(model))
+        {
+            // 不知道该用哪个模型就别猜一个。说清"验到哪一步"比给个漂亮结论重要。
+            return new CodexAuthResult(
+                CodexAuthOutcome.Authorized, "可用 · 凭据已验证(配置里没写 model,推理权限未核实)");
+        }
+
+        using var body = new StringContent(
+            JsonSerializer.Serialize(new
+            {
+                model,
+                max_tokens = 1,
+                messages = new[] { new { role = "user", content = "1" } },
+            }),
+            System.Text.Encoding.UTF8,
+            "application/json");
+
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post, baseUrl.TrimEnd('/') + "/v1/chat/completions") { Content = body };
+        request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + apiKey);
+        request.Headers.TryAddWithoutValidation("User-Agent", UserAgent);
+
+        try
+        {
+            using HttpResponseMessage response = await client
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct)
+                .ConfigureAwait(false);
+            return ClassifyInference(response.StatusCode);
+        }
+        catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // 凭据这一关已经过了,只是推理那一步没走完 —— 不能因此把凭据判成坏的。
+            return new CodexAuthResult(
+                CodexAuthOutcome.Authorized, "可用 · 凭据已验证(推理探测超时,推理权限未核实)");
+        }
+        catch (HttpRequestException ex)
+        {
+            // 措辞与其它降级分支保持一致:凡是没验到推理的,都必须出现"未核实"。
+            // 说法不统一等于让用户逐句去猜哪句代表"验过了"。
+            return new CodexAuthResult(
+                CodexAuthOutcome.Authorized, "可用 · 凭据已验证(推理权限未核实:" + ex.Message + ")");
         }
     }
 }

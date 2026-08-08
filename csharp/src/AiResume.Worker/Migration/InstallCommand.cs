@@ -1,4 +1,5 @@
 using AiResume.Worker.Notifications;
+using AiResume.Worker.Products;
 
 namespace AiResume.Worker.Migration;
 
@@ -86,11 +87,20 @@ public static class InstallCommand
             return rc;
         }
 
-        RepointHooks(hookExe);
+        bool hooksOk = ReconcileHooks(hookExe);
 
         Console.WriteLine();
         Console.WriteLine("入口已全部指向安装目录,与仓库路径脱钩(改名/清 bin/换分支都不再影响)。");
         Console.WriteLine("改动代码后需重新运行 install 才生效。");
+
+        // 通知源没对齐就**不要报告成功**。退出码 0 加一句"入口已全部指向安装目录"
+        // 正是审计 B3 里那条骗人的输出:命令说成功,五个通知源全是关的。
+        if (!hooksOk)
+        {
+            Console.Error.WriteLine("注意:部分通知源未能启用(见上方警告),完成通知可能收不到。");
+            return 2;
+        }
+
         return 0;
     }
 
@@ -102,7 +112,14 @@ public static class InstallCommand
         // 钩子必须**逐个源关掉**而不是删配置文件:用户 ~/.claude/settings.json 里
         // 还有他自己的钩子和一堆无关设置,整份删等于毁掉用户配置。
         var registry = new NotificationRegistry();
-        foreach (NotificationProviderStatus s in registry.ProbeAll())
+        IReadOnlyList<NotificationProviderStatus> before = registry.ProbeAll();
+
+        // **关掉之前先把"本来开着哪几个"记下来。** 关完再问就永远问不出来了——
+        // 重装恢复不了通知源这个缺陷(审计 B3)的根就在这里:
+        // 卸载把现状清空,而现状是当时唯一的依据。
+        SaveIntent(NotifyIntent.FromProbe(before));
+
+        foreach (NotificationProviderStatus s in before)
         {
             if (s.IsEnabled)
             {
@@ -153,32 +170,99 @@ public static class InstallCommand
     }
 
     /// <summary>
-    /// 把已启用的通知源重新指向安装目录里的 hook。
+    /// 把通知源对账到安装目录里的 hook。
     ///
-    /// 不重指的话,钩子仍写着仓库里的 bin 路径——安装等于白做,
-    /// 而且失败是静默的(探测只看命令里有没有我们的文件名,不看文件在不在)。
+    /// 「对账」而不是「重指」:原来的判据是"当前已启用的才重指",
+    /// 于是 <c>uninstall</c> 之后再 <c>install</c>,现状是空的、循环体一次都没进,
+    /// 命令照样退出码 0 并打印"入口已全部指向安装目录" —— 而五个源全是关的
+    /// (2026-08-08 审计 B3)。现在的依据是**意图 ∪ 现状**,见 <see cref="NotifyIntent.Targets"/>。
+    ///
+    /// 单个源写失败不终止其余:一个装坏的 Qoder 配置不该连累另外四个。
+    /// 但失败必须被数出来并影响退出码,否则又是一次"命令说成功、事情没做成"。
     /// </summary>
-    private static void RepointHooks(string hookExe)
+    private static bool ReconcileHooks(string hookExe)
     {
         if (!File.Exists(hookExe))
         {
-            Console.Error.WriteLine($"警告:安装目录里没有 {HookExecutable.FileName},通知钩子未重指。");
-            return;
+            Console.Error.WriteLine($"警告:安装目录里没有 {HookExecutable.FileName},通知钩子未对账。");
+            return false;
         }
 
         var registry = new NotificationRegistry();
-        foreach (NotificationProviderStatus s in registry.ProbeAll())
-        {
-            if (!s.IsEnabled)
-            {
-                continue;
-            }
+        IReadOnlyList<NotificationProviderStatus> probed = registry.ProbeAll();
+        List<NotificationProviderKind> targets = NotifyIntent.Targets(LoadIntent(), probed);
 
-            // 先关后开:适配器按"命令里含我们的文件名"识别自己的条目,
-            // 直接再开一次会留下两条(旧路径一条、新路径一条)。
-            registry.SetEnabled(s.Kind, false, string.Empty);
-            registry.SetEnabled(s.Kind, true, hookExe);
-            Console.WriteLine($"通知源 {s.Kind} 已重指到安装目录");
+        var done = new List<NotificationProviderKind>();
+        bool allOk = true;
+        foreach (NotificationProviderKind kind in targets)
+        {
+            try
+            {
+                // 先关后开:适配器按"命令里含我们的文件名"识别自己的条目,
+                // 直接再开一次会留下两条(旧路径一条、新路径一条)。
+                registry.SetEnabled(kind, false, string.Empty);
+                registry.SetEnabled(kind, true, hookExe);
+                done.Add(kind);
+                Console.WriteLine($"通知源 {kind} 已指向安装目录");
+            }
+            catch (Exception ex)
+            {
+                allOk = false;
+                Console.Error.WriteLine($"警告:通知源 {kind} 启用失败({ex.Message});其余源继续。");
+            }
+        }
+
+        if (targets.Count == 0)
+        {
+            Console.WriteLine("没有需要启用的通知源(此前也没开过)。");
+        }
+
+        // 只记真正写成功的:把失败的也记进意图,下次安装会再试一遍失败的动作,
+        // 而界面读的是探测结果,两边会长期对不上。
+        SaveIntent(done.Select(k => k.ToString()).ToList());
+
+        // 核对到底:写完再探一次,确认配置里真的有了。写成功不等于探得到——
+        // 本项目已经三次栽在"只看自己写了什么,不回头看世界变没变"上。
+        var after = new NotificationRegistry().ProbeAll()
+            .Where(s => s.IsEnabled && !s.HookBroken).Select(s => s.Kind).ToHashSet();
+        foreach (NotificationProviderKind kind in done)
+        {
+            if (!after.Contains(kind))
+            {
+                allOk = false;
+                Console.Error.WriteLine($"警告:通知源 {kind} 写入后复查未通过,通知可能收不到。");
+            }
+        }
+
+        return allOk;
+    }
+
+    /// <summary>读回持久化的通知意图;读不出来当作空(不阻断安装)。</summary>
+    private static List<string> LoadIntent()
+    {
+        try
+        {
+            return new ProductConfigStore(ShadowPaths.EnsureRoot()).Load().NotifySources;
+        }
+        catch (Exception)
+        {
+            return new List<string>();
+        }
+    }
+
+    /// <summary>
+    /// 写回通知意图。**只改这一个字段**:配置同时被 GUI 与续跑引擎写,
+    /// 锁外读旧快照整体写回会互相覆盖(本项目有过这个事故)。
+    /// </summary>
+    private static void SaveIntent(List<string> sources)
+    {
+        try
+        {
+            new ProductConfigStore(ShadowPaths.EnsureRoot()).Update(c => c.NotifySources = sources);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"警告:通知源意图未能保存({ex.Message});重装后可能需要手动重开。");
         }
     }
 

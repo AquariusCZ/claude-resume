@@ -1,4 +1,4 @@
-<!-- project-tour · generated 2026-08-05 · git e718fe2 · 迁移方向于 2026-08-06 经 ADR-0003 修订,目标架构描述以 ADR-0003 为准;2026-08-07(S10-O)同步了 FEISHU-BOT-GUIDE 菜单删除、STAGE-10-SMOKE-PLAN 项目名 ai-resume 与 send 不驱动 agent 教训、STAGE-11-GATE 失效 PID,见 docs/P4-DOC-SYNC-TABLE.md;本导览正文待下次 project-tour 重跑后同步 -->
+<!-- project-tour · generated 2026-08-05 · git e718fe2 · 迁移方向于 2026-08-06 经 ADR-0003 修订,目标架构描述以 ADR-0003 为准;2026-08-07(S10-O)同步了 FEISHU-BOT-GUIDE 菜单删除、STAGE-10-SMOKE-PLAN 项目名 ai-resume 与 send 不驱动 agent 教训、STAGE-11-GATE 失效 PID,见 docs/P4-DOC-SYNC-TABLE.md;本导览正文待下次 project-tour 重跑后同步;2026-08-08 第二轮审计后同步了「界面肯定句必须可证伪」的 GUI 状态语义、通知源意图持久化(NotifyIntent)与点阵字排版规则,见 CLAUDE.md「GUI 服务状态语义」与 docs/LESSONS.md 第十一节 -->
 # AI Resume — AI 导览(AI_GUIDE.md)
 
 > **2026-08-06 方向变更**:目标架构经 `docs/adr/0003-cc-connect-direct-and-control-plane.md` 修订——cc-connect 直接运行不再包装,AI Resume 收敛为控制面 + 续跑引擎(四项职责)。本文正文描述的**现役**行为不受影响。

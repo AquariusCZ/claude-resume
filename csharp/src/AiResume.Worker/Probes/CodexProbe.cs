@@ -99,8 +99,14 @@ public sealed class CodexProbe
         return auth.Outcome switch
         {
             // 带凭据请求成功 = 真的验证过了,给绿灯(DeepChecked=true)。
+            // **文案直接用 auth.Detail**:探测已经区分了"凭据+推理都验过"和
+            // "凭据验过但推理没核实"(端点不支持/没配 model),拼一句固定话会把这个区别抹掉。
             CodexAuthOutcome.Authorized =>
-                new CodexProbeResult(CodexReadiness.Ok, "authorized", "可用 · 凭据已验证", true),
+                new CodexProbeResult(CodexReadiness.Ok, "authorized", auth.Detail, true),
+            // 能列模型、不能推理:凭据没坏,但**任务跑不了**,所以归 Auth(红)而不是 Ok。
+            // 给绿灯等于告诉用户"随时可以跑",而它一跑就失败(审计 A6)。
+            CodexAuthOutcome.NoInference =>
+                new CodexProbeResult(CodexReadiness.Auth, "no-inference", auth.Detail, true),
             CodexAuthOutcome.Rejected =>
                 new CodexProbeResult(CodexReadiness.Auth, "auth-rejected", auth.Detail, true),
             CodexAuthOutcome.Limited =>

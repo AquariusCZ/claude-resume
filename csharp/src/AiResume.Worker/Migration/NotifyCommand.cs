@@ -53,13 +53,19 @@ public static class NotifyCommand
         var statuses = registry.ProbeAll();
 
         // 按 Kind 排序输出,保证多次运行输出顺序稳定,便于 diff 对比。
+        // **单列「可送达」**:已启用只说明配置里有这条命令,说明不了它跑得起来。
+        // 审计里把 hook 可执行文件挪走后,这一行照旧打印"已启用=True"(2026-08-08 A1)。
         foreach (var status in statuses.OrderBy(s => s.Kind))
         {
+            string deliverable = status.IsEnabled ? (status.HookBroken ? "False(钩子断链)" : "True") : "-";
             Console.WriteLine(
                 $"{status.Kind}  {status.DisplayName}  " +
-                $"已安装={status.IsInstalled}  已启用={status.IsEnabled}  {status.Detail}");
+                $"已安装={status.IsInstalled}  已启用={status.IsEnabled}  " +
+                $"可送达={deliverable}  {status.Detail}");
         }
-        return 0;
+
+        // 断链是需要动手的状态,不能只混在一行文字里:退出码得让脚本也看得见。
+        return statuses.Any(s => s.IsEnabled && s.HookBroken) ? 2 : 0;
     }
 
     /// <summary>
@@ -101,6 +107,8 @@ public static class NotifyCommand
         try
         {
             registry.SetEnabled(kind, enable, hookCommand);
+            // 记下意图:重装时靠它恢复。不记的话卸载一次现状就没了(审计 B3)。
+            RecordIntent(kind, enable);
             Console.WriteLine($"已{(enable ? "启用" : "停用")} {kind}");
             return 0;
         }
@@ -109,6 +117,24 @@ public static class NotifyCommand
             // 只打印异常消息,不打印堆栈,避免泄露内部路径等敏感信息。
             Console.Error.WriteLine(ex.Message);
             return 1;
+        }
+    }
+
+    /// <summary>
+    /// 把开关动作记进持久化意图。**只改这一个字段**(锁内读-改-写):
+    /// 配置同时被 GUI 与续跑引擎写,整体写回旧快照会互相覆盖。
+    /// 记不下来不影响本次开关是否生效,所以只警告不失败。
+    /// </summary>
+    private static void RecordIntent(NotificationProviderKind kind, bool enable)
+    {
+        try
+        {
+            var store = new Products.ProductConfigStore(ShadowPaths.EnsureRoot());
+            store.Update(c => c.NotifySources = NotifyIntent.Toggle(c.NotifySources, kind, enable));
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"警告:通知源意图未能保存({ex.Message});重装后可能需要手动重开。");
         }
     }
 

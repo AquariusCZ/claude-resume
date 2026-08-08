@@ -6,7 +6,7 @@
 
 Chat with your projects from Feishu or WeChat on your phone, get a notification on your desktop when a long agent task finishes, and watch quota burn down on a rack-panel dashboard. Everything runs locally — no server, no public IP, no third-party relay.
 
-![Control panel](docs/gui.png)
+![Control panel](docs/assets/panel.png)
 
 ---
 
@@ -69,6 +69,8 @@ Double-click **AI Resume** on the Desktop.
 
 **Providers** shows availability. A green light only ever comes from a **real request that succeeded** — a configured API key or an installed CLI is never treated as proof. Anything unverified stays grey.
 
+The Codex row verifies one step further. Listing models only proves the server **recognises** the key; it does not prove the key is **allowed to do work**. So after `/v1/models` the probe sends one `max_tokens=1` completion — single-digit tokens. A key that can list but not infer shows red, because any task using it will fail.
+
 ---
 
 ## Talking to your projects from your phone
@@ -119,6 +121,10 @@ Verified sources:
 
 Adapters merge into existing hook configuration rather than overwriting it, and uninstall removes only their own entries. AI Resume's own probes and background resume runs set `AI_RESUME_INTERNAL_RUN=1` so they never notify.
 
+The switch has **three** states, not two: off, on, and **on but undeliverable** — the hook is still written into the config, but the program it points at is gone. The third state turns red and carries a 「钩子断链」(broken hook) badge, because it is not the same thing as off: off is your choice, broken is a fault.
+
+![Completion notification sources](docs/assets/panel-notify.png)
+
 ---
 
 ## Safety
@@ -163,7 +169,7 @@ Further reading: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [RUN-CONTRACT.md](do
 dotnet test csharp\AiResume.sln
 ```
 
-549 xUnit tests. They never start an AI run against a real project or session, never touch `~/.claude`, `~/.codex` or the production state directory, and never make a paid API call. Probe classification is tested against recorded real responses rather than guessed shapes — a mock that guesses the wrong response shape produces an all-green suite and a silently broken product.
+706 xUnit tests. They never start an AI run against a real project or session, never touch `~/.claude`, `~/.codex` or the production state directory, and never make a paid API call. Probe classification is tested against recorded real responses rather than guessed shapes — a mock that guesses the wrong response shape produces an all-green suite and a silently broken product.
 
 ---
 
@@ -173,11 +179,40 @@ Version 2 is the C# implementation described above. The v1 PowerShell + Node run
 
 Known gaps, stated plainly:
 
-- cc-connect is not auto-started yet. `cc-connect daemon install` registers it as a scheduled task; that is the intended fix.
-- Resume under a real rate limit has not been verified end to end.
+- **Resume under a real rate limit has never been carried through end to end.** The internal chain (arm → observe limit → wait → resume → disarm) has been walked with a controlled agent response; a real account quota reset has not.
+- **The five notification sources have never all delivered in one run.** Only two of the five CLIs are installed on this machine.
+- **The 24-hour soak has a short-sample baseline only**, which is not enough to conclude anything.
+
+---
+
+## Every claim on the screen
+
+The main work in this release is not a feature. It is walking every **affirmative sentence** in the UI back to what it actually verifies.
+
+The trigger was an external audit. None of its seven findings was a crash — all seven were **silent failures**: the panel said fine, the thing had been broken for a while.
+
+| The panel said | Reality |
+|---|---|
+| Notification source "enabled" | The program the hook points at was deleted; notifications never arrive |
+| Feishu "configured" | The credential had been reset upstream; every message was dropped |
+| "cc-connect config generated" | That TOML would not parse at all |
+| "Monitoring" in the header | The resume engine had been killed |
+| Codex "credential verified" | Could list models; inference returned 403 |
+| `install` exit code 0 | Not one of the five notification sources was enabled |
+
+The common thread is not carelessness. It is that **the test looked at the configuration and never at the world**. So now:
+
+- a notification source checks whether the executable in its command still exists;
+- Feishu credentials get a **Verify** button that really exchanges a token;
+- the cc-connect config is judged by **cc-connect's own parser** — on a copy, never touching the original;
+- the status lamp checks whether the engine process is actually running, and how long since the last quota probe;
+- install **persists the intent** ("which sources does the user want on") and reconciles against it — uninstall wipes the present state, and the present state was the only evidence there was;
+- when nothing can be concluded it says "unverified", not "fine". **Reporting the unknown as normal is the same lie as reporting a fault as normal.**
 
 ---
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+The interface uses the [Ark Pixel Font](https://github.com/TakWolf/ark-pixel-font) (12px monospaced, zh_cn), distributed under the SIL Open Font License 1.1; the licence text ships at [`fonts/OFL.txt`](csharp/src/AiResume.Gui/wwwroot/fonts/OFL.txt).

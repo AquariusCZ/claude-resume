@@ -1,6 +1,3 @@
-using System.Net.Http.Json;
-using System.Text.Json;
-
 namespace AiResume.Worker.Migration;
 
 /// <summary>
@@ -31,43 +28,17 @@ public static class FeishuCheckCommand
         Console.WriteLine($"allow_from  : {allowFrom}");
         Console.WriteLine();
 
-        try
+        // 判定逻辑搬到 FeishuCredentialVerifier,与界面共用同一条路径。
+        // 命令行和界面对同一份凭据给出不同结论,比两边都不说更能把排查引向别处。
+        FeishuVerifyResult r = FeishuCredentialVerifier
+            .VerifyAsync(CancellationToken.None).GetAwaiter().GetResult();
+
+        if (r.Code is not null)
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
-            using HttpResponseMessage resp = http.PostAsJsonAsync(
-                TokenUrl, new { app_id = appId, app_secret = appSecret }).GetAwaiter().GetResult();
-
-            string body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-            Console.WriteLine($"HTTP {(int)resp.StatusCode}");
-
-            // 飞书把业务错误码放在 200/400 的响应体里。code/msg 不是机密,是诊断依据。
-            try
-            {
-                using JsonDocument doc = JsonDocument.Parse(body);
-                JsonElement root = doc.RootElement;
-                int code = root.TryGetProperty("code", out JsonElement c) && c.TryGetInt32(out int v) ? v : -1;
-                string msg = root.TryGetProperty("msg", out JsonElement m) ? m.GetString() ?? "" : "";
-                bool hasToken = root.TryGetProperty("tenant_access_token", out _);
-
-                Console.WriteLine($"code={code}  msg={msg}");
-                Console.WriteLine(code == 0 && hasToken
-                    ? "结论:**凭据有效**,飞书正常签发 token。问题不在凭据。"
-                    : "结论:**凭据被飞书拒绝**。常见原因:app_secret 已在开放平台被重置、"
-                      + "应用被停用/未发布、或该应用被限流。需在开放平台核对后更新凭据。");
-                return code == 0 ? 0 : 1;
-            }
-            catch (JsonException)
-            {
-                Console.WriteLine("响应不是 JSON,无法判定。");
-                return 1;
-            }
+            Console.WriteLine($"code={r.Code}  msg={r.Msg}");
         }
-        catch (Exception ex)
-        {
-            // 网络类失败与凭据无关,必须分开说,否则会误导用户去重置 secret。
-            Console.Error.WriteLine($"请求未能完成(网络层):{ex.GetType().Name}");
-            Console.Error.WriteLine("结论:这是网络问题,**不能据此判断凭据失效**。");
-            return 1;
-        }
+
+        Console.WriteLine("结论:" + r.Summary);
+        return r.Ok ? 0 : 1;
     }
 }

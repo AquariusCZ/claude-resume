@@ -31,7 +31,16 @@ GUI(`src/picker.ps1`)、共享配置库(`src/lib.ps1`)和健康探测入口(`src
 
 ## GUI 服务状态语义
 
+- **界面上每一句肯定句都必须能被外部证伪(2026-08-08 第二轮审计后的硬规则)。** 判据不得停在"我们自己那一步":
+  「已启用」要核对钩子命令指向的可执行文件是否存在(`HookHealth`),断链时标 `hookBroken` 并显红,不得继续显示成普通的"开";
+  「已配置(飞书)」只代表 DPAPI 里有值,真实结论必须来自 `FeishuCredentialVerifier` 换一次 tenant_access_token,且**飞书把业务错误码放在 200 响应体里,只看 HTTP 状态会把 `code=10003` 读成成功**;
+  「cc-connect 配置已生成」必须由 **cc-connect 自己的解析器**判定(`CcConnectConfigValidator` → `config format --config <副本>`;标志必须在子命令之后,前置 `--config` 会获取实例锁走启动路径;该命令会重写文件,只能校验副本);
+  「监视中」必须同时满足 `config.Armed`、引擎进程存活与探测新鲜度(`EngineLiveness`),引擎不在时压过一切阶段文案显红。
+  核对不出结论时一律显示「未核实」,**绝不显示「没问题」**。
+- **通知源意图必须持久化。** `ProductConfig.NotifySources` 记录"用户想开哪几个",`install` 按 `NotifyIntent.Targets`(意图 ∪ 现状 ∩ 本机已装)对账重建,`uninstall` 关闭前先记录现状。只按现状恢复必然失败——卸载会把现状清空。安装未能对齐通知源时**不得返回 0**。
 - OpenAI / DeepSeek / Claude 的绿色「可用」只能来自启动时或手动刷新的**真实最小请求成功**;API Key 已填写、CLI 命令存在只能说明“可探测”,绝不能显示成可用。
+- **Codex 探测必须两步**:`/v1/models` 只证明服务端接受这把 key,不证明允许推理;之后再发一次 `max_tokens=1` 的最小推理请求。能列不能推理(`NoInference`)归红;端点不支持该形状(400/404/422)不得判成无权限,只能降级为"推理权限未核实"。
+- **前端字号一律走 rem,1rem = 点阵字设计尺寸 12px。** 开机脚本按 `devicePixelRatio` 把 `html` 的基准挪到"乘上缩放率正好是 12 的整数倍"的值(150% → 16px);字距用 rem 折算的整数设计像素;`font-synthesis:none` 与 `-webkit-font-smoothing:none` 是点阵字清晰的前提,不得移除。布局尺寸仍用 px,不随字号缩放。
 - Claude 探测必须区分未登录、订阅/额度、网络/超时、模型不可用和未安装;探测失败时额度区不得回退成「空闲」。
 - **现役兼容行为**:GUI 默认模型和飞书模型卡都只能暴露最近一次真实探测成功的 provider;飞书使用 provider→model 两级选择,旧卡和文字命令也必须复用同一可用性校验,不可通过静态 profile id 绕过。OpenAI/DeepSeek 的真实探测先按大小写不敏感规则清除进程代理做直连,现役 Node 仅在 `transient` 网络类失败且配置了 `aiProxy` 时尝试备用代理;认证、额度、模型和命令错误禁止换线。成功线路随健康快照缓存 5 分钟,失败只负缓存 30 秒;密钥、端点或代理配置变化必须用哈希指纹立即作废旧线路。`childPending=true` 时禁止再次探测,真实 close 后通过 `waitForIdle` 清理临时目录并立即使快照过期。正式任务固定使用该线路且不得在任务中途换线重放;等待探测期间用户停止或现役 legacy deadline 到期都阻止正式子进程启动。`aiProxy` 不应用于 Claude。**目标 C# HealthProbe 不设置客户端总时限;DNS/TCP/TLS/reset 与监控异常归 `failed_local`,不得因静默或本地计时器触发 provider fallback/重放。**
 - `-SelfTest`、`-SessionSelfTest`、`-RenderTo`、`-AISettingsRenderTo` 禁止发真实探测,只显示「待检测」;OpenAI/DeepSeek 成功状态必须区分「直连可用」和「代理可用」,双线路网络失败显示「代理异常」。改服务状态逻辑后必须同时跑 GUI 自测、`node test/ai-providers.js`、`node test/provider-live.js`,并在部署后的真实窗口核验三行状态。

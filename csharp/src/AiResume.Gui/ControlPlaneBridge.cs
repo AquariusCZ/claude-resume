@@ -83,6 +83,7 @@ public sealed class ControlPlaneBridge
                 "feishu.status" => await Task.Run(() => FeishuStatus(), cancellationToken).ConfigureAwait(false),
                 "feishu.save" => await Task.Run(() => SaveFeishu(root), cancellationToken).ConfigureAwait(false),
                 "feishu.clear" => await Task.Run(() => ClearFeishu(), cancellationToken).ConfigureAwait(false),
+                "feishu.verify" => await VerifyFeishuAsync(cancellationToken).ConfigureAwait(false),
                 "cutover.generate" => await Task.Run(() => GenerateCutoverConfig(), cancellationToken).ConfigureAwait(false),
                 "cutover.preflight" => await Task.Run(() => Preflight(), cancellationToken).ConfigureAwait(false),
                 "app.info" => AppInfo(),
@@ -321,7 +322,10 @@ public sealed class ControlPlaneBridge
             s.IsInstalled,
             s.IsEnabled,
             s.ConfigPath,
-            s.Detail)).ToList();
+            s.Detail,
+            // 「已启用但送不到」必须能被界面单独表达。只回 isEnabled 的话,
+            // 钩子程序被删之后开关照旧是绿的(2026-08-08 审计 A1)。
+            s.HookBroken)).ToList();
         return new NotificationsPayload(items);
     }
 
@@ -362,6 +366,17 @@ public sealed class ControlPlaneBridge
         string hookCommand = $"{hookExe} {sourceArg}";
 
         _notificationRegistry.SetEnabled(kind, enabled, hookCommand);
+
+        // 把开关记进配置。这条记录是重装后恢复通知源的**唯一依据**——
+        // 卸载会把 ~/.claude 之类里的现状清空,清空之后就再没有东西能说出
+        // "本来开着哪几个"(2026-08-08 审计 B3)。记不下来不影响本次开关生效,所以不抛。
+        try
+        {
+            _configStore.Update(c => c.NotifySources = NotifyIntent.Toggle(c.NotifySources, kind, enabled));
+        }
+        catch (Exception)
+        {
+        }
 
         // 返回与 notifications.list 相同形状的最新列表。
         return ListNotifications();
@@ -408,6 +423,14 @@ public sealed class ControlPlaneBridge
         var statuses = (state.ProjectStatus ?? new Dictionary<string, string>())
             .Select(kv => new ProjectStatusItem(kv.Key, kv.Value)).ToList();
 
+        // **布防是意图,不是事实。** 只回 armed 的话,续跑 Worker 被杀掉之后
+        // 面板照旧写着「监视中」(2026-08-08 审计 A4)——而用户会真的去睡觉。
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        EngineVerdict verdict = EngineLiveness.Evaluate(config, state, now);
+        long? probeAge = state.LastProbeUtc is { } lp
+            ? (long)Math.Max(0, (now - lp).TotalSeconds)
+            : null;
+
         return new ArmPayload(
             config.Armed,
             config.Continuous,
@@ -415,7 +438,10 @@ public sealed class ControlPlaneBridge
             state.Phase,
             state.SawLimited,
             selected,
-            statuses);
+            statuses,
+            verdict.ToString(),
+            EngineLiveness.Describe(verdict),
+            probeAge);
     }
 
     /// <summary>
@@ -514,13 +540,53 @@ public sealed class ControlPlaneBridge
     private FeishuPayload FeishuStatus()
     {
         FeishuCredentialStatus status = new FeishuCredentialStore().Describe();
+
+        // **文件在 ≠ cc-connect 加载得了。** 原来这里只回 File.Exists,
+        // 于是配置被改坏之后界面照旧说"配置已生成"(2026-08-08 审计 A3)。
+        // 校验走 cc-connect 自己的解析器,且只校验副本(见 CcConnectConfigValidator)。
+        CcConnectConfigCheck check;
+        try
+        {
+            check = CcConnectConfigValidator.CheckFile(CutoverConfigCommand.DefaultConfigPath);
+        }
+        catch (Exception ex)
+        {
+            check = new CcConnectConfigCheck(
+                CcConnectConfigState.Unknown, $"配置未能复核:{ex.Message}", Array.Empty<string>());
+        }
+
         return new FeishuPayload(
             status.HasCredentials,
             status.AppIdMasked,
             // 授权 open_id 不是口令,展示它才能让用户确认"锁的是我"。
             status.AllowFrom,
             CutoverConfigCommand.DefaultConfigPath,
-            File.Exists(CutoverConfigCommand.DefaultConfigPath));
+            File.Exists(CutoverConfigCommand.DefaultConfigPath),
+            check.State.ToString().ToLowerInvariant(),
+            check.Summary,
+            check.Problems.ToList());
+    }
+
+    /// <summary>
+    /// 真实校验飞书凭据:拿它去换一次 tenant_access_token。
+    ///
+    /// 「DPAPI 里有值」只证明用户填过。secret 在开放平台被重置之后本机这份就永久失效,
+    /// 而失效的表现是**机器人不理你** —— 和进程没起来、open_id 夹空格、钩子断链
+    /// 长得一模一样。不真发一次请求,界面就没有能力把它们分开(审计 A2)。
+    /// </summary>
+    private async Task<object> VerifyFeishuAsync(CancellationToken cancellationToken)
+    {
+        FeishuVerifyResult r = await FeishuCredentialVerifier
+            .VerifyAsync(cancellationToken).ConfigureAwait(false);
+
+        // 只回结论与飞书原文的 code/msg(不是机密);app_secret 从不离开 DPAPI。
+        return new
+        {
+            ok = r.Ok,
+            verdict = r.Verdict.ToString(),
+            code = r.Code,
+            summary = r.Summary,
+        };
     }
 
     private FeishuPayload SaveFeishu(JsonElement root)
@@ -732,7 +798,11 @@ public sealed class ControlPlaneBridge
         [property: JsonPropertyName("appIdMasked")] string? AppIdMasked,
         [property: JsonPropertyName("allowFrom")] string? AllowFrom,
         [property: JsonPropertyName("configPath")] string ConfigPath,
-        [property: JsonPropertyName("configExists")] bool ConfigExists);
+        [property: JsonPropertyName("configExists")] bool ConfigExists,
+        // missing / ok / invalid / unknown —— 「文件在」和「加载得了」是两件事。
+        [property: JsonPropertyName("configState")] string ConfigState,
+        [property: JsonPropertyName("configSummary")] string ConfigSummary,
+        [property: JsonPropertyName("configProblems")] IReadOnlyList<string> ConfigProblems);
 
     private sealed record CutoverPayload(
         [property: JsonPropertyName("ok")] bool Ok,
@@ -775,7 +845,10 @@ public sealed class ControlPlaneBridge
         [property: JsonPropertyName("phase")] string Phase,
         [property: JsonPropertyName("sawLimited")] bool SawLimited,
         [property: JsonPropertyName("selected")] IReadOnlyList<string> Selected,
-        [property: JsonPropertyName("projectStatus")] IReadOnlyList<ProjectStatusItem> ProjectStatus);
+        [property: JsonPropertyName("projectStatus")] IReadOnlyList<ProjectStatusItem> ProjectStatus,
+        [property: JsonPropertyName("engine")] string Engine,
+        [property: JsonPropertyName("engineText")] string EngineText,
+        [property: JsonPropertyName("probeAgeSeconds")] long? ProbeAgeSeconds);
 
     private sealed record ProjectStatusItem(
         [property: JsonPropertyName("path")] string Path,
@@ -805,5 +878,6 @@ public sealed class ControlPlaneBridge
         [property: JsonPropertyName("isInstalled")] bool IsInstalled,
         [property: JsonPropertyName("isEnabled")] bool IsEnabled,
         [property: JsonPropertyName("configPath")] string? ConfigPath,
-        [property: JsonPropertyName("detail")] string? Detail);
+        [property: JsonPropertyName("detail")] string? Detail,
+        [property: JsonPropertyName("hookBroken")] bool HookBroken);
 }
