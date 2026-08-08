@@ -268,6 +268,25 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 4. **xUnit `Assert.Equal(expected, actual, msg)` 有 comparer 重载坑**:第三个字符串参数会被解析为 `IEqualityComparer`,不报错但断言可能变恒真/恒假。断言信息用变量拼接或注释写清,别依赖第三参数。
 5. **Windows 专属依赖是传染的**:Worker 引用 windows-only 的 Secrets → Worker TFM 必须改 `net10.0-windows`;测试项目引用 Worker → 测试也变 windows。早定 TFM 矩阵,别等 NU1201。
 
+## 十、探测的外部足迹(2026-08)
+
+1. **★★ 一次性临时工作目录会在别人家里留下永久记录。** v1 的 `src/provider-health.js:64`
+   每次健康探测都 `fs.mkdtempSync(os.tmpdir(), 'ai-resume-health-<provider>-')` 建一个随机目录,
+   跑完自己删掉——**看起来很干净**。但 Claude Code 已经为那个 cwd 记了一条项目记录,
+   而那条记录没有任何人清。2026-08-08 清点:用户 `~/.claude/projects` 下
+   **1135 / 1169 = 97%** 是这些残留(36.4 MB,7 天累积)。
+   代价不是磁盘,是**用户每次 `/resume` 都要从 1135 条垃圾里找自己的项目**。
+   解法:探测复用**一个固定目录**(C# 侧的 `ClaudeCodeProbe` 传 `ShadowPaths.Root`,
+   因此只产生一条记录)。教训:**判断"清理干净了"不能只看自己创建的那个目录——
+   要问"我这次运行让别的程序在哪里写了什么"。** 起 agent 尤其如此:
+   它有自己的持久化,不受你的 `finally` 管辖。
+2. **同类风险清单**(新增探测/子进程时逐条过):Claude Code 的 `~/.claude/projects/<cwd编码>/`、
+   Codex 的 thread rollout、cc-connect 的 `~/.cc-connect/sessions/`。
+   凡是把 cwd 当成会话身份的工具,随机 cwd = 无限增长的记录。
+3. **`codex exec` 也必须给固定或一次性目录,但理由相反**:它起的是真 agent,
+   不指定工作目录就继承调用方的 cwd,无人值守的探测会落到用户仓库里(见 `CodexProbe`)。
+   两个方向都要想:**别污染别人,也别在别人家里干活。**
+
 ---
 
 _维护提示:再遇到新坑,按上面的分类追加一条(现象→原因→解法→代码位置);改了状态机先跑 `node test/card-flow.js`,改了查询或安全边界再跑对应离线回归与 `query-security.js` / `chat-security.js`。_
