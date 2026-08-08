@@ -175,7 +175,7 @@ dotnet test csharp\AiResume.sln
 
 ## Status
 
-Version 2 is the C# implementation described above. The v1 PowerShell + Node runtime is retired but still present in `src/` and `test/` for reference.
+Version 2 is the C# implementation described above. The v1 PowerShell + Node runtime was removed on 2026-08-08; read it via `git log -- src test`.
 
 Known gaps, stated plainly:
 

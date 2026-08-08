@@ -1,6 +1,21 @@
 <!-- project-tour · generated 2026-08-05 · git e718fe2 · 迁移方向于 2026-08-06 经 ADR-0003 修订,目标架构描述以 ADR-0003 为准;2026-08-07(S10-O)同步了 FEISHU-BOT-GUIDE 菜单删除、STAGE-10-SMOKE-PLAN 项目名 ai-resume 与 send 不驱动 agent 教训、STAGE-11-GATE 失效 PID,见 docs/P4-DOC-SYNC-TABLE.md;本导览正文待下次 project-tour 重跑后同步;2026-08-08 第二轮审计后同步了「界面肯定句必须可证伪」的 GUI 状态语义、通知源意图持久化(NotifyIntent)与点阵字排版规则,见 CLAUDE.md「GUI 服务状态语义」与 docs/LESSONS.md 第十一节 -->
 # AI Resume — AI 导览(AI_GUIDE.md)
 
+> ## ⚠️ 本文正文描述的是**已退役的 v1 运行时**,不是现役实现
+>
+> 2026-08-08:v1 的 PowerShell + Node 运行时(仓库根的 `src/`、`test/`)已从工作树删除,
+> 查阅走 `git log -- src test`。下面的文件表、函数名、测试清单**全部指向已不存在的文件**。
+>
+> 现役实现在 `csharp/` 下。要了解它,读:
+> **[CLAUDE.md](CLAUDE.md)**(协作规则与红线,唯一规则真身)·
+> **[README.zh-CN.md](README.zh-CN.md)**(做什么、怎么用)·
+> **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**(机制与配置)·
+> **[docs/adr/0003](docs/adr/0003-cc-connect-direct-and-control-plane.md)**(边界与取舍)。
+>
+> 本文暂时保留,是因为其中的**取舍与踩坑记录**对理解现在的设计仍有价值
+> (同类教训已收进 [docs/LESSONS.md](docs/LESSONS.md))。
+> 把它当**历史**读,不要当现状读 —— 按项目规则:历史说法不得继续冒充现役行为。
+
 > **2026-08-06 方向变更**:目标架构经 `docs/adr/0003-cc-connect-direct-and-control-plane.md` 修订——cc-connect 直接运行不再包装,AI Resume 收敛为控制面 + 续跑引擎(四项职责)。本文正文描述的**现役**行为不受影响。
 
 > 一句话:**AI Resume v2.0.0** 是一个 Windows 多 AI 工作台:显式切换 OpenAI GPT-5.6 Sol、DeepSeek V4/V4 Pro 或 Claude,管理 provider-native 会话,通过飞书闲聊/查询/授权修改项目,并保留 Claude 额度重置后的多项目自动续跑;飞书 scratch 会话 14 天归档、30 天删除,项目工作会话只手动归档。

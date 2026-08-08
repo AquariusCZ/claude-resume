@@ -175,7 +175,7 @@ dotnet test csharp\AiResume.sln
 
 ## 现状
 
-v2 就是上面这套 C# 实现。v1 的 PowerShell + Node 运行时已退役，但仍留在 `src/` 和 `test/` 里备查。
+v2 就是上面这套 C# 实现。v1 的 PowerShell + Node 运行时已于 2026-08-08 删除，查阅走 `git log -- src test`。
 
 已知缺口，明说：
 
