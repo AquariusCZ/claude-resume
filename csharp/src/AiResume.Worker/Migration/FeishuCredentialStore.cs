@@ -29,6 +29,35 @@ public sealed class FeishuCredentialStore
     public FeishuCredentialStore(string? secretsRoot = null)
         => _store = new DpapiSecretStore(secretsRoot ?? ShadowPaths.SecretsRoot);
 
+    /// <summary>
+    /// 清掉 allow_from 里的**全部空白**,不只是首尾。
+    ///
+    /// **2026-08-08 真事故**:用户填进来的 open_id 中间夹了一个空格
+    /// (<c>ou_160a7866f6c507d6c 508896eadda3c34</c>,36 字符而不是 35),
+    /// `.Trim()` 去不掉它。于是 cc-connect 拿着一个永远匹配不上的白名单跑,
+    /// **每一条飞书消息都被静默丢弃** —— 日志里连一行 "message received" 都没有,
+    /// 表现就是"机器人不理我",而所有健康检查全绿。
+    ///
+    /// open_id / union_id 里不可能有空白,所以这里剥掉是安全的;
+    /// 逗号分隔的多个 id 也一并规整(去空项、去重复逗号)。
+    /// **读路径也要过这一遭**,否则已经存坏的值只能靠重填修复,
+    /// 而重填要用户再拿一次 app_secret。
+    /// </summary>
+    public static string NormalizeAllowFrom(string? allowFrom)
+    {
+        if (string.IsNullOrWhiteSpace(allowFrom))
+        {
+            return string.Empty;
+        }
+
+        IEnumerable<string> ids = allowFrom
+            .Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Select(x => new string(x.Where(c => !char.IsWhiteSpace(c)).ToArray()))
+            .Where(x => x.Length > 0);
+
+        return string.Join(",", ids);
+    }
+
     public void Save(string appId, string appSecret, string allowFrom)
     {
         if (string.IsNullOrWhiteSpace(appId))
@@ -48,7 +77,7 @@ public sealed class FeishuCredentialStore
         }
 
         byte[] payload = JsonSerializer.SerializeToUtf8Bytes(
-            new Payload(appId.Trim(), appSecret.Trim(), allowFrom.Trim()));
+            new Payload(appId.Trim(), appSecret.Trim(), NormalizeAllowFrom(allowFrom)));
         try
         {
             _store.SaveAsync(CredentialRef, payload, CancellationToken.None).GetAwaiter().GetResult();
@@ -80,8 +109,10 @@ public sealed class FeishuCredentialStore
 
             appId = payload.AppId;
             appSecret = payload.AppSecret;
-            allowFrom = payload.AllowFrom;
-            return true;
+            // 读路径也规整:已经存坏的值(中间夹空格)靠这一步就地修好,
+            // 不必让用户为了改一个 open_id 再去开放平台取一次 app_secret。
+            allowFrom = NormalizeAllowFrom(payload.AllowFrom);
+            return string.IsNullOrEmpty(allowFrom) ? false : true;
         }
         catch (KeyNotFoundException)
         {

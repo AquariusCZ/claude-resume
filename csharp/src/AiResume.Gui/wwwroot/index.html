@@ -889,7 +889,11 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   async function saveFeishu() {
     if (fsBusy) return;
     const appId = $('fsId').value.trim(), appSecret = $('fsSecret').value.trim();
-    const allowFrom = $('fsAllow').value.trim();
+    // **剥掉全部空白,不只是首尾。** open_id 里不可能有空白,而中间夹一个空格
+    // 的后果是 cc-connect 拿着一个永远匹配不上的白名单跑:每条飞书消息被静默丢弃,
+    // 日志里连一行 "message received" 都没有,所有健康检查还全绿 ——
+    // 表现就是"机器人不理我",而且完全无从查起(2026-08-08 实际发生过)。
+    const allowFrom = $('fsAllow').value.replace(/\s+/g, '');
     if (!appId || !appSecret) { fsShow('App ID 与 App Secret 都要填。', 'bad'); return; }
     // fail-closed:空 allow_from 会让 cc-connect 放行所有飞书用户。
     if (!allowFrom) { fsShow('必须填授权用户 open_id,否则任何人都能驱动本机 AI。', 'bad'); return; }
