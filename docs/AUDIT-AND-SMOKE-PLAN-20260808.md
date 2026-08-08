@@ -1,6 +1,6 @@
 # AI Resume v2 审计 + 冒烟计划(2026-08-08 交接版)
 
-> 基线:`main` = 见 `git log --oneline -1`,`dotnet test csharp\AiResume.sln` = **587 通过 / 0 失败 / 0 跳过**。
+> 基线:`main` = 见 `git log --oneline -1`,`dotnet test csharp\AiResume.sln` = **616 通过 / 0 失败 / 0 跳过**。
 > 仓库根:`C:\Users\<你>\Desktop\AI Resume`(**路径含空格,命令里必须加引号**)。
 
 ## 0. 先读这一段:上一轮审计到底覆盖了什么
@@ -45,7 +45,7 @@
 
 | # | 检查 | 期望 |
 |---|---|---|
-| 1 | `dotnet test "…\AI Resume\csharp\AiResume.sln"` | 587 通过 / 0 失败 / 0 跳过 |
+| 1 | `dotnet test "…\AI Resume\csharp\AiResume.sln"` | 616 通过 / 0 失败 / 0 跳过 |
 | 2 | `git -C "…\AI Resume" status --short` + `git log --oneline -1` | 干净;HEAD 与 origin/main 一致 |
 | 3 | `Get-ChildItem "$env:LOCALAPPDATA\AI Resume\state"` | 目录存在,含 `secrets\feishu-platform.bin` |
 | 4 | `cc-connect daemon status` | `Status: Running` |
@@ -62,7 +62,11 @@
 
 这是本产品**唯一不可替代**的能力,而它从来没有在真实限额下跑通过。
 
-1. 新建靶子目录 `%TEMP%\airesume-t1-target`,`git init`,提交一个 README。
+1. 新建靶子目录 **`%USERPROFILE%\Desktop\airesume-t1-target`**,`git init`,提交一个 README。
+   > **不要用 `%TEMP%`。** 产品有一条安全规则:系统目录与程序自身目录不能加为项目
+   > (`该目录属于系统或程序自身目录,不能作为项目`)——自动续跑引擎不该跑到临时目录里去动 AI。
+   > 2026-08-08 首轮审计的 T1 就是因为计划指了 `%TEMP%` 而走不通:
+   > **产品是对的,计划是错的。**
 2. 打开控制面 → 「添加项目」选它 → 勾选 → 「布防」。
 3. 确认状态灯变绿、文案为「监视中」;`state\config.json` 的 `Armed=true` 且 `Selected` 含该路径。
 4. **不要真的去耗尽额度。** 用 `AIRESUME_SHADOW_DIR` 指向临时目录起一个隔离 Worker,
@@ -83,6 +87,8 @@
 2. 临时把 `~/.codex/auth.json` 改名(**记得改回来**)→ 应显示灰色「读不到 Codex 的 base_url 或凭据」。
 3. 正常状态 → 应显示绿色「可用 · 凭据已验证」,且**面板打开约 1-2 秒内**出现,不烧 token。
 4. 用 `codex doctor --json` 的输出对照:doctor 里的 401 **不得**导致红灯。
+5. 点「刷新额度」应在**约 1-2 秒**内完成。若卡十几秒,说明又走了 `codex exec`
+   (实测 10-12 秒、23,220 tokens)—— 那条路已在 2026-08-08 去掉,不该回来。
 
 ### T3 — 状态目录迁移(刚改,只在开发机验证过一次)
 

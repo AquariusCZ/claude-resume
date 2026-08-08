@@ -125,7 +125,24 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 .qc .fill{position:absolute;left:0;top:0;bottom:0;width:0;
   background:linear-gradient(90deg,var(--phos) 0%,var(--phos) 55%,var(--amber) 78%,var(--vermilion) 100%);
   box-shadow:0 0 8px var(--phos-glow);transition:width .3s ease}
-.qc.blocked .fill{background:var(--vermilion);box-shadow:0 0 8px rgba(226,81,43,.5)}
+/* 限流时**不要把整条压成纯红**。压成纯红等于把"用了多少"这个信息抹掉,
+   而且 5 小时窗口才 18% 的时候整条通红,读起来像"5 小时也满了"——是误导。
+   改成:光柱保持原本的绿→琥珀→朱橙渐变(它仍然在如实表示用量),
+   限流只用**边框和角标**表达,而且只标在真正打满的那一块上。 */
+.qc.blocked .scr{box-shadow:inset 0 0 18px rgba(0,0,0,.85),inset 0 0 0 1px rgba(226,81,43,.55)}
+.qc.blocked .t .h{color:var(--vermilion)}
+.qc .chip{display:none}
+.qc.blocked .chip{display:inline-block;margin-left:8px;padding:1px 5px;
+  font:600 9px/1.4 var(--mono);letter-spacing:.1em;color:#FFD9CC;
+  background:rgba(226,81,43,.22);border:1px solid rgba(226,81,43,.6);border-radius:1px;
+  animation:chipbeat 1.8s ease-in-out infinite}
+@keyframes chipbeat{0%,100%{opacity:1}50%{opacity:.45}}
+
+/* 灯格逐格点亮:开窗时从左往右扫过去,一眼看得出"这条在填充"。
+   用 clip-path 而不是 width —— width 已经被用来表示额度,
+   两个动画抢同一个属性会互相打架(改过一次才想明白)。 */
+@keyframes sweep{from{clip-path:inset(0 100% 0 0)}to{clip-path:inset(0 0 0 0)}}
+.qc .fill.first{animation:sweep .85s cubic-bezier(.22,1,.36,1)}
 /* 唯一的大动作:一道极缓慢的高光掠过已用段,说明「这是活的」。
    限流时停住——静止本身就是信号。 */
 @keyframes drift{from{transform:translateX(-120%)}to{transform:translateX(320%)}}
@@ -318,7 +335,8 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   .q,.side{-webkit-mask-image:none;mask-image:none}
 }
 @media (prefers-reduced-motion:reduce){
-  .sk,.btn.busy::after,.lnk.busy::after,.qc.live .fill::after,.qc .big.enter,.r.in{animation:none}
+  .sk,.btn.busy::after,.lnk.busy::after,.qc.live .fill::after,.qc .big.enter,.r.in,
+  .qc .fill.first,.qc.blocked .chip,.beacon.run .lamp{animation:none}
   .qc .fill,.qc .fill.first,.sw,.sw::after,.r,.r .rm,.lnk,.ch .act,.btn,.bank .k{transition:none}
   .r.in{opacity:1;transform:none}
 }
@@ -336,7 +354,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 
 <div class="quota">
   <div class="qc" id="q5"><div class="scr">
-    <div class="t"><span class="h">5H WINDOW</span><span class="src" id="q5src">本地会话统计</span></div>
+    <div class="t"><span class="h">5H WINDOW</span><span class="chip">已限流</span><span class="src" id="q5src">本地会话统计</span></div>
     <div class="big dim" id="q5big">读取中…</div>
     <div class="bar"><div class="fill"></div></div>
     <div class="tl"><span class="nowmark"></span></div>
@@ -344,7 +362,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     <div class="ex" id="q5ex"></div>
   </div></div>
   <div class="qc" id="q7"><div class="scr">
-    <div class="t"><span class="h">7D WINDOW</span><span class="src" id="q7src">服务端下发</span></div>
+    <div class="t"><span class="h">7D WINDOW</span><span class="chip">已限流</span><span class="src" id="q7src">服务端下发</span></div>
     <div class="big dim" id="q7big">探测中…</div>
     <div class="bar"><div class="fill"></div></div>
     <div class="tl"><span class="nowmark"></span></div>
@@ -558,16 +576,33 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       const p = await call('quota.get', { force: !!force }, 100000);
       const by = new Map((p.windows || []).map(w => [w.name, w]));
       const w7 = by.get('seven_day'), w5 = by.get('five_hour');
+      // 按模型限定的额度(weekly_scoped)。服务端只在存在这种限额时才下发。
+      const ws = by.get('weekly_scoped');
+      scopedRow = ws ? {
+        nm: 'Claude 按模型',
+        cls: ws.usedPercent >= 100 ? 'bad' : ws.usedPercent >= 90 ? 'wait' : 'ok',
+        txt: `${ws.usedPercent}% 已用`,
+      } : null;
+
+      // **blocked 只标在真正打满的那一块上。**
+      // 原来两块都吃全局的 p.limitReached,于是 5 小时才 18% 也整条通红——
+      // 那不是"提醒",是错误信息。
+      const blocked7 = w7 ? w7.status === 'blocked' : !!p.limitReached;
 
       if (w7 && w7.windowStartUnix != null) {
         paint('q7', {
           start: w7.windowStartUnix, end: w7.resetAtUnix, crossesDay: true, derived: true,
-          used: w7.usedPercent, blocked: p.limitReached,
-          extra: w7.usedPercent == null ? '服务端未下发用量百分比' : '',
+          used: w7.usedPercent, blocked: blocked7,
+          // 7 天总额度没满、却因为按模型额度打满而不能跑时,必须说出来,
+          // 否则面板显示 94% 可用而任务被拒,谁都会以为是别的毛病。
+          extra: w7.usedPercent == null ? '服务端未下发用量百分比'
+            : (ws && ws.usedPercent >= 100 && w7.usedPercent < 100)
+              ? '按模型额度已用尽(Fable/Opus 等),总额度尚有余量' : '',
+          warn: !!(ws && ws.usedPercent >= 100),
         });
       } else {
         paint('q7', {
-          placeholder: '本次未下发', blocked: p.limitReached,
+          placeholder: '本次未下发', blocked: blocked7,
           extra: p.unavailableReason || '服务端本次未附 7 天窗口信息',
           warn: !!p.limitReached,
         });
@@ -578,7 +613,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
         $('q5src').textContent = '服务端下发';
         paint('q5', {
           start: w5.windowStartUnix, end: w5.resetAtUnix, crossesDay: false, derived: true,
-          used: w5.usedPercent, blocked: p.limitReached,
+          used: w5.usedPercent, blocked: w5.status === 'blocked',
           extra: w5.usedPercent == null ? '服务端未下发用量百分比' : '',
         });
       }
@@ -620,14 +655,18 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   // 三档上色:ok 绿 / bad 红 / 其余灰。**没验证过就是灰**——
   // 项目铁律:绿色"可用"只能来自真实请求成功,"配了 key""装好了"都不算。
   let probedRows = null;
+  // 按模型限定的额度行(weekly_scoped)。它回答的是「我的 Fable 还能不能用」——
+  // 光看 7 天总额度看不出来:实测出现过总额度 94% 可用、而 Fable 已被拒的情况。
+  let scopedRow = null;
   function renderProviders(ok) {
     const head = (() => {
       if (ok === true) return { cls: 'ok', txt: '正常' };
       if (ok === false) return { cls: 'bad', txt: '额度不可得' };
       return { cls: '', txt: '读取中' };
     })();
-    const rows = [{ nm: 'Claude Code', cls: head.cls, txt: head.txt }].concat(
-      probedRows || [{ nm: 'DeepSeek', cls: '', txt: '探测中' }, { nm: 'Codex', cls: '', txt: '探测中' }]);
+    const rows = [{ nm: 'Claude Code', cls: head.cls, txt: head.txt }]
+      .concat(scopedRow ? [scopedRow] : [])
+      .concat(probedRows || [{ nm: 'DeepSeek', cls: '', txt: '探测中' }, { nm: 'Codex', cls: '', txt: '探测中' }]);
     $('providers').innerHTML = rows.map(r =>
       `<div class="pv"><span class="led ${r.cls}"></span>` +
       `<span class="nm">${esc(r.nm)}</span>` +
@@ -985,7 +1024,10 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     }
   }
 
-  $('refreshBtn').addEventListener('click', () => refreshQuota(true, true));
+  // **不再传 deep=true。** deep 会跑 `codex exec`,实测 10-12 秒、23,220 tokens,
+  // 点一下按钮整个面板卡十几秒。而默认探测现在已经做了**带凭据的真实请求**
+  // (1.3 秒、0 token),授权结论一样可靠 —— deep 已经没有存在价值了。
+  $('refreshBtn').addEventListener('click', () => refreshQuota(true, false));
   $('addBtn').addEventListener('click', addProject);
   $('hidToggle').addEventListener('click', () => { hidOpen = !hidOpen; renderHidden(); });
   $('fsOpen').addEventListener('click', openFsModal);

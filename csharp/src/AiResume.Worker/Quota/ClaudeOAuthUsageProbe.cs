@@ -200,6 +200,12 @@ public sealed class ClaudeOAuthUsageProbe
         AppendWindow(windows, "five_hour", UsageWindow.FiveHourSeconds, payload.FiveHour);
         AppendWindow(windows, "seven_day", UsageWindow.SevenDaySeconds, payload.SevenDay);
 
+        // **按模型限定的额度也要露出来。** 光有两个总窗口的话,面板会出现
+        // "7 天还剩 7%、显示正常,而 Fable 已经一个 token 都发不出去"这种自相矛盾
+        // (2026-08-08 审计实测)。把 weekly_scoped 也做成一个窗口,
+        // 用户才看得见"到底是哪一条打满了"。
+        AppendScopedWindow(windows, payload.Limits);
+
         bool limitReached = IsLimitReached(
             windows.Select(w => w.UsedPercent).ToList(),
             payload.Limits?.Select(l => l.Percent).ToList() ?? (IReadOnlyList<double?>)Array.Empty<double?>());
@@ -242,6 +248,37 @@ public sealed class ClaudeOAuthUsageProbe
             resetAtUnix,
             resetAfterSeconds,
             usedPercent));
+    }
+
+    /// <summary>
+    /// 把 <c>limits</c> 里 <c>kind = "weekly_scoped"</c> 的那条也做成一个窗口。
+    /// 服务端只在存在按模型限额时才下发它;没有就什么都不加(不造一个 0% 的假窗口)。
+    /// </summary>
+    private static void AppendScopedWindow(List<UsageWindow> windows, List<OAuthLimit>? limits)
+    {
+        OAuthLimit? scoped = limits?.FirstOrDefault(
+            l => string.Equals(l.Kind, "weekly_scoped", StringComparison.OrdinalIgnoreCase));
+        if (scoped?.Percent is not { } percent)
+        {
+            return;
+        }
+
+        int used = Math.Clamp((int)Math.Round(percent), 0, 100);
+        long? resetAtUnix = ParseResetAt(scoped.ResetsAt);
+        int? resetAfterSeconds = null;
+        if (resetAtUnix is { } unix)
+        {
+            long delta = unix - DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            resetAfterSeconds = delta <= 0 ? 0 : (int)Math.Min(delta, int.MaxValue);
+        }
+
+        windows.Add(new UsageWindow(
+            "weekly_scoped",
+            used >= 100 ? "blocked" : "allowed",
+            UsageWindow.SevenDaySeconds,
+            resetAtUnix,
+            resetAfterSeconds,
+            used));
     }
 
     /// <summary>
