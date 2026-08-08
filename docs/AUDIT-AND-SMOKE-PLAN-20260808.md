@@ -1,6 +1,6 @@
 # AI Resume v2 审计 + 冒烟计划(2026-08-08 交接版)
 
-> 基线:`main` = `65086a9`,`dotnet test csharp\AiResume.sln` = **573 通过 / 0 失败 / 0 跳过**。
+> 基线:`main` = 见 `git log --oneline -1`,`dotnet test csharp\AiResume.sln` = **573 通过 / 0 失败 / 0 跳过**。
 > 仓库根:`C:\Users\<你>\Desktop\AI Resume`(**路径含空格,命令里必须加引号**)。
 
 ## 0. 先读这一段:上一轮审计到底覆盖了什么
@@ -11,7 +11,7 @@
 **本计划 §3 之后的内容,一条都没有被验证过。** 不要把上一轮的"533 通过"当成功能验证,
 那只是单元测试,和"这个产品在真机上能用"是两件事。
 
-它有价值的产出只有一条,已确认为真:**没有任何东西守护 cc-connect**。
+它有价值的产出只有一条,已确认为真:**没有任何东西守护 cc-connect**——该项已于 2026-08-08 修复(§4.1)。
 
 ---
 
@@ -41,10 +41,13 @@
 | # | 检查 | 期望 |
 |---|---|---|
 | 1 | `dotnet test "…\AI Resume\csharp\AiResume.sln"` | 573 通过 / 0 失败 / 0 跳过 |
-| 2 | `git -C "…\AI Resume" status --short` + `git log --oneline -1` | 干净;HEAD = `65086a9` |
-| 3 | `Get-ChildItem "$env:LOCALAPPDATA\AI Resume\state"` | 目录存在 |
+| 2 | `git -C "…\AI Resume" status --short` + `git log --oneline -1` | 干净;HEAD 与 origin/main 一致 |
+| 3 | `Get-ChildItem "$env:LOCALAPPDATA\AI Resume\state"` | 目录存在,含 `secrets\feishu-platform.bin` |
+| 4 | `cc-connect daemon status` | `Status: Running` |
+| 5 | `Get-CimInstance Win32_Process -Filter "Name='cc-connect.exe'"` | **恰好 1 个进程** |
 
-**不检查 cc-connect 是否在运行**——目前它本来就没有自启,这是已知缺口(见 §4),不是异常。
+条件 5 是硬红线:飞书长连接是集群模式,**两个消费者在线时事件会被随机投给其中一个**,
+表现为"机器人时灵时不灵"。数量不是 1 就停手报告,不要自行杀进程。
 
 ---
 
@@ -97,7 +100,7 @@
 **重点**:Qoder 的脚本必须检查 stdin 的 `stop_hook_active`,为 true 时立即 exit 0,
 否则会触发阻断→重试的无限循环。
 
-### T6 — cc-connect 手机端(需要先解决 §4)
+### T6 — cc-connect 手机端(daemon 已就位,可直接测)
 
 `/dir` 切目录、`/mode plan` vs `/mode yolo` 的读写边界、`/model switch`、`/provider switch`、
 `/new` + `/list` + `/switch`、`/stop`。修改类命令**只允许对靶子目录**执行。
@@ -113,11 +116,38 @@
 
 | 缺口 | 状态 | 既定修法 |
 |---|---|---|
-| **cc-connect 无自启无守护** | `CcConnectSupervisor` 写了、测了,**生产无任何调用者**,且其注释明写"不做自动重启循环" | 上游自带 `cc-connect daemon install`(注册 Windows 计划任务)。**按"上游优先"应当用它,而不是自研守护。** 装之前必须先过单消费者预检 |
+| ~~cc-connect 无自启无守护~~ | **2026-08-08 已解决** —— `cc-connect daemon install` 注册为 Windows 计划任务(登录触发)。见下方 §4.1 | — |
 | **限额续跑未端到端验证** | 见 T1 | — |
+| **改配置后 GUI 不提示要重启 daemon** | 「生成 cc-connect 配置」写完文件就返回,但 daemon 不会自己重读 | 需在 GUI 补一句提示或直接调 `cc-connect daemon restart` |
 | **IPC `ipc_status` 曾 60/60 空响应** | 未复查 | 读 IPC 服务端代码后再定 |
 | `~/.codex/config.toml` 的 `notify` 链损坏 | 六层嵌套转义,指向已被删除的 `%LOCALAPPDATA%\ClaudeResume\completion-notify.js` | 需人工确认后清理;**不要自动改用户的 codex 配置** |
 | 仓库仍留 39 个 v1 的 JS 模块 | 有意保留备查 | — |
+
+### 4.1 计划任务的四项设置必须复核(装 daemon 时真踩到)
+
+`cc-connect daemon install` 建出来的计划任务,**四项默认值里三项是错的**:
+
+| 设置 | 上游默认 | 已改成 | 不改会怎样 |
+|---|---|---|---|
+| `ExecutionTimeLimit` | **`PT72H`** | `PT0S` | **跑满 72 小时被 Windows 掐掉**,且极难联想到是计划任务干的 |
+| `StopIfGoingOnBatteries` | **`True`** | `False` | 笔记本一拔电源机器人就停 |
+| `DisallowStartIfOnBatteries` | **`True`** | `False` | 电池供电时开机根本不启动 |
+| `RestartCount` | **`0`** | `3`(间隔 `PT1M`) | **崩了不会自动拉起** —— "装了 daemon 就有守护"这句话在改之前是假的 |
+
+**任何一次 `daemon uninstall` + `install` 都会把这四项打回默认。** 重装后必须重跑:
+
+```powershell
+$s = (Get-ScheduledTask -TaskName 'cc-connect').Settings
+$s.ExecutionTimeLimit = 'PT0S'; $s.StopIfGoingOnBatteries = $false
+$s.DisallowStartIfOnBatteries = $false; $s.RestartCount = 3; $s.RestartInterval = 'PT1M'
+Set-ScheduledTask -TaskName 'cc-connect' -Settings $s
+```
+
+### 4.2 启动日志里那条 WARN 是正常的
+
+`engine started with partial readiness ... ready=1 pending=1` 出现在启动瞬间,
+因为 weixin(ilink)握手比 feishu 慢约 18 秒。**判据是之后有没有第二条 `platform ready`**,
+不是这条 WARN 本身。实测 01:20:16 feishu ready → 01:20:34 weixin ready,之后无新告警。
 
 ---
 
@@ -126,7 +156,7 @@
 > 你要审计的项目在 `C:\Users\<你>\Desktop\AI Resume`(**路径含空格,命令加引号**)。
 > 先完整读 `CLAUDE.md` 和 `docs/AUDIT-AND-SMOKE-PLAN-20260808.md`,**§1 红线逐条遵守**。
 >
-> 按 §2 核对三条前置条件。**任一不符立即停手报告,不要自行修复。**
+> 按 §2 核对**五条**前置条件。**任一不符立即停手报告,不要自行修复。**
 >
 > 通过后按 §3 的 T1→T7 顺序执行。每一项都要给出**可核验的证据**
 > (命令原文 + 输出片段 + 文件路径 + 时间戳),而不是"看起来正常"。
