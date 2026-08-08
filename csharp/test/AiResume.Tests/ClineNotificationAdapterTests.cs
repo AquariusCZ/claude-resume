@@ -17,8 +17,10 @@ public class ClineNotificationAdapterTests : IDisposable
 
     public ClineNotificationAdapterTests()
     {
-        // 创建唯一临时目录
-        _hooksDirectory = Path.Combine(Path.GetTempPath(), "AiResumeTests_" + Guid.NewGuid().ToString("N"));
+        // **只取路径,不创建**:这一组里有一条测的正是"hooks 目录不存在时报未安装",
+        // 先建出来会把前提创没了——测试照样绿,但它已经不再测那件事。
+        // 需要目录的用例各自 CreateDirectory(适配器的 Enable 本来也会建)。
+        _hooksDirectory = TestTemp.NewPath("cline-hooks");
         _adapter = new ClineNotificationAdapter(_hooksDirectory);
     }
 

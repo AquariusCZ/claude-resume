@@ -20,7 +20,7 @@ public class OpenCodeNotificationAdapterTests : IDisposable
     public OpenCodeNotificationAdapterTests()
     {
         // 创建唯一临时目录,模拟 ~/.config/opencode/plugins 结构
-        _tempRoot = Path.Combine(Path.GetTempPath(), "AiResumeTests_" + Guid.NewGuid().ToString("N"));
+        _tempRoot = TestTemp.NewDir("AiResumeTests");
         _configDirectory = Path.Combine(_tempRoot, ".config", "opencode");
         _pluginsDirectory = Path.Combine(_configDirectory, "plugins");
         _adapter = new OpenCodeNotificationAdapter(_pluginsDirectory);

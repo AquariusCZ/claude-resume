@@ -19,7 +19,7 @@ public sealed class StorageRunStoreTests : IDisposable
 
     public StorageRunStoreTests()
     {
-        _dir = Path.Combine(Path.GetTempPath(), "airesume-storage-tests", Guid.NewGuid().ToString("N"));
+        _dir = TestTemp.NewDir("airesume-storage-tests");
         Directory.CreateDirectory(_dir);
         _dbPath = Path.Combine(_dir, "runs.db");
         StorageDatabase.Migrate(_dbPath);

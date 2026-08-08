@@ -22,8 +22,7 @@ namespace AiResume.Tests;
 /// </summary>
 public sealed class NotificationMarkerIdentityTests : IDisposable
 {
-    private readonly string _root = Path.Combine(
-        Path.GetTempPath(), "airesume-marker-" + Guid.NewGuid().ToString("N"));
+    private readonly string _root = TestTemp.NewDir("marker");
 
     public NotificationMarkerIdentityTests() => Directory.CreateDirectory(_root);
 

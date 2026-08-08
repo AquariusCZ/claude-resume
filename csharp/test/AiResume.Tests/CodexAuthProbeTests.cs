@@ -35,7 +35,7 @@ public sealed class CodexAuthProbeTests : IDisposable
 
     private string NewCodexHome(string? configToml, string? authJson)
     {
-        string dir = Path.Combine(Path.GetTempPath(), "airesume-codexhome-" + Guid.NewGuid().ToString("N"));
+        string dir = TestTemp.NewDir("codexhome");
         Directory.CreateDirectory(dir);
         _dirs.Add(dir);
         if (configToml is not null)

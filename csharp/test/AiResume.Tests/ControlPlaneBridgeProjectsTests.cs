@@ -28,7 +28,7 @@ public class ControlPlaneBridgeProjectsTests : IDisposable
     public ControlPlaneBridgeProjectsTests()
     {
         // 创建临时目录,避免触碰真实用户目录与 shadow 根
-        _tempRoot = Path.Combine(Path.GetTempPath(), "AiResumeTests_" + Guid.NewGuid().ToString("N"));
+        _tempRoot = TestTemp.NewDir("AiResumeTests");
         _configDir = Path.Combine(_tempRoot, "config");
         _fakeHome = Path.Combine(_tempRoot, "fakehome");
         _systemp = Path.Combine(_tempRoot, "systemp");

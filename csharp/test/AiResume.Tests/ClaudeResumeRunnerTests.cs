@@ -116,7 +116,7 @@ public sealed class ClaudeResumeRunnerTests : IDisposable
 
     public ClaudeResumeRunnerTests()
     {
-        _tempRoot = Path.Combine(Path.GetTempPath(), "airesume-tests-" + Guid.NewGuid().ToString("N"));
+        _tempRoot = TestTemp.NewDir("airesume-tests");
         Directory.CreateDirectory(_tempRoot);
 
         _projectDir = Path.Combine(_tempRoot, "project");

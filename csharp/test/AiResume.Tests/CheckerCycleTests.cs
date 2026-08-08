@@ -17,7 +17,7 @@ public sealed class CheckerCycleTests : IDisposable
 
     public CheckerCycleTests()
     {
-        string dir = Path.Combine(Path.GetTempPath(), "s5c-" + Guid.NewGuid().ToString("N"));
+        string dir = TestTemp.NewDir("s5c");
         Directory.CreateDirectory(dir);
         _dbPath = Path.Combine(dir, "shadow.db");
         StorageDatabase.Migrate(_dbPath);
@@ -435,7 +435,7 @@ public sealed class CheckerCycleTests : IDisposable
     public void Store_loads_default_when_table_missing_or_empty()
     {
         // 全新数据库(未迁移):Load 容错回默认。
-        string dir = Path.Combine(Path.GetTempPath(), "s5c-" + Guid.NewGuid().ToString("N"));
+        string dir = TestTemp.NewDir("s5c");
         Directory.CreateDirectory(dir);
         try
         {

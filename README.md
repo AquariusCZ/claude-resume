@@ -169,7 +169,7 @@ Further reading: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [RUN-CONTRACT.md](do
 dotnet test csharp\AiResume.sln
 ```
 
-706 xUnit tests. They never start an AI run against a real project or session, never touch `~/.claude`, `~/.codex` or the production state directory, and never make a paid API call. Probe classification is tested against recorded real responses rather than guessed shapes — a mock that guesses the wrong response shape produces an all-green suite and a silently broken product.
+723 xUnit tests. They never start an AI run against a real project or session, never touch `~/.claude`, `~/.codex` or the production state directory, and never make a paid API call. Probe classification is tested against recorded real responses rather than guessed shapes — a mock that guesses the wrong response shape produces an all-green suite and a silently broken product.
 
 ---
 

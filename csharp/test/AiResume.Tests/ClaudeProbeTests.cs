@@ -37,7 +37,7 @@ public sealed class ClaudeProbeTests : IDisposable
 
     private static string CreateTempRoot()
     {
-        string dir = Path.Combine(Path.GetTempPath(), "s5b-" + Guid.NewGuid().ToString("N"));
+        string dir = TestTemp.NewDir("s5b");
         Directory.CreateDirectory(dir);
         return dir;
     }

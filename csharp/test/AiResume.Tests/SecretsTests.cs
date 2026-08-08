@@ -18,7 +18,7 @@ public sealed class SecretsTests : IDisposable
 
     public SecretsTests()
     {
-        _dir = Path.Combine(Path.GetTempPath(), "airesume-secrets-tests", Guid.NewGuid().ToString("N"));
+        _dir = TestTemp.NewDir("airesume-secrets-tests");
         Directory.CreateDirectory(_dir);
     }
 

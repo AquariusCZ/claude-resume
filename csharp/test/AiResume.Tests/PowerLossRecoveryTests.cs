@@ -190,7 +190,7 @@ public sealed class PowerLossRecoveryTests : IDisposable
 
     private static string NewShadowDir()
     {
-        string dir = Path.Combine(Path.GetTempPath(), "s5d-powerloss-" + Guid.NewGuid().ToString("N"));
+        string dir = TestTemp.NewDir("s5d-powerloss");
         Directory.CreateDirectory(dir);
         return dir;
     }

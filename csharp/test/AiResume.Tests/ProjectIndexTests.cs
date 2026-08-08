@@ -35,7 +35,7 @@ public sealed class ProjectIndexTests : IDisposable
 
     private static string CreateTempRoot()
     {
-        string dir = Path.Combine(Path.GetTempPath(), "s7a-" + Guid.NewGuid().ToString("N"));
+        string dir = TestTemp.NewDir("s7a");
         Directory.CreateDirectory(dir);
         return dir;
     }

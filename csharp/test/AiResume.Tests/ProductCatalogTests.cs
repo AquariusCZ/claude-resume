@@ -33,7 +33,7 @@ public sealed class ProductCatalogTests : IDisposable
 
     private static string CreateTempRoot()
     {
-        string dir = Path.Combine(Path.GetTempPath(), "s5a-" + Guid.NewGuid().ToString("N"));
+        string dir = TestTemp.NewDir("s5a");
         Directory.CreateDirectory(dir);
         return dir;
     }

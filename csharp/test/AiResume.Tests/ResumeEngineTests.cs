@@ -35,7 +35,7 @@ public sealed class ResumeEngineTests : IDisposable
     public ResumeEngineTests()
     {
         // 每个测试独立临时目录,避免相互污染。
-        _shadowRoot = Path.Combine(Path.GetTempPath(), "airesume-tests-" + Guid.NewGuid().ToString("N"));
+        _shadowRoot = TestTemp.NewDir("airesume-tests");
         Directory.CreateDirectory(_shadowRoot);
         // ProductStateStore 落 SQLite 而非 JSON,且**必须先迁移建表**——
         // 不建表时 Save 会抛 no such table: product_state(隐含前置条件)。

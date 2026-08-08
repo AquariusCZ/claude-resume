@@ -47,7 +47,7 @@ public sealed class CcConnectSupervisorTests : IDisposable
 
     private string NewDir()
     {
-        string dir = Path.Combine(Path.GetTempPath(), "s6a-" + Guid.NewGuid().ToString("N"));
+        string dir = TestTemp.NewDir("s6a");
         Directory.CreateDirectory(dir);
         _dirs.Add(dir);
         return dir;

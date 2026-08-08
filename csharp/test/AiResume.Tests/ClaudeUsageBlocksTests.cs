@@ -12,7 +12,7 @@ public class ClaudeUsageBlocksTests : IDisposable
 
     public ClaudeUsageBlocksTests()
     {
-        _tempRoot = Path.Combine(Path.GetTempPath(), "airesume-tests-" + Guid.NewGuid().ToString("N"));
+        _tempRoot = TestTemp.NewDir("airesume-tests");
         Directory.CreateDirectory(_tempRoot);
     }
 

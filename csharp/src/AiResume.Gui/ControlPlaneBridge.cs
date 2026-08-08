@@ -702,21 +702,49 @@ public sealed class ControlPlaneBridge
                 {
                     name = "DeepSeek",
                     state = DeepSeekState(ds),
-                    text = ds.Summary ?? "未探测",
+                    text = ShortLabel(ds.Readiness.ToString(), ds.Summary),
+                    detail = ds.Summary ?? "未探测",
                 },
                 new
                 {
                     name = "Codex",
                     state = CodexState(codex, deep),
-                    // **直接用 Summary,不要再拼一句固定文案。**
-                    // 原来这里把 Ok+未深检的情况一律写成"已就绪 · 未验证授权",
-                    // 于是断网时 Summary 里那句"网络不可达:…"被丢掉,
-                    // 用户看到的只有"未验证授权"——排查方向立刻跑偏(2026-08-08 审计实测)。
-                    text = codex.Summary ?? "未探测",
+                    // 侧栏只有一行的宽度,长句必然被省略号截掉 ——
+                    // 而被截掉的恰恰是结论那几个字(实测显示成"可用 · 凭据与推理已…")。
+                    // 所以这里给**短标签**,完整那句放 detail,由前端挂到 title 上。
+                    text = ShortLabel(codex.Reason, codex.Summary),
+                    detail = codex.Summary ?? "未探测",
                 },
             },
         };
     }
+
+    /// <summary>
+    /// 把探测结论压成 2–5 个字。
+    ///
+    /// 不是为了好看:侧栏一行放不下整句,截断之后剩的是前半句,
+    /// 而结论在后半句 —— 截断等于把最有用的部分丢掉。短标签 + title 里的全文,
+    /// 一眼能看懂,想细看也拿得到。
+    /// </summary>
+    internal static string ShortLabel(string? reason, string? summary) => reason switch
+    {
+        "authorized" => (summary ?? string.Empty).Contains("未核实", StringComparison.Ordinal)
+            ? "未验推理"      // 凭据过了,但推理那一步没验到 —— 不能说成"已验证"
+            : "已验证",
+        "no-inference" => "不能推理",
+        "auth-rejected" or "auth" => "凭据被拒",
+        "http-429" or "limited" => "被限流",
+        "server-error" => "服务端异常",
+        "unverified" => "未验证",
+        "no-cli" => "未安装",
+        "timeout" => "探测超时",
+        "unreachable" => "网络不可达",
+        "Ok" => "可用",
+        "Auth" => "凭据被拒",
+        "Insufficient" => "余额不足",
+        "Unreachable" => "网络不可达",
+        _ => string.IsNullOrWhiteSpace(summary) ? "未探测" : "未探测",
+    };
 
     private object GetAgent()
     {

@@ -27,7 +27,7 @@ public sealed class OrchestratorTests : IDisposable
 
     public OrchestratorTests()
     {
-        _dir = Path.Combine(Path.GetTempPath(), "airesume-orchestrator-tests", Guid.NewGuid().ToString("N"));
+        _dir = TestTemp.NewDir("airesume-orchestrator-tests");
         Directory.CreateDirectory(_dir);
         _dbPath = Path.Combine(_dir, "runs.db");
         StorageDatabase.Migrate(_dbPath);

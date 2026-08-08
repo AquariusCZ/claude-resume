@@ -87,7 +87,7 @@ public sealed class CcConnectProjectIdentityTests
     {
         // 用空目录当搜索路径,而不是挑一个"本机大概没装"的 agent ——
         // 后者在用户哪天真装了它之后会假红。
-        string empty = Path.Combine(Path.GetTempPath(), "airesume-nopath-" + Guid.NewGuid().ToString("N"));
+        string empty = TestTemp.NewDir("airesume-nopath");
         Directory.CreateDirectory(empty);
         try
         {
@@ -107,7 +107,7 @@ public sealed class CcConnectProjectIdentityTests
     {
         // 反向:放一个假的 claude.exe 进去,探测必须认出来。
         // 只测"能不能解析",不测它是不是真的 Claude Code——那不是这层的职责。
-        string dir = Path.Combine(Path.GetTempPath(), "airesume-path-" + Guid.NewGuid().ToString("N"));
+        string dir = TestTemp.NewDir("airesume-path");
         Directory.CreateDirectory(dir);
         try
         {

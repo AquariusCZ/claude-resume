@@ -10,7 +10,7 @@ namespace AiResume.Tests;
 /// </summary>
 public class LarkCliInvokerTests : IDisposable
 {
-    private readonly string _tempDir = Path.Combine(Path.GetTempPath(), "airesume-larkcli-" + Guid.NewGuid().ToString("N"));
+    private readonly string _tempDir = TestTemp.NewDir("airesume-larkcli");
 
     public LarkCliInvokerTests()
     {

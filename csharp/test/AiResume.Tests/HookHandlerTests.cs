@@ -18,7 +18,7 @@ public class HookHandlerTests : IDisposable
     public HookHandlerTests()
     {
         // 为每个测试创建唯一临时目录
-        _tempDir = Path.Combine(Path.GetTempPath(), "AiResumeTests_" + Guid.NewGuid().ToString("N"));
+        _tempDir = TestTemp.NewDir("AiResumeTests");
         Directory.CreateDirectory(_tempDir);
     }
 

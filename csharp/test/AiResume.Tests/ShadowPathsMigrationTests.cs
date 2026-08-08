@@ -32,7 +32,7 @@ public sealed class ShadowPathsMigrationTests : IDisposable
 
     private string NewDir(string tag)
     {
-        string p = Path.Combine(Path.GetTempPath(), $"airesume-shadowmig-{tag}-{Guid.NewGuid():N}");
+        string p = TestTemp.NewDir($"airesume-shadowmig-{tag}");
         Directory.CreateDirectory(p);
         _dirs.Add(p);
         return p;
@@ -93,7 +93,7 @@ public sealed class ShadowPathsMigrationTests : IDisposable
     public void 旧目录不存在时无事发生()
     {
         string to = NewDir("to");
-        string ghost = Path.Combine(Path.GetTempPath(), "airesume-nope-" + Guid.NewGuid().ToString("N"));
+        string ghost = TestTemp.NewDir("airesume-nope");
 
         Assert.Equal(0, ShadowPaths.TryMigrateLegacy(ghost, to));
     }

@@ -50,7 +50,7 @@ public sealed class FaultInjectionTests : IDisposable
 
     private string NewDir()
     {
-        string dir = Path.Combine(Path.GetTempPath(), "s10o-fault-" + Guid.NewGuid().ToString("N"));
+        string dir = TestTemp.NewDir("s10o-fault");
         Directory.CreateDirectory(dir);
         _dirs.Add(dir);
         return dir;

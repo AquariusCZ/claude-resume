@@ -471,7 +471,7 @@ public sealed class CompletionNotifierTests
 
     private static string CreateTempDir()
     {
-        return Path.Combine(Path.GetTempPath(), "s12-test-" + Guid.NewGuid().ToString("N"));
+        return TestTemp.NewDir("s12-test");
     }
 
     private static void Cleanup(string dir)

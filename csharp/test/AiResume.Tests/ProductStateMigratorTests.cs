@@ -22,7 +22,7 @@ public class ProductStateMigratorTests : IDisposable
 
     public ProductStateMigratorTests()
     {
-        _tempRoot = Path.Combine(Path.GetTempPath(), "AiResumeMigratorTests_" + Guid.NewGuid().ToString("N"));
+        _tempRoot = TestTemp.NewDir("AiResumeMigratorTests");
         _legacyAppDir = Path.Combine(_tempRoot, "legacy");
         _shadowRoot = Path.Combine(_tempRoot, "shadow");
         _dbPath = Path.Combine(_tempRoot, "shadow", "state.db");

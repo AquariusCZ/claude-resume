@@ -429,7 +429,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   <span class="sn" id="snPlate"><b>MODEL AR-2</b>BUILD 读取中</span>
   <div class="beacon" id="beacon" role="status" aria-live="polite">
     <span class="lamp"></span>
-    <span class="txt"><b id="armLine">未布防</b><span class="sub2" id="phaseLine">额度恢复后按队列顺序继续</span></span>
+    <span class="txt"><b id="armLine">未布防</b><span class="sub2" id="phaseLine">额度恢复后按队列续跑</span></span>
   </div>
   <div class="rt"><span class="lnk" id="refreshBtn">刷新额度</span><span id="nextRefresh">—</span></div>
 </div>
@@ -465,7 +465,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     <div class="sect">
       <div class="sl">Agent · 执行体</div>
       <div class="bank" id="agentBank"></div>
-      <div class="note" id="agentNote">cc-connect 一个项目死绑一个 agent,切换后需重启 cc-connect 生效。</div>
+      <div class="note" id="agentNote">切换需重启 cc-connect</div>
     </div>
     <div class="sect">
       <div class="sl">Quota · 额度模型</div>
@@ -676,7 +676,9 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       scopedRow = ws ? {
         nm: wsModel ? `Claude · ${wsModel}` : 'Claude 按模型',
         cls: ws.usedPercent >= 100 ? 'bad' : ws.usedPercent >= 90 ? 'wait' : 'ok',
-        txt: ws.usedPercent >= 100 ? '额度已用尽' : `${ws.usedPercent}% 已用`,
+        txt: ws.usedPercent >= 100 ? '已用尽' : `${ws.usedPercent}%`,
+        detail: ws.usedPercent >= 100
+          ? `${wsModel || '该模型'} 的按模型额度已用尽` : `${wsModel || '该模型'} 已用 ${ws.usedPercent}%`,
       } : null;
 
       // **blocked 只标在真正打满的那一块上。**
@@ -770,8 +772,10 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     const rows = [{ nm: 'Claude Code', cls: head.cls, txt: head.txt }]
       .concat(scopedRow ? [scopedRow] : [])
       .concat(probedRows || [{ nm: 'DeepSeek', cls: '', txt: '探测中' }, { nm: 'Codex', cls: '', txt: '探测中' }]);
+    // 短标签上屏,完整结论进 title:侧栏一行放不下整句,
+    // 而被省略号截掉的恰好是结论那几个字。
     $('providers').innerHTML = rows.map(r =>
-      `<div class="pv"><span class="led ${r.cls}"></span>` +
+      `<div class="pv" title="${esc(r.detail || r.txt)}"><span class="led ${r.cls}"></span>` +
       `<span class="nm">${esc(r.nm)}</span>` +
       `<span class="v ${r.cls}">${esc(r.txt)}</span></div>`).join('');
   }
@@ -783,6 +787,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
         nm: it.name,
         cls: ['ok', 'bad', 'wait'].includes(it.state) ? it.state : '',
         txt: it.text,
+        detail: it.detail,
       }));
       renderProviders(lastQuotaOk);
     }).catch(() => { /* 探测失败保持上一次显示,不把面板打成错误页 */ });
@@ -935,8 +940,8 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     if (on && arm.engine === 'NotRunning') {
       $('beacon').className = 'beacon bad';
       $('armLine').textContent = '没有在监视';
-      $('phaseLine').textContent = `已布防 ${n} 个项目,但续跑引擎没在运行`;
-      $('armNote').textContent = '解除只停止自动续跑,不影响已在跑的任务。';
+      $('phaseLine').textContent = `已布防 ${n} 个,但引擎没在运行`;
+      $('armNote').textContent = '解除只停自动续跑';
       return;
     }
     if (on && arm.engine === 'Stalled') {
@@ -945,19 +950,19 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       const mins = arm.probeAgeSeconds ? Math.floor(arm.probeAgeSeconds / 60) : null;
       $('phaseLine').textContent = mins != null
         ? `进程还在,但已 ${mins} 分钟没探过额度` : '进程还在,但久未探测额度';
-      $('armNote').textContent = '解除只停止自动续跑,不影响已在跑的任务。';
+      $('armNote').textContent = '解除只停自动续跑';
       return;
     }
     if (!on) {
-      head = '未布防'; sub = '额度恢复后按队列顺序继续';
+      head = '未布防'; sub = '额度恢复后按队列续跑';
     } else if (failed) {
-      cls = 'bad'; head = `${failed} 个项目续跑失败`; sub = '失败项见队列右侧状态,其余照常排队';
+      cls = 'bad'; head = `${failed} 个续跑失败`; sub = '失败项见队列右侧,其余照常排队';
     } else if (arm.phase === 'resuming') {
       cls = 'on run'; head = '正在续跑'; sub = `共 ${n} 个项目`;
     } else if (arm.phase === 'waiting') {
       cls = arm.sawLimited ? 'wait' : 'on';
       head = arm.sawLimited ? '等待额度恢复' : '监视中';
-      sub = arm.sawLimited ? `恢复后按顺序续跑 ${n} 个项目` : `已布防 ${n} 个项目,尚未观测到限流`;
+      sub = arm.sawLimited ? `恢复后续跑 ${n} 个项目` : `已布防 ${n} 个,尚未限流`;
     } else if (arm.phase === 'done') {
       cls = 'on'; head = '本轮已完成'; sub = `${n} 个项目已跑完`;
     } else {
@@ -967,9 +972,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     $('armLine').textContent = head;
     $('phaseLine').textContent = sub;
     // 状态灯已经把「现在是什么状态」说完了,这里只补它说不了的:这个按钮按下去会怎样。
-    $('armNote').textContent = on
-      ? '解除只停止自动续跑,不影响已在跑的任务。'
-      : '勾选项目后布防;引擎会在下一拍探测额度。';
+    $('armNote').textContent = on ? '解除只停自动续跑' : '勾选项目后布防';
   }
 
   async function toggleArm() {
@@ -1052,8 +1055,15 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     if (p.hasCredentials) {
       const v = fsVerdict;
       $('fsCredLed').className = 'led' + (v ? (v.ok ? ' ok' : v.verdict === 'NetworkFailed' ? ' wait' : ' bad') : '');
-      $('fsCredText').textContent = v ? v.summary : '凭据未验证(点右侧验证)';
-      $('fsCredText').title = v ? v.summary : '「已配置」只说明本机存过这份凭据,不代表飞书现在还认它。';
+      // 一行装得下才不会把「验证」挤走:结论压成几个字,全文进 title。
+      const credText = !v ? '未验证'
+        : v.ok ? '凭据有效'
+        : v.verdict === 'NetworkFailed' ? '网络未通'
+        : v.verdict === 'NoCredentials' ? '未配置'
+        : v.code ? `凭据被拒 ${v.code}` : '凭据被拒';
+      $('fsCredText').textContent = credText;
+      $('fsCredText').title = v ? v.summary
+        : '「已配置」只说明本机存过这份凭据,不代表飞书现在还认它。点「验证」真发一次请求。';
     }
 
     // ── 配置:文件在 ≠ cc-connect 加载得了 ──
@@ -1062,15 +1072,18 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     if (cfg !== 'missing') {
       $('fsCfgLed').className = 'led' + (cfg === 'ok' ? ' ok' : cfg === 'invalid' ? ' bad' : ' wait');
       const problems = p.configProblems || [];
-      $('fsCfgText').textContent = p.configSummary || '';
+      $('fsCfgText').textContent =
+        cfg === 'ok' ? '配置可加载' : cfg === 'invalid' ? '配置无法加载' : '配置未核对';
       // 具体哪一行坏了放 title:侧栏放不下,而它恰恰是唯一能用的线索。
       $('fsCfgLine').title = [p.configPath, p.configSummary].concat(problems).filter(Boolean).join('\n');
     }
 
     // 路径太长会把整段说明挤出侧栏可视区(实测被裁在"配置已存"处),
     // 改为短句 + 完整路径放 title。
-    $('fsNote').textContent = '凭据经 DPAPI 按当前用户加密存本机,不写入仓库,也不回传界面。';
-    $('fsNote').title = p.configPath || '';
+    // 原文三行,末行只剩「面。」两个字 —— 压成一行。完整说明进 title。
+    $('fsNote').textContent = '凭据经 DPAPI 加密存本机';
+    $('fsNote').title = [p.configPath, '凭据按当前用户加密,不写入仓库,界面也读不回来。']
+      .filter(Boolean).join('\n');
   }
 
   // 真发一次请求去换 token。这是界面上唯一能把「凭据坏了」和其它三种
@@ -1179,7 +1192,13 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       if (arm.armed) { picked.clear(); arm.selected.forEach(p => picked.add(p)); }
     } catch (e) { $('armNote').textContent = '读取布防状态失败:' + e.message; }
 
-    call('feishu.status').then(renderFeishu).catch(e => {
+    call('feishu.status').then(p => {
+      renderFeishu(p);
+      // **开窗就验一次。** 「已配置」只说明 DPAPI 里有值,而用户想知道的是"现在还能用吗";
+      // 让他自己去点一下才知道,等于把问题又丢回给他。
+      // 一次请求、几十毫秒,没有不做的理由。手动「验证」按钮保留,用于改完凭据后立刻复核。
+      if (p.hasCredentials) verifyFeishu();
+    }).catch(e => {
       $('fsState').textContent = '读取失败:' + e.message;
     });
 
@@ -1292,8 +1311,8 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 
     const hiddenCount = p.options.length - shown.length;
     note.textContent = hiddenCount > 0
-      ? `另有 ${hiddenCount} 个 agent 未安装,已隐藏。切换后需重启 cc-connect 生效。`
-      : '切换后需重启 cc-connect 生效。';
+      ? `另有 ${hiddenCount} 个未安装;切换需重启`
+      : '切换需重启 cc-connect';
   };
 
   const pick = async (id) => {
@@ -1306,7 +1325,12 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       cached.current = r.current;
       // 只说"已记录"而不是"已生效":配置要重新生成 + 重启 cc-connect 才真的换。
       // 谎称已生效会让人以为发消息就是新 agent 在答,排查时全跑偏。
-      note.textContent = '已记录。需点「生成 cc-connect 配置」并重启 cc-connect 才生效。';
+      //
+      // 但**切回原来那个就不该继续报"需重启"** —— 那时磁盘上的配置和选择本来就一致,
+      // 提示还挂着会让人白重启一次,而且它久了就变成一句没人再读的常驻文案。
+      note.textContent = id === booted
+        ? '与已生成的配置一致'
+        : '已记录,需重新生成配置并重启';
     } catch (err) {
       note.textContent = '切换失败:' + err.message;
     } finally {
@@ -1316,6 +1340,8 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   };
 
   let cached = { current: '', options: [] };
+  // 开窗那一刻的选择 = 磁盘上配置对应的那个。切回它就等于没改。
+  let booted = '';
   // 未安装的已经不渲染了,这里只需挡住"点当前项"。
   // 后端仍会拒未安装项(双保险):界面是几分钟前探测的,
   // 用户卸掉 CLI 之后不刷新就点,只有后端那道拦得住。
@@ -1330,7 +1356,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     if (pickable(k)) { e.preventDefault(); pick(k.dataset.id); }
   });
 
-  rpc('agent.get').then(p => { cached = p; render(p); })
+  rpc('agent.get').then(p => { cached = p; booted = p.current; render(p); })
     .catch(err => { note.textContent = '读取执行体失败:' + err.message; });
 
   // 右栏各区块是异步填充的(providers / 通知源 / 本区)。任何一块在填充时

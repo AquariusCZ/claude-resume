@@ -20,7 +20,7 @@ public sealed class ReconcilerTests : IDisposable
 
     public ReconcilerTests()
     {
-        _dir = Path.Combine(Path.GetTempPath(), "s5d-reconciler-" + Guid.NewGuid().ToString("N"));
+        _dir = TestTemp.NewDir("s5d-reconciler");
         Directory.CreateDirectory(_dir);
         _dbPath = Path.Combine(_dir, "shadow.db");
         StorageDatabase.Migrate(_dbPath);

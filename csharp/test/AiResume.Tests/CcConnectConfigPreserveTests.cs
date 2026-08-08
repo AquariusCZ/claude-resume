@@ -41,7 +41,7 @@ public sealed class CcConnectConfigPreserveTests : IDisposable
 
     private string NewDir()
     {
-        string dir = Path.Combine(Path.GetTempPath(), "s10g-" + Guid.NewGuid().ToString("N"));
+        string dir = TestTemp.NewDir("s10g");
         Directory.CreateDirectory(dir);
         _dirs.Add(dir);
         return dir;

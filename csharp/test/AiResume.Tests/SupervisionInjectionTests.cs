@@ -16,7 +16,7 @@ public sealed class SupervisionInjectionTests : IDisposable
 
     public SupervisionInjectionTests()
     {
-        _dir = Path.Combine(Path.GetTempPath(), "airesume-supervision-inject", Guid.NewGuid().ToString("N"));
+        _dir = TestTemp.NewDir("airesume-supervision-inject");
         Directory.CreateDirectory(_dir);
     }
 

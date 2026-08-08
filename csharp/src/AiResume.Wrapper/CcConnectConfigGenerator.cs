@@ -128,6 +128,7 @@ public static class CcConnectConfigGenerator
 
         string preserved = string.Empty;
         IReadOnlyList<string> foreignPlatforms = Array.Empty<string>();
+        IReadOnlyList<string> extraKeys = Array.Empty<string>();
         if (File.Exists(path))
         {
             try
@@ -135,16 +136,20 @@ public static class CcConnectConfigGenerator
                 string existing = File.ReadAllText(path);
                 preserved = ExtractNonProjectSections(existing);
                 foreignPlatforms = ExtractForeignPlatforms(existing);
+                // 用户在飞书里 /provider switch、/model switch 的结果就落在项目区里。
+                // 不捞回来,点一次「生成配置」就把他刚切的 provider 和模型无声抹掉。
+                extraKeys = ExtractProjectExtraKeys(existing);
             }
             catch (IOException)
             {
                 // 读不到旧文件:退化成只写项目段。宁可少保留,也不要因此写不出配置。
                 preserved = string.Empty;
                 foreignPlatforms = Array.Empty<string>();
+                extraKeys = Array.Empty<string>();
             }
         }
 
-        string content = RenderCore(config, redact: false, foreignPlatforms);
+        string content = RenderCore(config, redact: false, foreignPlatforms, extraKeys);
         if (!string.IsNullOrWhiteSpace(preserved))
         {
             content = preserved.TrimEnd() + Environment.NewLine + Environment.NewLine + content;
@@ -180,6 +185,77 @@ public static class CcConnectConfigGenerator
     /// 用户的注释、段落顺序和格式就全没了——而这份文件里的注释正是 cc-connect
     /// 自带的使用说明。同理也剔除我们自己上一轮写入的生成标记行,避免逐轮累积。
     /// </summary>
+    /// <summary>我们自己生成的键。除这些之外,项目区里的键都是 cc-connect 或用户的,必须原样留下。</summary>
+    private static readonly HashSet<string> OwnedProjectKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "name", "admin_from", "type", "provider_refs", "mode", "work_dir",
+        "app_id", "app_secret", "allow_from",
+    };
+
+    /// <summary>
+    /// 抽出项目区里**不归我们管**的键(原始行,原样返回)。
+    ///
+    /// 2026-08-08 实测:用户在飞书里跑 <c>/provider switch deepseek</c> 与 <c>/model switch</c>
+    /// 之后,cc-connect 把结果写回项目区:
+    /// <code>
+    /// provider = "deepseek"
+    /// model = "opus"
+    /// </code>
+    /// 而 <see cref="ExtractNonProjectSections"/> 把整个项目区都丢掉 ——
+    /// 于是用户下一次点「生成 cc-connect 配置」,**他刚切的 provider 和模型就没了**,
+    /// 而且没有任何提示。这和「保留 [management]」「保留微信平台块」是同一类错:
+    /// **这份配置不归我们独占,我们只拥有项目清单那一部分。**
+    ///
+    /// 只收 <c>key = value</c> 形状的行,且键不在 <see cref="OwnedProjectKeys"/> 里;
+    /// 平台子块(<c>[[projects.platforms]]</c> 之后)交给 ExtractForeignPlatforms,这里不重复收。
+    /// </summary>
+    public static IReadOnlyList<string> ExtractProjectExtraKeys(string existingToml)
+    {
+        var kept = new List<string>();
+        if (string.IsNullOrEmpty(existingToml))
+        {
+            return kept;
+        }
+
+        bool inProjects = false;
+        bool inPlatforms = false;
+
+        foreach (string line in existingToml.Replace("\r\n", "\n").Split('\n'))
+        {
+            string trimmed = line.Trim();
+
+            if (trimmed.StartsWith('['))
+            {
+                inProjects =
+                    trimmed.StartsWith("[[projects]]", StringComparison.Ordinal) ||
+                    trimmed.StartsWith("[projects.", StringComparison.Ordinal) ||
+                    trimmed.StartsWith("[[projects.", StringComparison.Ordinal);
+                inPlatforms = trimmed.StartsWith("[[projects.platforms", StringComparison.Ordinal) ||
+                              trimmed.StartsWith("[projects.platforms", StringComparison.Ordinal);
+                continue;
+            }
+
+            if (!inProjects || inPlatforms || trimmed.Length == 0 || trimmed.StartsWith('#'))
+            {
+                continue;
+            }
+
+            int eq = trimmed.IndexOf('=');
+            if (eq <= 0)
+            {
+                continue;
+            }
+
+            string key = trimmed[..eq].Trim();
+            if (key.Length > 0 && !OwnedProjectKeys.Contains(key) && !kept.Contains(trimmed, StringComparer.Ordinal))
+            {
+                kept.Add(trimmed);
+            }
+        }
+
+        return kept;
+    }
+
     internal static string ExtractNonProjectSections(string existingToml)
     {
         var kept = new List<string>();
@@ -458,7 +534,8 @@ public static class CcConnectConfigGenerator
     private static string RenderCore(
         CcConnectConfig config,
         bool redact,
-        IReadOnlyList<string>? foreignPlatforms = null)
+        IReadOnlyList<string>? foreignPlatforms = null,
+        IReadOnlyList<string>? extraKeys = null)
     {
         CcConnectConfig.Validate(config);
         var sb = new StringBuilder();
@@ -500,6 +577,18 @@ public static class CcConnectConfigGenerator
             sb.Append("    [projects.agent.options]").Append(Environment.NewLine);
             sb.Append("      mode = ").Append(TomlString(project.Mode)).Append(Environment.NewLine);
             sb.Append("      work_dir = ").Append(TomlString(project.WorkDir)).Append(Environment.NewLine);
+
+            // cc-connect 自己写进项目区的键(/provider switch、/model switch 的结果)原样带回。
+            // 位置与它写的时候一致 —— 我们不知道它按哪张表读,挪位置等于替它做决定。
+            if (extraKeys is { Count: > 0 })
+            {
+                sb.Append(Environment.NewLine);
+                foreach (string extra in extraKeys)
+                {
+                    sb.Append(extra).Append(Environment.NewLine);
+                }
+            }
+
             sb.Append(Environment.NewLine);
             sb.Append("  [[projects.platforms]]").Append(Environment.NewLine);
             sb.Append("    type = \"feishu\"").Append(Environment.NewLine);

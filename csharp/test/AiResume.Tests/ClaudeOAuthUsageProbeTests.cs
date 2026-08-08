@@ -289,7 +289,7 @@ public class ClaudeOAuthUsageProbeTests
 
     private static string WriteCredentials(string? json = null)
     {
-        string dir = Path.Combine(Path.GetTempPath(), "claude-oauth-tests-" + Guid.NewGuid().ToString("N"));
+        string dir = TestTemp.NewDir("claude-oauth");
         Directory.CreateDirectory(dir);
         string path = Path.Combine(dir, ".credentials.json");
 

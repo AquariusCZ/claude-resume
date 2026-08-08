@@ -26,7 +26,7 @@ public sealed class SupervisionProcessTests : IDisposable
 
     public SupervisionProcessTests()
     {
-        _dir = Path.Combine(Path.GetTempPath(), "airesume-supervision-tests", Guid.NewGuid().ToString("N"));
+        _dir = TestTemp.NewDir("airesume-supervision-tests");
         Directory.CreateDirectory(_dir);
         _dbPath = Path.Combine(_dir, "supervision.db");
         StorageDatabase.Migrate(_dbPath);

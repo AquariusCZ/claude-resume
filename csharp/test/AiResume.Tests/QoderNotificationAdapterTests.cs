@@ -19,7 +19,7 @@ public class QoderNotificationAdapterTests : IDisposable
 
     public QoderNotificationAdapterTests()
     {
-        _tempDir = Path.Combine(Path.GetTempPath(), "AiResumeTests_" + Guid.NewGuid().ToString("N"));
+        _tempDir = TestTemp.NewDir("AiResumeTests");
         Directory.CreateDirectory(_tempDir);
         _settingsPath = Path.Combine(_tempDir, "settings.json");
         _adapter = new QoderNotificationAdapter(_settingsPath);

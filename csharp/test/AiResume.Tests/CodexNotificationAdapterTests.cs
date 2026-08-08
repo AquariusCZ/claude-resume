@@ -21,7 +21,7 @@ public class CodexNotificationAdapterTests : IDisposable
     public CodexNotificationAdapterTests()
     {
         // 创建唯一临时目录
-        _tempRoot = Path.Combine(Path.GetTempPath(), "AiResumeTests_" + Guid.NewGuid().ToString("N"));
+        _tempRoot = TestTemp.NewDir("AiResumeTests");
         _configDir = Path.Combine(_tempRoot, ".codex");
         _configPath = Path.Combine(_configDir, "config.toml");
         _adapter = new CodexNotificationAdapter(_configPath);

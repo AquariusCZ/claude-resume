@@ -51,7 +51,7 @@ public sealed class CcConnectConfigValidatorTests : IDisposable
 
     private string Write(string content)
     {
-        string p = Path.Combine(Path.GetTempPath(), "airesume-cfgtest-" + Guid.NewGuid().ToString("N") + ".toml");
+        string p = TestTemp.NewFile("cfgtest", ".toml");
         File.WriteAllText(p, content);
         _files.Add(p);
         return p;
@@ -61,7 +61,7 @@ public sealed class CcConnectConfigValidatorTests : IDisposable
     public void 文件不在报missing而不是invalid()
     {
         var r = CcConnectConfigValidator.CheckFile(
-            Path.Combine(Path.GetTempPath(), "airesume-not-here-" + Guid.NewGuid().ToString("N") + ".toml"));
+            TestTemp.NewFile("not-here", ".toml"));
 
         Assert.Equal(CcConnectConfigState.Missing, r.State);
     }

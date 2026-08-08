@@ -133,7 +133,7 @@ public sealed class CcConnectForeignPlatformTests
     [Fact]
     public void 写入后微信块仍在且飞书块被重写为新凭据()
     {
-        string path = Path.Combine(Path.GetTempPath(), "ccx-" + Guid.NewGuid().ToString("N") + ".toml");
+        string path = TestTemp.NewFile("ccx", ".toml");
         try
         {
             File.WriteAllText(path, Toml);
