@@ -1,6 +1,6 @@
 # AI Resume v2 审计 + 冒烟计划(2026-08-08 交接版)
 
-> 基线:`main` = 见 `git log --oneline -1`,`dotnet test csharp\AiResume.sln` = **573 通过 / 0 失败 / 0 跳过**。
+> 基线:`main` = 见 `git log --oneline -1`,`dotnet test csharp\AiResume.sln` = **587 通过 / 0 失败 / 0 跳过**。
 > 仓库根:`C:\Users\<你>\Desktop\AI Resume`(**路径含空格,命令里必须加引号**)。
 
 ## 0. 先读这一段:上一轮审计到底覆盖了什么
@@ -32,7 +32,12 @@
 5. **清理时作用域必须写死。** `%TEMP%` 下同时有 `pss_smoke_*` / `ocs_smoke`,
    那是用户**另外两个项目**的残留,与本项目无关。任何 `*smoke*` 的模糊匹配都是错的。
 6. **不得 `git push`**,不得改远端,不得放宽 `allow_from`。
-7. **不得启停 cc-connect** 除非本计划明确要求,且启动前必须先过单消费者预检。
+7. **不得 `daemon install` / `uninstall`,不得 `--force` 启动 cc-connect。**
+   但**允许**在前置条件 4 不满足时做一次有界恢复:先跑 `AiResume.Worker.exe preflight`,
+   返回 `Clear` 之后执行 `Start-ScheduledTask -TaskName 'cc-connect'`(或 `cc-connect daemon start`),
+   等 30 秒再复核。仍不满足才停手报告。
+   *这一条是补的*:2026-08-08 首次交接就死在"红线禁止启停"与"前置条件要求 Running"的
+   自相矛盾上——执行方三次复核、三次拒绝自行修复,**它做得对,是计划把它锁死了。**
 
 ---
 
@@ -40,7 +45,7 @@
 
 | # | 检查 | 期望 |
 |---|---|---|
-| 1 | `dotnet test "…\AI Resume\csharp\AiResume.sln"` | 573 通过 / 0 失败 / 0 跳过 |
+| 1 | `dotnet test "…\AI Resume\csharp\AiResume.sln"` | 587 通过 / 0 失败 / 0 跳过 |
 | 2 | `git -C "…\AI Resume" status --short` + `git log --oneline -1` | 干净;HEAD 与 origin/main 一致 |
 | 3 | `Get-ChildItem "$env:LOCALAPPDATA\AI Resume\state"` | 目录存在,含 `secrets\feishu-platform.bin` |
 | 4 | `cc-connect daemon status` | `Status: Running` |
@@ -134,14 +139,41 @@
 | `DisallowStartIfOnBatteries` | **`True`** | `False` | 电池供电时开机根本不启动 |
 | `RestartCount` | **`0`** | `3`(间隔 `PT1M`) | **崩了不会自动拉起** —— "装了 daemon 就有守护"这句话在改之前是假的 |
 
-**任何一次 `daemon uninstall` + `install` 都会把这四项打回默认。** 重装后必须重跑:
+还缺一项**上游根本没有**的:触发器只有「登录时」,没有重复。
+一旦停掉就再也回不来——`RestartCount` 只在任务**失败**时生效,而 Ctrl+C 退出(0xC000013A)不算失败。
+
+**任何一次 `daemon uninstall` + `install` 都会把这些打回默认。** 重装后必须重跑:
 
 ```powershell
-$s = (Get-ScheduledTask -TaskName 'cc-connect').Settings
+$t = Get-ScheduledTask -TaskName 'cc-connect'
+$s = $t.Settings
 $s.ExecutionTimeLimit = 'PT0S'; $s.StopIfGoingOnBatteries = $false
 $s.DisallowStartIfOnBatteries = $false; $s.RestartCount = 3; $s.RestartInterval = 'PT1M'
-Set-ScheduledTask -TaskName 'cc-connect' -Settings $s
+$s.MultipleInstances = 'IgnoreNew'
+$trg = $t.Triggers[0]
+$trg.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
+$trg.Repetition.Duration = $null            # 无限期
+$trg.Repetition.StopAtDurationEnd = $false
+Set-ScheduledTask -TaskName 'cc-connect' -Trigger $trg -Settings $s
 ```
+
+### 4.1.1 ⚠️ 桌面上那个黑窗口就是 cc-connect,别关
+
+计划任务的动作是 `powershell.exe -WindowStyle Hidden …`,但 **`-WindowStyle Hidden`
+在交互会话里不生效**——控制台由系统在 PowerShell 处理该参数之前分配,窗口照样留在桌面上。
+
+**2026-08-08 实测:用户顺手关掉那个"多余的 cmd 窗口",机器人立刻下线**
+(`CTRL_CLOSE_EVENT` → 退出码 `0xC000013A`),同一原因至少停过三次,
+而当时只有登录触发器,停了就再也回不来。
+
+彻底修法是把任务改成 **S4U**(非交互会话,根本没有窗口),但**需要管理员**,
+本机 `Set-ScheduledTask -Principal` 被拒。试过 `wscript` + `WScript.Shell.Run(cmd,0,True)`
+包一层:交互式手跑可行,**但计划任务里 wscript 立即以 0 退出且什么都没启动**,已放弃。
+
+**当前处置**:窗口留着,靠上面那个 5 分钟重复触发器兜底——关掉它最多离线 5 分钟。
+致命的部分(永久下线)已经修掉,剩下的只是难看。
+有管理员权限时,改 S4U 是一劳永逸的正解。
 
 ### 4.2 启动日志里那条 WARN 是正常的
 
@@ -156,7 +188,8 @@ Set-ScheduledTask -TaskName 'cc-connect' -Settings $s
 > 你要审计的项目在 `C:\Users\<你>\Desktop\AI Resume`(**路径含空格,命令加引号**)。
 > 先完整读 `CLAUDE.md` 和 `docs/AUDIT-AND-SMOKE-PLAN-20260808.md`,**§1 红线逐条遵守**。
 >
-> 按 §2 核对**五条**前置条件。**任一不符立即停手报告,不要自行修复。**
+> 按 §2 核对**五条**前置条件。条件 4/5 不满足时按 §1 第 7 条做一次有界恢复;
+> 其余任一不符立即停手报告,不要自行修复。
 >
 > 通过后按 §3 的 T1→T7 顺序执行。每一项都要给出**可核验的证据**
 > (命令原文 + 输出片段 + 文件路径 + 时间戳),而不是"看起来正常"。
