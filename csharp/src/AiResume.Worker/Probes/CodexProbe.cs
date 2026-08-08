@@ -245,7 +245,12 @@ public sealed class CodexProbe
         process.StartInfo = new ProcessStartInfo
         {
             FileName = _codexCommand,
-            Arguments = "exec OK",
+            // **--skip-git-repo-check 是必需的,不是可选优化。**
+            // 没有它,codex 在非受信目录直接 exit 1 并打印
+            // "Not inside a trusted directory and --skip-git-repo-check was not specified",
+            // 探测于是恒返回「codex 执行异常」——绿灯永远点不亮,而且看着像 Codex 坏了。
+            // 安装目录同样不是 git 仓库,所以这个参数在改用临时目录之前就已经是必需的。
+            Arguments = "exec --skip-git-repo-check OK",
             WorkingDirectory = workingDirectory,
             UseShellExecute = false,
             CreateNoWindow = true,
