@@ -113,8 +113,40 @@ public static class InstallCommand
 
         if (Directory.Exists(target))
         {
-            Directory.Delete(target, recursive: true);
-            Console.WriteLine($"已删除 {target}");
+            // **状态子目录必须留下。** 里面是 DPAPI 加密的飞书凭据、运行数据库和
+            // 完成事件队列 —— 整树删掉,重装之后要重新填 app secret,而卸载的人
+            // 想删的只是程序本身。要连状态一起清,得显式再删一次 state\。
+            string state = Path.Combine(target, ShadowPaths.StateFolder);
+            bool keepState = Directory.Exists(state);
+
+            foreach (string entry in Directory.EnumerateFileSystemEntries(target))
+            {
+                if (keepState && string.Equals(
+                        Path.GetFileName(entry), ShadowPaths.StateFolder, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (Directory.Exists(entry))
+                {
+                    Directory.Delete(entry, recursive: true);
+                }
+                else
+                {
+                    File.Delete(entry);
+                }
+            }
+
+            if (keepState)
+            {
+                Console.WriteLine($"已删除程序文件,保留状态目录 {state}");
+                Console.WriteLine("(内含加密的飞书凭据与运行记录;确实要清空请手动删除该目录。)");
+            }
+            else
+            {
+                Directory.Delete(target, recursive: true);
+                Console.WriteLine($"已删除 {target}");
+            }
         }
 
         return 0;

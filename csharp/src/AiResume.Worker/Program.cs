@@ -109,8 +109,9 @@ if (args.Length > 0 && string.Equals(args[0], "notify", StringComparison.Ordinal
 
 HostApplicationBuilder builder = Host.CreateApplicationBuilder(args);
 
-// 影子数据目录与数据库迁移(独立于生产 AppDir;shadow 模式永不触碰生产状态)。
-Directory.CreateDirectory(ShadowPaths.Root);
+// 状态目录与数据库迁移。EnsureRoot 会顺带把旧 ClaudeResumeShadow 的内容
+// 搬到 %LOCALAPPDATA%\AI Resume\state(已存在同名项则跳过,绝不覆盖)。
+ShadowPaths.EnsureRoot();
 StorageDatabase.Migrate(ShadowPaths.RunDatabasePath);
 
 builder.Services.AddSingleton(new RunStore(ShadowPaths.RunDatabasePath));

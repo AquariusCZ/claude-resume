@@ -608,10 +608,12 @@ public sealed class ControlPlaneBridge
         // 四态,与面板的颜色约定一致:ok=绿(正常) / wait=琥珀(在等,不是故障) /
         // bad=红(需要动手修) / idle=灰(没验证过)。
         // **被限流不是故障** —— 拿红色标它,真出问题时的红就不值钱了。
+        // 默认探测现在也做**带凭据的真实请求**(1.3 秒、0 token),
+        // 所以 DeepChecked 为真就给绿 —— 不再需要用户点一下才敢点亮。
+        // DeepChecked 为假只可能是"读不到配置"或"网络失败",那仍然是灰的。
         static string CodexState(CodexProbeResult r, bool deep) => r.Readiness switch
         {
-            // shallow 只证明装好/配好/可达,**没验证过授权**,所以不给绿。
-            CodexReadiness.Ok => deep && r.DeepChecked ? "ok" : "idle",
+            CodexReadiness.Ok => r.DeepChecked ? "ok" : "idle",
             CodexReadiness.Limited => "wait",
             CodexReadiness.Auth or CodexReadiness.Unreachable => "bad",
             _ => "idle",

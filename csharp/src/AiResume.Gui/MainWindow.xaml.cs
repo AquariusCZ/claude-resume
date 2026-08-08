@@ -55,8 +55,10 @@ public partial class MainWindow : Window
     {
         try
         {
-            // 用户数据目录落 shadow 目录,绝不写生产 AppDir。
-            string userData = Path.Combine(AiResume.Worker.ShadowPaths.Root, "webview2");
+            // EnsureRoot 建目录并把旧 ClaudeResumeShadow 的内容搬到
+            // %LOCALAPPDATA%\AI Resume\state —— GUI 常常是先被打开的那一个,
+            // 所以迁移必须在这里也触发,不能只挂在 Worker 上。
+            string userData = Path.Combine(AiResume.Worker.ShadowPaths.EnsureRoot(), "webview2");
             Directory.CreateDirectory(userData);
 
             CoreWebView2Environment env = await CoreWebView2Environment

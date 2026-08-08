@@ -56,15 +56,65 @@ public sealed class CodexProbe
 
     private readonly string _codexCommand;
     private readonly int _timeoutSeconds;
+    private readonly string? _codexHome;
+    private readonly HttpMessageHandler? _authHandler;
 
-    public CodexProbe(string? codexCommand = null, int timeoutSeconds = DefaultTimeoutSeconds)
+    public CodexProbe(
+        string? codexCommand = null,
+        int timeoutSeconds = DefaultTimeoutSeconds,
+        string? codexHome = null,
+        HttpMessageHandler? authHandler = null)
     {
         _codexCommand = string.IsNullOrWhiteSpace(codexCommand) ? "codex" : codexCommand;
         _timeoutSeconds = timeoutSeconds > 0 ? timeoutSeconds : DefaultTimeoutSeconds;
+        // 两个注入点只为测试:codexHome 让测试指向假配置目录,
+        // authHandler 让测试不联网就能断言状态码映射。生产一律走默认。
+        _codexHome = codexHome;
+        _authHandler = authHandler;
     }
 
-    /// <summary>只跑 codex doctor --json,不发模型请求(不烧额度)。</summary>
+    /// <summary>
+    /// 默认探测:<c>codex doctor --json</c> + **一次带凭据的 /v1/models 请求**。
+    ///
+    /// 后半段是关键 —— doctor 证明不了授权,而唯一此前能证明的办法 `codex exec`
+    /// 要 10-12 秒、2.3 万 tokens,贵到不能每次开窗都跑,于是面板长期只能显示
+    /// 「已就绪 · 未验证授权」。带凭据打 /v1/models 是 **1.3 秒、0 token** 的真实验证,
+    /// 所以现在**每一次探测都是真的**,绿灯有据可依。
+    ///
+    /// 授权探测拿不出结论时(读不到配置、网络失败),**不冒充绿灯**,
+    /// 退回 doctor 的「可达,授权未验证」。
+    /// </summary>
     public async Task<CodexProbeResult> ProbeShallowAsync(CancellationToken ct = default)
+    {
+        CodexProbeResult doctor = await ProbeDoctorAsync(ct).ConfigureAwait(false);
+        if (doctor.Readiness != CodexReadiness.Ok)
+        {
+            // doctor 已经给出明确的坏结论(没装/不可达/被限流),没必要再打一次网络。
+            return doctor;
+        }
+
+        CodexAuthResult auth = await CodexAuthProbe
+            .ProbeAsync(_codexHome, _authHandler, ct).ConfigureAwait(false);
+
+        return auth.Outcome switch
+        {
+            // 带凭据请求成功 = 真的验证过了,给绿灯(DeepChecked=true)。
+            CodexAuthOutcome.Authorized =>
+                new CodexProbeResult(CodexReadiness.Ok, "authorized", "可用 · 凭据已验证", true),
+            CodexAuthOutcome.Rejected =>
+                new CodexProbeResult(CodexReadiness.Auth, "auth-rejected", auth.Detail, true),
+            CodexAuthOutcome.Limited =>
+                new CodexProbeResult(CodexReadiness.Limited, "http-429", auth.Detail, true),
+            CodexAuthOutcome.ServerError =>
+                new CodexProbeResult(CodexReadiness.Unreachable, "server-error", auth.Detail, true),
+            // 读不到配置 / 网络失败:doctor 说可达,但授权没验成 —— 如实说,不给绿灯。
+            _ => new CodexProbeResult(
+                CodexReadiness.Ok, "unverified", "已装好并可达,未验证授权(" + auth.Detail + ")", false),
+        };
+    }
+
+    /// <summary>只跑 codex doctor --json,不发任何模型请求。</summary>
+    public async Task<CodexProbeResult> ProbeDoctorAsync(CancellationToken ct = default)
     {
         // 起进程 codex doctor --json,捕获 stdout。
         // 必须异步读流:先 WaitForExit 再读会死锁(输出超过管道缓冲)。
