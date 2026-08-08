@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <!--
+      NU1900 仅表示"无法从 nuget.org 拉取漏洞数据库"(外网依赖),不代表存在漏洞;
+      门禁被外网可用性支配会造成离线环境假失败(实测 2026-08-05)。
+      只豁免 NU1900;真实漏洞告警 NU1901/NU1902/NU1903/NU1904 仍由 -warnaserror 拦截。
+    -->
+    <NoWarn>$(NoWarn);NU1900</NoWarn>
+  </PropertyGroup>
+</Project>

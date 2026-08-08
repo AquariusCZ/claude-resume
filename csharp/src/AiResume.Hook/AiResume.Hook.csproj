@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>AiResume.Hook</RootNamespace>
+    <AssemblyName>AiResume.Hook</AssemblyName>
+    <!--
+      S8-D:各 AI 工具的完成 hook 直接指向本 exe(取代原批处理方案——批处理无法可靠解析 JSON)。
+      它由第三方进程(Qoder / Claude Code / Cline / OpenCode)调用,必须做到:
+      任何情况下退出码为 0、stdout 保持干净,绝不阻断宿主。
+    -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AiResume.Worker\AiResume.Worker.csproj" />
+  </ItemGroup>
+</Project>

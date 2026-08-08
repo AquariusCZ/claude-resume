@@ -1,0 +1,54 @@
+using System.Text.Json;
+
+namespace AiResume.Core;
+
+/// <summary>
+/// S5-C 布防周期状态(契约)。语义对齐现役 Get-CcuState(checker.ps1 + lib.ps1):
+/// phase=idle/waiting/resuming/done;cycleId 变化即周期失效;realReset 字段只取服务端
+/// 精确值(禁止本地估算);sawLimited/limitedRefires 支撑限流节奏与误判死循环防护。
+/// </summary>
+public sealed class CheckerState
+{
+    public static JsonSerializerOptions JsonOptions { get; } = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true,
+    };
+
+    public const string PhaseIdle = "idle";
+    public const string PhaseWaiting = "waiting";
+    public const string PhaseResuming = "resuming";
+    public const string PhaseDone = "done";
+
+    /// <summary>当前布防阶段:idle/waiting/resuming/done。</summary>
+    public string Phase { get; set; } = PhaseIdle;
+
+    /// <summary>布防周期 id(armCycleId 的 shadow 镜像);周期变化即失效。</summary>
+    public string CycleId { get; set; } = string.Empty;
+
+    /// <summary>本周期是否观测到过限流(决定恢复后是否触发续跑)。</summary>
+    public bool SawLimited { get; set; }
+
+    /// <summary>最近一次探测时间(节奏计算基线)。</summary>
+    public DateTimeOffset? LastProbeUtc { get; set; }
+
+    /// <summary>连续被误判限流计数(≥6 防死循环,标记 error 继续)。</summary>
+    public int LimitedRefires { get; set; }
+
+    /// <summary>服务端精确 5 小时重置时间(仅限流/接近限流时由探测下发)。</summary>
+    public DateTimeOffset? RealFiveHourResetUtc { get; set; }
+
+    /// <summary>服务端精确 7 天重置时间。</summary>
+    public DateTimeOffset? RealSevenDayResetUtc { get; set; }
+
+    /// <summary>最近一次读到真实重置时间的时间(诊断用)。</summary>
+    public DateTimeOffset? RealResetProbedUtc { get; set; }
+
+    /// <summary>服务端 5 小时窗口利用率(0..1)。</summary>
+    public double? RealFiveHourUtil { get; set; }
+
+    /// <summary>逐项目结果(path → success/error/…),resuming 阶段由续跑驱动更新。</summary>
+    public Dictionary<string, string>? ProjectStatus { get; set; }
+
+    public static CheckerState CreateDefault() => new();
+}

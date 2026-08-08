@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>AiResume.Tests</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\AiResume.Core\AiResume.Core.csproj" />
+    <ProjectReference Include="..\..\src\AiResume.Ipc\AiResume.Ipc.csproj" />
+    <ProjectReference Include="..\..\src\AiResume.Storage\AiResume.Storage.csproj" />
+    <!-- S2-D:ProcessSupervisor 真进程/注入测试 -->
+    <ProjectReference Include="..\..\src\AiResume.Worker\AiResume.Worker.csproj" />
+    <!-- S2-F:DPAPI 机密存储与脱敏测试 -->
+    <ProjectReference Include="..\..\src\AiResume.Secrets\AiResume.Secrets.csproj" />
+    <!-- S3-A:lark-cli 进程封装测试(假 CLI 离线) -->
+    <ProjectReference Include="..\..\src\AiResume.LarkCli\AiResume.LarkCli.csproj" />
+    <!-- S6-A:cc-connect wrapper 进程监督与配置生成(无 cc-connect 依赖) -->
+    <ProjectReference Include="..\..\src\AiResume.Wrapper\AiResume.Wrapper.csproj" />
+    <!-- S8-D:hook 处理器的抑制判定/事件 ID/幂等写入需要单元测试覆盖 -->
+    <ProjectReference Include="..\..\src\AiResume.Hook\AiResume.Hook.csproj" />
+    <!-- S7-D:布防是产品核心控制面,ControlPlaneBridge 的 arm.get/arm.set 需要覆盖 -->
+    <ProjectReference Include="..\..\src\AiResume.Gui\AiResume.Gui.csproj" />
+  </ItemGroup>
+</Project>

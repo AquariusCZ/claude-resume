@@ -1,0 +1,31 @@
+<Window x:Class="AiResume.Gui.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+        Title="AI Resume 控制面" Icon="icon.ico" Height="760" Width="1120" MinHeight="560" MinWidth="900"
+        WindowStartupLocation="CenterScreen"
+        Background="#0E1A1F" Foreground="#DDE9EB"
+        UseLayoutRounding="True" SnapsToDevicePixels="True"
+        TextOptions.TextFormattingMode="Display">
+  <!--
+    S7-B 控制面宿主。设计要点(ADR-0003 §5.4):首帧不得依赖任何 I/O——
+    窗口与骨架先出,WebView2 异步初始化,数据经桥接异步填充。
+    此处保留系统标题栏:自绘标题栏须自行处理 Aero Snap / 多显示器 DPI / 最大化边距,
+    收益不抵风险,留待视觉打磨阶段单独评估。
+  -->
+  <Grid>
+    <!-- 骨架:WebView2 就绪前显示,避免白屏 -->
+    <Border x:Name="Skeleton" Background="#0E1A1F">
+      <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+        <Border Width="34" Height="34" CornerRadius="9" Background="#3FBFB4" HorizontalAlignment="Center">
+          <TextBlock Text="AR" Foreground="#062024" FontWeight="Bold" FontSize="13"
+                     FontFamily="Consolas" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+        </Border>
+        <TextBlock x:Name="SkeletonText" Text="正在启动控制面…" Foreground="#63797F" FontSize="12.5"
+                   Margin="0,14,0,0" HorizontalAlignment="Center"/>
+      </StackPanel>
+    </Border>
+
+    <wv2:WebView2 x:Name="Host" Visibility="Collapsed" DefaultBackgroundColor="#0E1A1F"/>
+  </Grid>
+</Window>

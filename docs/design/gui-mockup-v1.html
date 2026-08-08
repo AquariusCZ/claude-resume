@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Resume 控制面 · 设计稿 v1</title>
+<style>
+:root{
+  /* 潮汐配色：深海青黑基底，避开「近黑+荧光色」与 GitHub 暗色的默认观感 */
+  --deep:#0A1316;        /* 窗体外底 */
+  --hull:#0E1A1F;        /* 主背景 */
+  --panel:#132329;       /* 面板 */
+  --panel-hi:#182C33;    /* 面板高亮 */
+  --line:#1E353D;        /* 分隔线 */
+  --line-soft:#17282E;
+  --ink:#DDE9EB;         /* 主文字 */
+  --ink-2:#9FB4B9;       /* 次要 */
+  --ink-3:#63797F;       /* 三级/占位 */
+  --tide:#3FBFB4;        /* 潮汐青：可用/运行中 */
+  --tide-glow:#5FE0D4;
+  --ebb:#D2894C;         /* 退潮琥珀：额度消耗/等待 */
+  --ebb-dim:#8A5B33;
+  --armed:#4FB86B;       /* 已布防 */
+  --alert:#D2685C;       /* 异常 */
+  --mono:ui-monospace,"Cascadia Code","JetBrains Mono",Consolas,"Courier New",monospace;
+  --ui:"Segoe UI Variable Display","Segoe UI","Microsoft YaHei UI",system-ui,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:var(--deep);color:var(--ink);font-family:var(--ui);
+  padding:32px 20px;display:flex;flex-direction:column;align-items:center;gap:28px;
+  -webkit-font-smoothing:antialiased;
+}
+
+/* ── 窗口外壳 ───────────────────────────── */
+.win{
+  width:100%;max-width:1120px;background:var(--hull);
+  border:1px solid var(--line);border-radius:12px;overflow:hidden;
+  box-shadow:0 24px 60px -12px rgba(0,0,0,.7),0 0 0 1px rgba(63,191,180,.05);
+}
+.titlebar{
+  height:44px;display:flex;align-items:center;gap:12px;padding:0 14px;
+  background:linear-gradient(180deg,#16272D,#112026);border-bottom:1px solid var(--line);
+}
+.mark{
+  width:26px;height:26px;border-radius:7px;flex:none;
+  background:linear-gradient(145deg,var(--tide),#2A8C84);
+  display:grid;place-items:center;font:600 11px/1 var(--mono);color:#062024;
+}
+.titlebar .name{font-size:13px;font-weight:600;letter-spacing:.01em}
+.titlebar .sub{font-size:11px;color:var(--ink-3);margin-left:-6px}
+.spacer{flex:1}
+.navlink{font-size:12px;color:var(--ink-2);padding:5px 10px;border-radius:6px;cursor:default}
+.navlink:hover{background:var(--panel);color:var(--ink)}
+.wctl{width:30px;height:26px;display:grid;place-items:center;color:var(--ink-3);font-size:11px;border-radius:5px}
+.wctl:hover{background:var(--panel)}
+.wctl.x:hover{background:var(--alert);color:#fff}
+
+/* ── 状态条 ─────────────────────────────── */
+.statusbar{
+  display:flex;align-items:center;gap:10px;padding:12px 18px 0;
+}
+.pill{
+  display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;
+  background:var(--panel);border:1px solid var(--line);font-size:12px;font-weight:600;
+}
+.dot{width:6px;height:6px;border-radius:50%;flex:none}
+.dot.armed{background:var(--armed);box-shadow:0 0 0 3px rgba(79,184,107,.15)}
+.dot.live{background:var(--tide);box-shadow:0 0 0 3px rgba(63,191,180,.15);animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.45}}
+.headline{font-size:20px;font-weight:650;letter-spacing:-.01em;padding:2px 18px 0}
+.headline .thin{color:var(--ink-3);font-weight:400;font-size:13px;margin-left:10px}
+
+/* ── SIGNATURE：额度潮汐轴 ───────────────── */
+.tidewrap{margin:14px 18px 0;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px 12px}
+.tidehead{display:flex;align-items:baseline;gap:10px;margin-bottom:12px}
+.tidehead .lbl{font-size:11px;font-weight:700;letter-spacing:.09em;color:var(--ink-3);text-transform:uppercase}
+.tidehead .who{font:500 12px/1 var(--mono);color:var(--ink-2)}
+.tidehead .pct{margin-left:auto;font:650 13px/1 var(--mono);color:var(--ebb)}
+
+.axis{position:relative;height:34px}
+.axis .track{
+  position:absolute;left:0;right:0;top:11px;height:8px;border-radius:4px;
+  background:linear-gradient(90deg,var(--line-soft),#132A31);overflow:hidden;
+}
+.axis .used{
+  position:absolute;left:0;top:0;bottom:0;width:67%;
+  background:linear-gradient(90deg,var(--ebb-dim),var(--ebb));
+}
+/* 潮汐纹理：细密斜纹表示"已消耗" */
+.axis .used::after{
+  content:"";position:absolute;inset:0;opacity:.28;
+  background:repeating-linear-gradient(115deg,transparent 0 5px,rgba(0,0,0,.55) 5px 7px);
+}
+.axis .now{
+  position:absolute;left:67%;top:4px;width:2px;height:22px;background:var(--tide-glow);
+  border-radius:1px;box-shadow:0 0 10px 1px rgba(95,224,212,.65);
+}
+.axis .now::after{
+  content:"";position:absolute;left:50%;top:-4px;transform:translateX(-50%);
+  width:7px;height:7px;border-radius:50%;background:var(--tide-glow);
+  box-shadow:0 0 8px rgba(95,224,212,.9);
+}
+.ticks{display:flex;justify-content:space-between;margin-top:2px;font:11px/1 var(--mono);color:var(--ink-3)}
+.ticks .reset{color:var(--tide)}
+.tidefoot{display:flex;gap:18px;margin-top:9px;font-size:11.5px;color:var(--ink-3)}
+.tidefoot b{color:var(--ink-2);font-weight:600;font-family:var(--mono)}
+
+/* ── 主体 ───────────────────────────────── */
+.body{display:grid;grid-template-columns:1fr 316px;gap:14px;padding:14px 18px 0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px}
+.card>header{
+  display:flex;align-items:center;gap:9px;padding:11px 14px;border-bottom:1px solid var(--line-soft);
+}
+.card>header h3{font-size:12px;font-weight:700;letter-spacing:.06em;color:var(--ink-2);text-transform:uppercase}
+.count{font:600 11px/1 var(--mono);color:var(--ink-3);background:var(--hull);padding:3px 7px;border-radius:5px}
+.hact{margin-left:auto;display:flex;gap:4px}
+.mini{font-size:11.5px;color:var(--ink-3);padding:4px 8px;border-radius:5px;cursor:default}
+.mini:hover{background:var(--panel-hi);color:var(--ink-2)}
+
+/* 队列 —— 序号编码真实执行顺序，不是装饰 */
+.q{padding:5px}
+.row{display:flex;align-items:center;gap:11px;padding:9px 10px;border-radius:7px}
+.row+.row{margin-top:1px}
+.row:hover{background:var(--panel-hi)}
+.row.active{background:linear-gradient(90deg,rgba(63,191,180,.11),transparent);box-shadow:inset 2px 0 0 var(--tide)}
+.seq{
+  width:19px;height:19px;flex:none;border-radius:5px;display:grid;place-items:center;
+  font:600 10.5px/1 var(--mono);background:var(--hull);color:var(--ink-3);border:1px solid var(--line);
+}
+.row.active .seq{background:var(--tide);color:#052321;border-color:var(--tide)}
+.row.done .seq{background:transparent;color:var(--armed);border-color:rgba(79,184,107,.4)}
+.pj{min-width:0;flex:1}
+.pj .n{font-size:13px;font-weight:550;display:flex;align-items:center;gap:7px}
+.pj .p{font:11px/1.5 var(--mono);color:var(--ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tag{font:600 9.5px/1 var(--mono);padding:2px 5px;border-radius:4px;background:var(--hull);color:var(--ink-3);border:1px solid var(--line)}
+.st{font:11px/1 var(--mono);flex:none;text-align:right}
+.st.live{color:var(--tide)}
+.st.wait{color:var(--ink-3)}
+.st.done{color:var(--armed)}
+.st.held{color:var(--ebb)}
+
+/* 右栏 */
+.sect{padding:12px 14px}
+.sect+.sect{border-top:1px solid var(--line-soft)}
+.slabel{font-size:10.5px;font-weight:700;letter-spacing:.09em;color:var(--ink-3);text-transform:uppercase;margin-bottom:9px}
+.agent{
+  display:flex;align-items:center;gap:10px;padding:10px 11px;border-radius:8px;
+  background:var(--hull);border:1px solid var(--line);
+}
+.agent .bar{width:3px;height:26px;border-radius:2px;background:var(--tide);flex:none}
+.agent .nm{font-size:13px;font-weight:600}
+.agent .md{font:10.5px/1.4 var(--mono);color:var(--ink-3)}
+.agent .chev{margin-left:auto;color:var(--ink-3);font-size:10px}
+
+.prov{display:flex;align-items:center;gap:8px;padding:6px 2px;font-size:12px}
+.prov .nm{color:var(--ink-2)}
+.prov .v{margin-left:auto;font:11px/1 var(--mono)}
+.v.ok{color:var(--tide)}
+.v.held{color:var(--ebb)}
+.v.off{color:var(--ink-3)}
+
+.btn{
+  width:100%;padding:10px;border-radius:8px;border:1px solid transparent;
+  font-size:13px;font-weight:650;font-family:var(--ui);cursor:default;
+}
+.btn.primary{background:linear-gradient(180deg,var(--tide),#2E9E95);color:#04201E;box-shadow:0 1px 0 rgba(255,255,255,.14) inset}
+.btn.ghost{background:transparent;border-color:var(--line);color:var(--ink-2)}
+.btnrow{display:flex;gap:8px;margin-top:8px}
+
+/* 日志（折叠态） */
+.log{margin:14px 18px 0;background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  display:flex;align-items:center;gap:9px;padding:10px 14px}
+.log .ar{color:var(--ink-3);font-size:9px}
+.log h3{font-size:12px;font-weight:700;letter-spacing:.06em;color:var(--ink-2);text-transform:uppercase}
+.log .last{font:11px/1 var(--mono);color:var(--ink-3);margin-left:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.foot{display:flex;gap:16px;padding:12px 18px 14px;font:10.5px/1 var(--mono);color:var(--ink-3)}
+.foot .r{margin-left:auto}
+
+/* ── 第二状态：限额中（等待涨潮） ──────────── */
+.alt .axis .used{width:100%}
+.alt .axis .now{display:none}
+.alt .tidehead .pct{color:var(--ebb)}
+.alt .waitmsg{
+  display:flex;align-items:center;gap:8px;margin-top:10px;padding:9px 11px;border-radius:7px;
+  background:rgba(210,137,76,.09);border:1px solid rgba(210,137,76,.25);font-size:12px;color:var(--ebb);
+}
+.alt .waitmsg b{font-family:var(--mono);font-weight:650}
+
+.caption{max-width:1120px;width:100%;color:var(--ink-3);font-size:12.5px;line-height:1.7}
+.caption h2{color:var(--ink);font-size:15px;font-weight:650;margin-bottom:8px}
+.caption code{font-family:var(--mono);color:var(--tide);font-size:11.5px}
+.caption b{color:var(--ink-2)}
+</style>
+</head>
+<body>
+
+<!-- ══ 主状态：运行中 ══ -->
+<div class="win">
+  <div class="titlebar">
+    <div class="mark">AR</div>
+    <div class="name">AI Resume</div>
+    <div class="sub">本机 AI 调度台</div>
+    <div class="spacer"></div>
+    <div class="navlink">会话</div>
+    <div class="navlink">通知源</div>
+    <div class="navlink">设置</div>
+    <div class="wctl">&#9472;</div>
+    <div class="wctl x">&#10005;</div>
+  </div>
+
+  <div class="statusbar">
+    <span class="pill"><i class="dot armed"></i>已布防</span>
+    <span class="pill"><i class="dot live"></i>1 个运行中</span>
+  </div>
+  <div class="headline">自动续跑工作台<span class="thin">额度恢复后按队列顺序继续</span></div>
+
+  <!-- SIGNATURE -->
+  <div class="tidewrap">
+    <div class="tidehead">
+      <span class="lbl">额度潮汐</span>
+      <span class="who">Claude Code · 5h 窗口</span>
+      <span class="pct">已用 67%</span>
+    </div>
+    <div class="axis">
+      <div class="track"><div class="used"></div></div>
+      <div class="now"></div>
+    </div>
+    <div class="ticks"><span>09:32 窗口开始</span><span class="reset">14:32 重置 &middot; 2h14m</span></div>
+    <div class="tidefoot">
+      <span>本窗口已跑 <b>4</b> 个任务</span>
+      <span>预计可再跑 <b>~2</b> 个</span>
+      <span>下次续跑 <b>14:32</b></span>
+    </div>
+  </div>
+
+  <div class="body">
+    <div class="card">
+      <header>
+        <h3>续跑队列</h3><span class="count">7</span>
+        <div class="hact"><span class="mini">全选</span><span class="mini">添加文件夹</span><span class="mini">更新导览</span></div>
+      </header>
+      <div class="q">
+        <div class="row active">
+          <div class="seq">1</div>
+          <div class="pj"><div class="n">claude-resume <span class="tag">git</span></div><div class="p">C:\Users\<you>\Desktop\claude-resume</div></div>
+          <div class="st live">运行中 · 04:12</div>
+        </div>
+        <div class="row">
+          <div class="seq">2</div>
+          <div class="pj"><div class="n">Sample-Analyzer <span class="tag">git</span></div><div class="p">C:\Users\<you>\Desktop\Sample-Analyzer</div></div>
+          <div class="st wait">排队</div>
+        </div>
+        <div class="row">
+          <div class="seq">3</div>
+          <div class="pj"><div class="n">Instrument-Suite <span class="tag">git</span></div><div class="p">C:\Users\<you>\Desktop\MPI\Instrument-Suite</div></div>
+          <div class="st wait">排队</div>
+        </div>
+        <div class="row">
+          <div class="seq">4</div>
+          <div class="pj"><div class="n">Process-Data <span class="tag">git</span></div><div class="p">C:\Users\<you>\Desktop\Process-Data</div></div>
+          <div class="st wait">排队</div>
+        </div>
+        <div class="row done">
+          <div class="seq">&#10003;</div>
+          <div class="pj"><div class="n">Band-Test <span class="tag">git</span></div><div class="p">C:\Users\<you>\Desktop\Band-Test</div></div>
+          <div class="st done">完成 11:04</div>
+        </div>
+        <div class="row done">
+          <div class="seq">&#10003;</div>
+          <div class="pj"><div class="n">Data-Viewer-App <span class="tag">git</span></div><div class="p">C:\Users\<you>\Desktop\Data-Viewer-App</div></div>
+          <div class="st done">完成 10:41</div>
+        </div>
+        <div class="row">
+          <div class="seq">5</div>
+          <div class="pj"><div class="n">Curve-Fitting-Suite <span class="tag">git</span></div><div class="p">C:\Users\<you>\Desktop\Curve-Fitting-Suite</div></div>
+          <div class="st wait">排队</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="sect">
+        <div class="slabel">当前 AI</div>
+        <div class="agent">
+          <div class="bar"></div>
+          <div><div class="nm">Claude Code</div><div class="md">claude-opus-5</div></div>
+          <div class="chev">&#9662;</div>
+        </div>
+      </div>
+      <div class="sect">
+        <div class="slabel">Provider</div>
+        <div class="prov"><span class="nm">Claude</span><span class="v ok">本机可用</span></div>
+        <div class="prov"><span class="nm">OpenAI</span><span class="v ok">直连可用</span></div>
+        <div class="prov"><span class="nm">DeepSeek</span><span class="v ok">直连可用</span></div>
+        <div class="prov"><span class="nm">Codex</span><span class="v held">额度 8%</span></div>
+      </div>
+      <div class="sect">
+        <div class="slabel">通知源</div>
+        <div class="prov"><span class="nm">Claude Code</span><span class="v ok">已启用</span></div>
+        <div class="prov"><span class="nm">Codex</span><span class="v ok">已启用</span></div>
+        <div class="prov"><span class="nm">Cline</span><span class="v ok">已启用</span></div>
+        <div class="prov"><span class="nm">Qoder</span><span class="v off">未启用</span></div>
+        <div class="prov"><span class="nm">OpenCode</span><span class="v off">未启用</span></div>
+      </div>
+      <div class="sect">
+        <button class="btn primary">解除布防</button>
+        <div class="btnrow">
+          <button class="btn ghost">预演</button>
+          <button class="btn ghost">立即续跑</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="log">
+    <span class="ar">&#9654;</span><h3>运行日志</h3>
+    <span class="last">11:04:13  claude-resume · turn 完成 · 4 个文件变更</span>
+  </div>
+
+  <div class="foot">
+    <span>队列 7 &middot; 完成 2 &middot; 运行 1</span>
+    <span class="r">闲聊/查询 14 天归档 &middot; 30 天删除 &middot; 工作会话仅手动</span>
+  </div>
+</div>
+
+<!-- ══ 第二状态：限额中 ══ -->
+<div class="win alt">
+  <div class="titlebar">
+    <div class="mark">AR</div><div class="name">AI Resume</div><div class="sub">本机 AI 调度台</div>
+    <div class="spacer"></div><div class="navlink">会话</div><div class="navlink">通知源</div><div class="navlink">设置</div>
+    <div class="wctl">&#9472;</div><div class="wctl x">&#10005;</div>
+  </div>
+  <div class="statusbar">
+    <span class="pill"><i class="dot armed"></i>已布防</span>
+    <span class="pill" style="color:var(--ebb)"><i class="dot" style="background:var(--ebb)"></i>等待额度恢复</span>
+  </div>
+  <div class="headline">自动续跑工作台<span class="thin">队列已暂停，涨潮后自动继续</span></div>
+  <div class="tidewrap">
+    <div class="tidehead">
+      <span class="lbl">额度潮汐</span><span class="who">Claude Code · 5h 窗口</span><span class="pct">已用尽</span>
+    </div>
+    <div class="axis"><div class="track"><div class="used"></div></div></div>
+    <div class="ticks"><span>09:32 窗口开始</span><span class="reset">14:32 重置</span></div>
+    <div class="waitmsg">
+      <span>&#9203;</span><span>额度将在 <b>1h 47m</b> 后恢复，届时自动从队列第 <b>2</b> 项继续。无需保持窗口打开。</span>
+    </div>
+  </div>
+  <div class="foot"><span>队列 5 待续 &middot; 完成 2</span><span class="r">下次检查 14:32</span></div>
+</div>
+
+<div class="caption">
+  <h2>设计说明</h2>
+  <p><b>立论。</b>这个产品的本质是<b>等待与调度</b>——额度像潮水退去又回来，引擎在岸边值守。所以主视觉不是又一个进度条，而是「<b>额度潮汐轴</b>」：它同时回答三个问题——窗口在哪、还剩多少、什么时候回来。这是 cc-connect 和其他 AI 工具都没有的东西，也正是本产品唯一不可替代的能力（ADR-0003 §1 实证 4）。</p>
+  <p><b>配色。</b>深海青黑基底（<code>#0E1A1F</code>）而非纯黑，避开「近黑 + 单一荧光色」的通用观感；<code>--tide</code> 青绿代表可用与运行，<code>--ebb</code> 琥珀代表消耗与等待——两色互为潮汐两端，语义闭环，不是随意取的强调色。现役 GUI 的高饱和橙主按钮已移除。</p>
+  <p><b>字体分工。</b>所有<b>数据</b>（时间、路径、百分比、时长、序号）走等宽，所有<b>叙述</b>走比例字体。这条规则贯穿全局，让「机器事实」和「人类说明」一眼可分——这是开发者工具应有的身份，也顺带解决现役中文字重层级扁平的问题。</p>
+  <p><b>队列序号。</b><code>1 2 3</code> 编码的是<b>真实执行顺序</b>（续跑确实按序进行），不是装饰性编号；已完成项换成对勾并退出编号序列，队列因此始终可读作「接下来会发生什么」。</p>
+  <p><b>密度。</b>项目行高从现役的约 62px 压到 40px，7 个项目无需滚动即可全见；腾出的纵向空间给了潮汐轴和状态面板。日志默认折叠为单行，只显示最后一条——它平时不重要，出事时才展开。</p>
+  <p><b>与性能的关系。</b>视觉之外的硬指标：首帧渲染不得依赖项目发现与健康探测（现役实测冷启动 3701ms，主因是 UI 线程同步 I/O）。上图所有「状态值」都应以骨架先出、异步填充，<b>任何技术栈都必须遵守这一条</b>。</p>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,1109 @@
+<meta charset="utf-8">
+<title>AI Resume 控制面</title>
+<style>
+/* ══ 取向:机架式仪表 ══
+   这台程序的职责是「你睡觉时盯着 AI 的燃料表,烧完了替你重启」。
+   仪表盘不是装饰性复古,是对职责的直译:骨白金属面板、角上真螺丝、
+   型号铭牌,以及唯一的亮点——两块磷光绿 CRT 额度表。
+   除 CRT 外全部平涂 + 1px 硬边接缝;渐变只用在螺丝和 CRT 辉光上。 */
+:root{
+  /* 面板:比原来的纸白更暗更黄,CRT 才压得住 */
+  --panel:#DEDACB; --panel-hi:#EAE6D8; --panel-lo:#C7C1AE; --sunk:#CFC9B6;
+  --seam:#B4AD98; --line:#C7C1AE; --line-soft:#D5D0BF;
+  --ink:#26231D; --ink-2:#5E5A4F; --ink-3:#7A7566;
+  /* CRT:磷光绿是全页唯一的高饱和色,只出现在两块屏里 */
+  --crt:#0C1310; --crt-hi:#132019;
+  --phos:#46E888; --phos-dim:#1F8A4E; --phos-glow:rgba(70,232,136,.42);
+  /* 朱橙:只给「有后果的动作」和告警,量必须小 */
+  --vermilion:#E2512B; --vermilion-deep:#B23A1B; --vermilion-wash:#F3DCD3;
+  --amber:#E0A02E; --amber-deep:#8A6114;
+  /* 状态色只有三支,且每支只有「发光版」和「墨版」两态:
+     绿 = 正常工作,琥珀 = 在等(不是故障),红 = 有问题。
+     原来还另有一支 --alert:#C0392B,和朱橙差 8° 色相——同一块面板上
+     两个几乎一样的红,读者分不清哪个更严重,等于没有分级。已合并到朱橙。 */
+  --ok:#2F7D4F; --alert:var(--vermilion-deep);
+  --bevel-hi:rgba(255,255,255,.86); --bevel-lo:#B9B29D; --bevel-cast:rgba(90,80,60,.22);
+  --ui:"Microsoft YaHei UI","Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
+  /* 丝印字:只给铭牌上那一个词。Windows 11 自带 Segoe UI Variable Display,
+     专为大字号设计,不必引外部字体(WebView2 离线,也不该引)。 */
+  --display:"Segoe UI Variable Display","Segoe UI Semibold","Segoe UI",system-ui,sans-serif;
+  /* 等宽只用于拉丁字母/数字/路径/代号。**中文绝不放进 --mono**:
+     等宽字体没有中日韩字形,浏览器会逐字回退,一行里冒出两种字重和两种字宽。 */
+  --mono:"Cascadia Mono","Cascadia Code",ui-monospace,Consolas,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--panel);color:var(--ink);font:13.5px/1.5 var(--ui);
+  display:flex;flex-direction:column;overflow:hidden;-webkit-font-smoothing:antialiased}
+/* 面板本体的细磨砂:极淡的斜向纹,让大片平涂不至于像未上色的稿子。 */
+body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;
+  background:repeating-linear-gradient(135deg,rgba(255,255,255,.35) 0 1px,transparent 1px 4px)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:var(--sunk)}
+::-webkit-scrollbar-thumb{background:var(--panel-lo);border:1px solid var(--seam)}
+::-webkit-scrollbar-thumb:hover{background:#B9B29D}
+
+/* ── 通用:大写等宽标签 ── */
+.lbl{font:600 10px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--ink-3)}
+
+/* ── 顶部铭牌条:丝印型号 + 状态灯 ── */
+.plate{flex:none;display:flex;align-items:center;gap:14px;height:54px;
+  padding:0 20px;background:var(--panel-hi);border-bottom:1px solid var(--seam);
+  box-shadow:inset 0 -1px 0 var(--bevel-hi)}
+/* 铭牌字:整页唯一的大字。此前全页除 CRT 读数外都是 10–13.5px,
+   没有任何字号锚点——而一台真仪器的面板上,型号是丝印上去的,隔两步也认得出。
+   负字距把字母挤成一个实心块,那正是丝印该有的样子。 */
+.plate h1{font:800 25px/1 var(--display);letter-spacing:-.035em;text-transform:uppercase;
+  color:var(--ink);white-space:nowrap}
+/* 型号铭牌:真值。原来这里写死 "SN ————",JS 从不赋值——
+   面板上挂一个永远填不上的序列号,比不挂更糟。改成版本号,是能核对的东西。 */
+.plate .sn{font:10px/1.5 var(--mono);letter-spacing:.1em;color:var(--ink-3);
+  border-left:1px solid var(--seam);padding-left:14px;white-space:nowrap}
+.plate .sn b{display:block;font-weight:600;color:var(--ink-2)}
+.plate .rt{margin-left:auto;display:flex;align-items:center;gap:12px;
+  font:10.5px/1 var(--mono);color:var(--ink-3);white-space:nowrap}
+.lnk{color:var(--ink-2);cursor:pointer;border-bottom:1px solid var(--seam);padding-bottom:1px;
+  user-select:none;font-family:var(--ui);font-size:11.5px;transition:color .15s,border-color .15s}
+.lnk:hover{color:var(--vermilion-deep);border-color:var(--vermilion)}
+.lnk.busy{opacity:.45;cursor:default}
+
+/* ══ 状态灯:整台机器"在不在干活"的唯一答案 ══
+   原来这里是两个割裂的东西:一句纯黑文字写着布防态,以及右上角一颗**恒亮的红灯**。
+   而这块面板上红色的含义是「有问题」——一颗永远红着的灯等于永远在报警,
+   谁看久了都会学会忽略它。现在只留一颗灯,它真的跟着状态变色:
+   绿=在正常工作 / 琥珀=在等(不是故障) / 红=有问题 / 灰=没布防。 */
+.beacon{display:flex;align-items:center;gap:9px;min-width:0}
+.beacon .lamp{width:10px;height:10px;flex:none;border-radius:50%;
+  background:var(--panel-lo);border:1px solid var(--seam);
+  box-shadow:inset 0 1px 1px rgba(0,0,0,.18);transition:background .2s,box-shadow .2s}
+.beacon .txt{min-width:0;font-size:12px;line-height:1.35;color:var(--ink-2)}
+.beacon .txt b{font-weight:600;color:var(--ink)}
+.beacon .txt .sub2{display:block;font-size:11px;color:var(--ink-3)}
+.beacon.on   .lamp{background:var(--phos);border-color:#2F8A56;box-shadow:0 0 7px var(--phos-glow)}
+.beacon.wait .lamp{background:var(--amber);border-color:var(--amber-deep);box-shadow:0 0 7px rgba(224,160,46,.55)}
+.beacon.bad  .lamp{background:var(--vermilion);border-color:var(--vermilion-deep);
+  box-shadow:0 0 7px rgba(226,81,43,.65)}
+.beacon.on .txt b{color:var(--ok)}
+.beacon.wait .txt b{color:var(--amber-deep)}
+.beacon.bad .txt b{color:var(--vermilion-deep)}
+/* 正在续跑是全程唯一会自己动的状态灯——续跑是这台机器存在的理由,
+   它真在跑的时候,面板上该有东西在动。 */
+@keyframes beat{0%,100%{opacity:1}50%{opacity:.42}}
+.beacon.run .lamp{animation:beat 1.5s ease-in-out infinite}
+
+/* ── 面板上的一块「设备」:上缘高光、下缘暗影、硬边 ── */
+.card{background:var(--panel-hi);border:1px solid var(--seam);border-radius:2px;
+  box-shadow:inset 0 1px 0 var(--bevel-hi),inset 0 -1px 0 rgba(0,0,0,.05),2px 2px 0 var(--bevel-cast)}
+
+/* ══ 签名元素:CRT 额度表 ══ */
+.quota{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px 20px 0;flex:none}
+.qc{position:relative;padding:5px;background:var(--panel-lo);
+  border:1px solid var(--seam);border-radius:2px;
+  box-shadow:inset 0 1px 0 var(--bevel-hi),2px 2px 0 var(--bevel-cast)}
+/* 屏幕本体:深色内凹 + 扫描线 + 边缘暗角 */
+.qc .scr{position:relative;overflow:hidden;background:var(--crt);
+  border:1px solid #05100B;padding:12px 14px 13px;
+  box-shadow:inset 0 0 18px rgba(0,0,0,.85),inset 0 0 0 1px rgba(70,232,136,.10)}
+.qc .scr::after{content:"";position:absolute;inset:0;pointer-events:none;
+  background:repeating-linear-gradient(180deg,rgba(0,0,0,.28) 0 1px,transparent 1px 3px)}
+.qc .t{display:flex;align-items:baseline;gap:8px;margin-bottom:9px;position:relative;z-index:1}
+.qc .t .h{font:600 10px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--phos-dim)}
+.qc .t .src{font:9.5px/1 var(--mono);letter-spacing:.08em;color:#2C5C41;margin-left:auto}
+/* 大读数:磷光绿 + 辉光。数字用等宽表格数字,每秒 tick 不抖。 */
+.qc .big{position:relative;z-index:1;font:600 26px/1 var(--mono);font-variant-numeric:tabular-nums;
+  letter-spacing:.01em;display:flex;align-items:baseline;gap:8px;
+  color:var(--phos);text-shadow:0 0 10px var(--phos-glow)}
+.qc .big .u{font:400 11px/1 var(--ui);color:#3E9C68;text-shadow:none}
+.qc .big.dim{color:#2C6A47;font-size:15px;font-weight:500;text-shadow:none}
+/* LED 光柱:mask 切格,与旧版同法(width 过渡照旧生效,tick 不用改几十个节点)。
+   格子加高到 9px 才有灯柱感;间隙 3px 保持通透。 */
+.qc .bar{position:relative;z-index:1;margin-top:14px;height:9px;background:#0A2318;
+  overflow:hidden;--cell:9px;--gap:3px;
+  -webkit-mask-image:repeating-linear-gradient(90deg,#000 0 var(--cell),transparent var(--cell) calc(var(--cell) + var(--gap)));
+  mask-image:repeating-linear-gradient(90deg,#000 0 var(--cell),transparent var(--cell) calc(var(--cell) + var(--gap)))}
+/* 绿→琥珀→朱橙:燃料表的通用读法,不需要图例。 */
+.qc .fill{position:absolute;left:0;top:0;bottom:0;width:0;
+  background:linear-gradient(90deg,var(--phos) 0%,var(--phos) 55%,var(--amber) 78%,var(--vermilion) 100%);
+  box-shadow:0 0 8px var(--phos-glow);transition:width .3s ease}
+.qc.blocked .fill{background:var(--vermilion);box-shadow:0 0 8px rgba(226,81,43,.5)}
+/* 唯一的大动作:一道极缓慢的高光掠过已用段,说明「这是活的」。
+   限流时停住——静止本身就是信号。 */
+@keyframes drift{from{transform:translateX(-120%)}to{transform:translateX(320%)}}
+.qc .fill::after{content:"";position:absolute;inset:0;width:30%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.30),transparent);opacity:0}
+.qc.live .fill::after{opacity:1;animation:drift 5.5s linear infinite}
+.qc .fill.first{transition:width .9s cubic-bezier(.22,1,.36,1)}
+@keyframes rise{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.qc .big.enter{animation:rise .28s ease-out}
+/* 时间轴:一条极淡的细线,上面一个游标标出「现在」在这个窗口里的位置。
+   刻意做得比额度光柱弱得多——它是背景信息,不该和主读数抢注意力。 */
+.qc .tl{position:relative;z-index:1;height:7px;margin-top:3px;
+  border-top:1px solid rgba(70,232,136,.14)}
+.qc .tl .nowmark{position:absolute;top:0;width:1px;height:5px;background:#3E9C68;
+  transform:translateX(-.5px);transition:left .3s ease}
+.qc .ends{position:relative;z-index:1;display:flex;justify-content:space-between;margin-top:4px;
+  font:10px/1 var(--mono);letter-spacing:.06em;color:#3E9C68}
+.qc .ex{position:relative;z-index:1;margin-top:8px;font-size:11px;color:#4FA877}
+.qc .ex.warn{color:#FF7A55}
+
+/* ── 主体两栏 ── */
+/* minmax(0,1fr) 是必须的:默认 1fr 的最小尺寸是 auto,长路径会把左栏撑开,
+   右栏就被挤出可视区——旧版右侧按钮被裁掉正是这个原因。 */
+.body{display:grid;grid-template-columns:minmax(0,1fr) clamp(232px,21vw,292px);
+  gap:12px;padding:12px 20px 0;flex:1;min-height:0}
+.col{display:flex;flex-direction:column;min-height:0;min-width:0}
+.pad{padding:11px 13px;display:flex;flex-direction:column;min-height:0;flex:1}
+.ch{display:flex;align-items:baseline;gap:9px;padding-bottom:9px;margin-bottom:2px;
+  border-bottom:1px solid var(--line);flex:none}
+.ch h2{font:600 10px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--ink-2)}
+.ch .n{font:600 10px/1 var(--mono);color:var(--ink-3)}
+.ch .act{margin-left:auto;white-space:nowrap;font-size:11.5px;color:var(--ink-2);cursor:pointer;transition:color .15s}
+.ch .act:hover{color:var(--vermilion-deep)}
+
+.q{overflow-y:auto;flex:1;min-height:0;margin:0 -3px;padding:6px 3px 10px;
+  -webkit-mask-image:linear-gradient(180deg,#000 calc(100% - 18px),transparent);
+  mask-image:linear-gradient(180deg,#000 calc(100% - 18px),transparent)}
+/* ── 队列行:数据表样式,名称与时间之间用虚线引导 ── */
+/* 台账横线:虚线下缘让每一行读成数据表的一条记录,而不是一张浮起的卡片。
+   比给每行加边框和投影安静得多——十几行卡片会把注意力从内容上抢走。 */
+.r{display:flex;align-items:center;gap:9px;padding:6px 8px;margin-bottom:3px;
+  cursor:pointer;border:1px solid transparent;border-radius:2px;
+  background-image:repeating-linear-gradient(90deg,var(--seam) 0 1px,transparent 1px 4px);
+  background-size:100% 1px;background-position:0 100%;background-repeat:no-repeat;
+  transition:background-color .12s,border-color .12s}
+.r:hover{background:var(--panel-hi);border-color:var(--line)}
+.r.on{background:var(--panel-hi);border-color:var(--vermilion);
+  box-shadow:inset 2px 0 0 var(--vermilion)}
+.r:last-child{margin-bottom:0}
+/* 序号做成小铭牌 */
+.r .i{width:20px;height:18px;flex:none;display:grid;place-items:center;
+  font:600 9.5px/1 var(--mono);color:var(--ink-3);border:1px solid var(--seam);
+  background:var(--sunk);border-radius:1px}
+.r.on .i{background:var(--vermilion);border-color:var(--vermilion-deep);color:#fff}
+.r .m{min-width:0;flex:1}
+.r .nm{font-size:12.5px;font-weight:500;display:flex;align-items:center;gap:7px}
+.r .pa{font:10px/1.35 var(--mono);color:var(--ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tag{font:600 9px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+  color:#6B5A12;background:#E4D9A8;border:1px solid #BFAE68;border-radius:1px;padding:2px 5px}
+.r .rt{font:10.5px/1 var(--ui);color:var(--ink-3);flex:none}
+.r .rt.ok{color:var(--ok)}
+.r .rt.wait{color:var(--amber-deep)}
+.r .rt.bad{color:var(--alert)}
+.r .rm{flex:none;width:20px;height:20px;border-radius:1px;border:1px solid transparent;
+  background:transparent;color:var(--ink-3);font:13px/1 var(--ui);cursor:pointer;
+  opacity:.3;transition:opacity .15s,background .15s,color .15s}
+.r:hover .rm,.r .rm:focus-visible{opacity:1}
+.r .rm:hover{background:var(--vermilion-wash);color:var(--vermilion-deep)}
+
+.hid{flex:none;margin-top:8px;padding-top:9px;border-top:1px solid var(--line);
+  font-size:11.5px;color:var(--ink-2);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.hid[hidden]{display:none}
+.hid .p{font:10.5px var(--mono);color:var(--ink-3);background:var(--sunk);
+  border:1px solid var(--seam);border-radius:1px;padding:3px 7px;cursor:pointer}
+.hid .p:active{transform:translate(1px,1px)}
+.hid .p:hover{color:var(--vermilion-deep);background:var(--vermilion-wash)}
+.sk{height:34px;background:var(--sunk);margin:0 3px 4px;animation:bl 1.4s ease-in-out infinite}
+@keyframes bl{50%{opacity:.5}}
+.r.in{animation:rowin .26s ease-out backwards;animation-delay:var(--d,0ms)}
+@keyframes rowin{from{opacity:0;transform:translateY(-5px)}to{opacity:1;transform:none}}
+
+/* ── 右栏:控制区 ── */
+.side{overflow-y:auto;padding-bottom:16px}
+.sect{padding-bottom:13px;margin-bottom:13px;border-bottom:1px solid var(--line)}
+.sect:last-child{border-bottom:0;margin-bottom:0;padding-bottom:0}
+.sl{font:600 10px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;
+  color:var(--ink-3);margin-bottom:9px}
+
+/* 波段开关:一排互锁按钮,选中的那个亮灯并压下去。
+   比假旋钮好用——离散选择本来就该一眼看全部选项。 */
+.bank{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+/* nowrap + 省略号:两字词与「Claude Code」混排时,一旦有一格折行整排高度就参差,
+   波段开关看着像坏了。宁可省略也要保持一排等高。 */
+.bank .k{display:flex;align-items:center;gap:5px;padding:0 7px;height:28px;cursor:pointer;
+  white-space:nowrap;overflow:hidden;
+  font:10px/1 var(--mono);letter-spacing:.02em;color:var(--ink-2);
+  background:var(--panel-hi);border:1px solid var(--seam);border-radius:1px;
+  box-shadow:inset 0 1px 0 var(--bevel-hi),1px 1px 0 var(--bevel-cast);
+  transition:background .12s,color .12s}
+.bank .k:hover{background:#F2EEE1}
+.bank .k .d{width:6px;height:6px;flex:none;border-radius:50%;background:var(--sunk);
+  border:1px solid var(--seam)}
+.bank .k.on{background:var(--sunk);color:var(--ink);transform:translate(1px,1px);
+  box-shadow:inset 0 1px 2px rgba(0,0,0,.16)}
+.bank .k.on .d{background:var(--phos);border-color:#2F8A56;box-shadow:0 0 5px var(--phos-glow)}
+/* 选中但 CLI 已被卸载:红灯 + 红边。这是需要动手修的状态,不是"暂时不可用"。 */
+.bank .k.broken{border-color:var(--vermilion);color:var(--vermilion-deep)}
+.bank .k.broken .d{background:var(--vermilion);border-color:var(--vermilion-deep);
+  box-shadow:0 0 5px rgba(226,81,43,.6)}
+
+.btn{width:100%;padding:8px 10px;font:600 11px/1 var(--ui);letter-spacing:.04em;cursor:pointer;
+  color:#fff;background:var(--vermilion);border:1px solid var(--vermilion-deep);border-radius:1px;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.28),2px 2px 0 var(--bevel-cast);
+  transition:background .12s}
+.btn:hover:not(:disabled){background:#EC5E38}
+.btn:active:not(:disabled){transform:translate(2px,2px);box-shadow:inset 0 1px 3px rgba(0,0,0,.25)}
+.btn:disabled{opacity:.42;cursor:default}
+.btn.line{color:var(--ink);background:var(--panel-hi);border-color:var(--seam);
+  box-shadow:inset 0 1px 0 var(--bevel-hi),2px 2px 0 var(--bevel-cast)}
+.btn.line:hover:not(:disabled){background:#F2EEE1}
+.brow{display:flex;gap:6px;margin-top:6px}
+.note{margin-top:8px;font-size:11px;line-height:1.55;color:var(--ink-3)}
+
+/* 状态指示灯排 */
+.fs-state,.pv{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--ink-2);
+  padding:4px 0}
+.led,.fs-state .dot{width:7px;height:7px;flex:none;border-radius:50%;
+  background:var(--sunk);border:1px solid var(--seam)}
+.led.ok,.fs-state.on .dot{background:var(--phos);border-color:#2F8A56;box-shadow:0 0 5px var(--phos-glow)}
+.led.wait{background:var(--amber);border-color:var(--amber-deep);box-shadow:0 0 5px rgba(224,160,46,.5)}
+.led.bad{background:var(--vermilion);border-color:var(--vermilion-deep);box-shadow:0 0 5px rgba(226,81,43,.6)}
+.fs-state .id{font:10.5px/1 var(--mono);color:var(--ink-3)}
+/* 未安装的通知源:压暗但仍列出来 —— 让人知道"支持它,只是本机没有"。
+   开关另有 aria-disabled + tabindex=-1,这里只补视觉。 */
+.pv.off{opacity:.5}
+.pv.off .sw{cursor:default}
+
+/* 小读数屏:与上方两块 CRT 同一套材质(内凹、扫描线、同色边框),
+   这样整页只有「面板」和「屏幕」两种材质,而不是第三种随机的深色盒子。 */
+.fs-out{position:relative;margin-top:8px;padding:9px 10px;background:var(--crt);color:var(--phos);
+  border:1px solid #05100B;font:10.5px/1.55 var(--mono);white-space:pre-wrap;
+  max-height:150px;overflow:auto;
+  box-shadow:inset 0 0 14px rgba(0,0,0,.8),inset 0 0 0 1px rgba(70,232,136,.10)}
+/* 成功/失败此前**只在 JS 里加了 class,CSS 根本没有对应规则** ——
+   于是"可以启动"和"预检失败"长得一模一样,全靠读字。屏幕该自己说话。 */
+.fs-out.good{color:var(--phos)}
+.fs-out.bad{color:#FF8A66;box-shadow:inset 0 0 14px rgba(0,0,0,.8),inset 0 0 0 1px rgba(226,81,43,.30)}
+
+.pv .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pv .v{flex:none;font:10.5px/1 var(--mono);letter-spacing:.04em;color:var(--ink-3)}
+.pv .v.ok{color:var(--ok)}
+.pv .v.wait{color:var(--amber-deep)}
+.pv .v.bad{color:var(--alert)}
+.sw{flex:none;width:30px;height:16px;border-radius:1px;background:var(--sunk);
+  border:1px solid var(--seam);position:relative;cursor:pointer;transition:background .15s}
+.sw::after{content:"";position:absolute;top:1px;left:1px;width:12px;height:12px;
+  background:var(--panel-hi);border:1px solid var(--seam);transition:transform .15s}
+.sw.on{background:#2F8A56}
+.sw.on::after{transform:translateX(14px)}
+
+/* ── 模态 ── */
+.modal{position:fixed;inset:0;z-index:20;display:grid;place-items:center;background:rgba(30,26,18,.5)}
+.modal[hidden]{display:none}
+.sheet{width:min(460px,calc(100vw - 40px));padding:18px 20px}
+.sheet h3{font:600 12px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;margin-bottom:9px}
+.hint{font-size:11.5px;line-height:1.6;color:var(--ink-3);margin-bottom:12px}
+.hint.warn{color:var(--vermilion-deep)}
+.fld{display:block;margin-bottom:11px}
+.fld span{display:block;font:600 10px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;
+  color:var(--ink-3);margin-bottom:5px}
+.fld input{width:100%;padding:7px 9px;font:12px var(--mono);color:var(--ink);
+  background:var(--sunk);border:1px solid var(--seam);border-radius:1px;
+  box-shadow:inset 0 1px 2px rgba(0,0,0,.10)}
+.fld input:focus{outline:none;border-color:var(--vermilion);background:#F5F2E7}
+.sheet .brow .btn{width:auto;flex:1}
+
+/* ── 底部状态条 ── */
+.foot{flex:none;display:flex;align-items:center;gap:10px;padding:7px 20px;
+  background:var(--panel-hi);border-top:1px solid var(--seam);
+  box-shadow:inset 0 1px 0 var(--bevel-hi);
+  font:10px/1 var(--mono);letter-spacing:.08em;color:var(--ink-3)}
+.foot .r2{margin-left:auto}
+
+:focus-visible{outline:2px solid var(--vermilion);outline-offset:2px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.btn.busy::after,.lnk.busy::after{content:"";display:inline-block;width:10px;height:10px;
+  margin-left:7px;vertical-align:-1px;border:2px solid currentColor;border-right-color:transparent;
+  border-radius:50%;animation:spin .8s linear infinite}
+@supports not ((mask-image:linear-gradient(#000,#0000)) or (-webkit-mask-image:linear-gradient(#000,#0000))){
+  .q,.side{-webkit-mask-image:none;mask-image:none}
+}
+@media (prefers-reduced-motion:reduce){
+  .sk,.btn.busy::after,.lnk.busy::after,.qc.live .fill::after,.qc .big.enter,.r.in{animation:none}
+  .qc .fill,.qc .fill.first,.sw,.sw::after,.r,.r .rm,.lnk,.ch .act,.btn,.bank .k{transition:none}
+  .r.in{opacity:1;transform:none}
+}
+</style>
+
+<div class="plate">
+  <h1>AI&nbsp;Resume</h1>
+  <span class="sn" id="snPlate"><b>MODEL AR-2</b>BUILD 读取中</span>
+  <div class="beacon" id="beacon" role="status" aria-live="polite">
+    <span class="lamp"></span>
+    <span class="txt"><b id="armLine">未布防</b><span class="sub2" id="phaseLine">额度恢复后按队列顺序继续</span></span>
+  </div>
+  <div class="rt"><span class="lnk" id="refreshBtn">刷新额度</span><span id="nextRefresh">—</span></div>
+</div>
+
+<div class="quota">
+  <div class="qc" id="q5"><div class="scr">
+    <div class="t"><span class="h">5H WINDOW</span><span class="src" id="q5src">本地会话统计</span></div>
+    <div class="big dim" id="q5big">读取中…</div>
+    <div class="bar"><div class="fill"></div></div>
+    <div class="tl"><span class="nowmark"></span></div>
+    <div class="ends"><span id="q5a"></span><span id="q5b"></span></div>
+    <div class="ex" id="q5ex"></div>
+  </div></div>
+  <div class="qc" id="q7"><div class="scr">
+    <div class="t"><span class="h">7D WINDOW</span><span class="src" id="q7src">服务端下发</span></div>
+    <div class="big dim" id="q7big">探测中…</div>
+    <div class="bar"><div class="fill"></div></div>
+    <div class="tl"><span class="nowmark"></span></div>
+    <div class="ends"><span id="q7a"></span><span id="q7b"></span></div>
+    <div class="ex" id="q7ex"></div>
+  </div></div>
+</div>
+
+<div class="body">
+  <div class="col"><div class="card pad">
+    <div class="ch"><h2>Queue · 续跑队列</h2><span class="n" id="qn">—</span>
+      <span class="act" id="hidToggle" hidden></span><span class="act" id="addBtn" style="margin-left:12px">添加项目</span><span class="act" id="rescanBtn" style="margin-left:12px">重新扫描</span></div>
+    <div class="q" id="q"><div class="sk"></div><div class="sk"></div><div class="sk"></div></div>
+    <div class="hid" id="hid" hidden></div>
+  </div></div>
+
+  <div class="col"><div class="card pad side">
+    <div class="sect">
+      <div class="sl">Agent · 执行体</div>
+      <div class="bank" id="agentBank"></div>
+      <div class="note" id="agentNote">cc-connect 一个项目死绑一个 agent,切换后需重启 cc-connect 生效。</div>
+    </div>
+    <div class="sect">
+      <div class="sl">Quota · 额度模型</div>
+      <div id="providers"></div>
+    </div>
+    <div class="sect">
+      <button class="btn" id="armBtn" disabled>布防所选项目</button>
+      <div class="brow">
+        <button class="btn line" id="dryBtn" disabled>预演</button>
+        <button class="btn line" id="nowBtn" disabled title="需在 Worker 进程内触发,跨进程通道尚未接入">立即续跑</button>
+      </div>
+      <div class="note" id="armNote">勾选项目后布防;引擎会在下一拍探测额度。</div>
+    </div>
+    <div class="sect">
+      <div class="sl">Feishu · 飞书接入</div>
+      <div id="fsState" class="fs-state">读取中…</div>
+      <div class="brow"><button class="btn line" id="fsOpen">配置凭据与授权…</button></div>
+      <div class="brow"><button class="btn line" id="fsGen" disabled>生成 cc-connect 配置</button></div>
+      <div class="brow"><button class="btn line" id="fsPre">单消费者预检</button></div>
+      <div class="fs-out" id="fsOut" hidden></div>
+      <div class="note" id="fsNote">凭据经 Windows DPAPI 按当前用户加密存本机,不写入仓库,也不回传界面。</div>
+    </div>
+    <div class="sect">
+      <div class="sl">Notify · 完成通知源</div>
+      <div id="notify"><div class="pv"><span class="nm" style="color:var(--ink-3)">检测中…</span></div></div>
+    </div>
+  </div></div>
+</div>
+
+<div class="modal" id="fsModal" hidden>
+  <div class="sheet card" role="dialog" aria-modal="true" aria-labelledby="fsModalTitle">
+    <h3 id="fsModalTitle">飞书接入配置</h3>
+    <p class="hint">切换飞书应用时才需要改动。凭据经 Windows DPAPI 按当前用户加密存本机,不写入仓库,保存后界面也读不回来。</p>
+    <label class="fld"><span>App ID</span>
+      <input id="fsId" type="text" autocomplete="off" spellcheck="false" placeholder="cli_…"></label>
+    <label class="fld"><span>App Secret</span>
+      <input id="fsSecret" type="password" autocomplete="off" spellcheck="false" placeholder="开放平台「凭证与基础信息」"></label>
+    <label class="fld"><span>授权用户 open_id(逗号分隔,必填)</span>
+      <input id="fsAllow" type="text" autocomplete="off" spellcheck="false" placeholder="ou_…"></label>
+    <p class="hint warn">留空会让 cc-connect 放行所有飞书用户——任何人都能驱动本机 AI 改你的项目。</p>
+    <div class="brow"><button class="btn" id="fsSave">保存</button><button class="btn line" id="fsCancel">取消</button></div>
+  </div>
+</div>
+
+<div class="foot"><span id="fl">正在加载…</span><span class="r2" id="fr">—</span></div>
+
+<script>
+(() => {
+  'use strict';
+  const wv = window.chrome && window.chrome.webview;
+  const pending = new Map();
+  let seq = 0;
+
+  function call(type, extra, timeoutMs) {
+    if (!wv) return Promise.reject(new Error('WebView2 宿主不可用'));
+    const id = 'r' + (++seq);
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      wv.postMessage(Object.assign({ id, type }, extra || {}));
+      setTimeout(() => {
+        if (pending.has(id)) { pending.delete(id); reject(new Error('请求超时')); }
+      }, timeoutMs || 15000);
+    });
+  }
+
+  if (wv) {
+    wv.addEventListener('message', (ev) => {
+      const m = ev.data;
+      if (!m || !m.id) return;
+      const s = pending.get(m.id);
+      if (!s) return;
+      pending.delete(m.id);
+      if (m.error) s.reject(new Error(m.error)); else s.resolve(m.payload);
+    });
+  }
+
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const fmtNum = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n);
+
+  function fmtClock(unix, withDate) {
+    const d = new Date(unix * 1000);
+    const hm = pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    return withDate ? `${d.getMonth() + 1}/${d.getDate()} ${hm}` : hm;
+  }
+  function fmtDur(sec) {
+    if (sec <= 0) return '0 分';
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+    return h > 0 ? `${h} 小时 ${pad2(m)} 分` : `${m} 分`;
+  }
+
+  // ───────── 额度 ─────────
+  // 两条独立来源,刻意分开:
+  //  · 5 小时窗口 ← **本地会话 jsonl 统计**,毫秒级、开窗即出、必定有;
+  //  · 7 天窗口   ← 服务端 rate_limit_event,约 7 秒、偶发下发。
+  // 服务端若同时给了 five_hour,以它为准覆盖本地推导(服务端是权威)。
+  const cards = new Map();   // id -> {start, end, crossesDay, extra}
+  let cardTimer = null;
+  let quotaBusy = false;
+  let refreshMinutes = 15;
+  let nextRefreshAt = 0;
+
+  // 已经画过真实读数的卡片:用来判断这次是不是「骨架 → 有值」的那一次转换,
+  // 只有那一次才播入场动画。后续每秒 tick 再播就成了闪烁。
+  const painted = new Set();
+
+  function paint(id, o) {
+    const el = $(id);
+    el.classList.toggle('blocked', !!o.blocked);
+    // live = 有数据且未限流。限流时条变红并停住——静止本身就是信号。
+    el.classList.toggle('live', !!o.start && !o.blocked);
+    const big = $(id + 'big');
+    if (!o.start) {
+      cards.delete(id);
+      painted.delete(id);
+      big.className = 'big dim';
+      big.textContent = o.placeholder || '不可得';
+      el.querySelector('.fill').style.width = '0';
+      $(id + 'a').textContent = ''; $(id + 'b').textContent = '';
+      $(id + 'ex').textContent = o.extra || '';
+      $(id + 'ex').classList.toggle('warn', !!o.warn);
+      return;
+    }
+    cards.set(id, o);
+    const firstPaint = !painted.has(id);
+    painted.add(id);
+    big.className = firstPaint ? 'big enter' : 'big';
+    if (firstPaint) {
+      const fill = el.querySelector('.fill');
+      fill.classList.add('first');
+      // 首次那一下用更慢的曲线量出来,之后交回 .3s。900ms 是 .first 的时长。
+      setTimeout(() => fill.classList.remove('first'), 950);
+    }
+    $(id + 'a').textContent = fmtClock(o.start, o.crossesDay) + (o.derived ? ' 起（推导）' : ' 起');
+    $(id + 'b').textContent = fmtClock(o.end, o.crossesDay) + ' 重置';
+    $(id + 'ex').textContent = o.extra || '';
+    $(id + 'ex').classList.toggle('warn', !!o.warn);
+    tick();
+  }
+
+  function tick() {
+    const now = Math.floor(Date.now() / 1000);
+    let stale = false;
+    cards.forEach((o, id) => {
+      // **光柱画的是额度,不是时间。**
+      // 原来画的是「窗口内已流逝的时间」——于是大数字写着 18% 已用、
+      // 光柱却走了一半(5 小时窗口过了一半)。一张卡里混两个量、还不加区分,
+      // 谁看都会读成额度。时间信息本来就有:大数字右边的「剩 N 小时」
+      // 和两端的起止时刻,不需要再用光柱说一遍。
+      const used = Math.max(0, Math.min(1, (o.used ?? 0) / 100));
+      $(id).querySelector('.fill').style.width = (used * 100).toFixed(2) + '%';
+
+      // 时间位置改用一根细刻度线单独标,不与额度抢同一条通道。
+      const elapsed = Math.max(0, Math.min(1, (now - o.start) / (o.end - o.start)));
+      const mark = $(id).querySelector('.nowmark');
+      if (mark) { mark.style.left = (elapsed * 100).toFixed(2) + '%'; }
+      const left = o.end - now;
+      $(id + 'big').innerHTML = o.used != null
+        ? `${o.used}%<span class="u">已用 · 剩 ${fmtDur(left)}</span>`
+        : `${fmtDur(left)}<span class="u">后重置</span>`;
+      if (left <= 0) stale = true;
+    });
+    if (stale && !quotaBusy) refreshQuota(true, false);
+    if (nextRefreshAt) {
+      const s = Math.max(0, nextRefreshAt - Date.now() / 1000);
+      $('nextRefresh').textContent = s > 0 ? `${Math.ceil(s / 60)} 分后自动刷新` : '正在刷新…';
+    }
+  }
+
+  // 本地块:纯读文件,不起进程,所以先画它,不让用户对着"读取中"干等。
+  async function loadLocal() {
+    try {
+      const b = await call('quota.local');
+      if (!b.active) {
+        paint('q5', { placeholder: '近 5 小时无活动', extra: `本地扫描 ${b.elapsedMs} ms` });
+        return;
+      }
+      paint('q5', {
+        start: b.startUnix, end: b.endUnix, crossesDay: false, derived: false,
+        extra: `本块 ${fmtNum(b.totalTokens)} tokens · ${b.messageCount} 条回复 · 本地扫描 ${b.elapsedMs} ms`,
+      });
+    } catch (e) {
+      paint('q5', { placeholder: '不可得', extra: '本地统计失败:' + e.message, warn: true });
+    }
+  }
+
+  async function loadServer(force) {
+    try {
+      const p = await call('quota.get', { force: !!force }, 100000);
+      const by = new Map((p.windows || []).map(w => [w.name, w]));
+      const w7 = by.get('seven_day'), w5 = by.get('five_hour');
+
+      if (w7 && w7.windowStartUnix != null) {
+        paint('q7', {
+          start: w7.windowStartUnix, end: w7.resetAtUnix, crossesDay: true, derived: true,
+          used: w7.usedPercent, blocked: p.limitReached,
+          extra: w7.usedPercent == null ? '服务端未下发用量百分比' : '',
+        });
+      } else {
+        paint('q7', {
+          placeholder: '本次未下发', blocked: p.limitReached,
+          extra: p.unavailableReason || '服务端本次未附 7 天窗口信息',
+          warn: !!p.limitReached,
+        });
+      }
+
+      // 服务端给了 five_hour 就以它为准:它是权威,本地统计只是补位。
+      if (w5 && w5.windowStartUnix != null) {
+        $('q5src').textContent = '服务端下发';
+        paint('q5', {
+          start: w5.windowStartUnix, end: w5.resetAtUnix, crossesDay: false, derived: true,
+          used: w5.usedPercent, blocked: p.limitReached,
+          extra: w5.usedPercent == null ? '服务端未下发用量百分比' : '',
+        });
+      }
+      lastQuotaOk = true;
+      renderProviders(true);
+    } catch (e) {
+      paint('q7', { placeholder: '不可得', extra: '额度探测失败:' + e.message, warn: true });
+      lastQuotaOk = false;
+      renderProviders(false);
+    }
+  }
+
+  // force = 绕过额度接口缓存;deep = 允许向 Codex 发一次**真实请求**(要花额度)。
+  // **两者必须分开**:定时刷新也传 force=true(它要拿最新额度),
+  // 若拿 force 当"用户主动"的判据,就变成每 15 分钟自动烧一次 Codex 额度、
+  // 而且是无人值守地烧。deep 只有用户点「刷新额度」时才为真。
+  async function refreshQuota(force, deep) {
+    if (quotaBusy) return;
+    quotaBusy = true;
+    $('refreshBtn').classList.add('busy');
+    try {
+      await loadLocal();
+      await loadServer(force);
+      await probeProviders(deep === true);
+    } finally {
+      quotaBusy = false;
+      $('refreshBtn').classList.remove('busy');
+      nextRefreshAt = Date.now() / 1000 + refreshMinutes * 60;
+    }
+  }
+
+  // ───────── 额度模型:按计费方式如实分类 ─────────
+  // 状态灯只有三态,且**绿灯必须有真实依据**。
+  // Claude Code 有服务端下发的额度,所以它能给出真绿/真红;
+  // DeepSeek 与 Codex 我们没有任何探测通道,一律灰灯「未探测」——
+  // 项目铁律:绿色"可用"只能来自真实请求成功,"配了 key"不算。
+  // 猜一个绿灯出来,等于在故障时告诉用户一切正常。
+  // Claude Code 的状态来自额度接口(服务端下发);其余 provider 由 providers.probe 探。
+  // 三档上色:ok 绿 / bad 红 / 其余灰。**没验证过就是灰**——
+  // 项目铁律:绿色"可用"只能来自真实请求成功,"配了 key""装好了"都不算。
+  let probedRows = null;
+  function renderProviders(ok) {
+    const head = (() => {
+      if (ok === true) return { cls: 'ok', txt: '正常' };
+      if (ok === false) return { cls: 'bad', txt: '额度不可得' };
+      return { cls: '', txt: '读取中' };
+    })();
+    const rows = [{ nm: 'Claude Code', cls: head.cls, txt: head.txt }].concat(
+      probedRows || [{ nm: 'DeepSeek', cls: '', txt: '探测中' }, { nm: 'Codex', cls: '', txt: '探测中' }]);
+    $('providers').innerHTML = rows.map(r =>
+      `<div class="pv"><span class="led ${r.cls}"></span>` +
+      `<span class="nm">${esc(r.nm)}</span>` +
+      `<span class="v ${r.cls}">${esc(r.txt)}</span></div>`).join('');
+  }
+  // deep=true 才允许发真实请求(会花额度),所以只挂在用户主动点的「刷新额度」上。
+  function probeProviders(deep) {
+    return call('providers.probe', { deep: !!deep }, 90000).then(p => {
+      // wait(琥珀)= 暂时用不了但不是坏了(被限流)。红只留给真需要动手修的。
+      probedRows = p.items.map(it => ({
+        nm: it.name,
+        cls: ['ok', 'bad', 'wait'].includes(it.state) ? it.state : '',
+        txt: it.text,
+      }));
+      renderProviders(lastQuotaOk);
+    }).catch(() => { /* 探测失败保持上一次显示,不把面板打成错误页 */ });
+  }
+  let lastQuotaOk = null;
+
+  // ───────── 队列与布防 ─────────
+  const picked = new Set();
+  let projects = [], hidden = [], arm = null, armBusy = false, queueBusy = false, lastQueueSig = null;
+
+  function renderProjects(p) {
+    projects = p.items;
+    hidden = p.hidden || hidden;
+    $('qn').textContent = p.items.length;
+    renderHidden();
+    const list = $('q');
+    if (!p.items.length) {
+      list.innerHTML = '<div style="padding:8px;color:var(--ink-3);font-size:12.5px">队列为空。用「添加项目」手动加入目录。</div>';
+      syncArm(); return;
+    }
+    // 只有列表内容真的变了才播入场:勾选走的是 toggleRow 改 class(不重渲染),
+    // 但布防成功后会用当前 projects 重渲一次,那次不该让全表重跳。
+    const sig = p.items.map(it => it.path).join('');
+    const fresh = sig !== lastQueueSig;
+    lastQueueSig = sig;
+
+    const st = new Map((arm && arm.projectStatus || []).map(s => [s.path, s.status]));
+    list.innerHTML = p.items.map((it, i) => {
+      const s = st.get(it.path);
+      // limited 是「在等额度」,不是故障 —— 给琥珀。原来它和 error 一样是红的,
+      // 于是"正常排队等恢复"看着跟"跑挂了"一模一样。
+      const cls = s === 'success' ? ' ok' : s === 'limited' ? ' wait' : s === 'error' ? ' bad' : '';
+      // 状态词直接落中文:面板上其余全是中文,只有这里蹦出 success/limited/error。
+      const stText = { success: '已完成', limited: '等额度', error: '失败', running: '进行中' }[s] || s;
+      // 错开量封顶 260ms:再长就从「有节奏」变成「加载很慢」。
+      const cn = 'r' + (picked.has(it.path) ? ' on' : '') + (fresh ? ' in' : '');
+      const style = fresh ? ` style="--d:${Math.min(i * 18, 260)}ms"` : '';
+      return `<div class="${cn}"${style} data-path="${esc(it.path)}"
+        role="checkbox" tabindex="0" aria-checked="${picked.has(it.path)}"
+        aria-label="选择项目 ${esc(it.name)}">
+        <div class="i">${i + 1}</div>
+        <div class="m"><div class="nm">${esc(it.name)}${it.isGit ? '<span class="tag">git</span>' : ''}</div>
+        <div class="pa">${esc(it.path)}</div></div>
+        <div class="rt${cls}">${s ? esc(stText) : (it.lastUsed ? esc(it.lastUsed) : '手动添加')}</div>
+        <button class="rm" data-path="${esc(it.path)}" title="从队列移除"
+          aria-label="从队列移除 ${esc(it.name)}">&times;</button>
+      </div>`;
+    }).join('');
+    const toggleRow = (el) => {
+      const path = el.dataset.path;
+      const on = !picked.has(path);
+      if (on) { picked.add(path); el.classList.add('on'); }
+      else { picked.delete(path); el.classList.remove('on'); }
+      el.setAttribute('aria-checked', String(on));
+      syncArm();
+    };
+    list.querySelectorAll('.r').forEach(el => {
+      el.addEventListener('click', () => toggleRow(el));
+      el.addEventListener('keydown', (ev) => {
+        if (ev.key === ' ' || ev.key === 'Enter') { ev.preventDefault(); toggleRow(el); }
+      });
+    });
+    // 移除按钮嵌在可勾选的行里:必须掐断冒泡,否则点一次叉号会连带把这一行选中。
+    list.querySelectorAll('.rm').forEach(el => {
+      el.addEventListener('click', (ev) => { ev.stopPropagation(); removeProject(el.dataset.path); });
+      el.addEventListener('keydown', (ev) => {
+        if (ev.key === ' ' || ev.key === 'Enter') ev.stopPropagation();
+      });
+    });
+    if (p.elapsedMs) $('fl').textContent = `发现 ${p.items.length} 个项目 · 扫描 ${p.elapsedMs} ms`;
+    syncArm();
+  }
+
+  // 默认收起:那条提示没有理由长期占着队列底部。
+  // 收起后仍在标题栏留一个计数入口,不然「怎么恢复」就没有去处了。
+  let hidOpen = false;
+
+  function renderHidden() {
+    const box = $('hid'), tog = $('hidToggle');
+    if (!hidden.length) {
+      box.hidden = true; box.innerHTML = '';
+      tog.hidden = true; hidOpen = false;
+      return;
+    }
+    tog.hidden = false;
+    // **它不是"已移除的历史",是"不再扫描"的名单。**
+    // 叫「已移除」会让人以为那是一条可以清掉的日志;可这份名单一旦清空,
+    // 这些目录下次扫描就又全回到队列里——这正是它必须一直留着的原因。
+    // 换个名字比加一句解释管用。
+    tog.textContent = `不再扫描 ${hidden.length} ${hidOpen ? '▴' : '▾'}`;
+    tog.title = hidOpen ? '收起' : '这些目录会被项目扫描跳过;展开可放回队列';
+    if (!hidOpen) { box.hidden = true; box.innerHTML = ''; return; }
+    box.hidden = false;
+    box.innerHTML = '<span>下列目录不参与自动扫描,放回队列后会重新出现:</span>' +
+      hidden.map(h => `<button class="p" data-path="${esc(h.path)}" title="${esc(h.path)}">${esc(h.name)} ↩</button>`).join('') +
+      '<button class="p" data-all="1" title="全部放回队列;名单随之清空">全部放回</button>';
+    box.querySelectorAll('.p').forEach(el => el.addEventListener('click', () =>
+      restoreProject(el.dataset.all ? null : el.dataset.path)));
+  }
+
+  // 增删都由后端写 shadow config 后回吐完整列表,前端不自己拼状态——
+  // 免得界面显示的和真正持久化下来的对不上。
+  async function mutateProjects(type, extra, busyText) {
+    if (queueBusy) return;
+    queueBusy = true;
+    $('fl').textContent = busyText;
+    try {
+      const p = await call(type, extra);
+      // 已移除的项目要一并退出勾选,否则它会继续计入"布防 N 个"。
+      const live = new Set(p.items.map(i => i.path));
+      [...picked].forEach(x => { if (!live.has(x)) picked.delete(x); });
+      renderProjects(p);
+      try { arm = await call('arm.get'); } catch { /* 布防态读不到不阻断列表更新 */ }
+      syncArm();
+    } catch (e) { $('fl').textContent = `${busyText.replace('…', '')}失败:${e.message}`; }
+    finally { queueBusy = false; }
+  }
+
+  async function addProject() {
+    if (queueBusy) return;
+    let path;
+    try { path = (await call('dialog.pickFolder', {}, 600000)).path; }
+    catch (e) { $('fl').textContent = `打开目录选择器失败:${e.message}`; return; }
+    if (!path) return;   // 用户取消,不是错误
+    await mutateProjects('projects.add', { path }, '正在添加项目…');
+  }
+
+  const removeProject = (path) => mutateProjects('projects.remove', { path }, '正在移除项目…');
+  const restoreProject = (path) => mutateProjects('projects.restore', path ? { path } : {}, '正在恢复项目…');
+
+  function syncArm() {
+    const on = !!(arm && arm.armed);
+    const b = $('armBtn');
+    b.textContent = on ? '解除布防' : `布防所选项目${picked.size ? ` (${picked.size})` : ''}`;
+    b.disabled = armBusy || (!on && picked.size === 0);
+    b.classList.toggle('busy', armBusy);
+    $('dryBtn').disabled = armBusy || (!on && picked.size === 0);
+
+    // ── 状态灯 ──
+    // 这是整块面板上唯一回答「它到底在不在干活」的元件,所以它必须自己带颜色:
+    //   绿 = 正常工作 / 琥珀 = 在等(不是故障) / 红 = 有问题 / 灰 = 没布防。
+    // 「等额度恢复」刻意给琥珀而不是红:那是这台机器的正常工作状态,不是故障——
+    // 拿红色去标它,真出问题时的红就不值钱了。
+    const failed = ((arm && arm.projectStatus) || []).filter(s => s.status === 'error').length;
+    const n = on ? arm.selected.length : 0;
+    let cls = '', head, sub;
+    if (!on) {
+      head = '未布防'; sub = '额度恢复后按队列顺序继续';
+    } else if (failed) {
+      cls = 'bad'; head = `${failed} 个项目续跑失败`; sub = '失败项见队列右侧状态,其余照常排队';
+    } else if (arm.phase === 'resuming') {
+      cls = 'on run'; head = '正在续跑'; sub = `共 ${n} 个项目`;
+    } else if (arm.phase === 'waiting') {
+      cls = arm.sawLimited ? 'wait' : 'on';
+      head = arm.sawLimited ? '等待额度恢复' : '监视中';
+      sub = arm.sawLimited ? `恢复后按顺序续跑 ${n} 个项目` : `已布防 ${n} 个项目,尚未观测到限流`;
+    } else if (arm.phase === 'done') {
+      cls = 'on'; head = '本轮已完成'; sub = `${n} 个项目已跑完`;
+    } else {
+      cls = 'wait'; head = '待初始化'; sub = `已布防 ${n} 个项目`;
+    }
+    $('beacon').className = 'beacon' + (cls ? ' ' + cls : '');
+    $('armLine').textContent = head;
+    $('phaseLine').textContent = sub;
+    // 状态灯已经把「现在是什么状态」说完了,这里只补它说不了的:这个按钮按下去会怎样。
+    $('armNote').textContent = on
+      ? '解除只停止自动续跑,不影响已在跑的任务。'
+      : '勾选项目后布防;引擎会在下一拍探测额度。';
+  }
+
+  async function toggleArm() {
+    if (armBusy) return;
+    armBusy = true; syncArm();
+    const want = !(arm && arm.armed);
+    try {
+      arm = await call('arm.set', { armed: want, paths: [...picked] });
+      $('fl').textContent = want ? `已布防 ${arm.selected.length} 个项目` : '已解除布防';
+      renderProjects({ items: projects, elapsedMs: 0 });
+    } catch (e) { $('fl').textContent = `布防操作失败:${e.message}`; }
+    finally { armBusy = false; syncArm(); }
+  }
+
+  function dryRun() {
+    const order = (arm && arm.armed) ? arm.selected : [...picked];
+    const st = new Map((arm && arm.projectStatus || []).map(s => [s.path, s.status]));
+    const nm = new Map(projects.map(p => [p.path, p.name]));
+    const lines = order.map((p, i) => `${i + 1}. ${nm.get(p) || p}${st.has(p) ? ' — 上轮 ' + st.get(p) : ''}`);
+    $('fl').textContent = lines.length ? `预演(不执行):${lines.join(' · ')}` : '预演:没有可续跑的项目。';
+  }
+
+  // ───────── 通知源 ─────────
+  let notifyBusy = false;
+  function renderNotify(p) {
+    const box = $('notify');
+    if (!p.items.length) { box.innerHTML = '<div class="pv"><span class="nm" style="color:var(--ink-3)">无可用通知源</span></div>'; return; }
+    box.innerHTML = p.items.map(it => `
+      <div class="pv${it.isInstalled ? '' : ' off'}" title="${esc(it.isInstalled ? (it.detail || it.configPath || '') : '未检测到该工具')}">
+        <span class="nm">${esc(it.displayName)}</span>
+        <div class="sw${it.isEnabled ? ' on' : ''}" data-kind="${esc(it.kind)}" data-installed="${it.isInstalled}"
+             role="switch" aria-checked="${it.isEnabled}" aria-disabled="${!it.isInstalled}"
+             aria-label="启用 ${esc(it.displayName)} 的完成通知" tabindex="${it.isInstalled ? 0 : -1}"></div>
+      </div>`).join('');
+    // 纯 CSS 绘制的开关必须自己补语义与键盘操作:它不是 <input>,读屏和 Tab 都不会自动认。
+    box.querySelectorAll('.sw').forEach(el => {
+      el.addEventListener('click', () => toggleNotify(el));
+      el.addEventListener('keydown', (ev) => {
+        if (ev.key === ' ' || ev.key === 'Enter') { ev.preventDefault(); toggleNotify(el); }
+      });
+    });
+  }
+  async function toggleNotify(el) {
+    if (notifyBusy || el.dataset.installed !== 'true') return;
+    notifyBusy = true; el.classList.add('busy');
+    try { renderNotify(await call('notifications.setEnabled', { kind: el.dataset.kind, enabled: !el.classList.contains('on') })); }
+    catch (e) { el.classList.remove('busy'); $('fl').textContent = `通知源切换失败:${e.message}`; }
+    finally { notifyBusy = false; }
+  }
+
+  // ───────── 飞书接入 ─────────
+  // **实值单向流动**:输入框 → 桥 → DPAPI。应答里从来没有 appSecret 字段,
+  // 所以界面永远拿不回它——保存后输入框立即清空,不做"回填已保存的值"这种事。
+  let fsBusy = false;
+
+  function renderFeishu(p) {
+    const st = $('fsState');
+    st.classList.toggle('on', !!p.hasCredentials);
+    st.innerHTML = p.hasCredentials
+      ? `<span class="dot"></span>已配置 <span class="id">${esc(p.appIdMasked || '')}</span>`
+      : '<span class="dot"></span>未配置';
+    $('fsGen').disabled = !p.hasCredentials || fsBusy;
+    // 路径太长会把整段说明挤出侧栏可视区(实测被裁在"配置已存"处),
+    // 改为短句 + 完整路径放 title。
+    $('fsNote').textContent = p.configExists
+      ? '凭据经 DPAPI 加密存本机;cc-connect 配置已生成。'
+      : '凭据经 DPAPI 按当前用户加密存本机,不写入仓库,也不回传界面。';
+    $('fsNote').title = p.configPath || '';
+  }
+
+  function fsShow(text, kind) {
+    const el = $('fsOut');
+    el.hidden = !text;
+    el.textContent = text || '';
+    el.className = 'fs-out' + (kind ? ' ' + kind : '');
+  }
+
+  async function saveFeishu() {
+    if (fsBusy) return;
+    const appId = $('fsId').value.trim(), appSecret = $('fsSecret').value.trim();
+    const allowFrom = $('fsAllow').value.trim();
+    if (!appId || !appSecret) { fsShow('App ID 与 App Secret 都要填。', 'bad'); return; }
+    // fail-closed:空 allow_from 会让 cc-connect 放行所有飞书用户。
+    if (!allowFrom) { fsShow('必须填授权用户 open_id,否则任何人都能驱动本机 AI。', 'bad'); return; }
+    fsBusy = true; $('fsSave').classList.add('busy');
+    try {
+      renderFeishu(await call('feishu.save', { appId, appSecret, allowFrom }));
+      // 保存成功立刻清空:凭据没有理由继续留在 DOM 里。
+      $('fsId').value = ''; $('fsSecret').value = ''; $('fsAllow').value = '';
+      closeFsModal();
+      fsShow('已加密保存到本机。', 'good');
+    } catch (e) { fsShow('保存失败:' + e.message, 'bad'); }
+    finally { fsBusy = false; $('fsSave').classList.remove('busy'); renderFeishu(await call('feishu.status')); }
+  }
+
+  function openFsModal() { $('fsModal').hidden = false; $('fsId').focus(); }
+  function closeFsModal() {
+    // 关闭即清空:凭据没有理由继续留在 DOM 里。
+    $('fsModal').hidden = true;
+    $('fsId').value = ''; $('fsSecret').value = ''; $('fsAllow').value = '';
+  }
+
+  async function genCutover() {
+    if (fsBusy) return;
+    fsBusy = true; $('fsGen').classList.add('busy'); $('fsGen').disabled = true;
+    try {
+      const r = await call('cutover.generate', {}, 60000);
+      // sanitizedToml 里的 app_secret 已是 [REDACTED],可安全展示给用户复核。
+      fsShow(r.ok ? r.message + '\n\n' + r.sanitizedToml : r.message, r.ok ? 'good' : 'bad');
+      renderFeishu(await call('feishu.status'));
+    } catch (e) { fsShow('生成失败:' + e.message, 'bad'); }
+    finally { fsBusy = false; $('fsGen').classList.remove('busy'); }
+  }
+
+  async function preflight() {
+    if (fsBusy) return;
+    fsBusy = true; $('fsPre').classList.add('busy');
+    try {
+      const r = await call('cutover.preflight', {}, 60000);
+      const lines = [`判定:${r.verdict}`];
+      if (r.reason) lines.push(r.reason);
+      r.conflicts.forEach(c => lines.push(`冲突 ${c.kind} PID=${c.pid} — ${c.detail}`));
+      lines.push(r.canStart
+        ? '本机没有其它飞书事件消费者,可以启动 cc-connect。'
+        : '不可启动:飞书长连接是集群模式,两个消费者在线时事件会被随机截走。');
+      fsShow(lines.join('\n'), r.canStart ? 'good' : 'bad');
+    } catch (e) { fsShow('预检失败:' + e.message, 'bad'); }
+    finally { fsBusy = false; $('fsPre').classList.remove('busy'); }
+  }
+
+  // ───────── 启动 ─────────
+  renderProviders(null);
+  if (!cardTimer) cardTimer = setInterval(tick, 1000);
+
+  async function load() {
+    refreshQuota(false, false);   // 不 await:本地块先画,服务端探测在后台补
+
+    try {
+      arm = await call('arm.get');
+      if (arm.armed) { picked.clear(); arm.selected.forEach(p => picked.add(p)); }
+    } catch (e) { $('armNote').textContent = '读取布防状态失败:' + e.message; }
+
+    call('feishu.status').then(renderFeishu).catch(e => {
+      $('fsState').textContent = '读取失败:' + e.message;
+    });
+
+    call('notifications.list').then(renderNotify).catch(e => {
+      $('notify').innerHTML = `<div class="pv"><span class="nm" style="color:var(--alert);font-size:11.5px">探测失败:${esc(e.message)}</span></div>`;
+    });
+
+    try { renderProjects(await call('projects.list')); }
+    catch (e) {
+      $('q').innerHTML = `<div style="padding:8px;color:var(--alert);font-size:12.5px">项目发现失败:${esc(e.message)}</div>`;
+      $('fl').textContent = '项目发现失败';
+    }
+
+    try {
+      const i = await call('app.info');
+      $('fr').textContent = `v${i.version} · ${i.shadowRoot}`;
+      // 铭牌上的 BUILD 用真版本号。原来这里是写死的 "SN ————",JS 从不赋值——
+      // 面板上挂一个永远填不上的序列号,比不挂更糟:它看着像数据,却不是。
+      $('snPlate').innerHTML = `<b>MODEL AR-2</b>BUILD ${esc(i.version)}`;
+      if (i.quotaRefreshMinutes >= 1) refreshMinutes = i.quotaRefreshMinutes;
+      // 定时刷新(默认 15 分钟,可由 config 的 quotaRefreshMinutes 调整),对齐 ccusage 的监视节奏。
+      setInterval(() => refreshQuota(true, false), refreshMinutes * 60 * 1000);
+      nextRefreshAt = Date.now() / 1000 + refreshMinutes * 60;
+    } catch {
+      // 版本读不到不阻断主流程,但铭牌不能一直停在"读取中"——那会被当成还在加载。
+      $('snPlate').innerHTML = '<b>MODEL AR-2</b>BUILD 不可得';
+    }
+  }
+
+  $('refreshBtn').addEventListener('click', () => refreshQuota(true, true));
+  $('addBtn').addEventListener('click', addProject);
+  $('hidToggle').addEventListener('click', () => { hidOpen = !hidOpen; renderHidden(); });
+  $('fsOpen').addEventListener('click', openFsModal);
+  $('fsCancel').addEventListener('click', closeFsModal);
+  $('fsModal').addEventListener('click', (ev) => { if (ev.target === $('fsModal')) closeFsModal(); });
+  document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && !$('fsModal').hidden) closeFsModal(); });
+  $('fsSave').addEventListener('click', saveFeishu);
+  $('fsGen').addEventListener('click', genCutover);
+  $('fsPre').addEventListener('click', preflight);
+  $('armBtn').addEventListener('click', toggleArm);
+  $('dryBtn').addEventListener('click', dryRun);
+  $('rescanBtn').addEventListener('click', () => {
+    $('q').innerHTML = '<div class="sk"></div><div class="sk"></div><div class="sk"></div>';
+    $('fl').textContent = '正在重新扫描…';
+    load();
+  });
+
+  load();
+})();
+</script>
+
+<script>
+/* Agent 波段开关。独立于主脚本:主脚本是一个 IIFE,不暴露内部的 rpc,
+   这里自带一份最小实现,避免为了加一个区块去改动那 500 行。 */
+(() => {
+  const bank = document.getElementById('agentBank');
+  const note = document.getElementById('agentNote');
+  if (!bank) return;
+
+  // **必须和主脚本一样 postMessage 一个对象,不能 postMessage(JSON 字符串)**。
+  // 宿主按 WebMessageAsJson 解析:传字符串进去,宿主拿到的是一个 JSON 字符串字面量
+  // 而不是对象,取 id/type 属性直接失败,应答的 id 为 null,调用方永远等到超时。
+  const wv = window.chrome && window.chrome.webview;
+  let seq = 0;
+  const pend = new Map();
+  if (wv) {
+    wv.addEventListener('message', ev => {
+      const m = ev.data;
+      if (!m || !m.id) return;
+      const p = pend.get(m.id);
+      if (!p) return;
+      pend.delete(m.id);
+      if (m.error) p.reject(new Error(m.error)); else p.resolve(m.payload);
+    });
+  }
+  const rpc = (type, extra) => new Promise((resolve, reject) => {
+    if (!wv) { reject(new Error('WebView2 宿主不可用')); return; }
+    const id = 'ag' + (++seq);
+    pend.set(id, { resolve, reject });
+    wv.postMessage(Object.assign({ id, type }, extra || {}));
+    setTimeout(() => { if (pend.delete(id)) reject(new Error('请求超时')); }, 15000);
+  });
+
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  let busy = false;
+
+  const render = (p) => {
+    // **本机没装的直接不显示**,不是置灰。
+    // 置灰仍占版面、仍要读一遍才知道点不了;而这些 agent 装没装是本机事实,
+    // 不是"暂时不可用"。当前选中的那个永远保留——即使 CLI 被卸载了,
+    // 也必须让人看见"现在挂在一个已经没有的 agent 上",否则故障无从解释。
+    const shown = p.options.filter(o => o.installed !== false || o.id === p.current);
+
+    bank.innerHTML = shown.map(o => {
+      const broken = o.installed === false;   // 只可能是"选中但已卸载"
+      return `<div class="k${o.id === p.current ? ' on' : ''}${broken ? ' broken' : ''}" data-id="${esc(o.id)}"
+         role="radio" tabindex="0" aria-checked="${o.id === p.current}"
+         ${broken ? 'title="当前选中,但本机已找不到它的命令行工具"' : ''}
+         aria-label="选择执行体 ${esc(o.display)}${broken ? '(命令行工具缺失)' : ''}"
+         ><span class="d"></span>${esc(o.display)}</div>`;
+    }).join('');
+
+    const hiddenCount = p.options.length - shown.length;
+    note.textContent = hiddenCount > 0
+      ? `另有 ${hiddenCount} 个 agent 未安装,已隐藏。切换后需重启 cc-connect 生效。`
+      : '切换后需重启 cc-connect 生效。';
+  };
+
+  const pick = async (id) => {
+    if (busy) return;
+    busy = true;
+    bank.querySelectorAll('.k').forEach(k => k.setAttribute('aria-disabled', 'true'));
+    try {
+      const r = await rpc('agent.set', { agent: id });
+      render({ current: r.current, options: cached.options });
+      cached.current = r.current;
+      // 只说"已记录"而不是"已生效":配置要重新生成 + 重启 cc-connect 才真的换。
+      // 谎称已生效会让人以为发消息就是新 agent 在答,排查时全跑偏。
+      note.textContent = '已记录。需点「生成 cc-connect 配置」并重启 cc-connect 才生效。';
+    } catch (err) {
+      note.textContent = '切换失败:' + err.message;
+    } finally {
+      busy = false;
+      bank.querySelectorAll('.k').forEach(k => k.removeAttribute('aria-disabled'));
+    }
+  };
+
+  let cached = { current: '', options: [] };
+  // 未安装的已经不渲染了,这里只需挡住"点当前项"。
+  // 后端仍会拒未安装项(双保险):界面是几分钟前探测的,
+  // 用户卸掉 CLI 之后不刷新就点,只有后端那道拦得住。
+  const pickable = k => k && k.dataset.id !== cached.current;
+  bank.addEventListener('click', e => {
+    const k = e.target.closest('.k');
+    if (pickable(k)) pick(k.dataset.id);
+  });
+  bank.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const k = e.target.closest('.k');
+    if (pickable(k)) { e.preventDefault(); pick(k.dataset.id); }
+  });
+
+  rpc('agent.get').then(p => { cached = p; render(p); })
+    .catch(err => { note.textContent = '读取执行体失败:' + err.message; });
+
+  // 右栏各区块是异步填充的(providers / 通知源 / 本区)。任何一块在填充时
+  // 让容器滚动过,首屏就会停在中间甚至底部——实测截图里 Agent 与额度模型
+  // 整个被滚出可视区。填充稳定后强制回到顶部。
+  const side = document.querySelector('.side');
+  if (side) {
+    const home = () => { side.scrollTop = 0; };
+    [0, 120, 400, 900].forEach(t => setTimeout(home, t));
+  }
+})();
+</script>

@@ -1,0 +1,5 @@
+bin/
+obj/
+*.user
+# vstest --blame-hang dump 可能含凭据形状测试 fixture,禁止入库
+TestResults/

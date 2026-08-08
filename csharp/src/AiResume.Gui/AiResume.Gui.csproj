@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>AiResume.Gui</RootNamespace>
+    <AssemblyName>AiResume.Gui</AssemblyName>
+    <!-- 复用现役 src/icon.ico,不另造图标资产 -->
+    <ApplicationIcon>icon.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- 随产物拷出:创建快捷方式时要指向它 -->
+    <None Include="icon.ico" CopyToOutputDirectory="PreserveNewest" />
+    <!-- 窗口 Icon="icon.ico" 走 WPF 资源解析,必须同时作为 Resource 编译进程序集 -->
+    <Resource Include="icon.ico" />
+    <!-- S2-G:经 Named Pipe 探测 Worker(命令/帧协议) -->
+    <ProjectReference Include="..\AiResume.Ipc\AiResume.Ipc.csproj" />
+    <!-- S7-B:控制面数据源(项目发现 + 索引) -->
+    <ProjectReference Include="..\AiResume.Worker\AiResume.Worker.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!--
+      S7-B:WebView2 宿主(ADR-0003 §5 选型 D)。版本固定,不使用浮动区间。
+      运行时为 Windows 11 系统组件(实测本机 Evergreen Runtime 151.0.4129.59),无需随应用分发。
+    -->
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4129.50" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- 前端资源随输出复制;经 SetVirtualHostNameToFolderMapping 以 https 虚拟主机加载。 -->
+    <None Include="wwwroot\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
