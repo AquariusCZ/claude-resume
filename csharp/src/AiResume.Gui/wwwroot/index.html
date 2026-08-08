@@ -436,7 +436,10 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 
 <div class="quota">
   <div class="qc" id="q5"><div class="scr">
-    <div class="t"><span class="h">5H WINDOW</span><span class="chip">已限流</span><span class="src" id="q5src">本地会话统计</span></div>
+    <!-- **必须写明是谁的额度。** 这两块屏读的是 Claude 的用量接口,和 cc-connect
+         此刻跑哪个 agent 毫无关系 —— 而用户把 agent 切成 Codex 之后,
+         合理地期待这里跟着变。不标出来,这块屏就是在让人误会(2026-08-08 实际发生)。 -->
+    <div class="t"><span class="h">CLAUDE · 5H</span><span class="chip">已限流</span><span class="src" id="q5src">本地会话统计</span></div>
     <div class="big dim" id="q5big">读取中…</div>
     <div class="bar"><div class="fill"></div></div>
     <div class="tl"><span class="nowmark"></span></div>
@@ -444,7 +447,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     <div class="ex" id="q5ex"></div>
   </div></div>
   <div class="qc" id="q7"><div class="scr">
-    <div class="t"><span class="h">7D WINDOW</span><span class="chip">已限流</span><span class="src" id="q7src">服务端下发</span></div>
+    <div class="t"><span class="h">CLAUDE · 7D</span><span class="chip">已限流</span><span class="src" id="q7src">服务端下发</span></div>
     <div class="big dim" id="q7big">探测中…</div>
     <div class="bar"><div class="fill"></div></div>
     <div class="tl"><span class="nowmark"></span></div>
@@ -463,7 +466,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 
   <div class="col"><div class="card pad side">
     <div class="sect">
-      <div class="sl">Agent · 执行体</div>
+      <div class="sl">Agent</div>
       <div class="bank" id="agentBank"></div>
       <div class="note" id="agentNote">切换需重启 cc-connect</div>
     </div>
@@ -486,7 +489,6 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
            一行一件事,右侧挂它自己的动作。 -->
       <div class="fs-line" id="fsCredLine" hidden>
         <span class="led" id="fsCredLed"></span><span class="t" id="fsCredText">未验证</span>
-        <span class="go" id="fsVerify" role="button" tabindex="0">验证</span>
       </div>
       <div class="fs-line" id="fsCfgLine" hidden>
         <span class="led" id="fsCfgLed"></span><span class="t" id="fsCfgText">—</span>
@@ -1063,19 +1065,26 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
         : v.code ? `凭据被拒 ${v.code}` : '凭据被拒';
       $('fsCredText').textContent = credText;
       $('fsCredText').title = v ? v.summary
-        : '「已配置」只说明本机存过这份凭据,不代表飞书现在还认它。点「验证」真发一次请求。';
+        : '开窗时会自动拿这份凭据换一次 token;这一行是那次的结果。';
     }
 
     // ── 配置:文件在 ≠ cc-connect 加载得了 ──
     const cfg = p.configState || (p.configExists ? 'unknown' : 'missing');
     $('fsCfgLine').hidden = cfg === 'missing';
     if (cfg !== 'missing') {
-      $('fsCfgLed').className = 'led' + (cfg === 'ok' ? ' ok' : cfg === 'invalid' ? ' bad' : ' wait');
       const problems = p.configProblems || [];
+      const warns = p.configWarnings || [];
+      // 「加载不了」和「加载得了但配错了」是两件事,颜色和措辞都得分开:
+      // 前者 cc-connect 起不来,后者照常运行、只是回复不会走你以为的那个模型。
+      $('fsCfgLed').className = 'led' +
+        (cfg === 'invalid' ? ' bad' : warns.length ? ' wait' : cfg === 'ok' ? ' ok' : ' wait');
       $('fsCfgText').textContent =
-        cfg === 'ok' ? '配置可加载' : cfg === 'invalid' ? '配置无法加载' : '配置未核对';
+        cfg === 'invalid' ? '配置无法加载'
+        : cfg !== 'ok' ? '配置未核对'
+        : warns.length ? `agent 与 provider 不匹配 ${warns.length}` : '配置可加载';
       // 具体哪一行坏了放 title:侧栏放不下,而它恰恰是唯一能用的线索。
-      $('fsCfgLine').title = [p.configPath, p.configSummary].concat(problems).filter(Boolean).join('\n');
+      $('fsCfgLine').title = [p.configPath, p.configSummary]
+        .concat(problems).concat(warns).filter(Boolean).join('\n');
     }
 
     // 路径太长会把整段说明挤出侧栏可视区(实测被裁在"配置已存"处),
@@ -1090,7 +1099,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   // 「机器人不理我」区分开的动作,所以它必须是用户点得到的。
   async function verifyFeishu() {
     if (fsBusy) return;
-    fsBusy = true; $('fsVerify').classList.add('busy');
+    fsBusy = true;
     const t0 = Date.now();
     try {
       fsVerdict = await call('feishu.verify', {}, 40000);
@@ -1100,7 +1109,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       // 同「刷新额度」:至少让转圈转满 450ms,让"我点了"和"它做了"之间有可见因果。
       const rest = 450 - (Date.now() - t0);
       if (rest > 0) { await new Promise(r => setTimeout(r, rest)); }
-      fsBusy = false; $('fsVerify').classList.remove('busy');
+      fsBusy = false;
       try { renderFeishu(await call('feishu.status')); } catch { /* 状态读不到不覆盖已得的结论 */ }
     }
   }
@@ -1129,7 +1138,10 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       // 保存成功立刻清空:凭据没有理由继续留在 DOM 里。
       $('fsId').value = ''; $('fsSecret').value = ''; $('fsAllow').value = '';
       closeFsModal();
-      fsShow('已加密保存到本机。', 'good');
+      fsShow('已加密保存到本机,正在验证…', 'good');
+      // 刚填完就是最该知道"这份能不能用"的时刻。不让用户再去点一次。
+      fsVerdict = null;
+      setTimeout(verifyFeishu, 0);
     } catch (e) { fsShow('保存失败:' + e.message, 'bad'); }
     finally { fsBusy = false; $('fsSave').classList.remove('busy'); renderFeishu(await call('feishu.status')); }
   }
@@ -1242,10 +1254,6 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   $('fsSave').addEventListener('click', saveFeishu);
   $('fsGen').addEventListener('click', genCutover);
   $('fsPre').addEventListener('click', preflight);
-  $('fsVerify').addEventListener('click', verifyFeishu);
-  $('fsVerify').addEventListener('keydown', (ev) => {
-    if (ev.key === ' ' || ev.key === 'Enter') { ev.preventDefault(); verifyFeishu(); }
-  });
   $('armBtn').addEventListener('click', toggleArm);
   $('dryBtn').addEventListener('click', dryRun);
   $('rescanBtn').addEventListener('click', () => {
@@ -1305,7 +1313,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       return `<div class="k${o.id === p.current ? ' on' : ''}${broken ? ' broken' : ''}" data-id="${esc(o.id)}"
          role="radio" tabindex="0" aria-checked="${o.id === p.current}"
          ${broken ? 'title="当前选中,但本机已找不到它的命令行工具"' : ''}
-         aria-label="选择执行体 ${esc(o.display)}${broken ? '(命令行工具缺失)' : ''}"
+         aria-label="选择 agent ${esc(o.display)}${broken ? '(命令行工具缺失)' : ''}"
          ><span class="d"></span>${esc(o.display)}</div>`;
     }).join('');
 
@@ -1357,7 +1365,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   });
 
   rpc('agent.get').then(p => { cached = p; booted = p.current; render(p); })
-    .catch(err => { note.textContent = '读取执行体失败:' + err.message; });
+    .catch(err => { note.textContent = '读取 agent 失败:' + err.message; });
 
   // 右栏各区块是异步填充的(providers / 通知源 / 本区)。任何一块在填充时
   // 让容器滚动过,首屏就会停在中间甚至底部——实测截图里 Agent 与额度模型

@@ -19,11 +19,18 @@ public enum CcConnectConfigState
     Unknown,
 }
 
-/// <summary>校验结果。<paramref name="Problems"/> 逐条可读,直接给用户看。</summary>
+/// <summary>
+/// 校验结果。<paramref name="Problems"/> 与 <paramref name="Warnings"/> 都逐条可读,直接给用户看。
+///
+/// 两者**必须分开**:语法错/缺键会让 cc-connect 起不来(Problems);
+/// 而 agent 与 provider 对不上是一份**完全合法、照常加载**的配置,只是行为不是用户以为的那样
+/// (Warnings)。把后者也说成"配置无法加载"是另一种谎——用户会去查一个根本没坏的东西。
+/// </summary>
 public sealed record CcConnectConfigCheck(
     CcConnectConfigState State,
     string Summary,
-    IReadOnlyList<string> Problems);
+    IReadOnlyList<string> Problems,
+    IReadOnlyList<string> Warnings);
 
 /// <summary>
 /// 「cc-connect 配置已生成」凭什么这么说。
@@ -94,6 +101,179 @@ public static class CcConnectConfigValidator
         return problems;
     }
 
+    /// <summary>Claude Code 自己的模型别名。出现在非 claudecode 的项目里就是配错了。</summary>
+    private static readonly HashSet<string> ClaudeAliases =
+        new(StringComparer.OrdinalIgnoreCase) { "opus", "sonnet", "haiku", "fable" };
+
+    /// <summary>
+    /// agent、provider、model 三者对不对得上。
+    ///
+    /// 这三个是**同一条链上的三段**,任何一段错位,表现都是"回复还是原来那个模型",
+    /// 而配置文件本身完全合法、cc-connect 也照常启动 —— 又一个静默失败:
+    ///
+    /// <list type="number">
+    /// <item><b>agent</b> 决定说哪种 API 方言:claudecode 说 Anthropic 的形状,codex 说 OpenAI 的;</item>
+    /// <item><b>provider</b> 是那个 agent 去连的端点 + 密钥,**必须和方言对得上**;</item>
+    /// <item><b>model</b> 是发给那个端点的名字,必须是**那个端点认识的名字**。</item>
+    /// </list>
+    ///
+    /// 2026-08-08 用户实测踩到的正是这个:把 agent 换成 codex、也重新生成了配置,
+    /// 但 <c>provider = "deepseek"</c>(base_url 是 <c>…/anthropic</c>,给 claudecode 用的)
+    /// 和 <c>model = "opus"</c>(Claude 的别名)都是当初 agent=claudecode 时留下的,
+    /// **换 agent 不会重置它们**。于是三段里有两段还指着 Claude。
+    ///
+    /// 判据都取"确凿冲突"这一档,不猜:没写 agent_types、base_url 看不出方言的,一律不报。
+    /// </summary>
+    public static IReadOnlyList<string> CheckAgentCoherence(string? toml)
+    {
+        var problems = new List<string>();
+        string text = toml ?? string.Empty;
+        if (text.Length == 0)
+        {
+            return problems;
+        }
+
+        // **必须按段取,不能取全文第一个。** 实测踩到:`[speech]` 段里有一行
+        // `provider = ""`,而它在文件里排在项目区之前 —— 取全文第一个会拿到空串,
+        // 于是整段 provider 判断被静默跳过,一条都不报。
+        // 判据自己出这种错,比不做检查更糟:它看起来在检查。
+        (string agent, string provider, string model) = ReadProjectAgentTriple(text);
+
+        if (agent.Length == 0)
+        {
+            return problems;
+        }
+
+        if (provider.Length > 0)
+        {
+            (string? agentTypes, string? baseUrl) = ReadProviderBlock(text, provider);
+
+            if (agentTypes is { Length: > 0 } &&
+                !agentTypes.Contains(agent, StringComparison.OrdinalIgnoreCase))
+            {
+                problems.Add(
+                    $"provider「{provider}」声明只支持 {agentTypes},而当前 agent 是「{agent}」——" +
+                    "这两个对不上,回复不会走这个 provider。");
+            }
+
+            // …/anthropic 是给 Claude Code 用的端点形状。
+            if (baseUrl is { Length: > 0 } &&
+                baseUrl.Contains("/anthropic", StringComparison.OrdinalIgnoreCase) &&
+                !agent.Equals("claudecode", StringComparison.OrdinalIgnoreCase))
+            {
+                problems.Add(
+                    $"provider「{provider}」的端点是 Anthropic 形状(…/anthropic)," +
+                    $"只有 agent=claudecode 说得通;当前是「{agent}」。");
+            }
+        }
+
+        if (model.Length > 0 &&
+            ClaudeAliases.Contains(model) &&
+            !agent.Equals("claudecode", StringComparison.OrdinalIgnoreCase))
+        {
+            problems.Add(
+                $"当前模型是「{model}」——这是 Claude Code 的别名,而 agent 是「{agent}」。" +
+                "换 agent 不会重置模型,需要在聊天里再 /model switch 一次。");
+        }
+
+        return problems;
+    }
+
+    /// <summary>
+    /// 从项目区读出 (agent 类型, 当前 provider, 当前 model)。
+    ///
+    /// 三个键分别落在不同的地方,只能逐段扫:
+    /// <c>type</c> 紧跟在 <c>[projects.agent]</c> 之后(平台块里也有 <c>type</c>,不能混);
+    /// <c>provider</c> / <c>model</c> 是 cc-connect 自己写回项目区的顶格键。
+    /// 取最后一次出现:同名键重复时,后写的才是当前值。
+    /// </summary>
+    public static (string Agent, string Provider, string Model) ReadProjectAgentTriple(string toml)
+    {
+        string agent = string.Empty, provider = string.Empty, model = string.Empty;
+        bool inProjects = false, inAgent = false, inPlatform = false;
+
+        foreach (string raw in (toml ?? string.Empty).Replace("\r\n", "\n").Split('\n'))
+        {
+            string line = raw.Trim();
+
+            if (line.StartsWith('['))
+            {
+                inProjects = line.StartsWith("[[projects]]", StringComparison.Ordinal) ||
+                             line.StartsWith("[projects.", StringComparison.Ordinal) ||
+                             line.StartsWith("[[projects.", StringComparison.Ordinal);
+                inAgent = line.StartsWith("[projects.agent]", StringComparison.Ordinal);
+                inPlatform = line.StartsWith("[[projects.platforms", StringComparison.Ordinal) ||
+                             line.StartsWith("[projects.platforms", StringComparison.Ordinal);
+                continue;
+            }
+
+            if (!inProjects || inPlatform || line.Length == 0 || line.StartsWith('#'))
+            {
+                continue;
+            }
+
+            if (inAgent && ReadFirstStringValue(line, "type") is { Length: > 0 } t)
+            {
+                agent = t;
+            }
+
+            if (ReadFirstStringValue(line, "provider") is { Length: > 0 } p)
+            {
+                provider = p;
+            }
+
+            if (ReadFirstStringValue(line, "model") is { Length: > 0 } m)
+            {
+                model = m;
+            }
+        }
+
+        return (agent, provider, model);
+    }
+
+    /// <summary>读全局 <c>[[providers]]</c> 里指定名字那一块的 agent_types 与 base_url。</summary>
+    private static (string? AgentTypes, string? BaseUrl) ReadProviderBlock(string toml, string name)
+    {
+        string? agentTypes = null, baseUrl = null;
+        bool inBlock = false;
+
+        foreach (string raw in toml.Replace("\r\n", "\n").Split('\n'))
+        {
+            string line = raw.Trim();
+            if (line.StartsWith('['))
+            {
+                // 只认顶层 [[providers]];[[projects…]] 之类一律退出。
+                inBlock = line.StartsWith("[[providers]]", StringComparison.Ordinal);
+                continue;
+            }
+
+            if (!inBlock || line.Length == 0 || line.StartsWith('#'))
+            {
+                continue;
+            }
+
+            if (ReadFirstStringValue(line, "name") is { } n &&
+                !n.Equals(name, StringComparison.OrdinalIgnoreCase))
+            {
+                inBlock = false;   // 是别的 provider 的块
+                continue;
+            }
+
+            if (line.StartsWith("agent_types", StringComparison.OrdinalIgnoreCase))
+            {
+                int eq = line.IndexOf('=');
+                if (eq > 0)
+                {
+                    agentTypes = line[(eq + 1)..].Trim();
+                }
+            }
+
+            baseUrl ??= ReadFirstStringValue(line, "base_url");
+        }
+
+        return (agentTypes, baseUrl);
+    }
+
     /// <summary>
     /// 校验磁盘上的配置。<paramref name="runner"/> 供测试注入(返回退出码与合并输出)。
     /// </summary>
@@ -104,7 +284,7 @@ public static class CcConnectConfigValidator
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
         {
             return new CcConnectConfigCheck(
-                CcConnectConfigState.Missing, "尚未生成 cc-connect 配置。", Array.Empty<string>());
+                CcConnectConfigState.Missing, "尚未生成 cc-connect 配置。", Array.Empty<string>(), Array.Empty<string>());
         }
 
         string text;
@@ -115,21 +295,23 @@ public static class CcConnectConfigValidator
         catch (Exception ex)
         {
             return new CcConnectConfigCheck(
-                CcConnectConfigState.Unknown, $"配置读不出来:{ex.Message}", Array.Empty<string>());
+                CcConnectConfigState.Unknown, $"配置读不出来:{ex.Message}", Array.Empty<string>(), Array.Empty<string>());
         }
 
         IReadOnlyList<string> semantic = CheckSemantics(text);
+        // 一致性是**告警**不是错误:配置照常加载,只是行为不是用户以为的那样。
+        IReadOnlyList<string> warnings = CheckAgentCoherence(text);
 
         Func<string, (int, string)>? run = runner ?? BuildDefaultRunner();
         if (run is null)
         {
             // 找不到 cc-connect:语义还能查,语法查不了。**这不是 ok。**
             return semantic.Count > 0
-                ? new CcConnectConfigCheck(CcConnectConfigState.Invalid, "配置有问题(未能用 cc-connect 复核语法)。", semantic)
+                ? new CcConnectConfigCheck(CcConnectConfigState.Invalid, "配置有问题(未能用 cc-connect 复核语法)。", semantic, warnings)
                 : new CcConnectConfigCheck(
                     CcConnectConfigState.Unknown,
                     "配置已存在,但本机找不到 cc-connect,无法确认它能否加载。",
-                    Array.Empty<string>());
+                    Array.Empty<string>(), warnings);
         }
 
         (int exitCode, string output) = (0, string.Empty);
@@ -145,7 +327,7 @@ public static class CcConnectConfigValidator
         catch (Exception ex)
         {
             return new CcConnectConfigCheck(
-                CcConnectConfigState.Unknown, $"未能调用 cc-connect 复核:{ex.Message}", semantic);
+                CcConnectConfigState.Unknown, $"未能调用 cc-connect 复核:{ex.Message}", semantic, warnings);
         }
         finally
         {
@@ -163,13 +345,19 @@ public static class CcConnectConfigValidator
             var problems = new List<string> { FirstMeaningfulLine(output) };
             problems.AddRange(semantic);
             return new CcConnectConfigCheck(
-                CcConnectConfigState.Invalid, "cc-connect 无法加载这份配置。", problems);
+                CcConnectConfigState.Invalid, "cc-connect 无法加载这份配置。", problems, warnings);
         }
 
-        return semantic.Count > 0
-            ? new CcConnectConfigCheck(CcConnectConfigState.Invalid, "语法能解析,但配置不完整。", semantic)
-            : new CcConnectConfigCheck(
-                CcConnectConfigState.Ok, "cc-connect 能加载这份配置。", Array.Empty<string>());
+        if (semantic.Count > 0)
+        {
+            return new CcConnectConfigCheck(
+                CcConnectConfigState.Invalid, "语法能解析,但配置不完整。", semantic, warnings);
+        }
+
+        return new CcConnectConfigCheck(
+            CcConnectConfigState.Ok,
+            warnings.Count > 0 ? "配置能加载,但 agent 与 provider 对不上。" : "cc-connect 能加载这份配置。",
+            Array.Empty<string>(), warnings);
     }
 
     /// <summary>定位 cc-connect 可执行文件;找不到返回 null。</summary>

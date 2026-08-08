@@ -552,7 +552,8 @@ public sealed class ControlPlaneBridge
         catch (Exception ex)
         {
             check = new CcConnectConfigCheck(
-                CcConnectConfigState.Unknown, $"配置未能复核:{ex.Message}", Array.Empty<string>());
+                CcConnectConfigState.Unknown, $"配置未能复核:{ex.Message}",
+                Array.Empty<string>(), Array.Empty<string>());
         }
 
         return new FeishuPayload(
@@ -564,7 +565,8 @@ public sealed class ControlPlaneBridge
             File.Exists(CutoverConfigCommand.DefaultConfigPath),
             check.State.ToString().ToLowerInvariant(),
             check.Summary,
-            check.Problems.ToList());
+            check.Problems.ToList(),
+            check.Warnings.ToList());
     }
 
     /// <summary>
@@ -702,7 +704,12 @@ public sealed class ControlPlaneBridge
                 {
                     name = "DeepSeek",
                     state = DeepSeekState(ds),
-                    text = ShortLabel(ds.Readiness.ToString(), ds.Summary),
+                    // **余额本身就是那一行该说的话。** 上一版为了压短统一换成「可用」,
+                    // 把唯一有信息量的数字丢掉了 —— 用户问的正是"我还有多少钱"。
+                    // 而且它本来就短:¥48.23 比「余额充足」还短两个字。
+                    text = ds.Readiness == ProviderReadiness.Ok && ds.BalanceCny is { } bal
+                        ? "¥" + bal.ToString("0.##")
+                        : ShortLabel(ds.Readiness.ToString(), ds.Summary),
                     detail = ds.Summary ?? "未探测",
                 },
                 new
@@ -830,7 +837,9 @@ public sealed class ControlPlaneBridge
         // missing / ok / invalid / unknown —— 「文件在」和「加载得了」是两件事。
         [property: JsonPropertyName("configState")] string ConfigState,
         [property: JsonPropertyName("configSummary")] string ConfigSummary,
-        [property: JsonPropertyName("configProblems")] IReadOnlyList<string> ConfigProblems);
+        [property: JsonPropertyName("configProblems")] IReadOnlyList<string> ConfigProblems,
+        // agent / provider / model 对不上:配置照常加载,但行为不是用户以为的那样。
+        [property: JsonPropertyName("configWarnings")] IReadOnlyList<string> ConfigWarnings);
 
     private sealed record CutoverPayload(
         [property: JsonPropertyName("ok")] bool Ok,
