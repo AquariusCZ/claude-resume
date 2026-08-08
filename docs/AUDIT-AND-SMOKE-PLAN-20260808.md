@@ -121,7 +121,7 @@
 
 | 缺口 | 状态 | 既定修法 |
 |---|---|---|
-| ~~cc-connect 无自启无守护~~ | **2026-08-08 已解决** —— `cc-connect daemon install` 注册为 Windows 计划任务(登录触发)。见下方 §4.1 | — |
+| ~~cc-connect 无自启无守护~~ | **2026-08-08 已解决** —— 注册为 Windows 计划任务;S4U 无窗口 + 5 分钟无限期重复自愈。见 §4.1 / §4.1.1 | — |
 | **限额续跑未端到端验证** | 见 T1 | — |
 | **改配置后 GUI 不提示要重启 daemon** | 「生成 cc-connect 配置」写完文件就返回,但 daemon 不会自己重读 | 需在 GUI 补一句提示或直接调 `cc-connect daemon restart` |
 | **IPC `ipc_status` 曾 60/60 空响应** | 未复查 | 读 IPC 服务端代码后再定 |
@@ -158,22 +158,31 @@ $trg.Repetition.StopAtDurationEnd = $false
 Set-ScheduledTask -TaskName 'cc-connect' -Trigger $trg -Settings $s
 ```
 
-### 4.1.1 ⚠️ 桌面上那个黑窗口就是 cc-connect,别关
+### 4.1.1 那个黑窗口(已解决,但重装会回来)
 
-计划任务的动作是 `powershell.exe -WindowStyle Hidden …`,但 **`-WindowStyle Hidden`
-在交互会话里不生效**——控制台由系统在 PowerShell 处理该参数之前分配,窗口照样留在桌面上。
+上游装出来的任务是 `LogonType = Interactive`,动作虽然写着 `-WindowStyle Hidden`,
+但**该参数在交互会话里不生效**——控制台由系统在 PowerShell 处理它之前就分配好了,
+桌面上于是留着一个黑窗口,**而那个窗口就是 cc-connect 本体**。
 
 **2026-08-08 实测:用户顺手关掉那个"多余的 cmd 窗口",机器人立刻下线**
-(`CTRL_CLOSE_EVENT` → 退出码 `0xC000013A`),同一原因至少停过三次,
-而当时只有登录触发器,停了就再也回不来。
+(`CTRL_CLOSE_EVENT` → 退出码 `0xC000013A`)。同一原因至少停过三次,
+而当时只有登录触发器、`RestartCount` 又只在任务**失败**时生效(Ctrl+C 退出不算失败),
+于是停了就再也回不来。
 
-彻底修法是把任务改成 **S4U**(非交互会话,根本没有窗口),但**需要管理员**,
-本机 `Set-ScheduledTask -Principal` 被拒。试过 `wscript` + `WScript.Shell.Run(cmd,0,True)`
-包一层:交互式手跑可行,**但计划任务里 wscript 立即以 0 退出且什么都没启动**,已放弃。
+**已修**:`LogonType` 改为 **S4U**(以本用户身份、不存密码、不要求已登录),
+进程因此跑在 **session 0** —— 那里没有桌面,窗口不可能存在。
+复核证据:`SessionId = 0`、`MainWindowHandle = 0`。
 
-**当前处置**:窗口留着,靠上面那个 5 分钟重复触发器兜底——关掉它最多离线 5 分钟。
-致命的部分(永久下线)已经修掉,剩下的只是难看。
-有管理员权限时,改 S4U 是一劳永逸的正解。
+改法见 [`tools/cc-connect-hide-window.ps1`](../tools/cc-connect-hide-window.ps1),
+**必须以管理员身份运行**(账户在 Administrators 组不够,进程本身要提权)。
+该脚本同时重申 §4.1 的全部加固项。
+
+> 走过的弯路,别再试:`wscript` + `WScript.Shell.Run(cmd,0,True)` 包一层,
+> 交互式手跑可行,**但在计划任务里 wscript 立即以 0 退出且什么都没启动**。
+>
+> 另:交给人手动执行的 `.ps1` **必须存成 UTF-8 with BOM**。
+> Windows PowerShell 5.1 读无 BOM 的 UTF-8 会按 GBK 解码,中文和 emoji 全乱、
+> 直接变语法错误(实测)。脚本里也不要用 emoji。
 
 ### 4.2 启动日志里那条 WARN 是正常的
 
