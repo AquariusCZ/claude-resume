@@ -203,7 +203,7 @@ public sealed class CodexAuthProbeTests : IDisposable
 
         CodexAuthResult r = await CodexAuthProbe.ProbeAsync(home, handler);
 
-        Assert.Equal(CodexAuthOutcome.Authorized, r.Outcome);
+        Assert.Equal(CodexAuthOutcome.InferenceUnverified, r.Outcome);
         Assert.Single(handler.Uris);
         // 说清"验到哪一步"比给一个漂亮但没依据的结论重要。
         Assert.Contains("未核实", r.Detail);
@@ -217,8 +217,8 @@ public sealed class CodexAuthProbeTests : IDisposable
     [InlineData(HttpStatusCode.InternalServerError, CodexAuthOutcome.ServerError)]
     // 端点形状不支持 ≠ 没有推理权限。sub2api 各家路由不一,
     // 把"这家不认识 chat/completions"标成红,是把好配置误判成坏的。
-    [InlineData(HttpStatusCode.NotFound, CodexAuthOutcome.Authorized)]
-    [InlineData(HttpStatusCode.BadRequest, CodexAuthOutcome.Authorized)]
+    [InlineData(HttpStatusCode.NotFound, CodexAuthOutcome.InferenceUnverified)]
+    [InlineData(HttpStatusCode.BadRequest, CodexAuthOutcome.InferenceUnverified)]
     public void 推理状态码映射(HttpStatusCode status, CodexAuthOutcome expected)
     {
         Assert.Equal(expected, CodexAuthProbe.ClassifyInference(status).Outcome);
@@ -236,7 +236,7 @@ public sealed class CodexAuthProbeTests : IDisposable
 
         // 凭据那一关已经过了。因为第二枪没打通就把凭据判成坏的,
         // 会让人去换一把其实没问题的 key。
-        Assert.Equal(CodexAuthOutcome.Authorized, r.Outcome);
+        Assert.Equal(CodexAuthOutcome.InferenceUnverified, r.Outcome);
         Assert.Contains("未核实", r.Detail);
     }
 

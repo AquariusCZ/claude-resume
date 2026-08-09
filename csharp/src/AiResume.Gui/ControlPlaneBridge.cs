@@ -1,4 +1,5 @@
 using System.IO;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using AiResume.Core;
@@ -36,6 +37,14 @@ public sealed class ControlPlaneBridge
     private readonly ProductConfigStore _configStore;
     private readonly ProductStateStore _stateStore;
     private readonly Func<CancellationToken, Task<string?>>? _folderPicker;
+    private readonly Func<CcConnectDaemonController> _daemonControllerFactory;
+    private readonly Func<string, CutoverConfigCommand.GenerateResult> _cutoverGenerate;
+    private readonly Func<string?> _hookExecutableResolver;
+    private readonly string _cutoverConfigPath;
+    private readonly bool _demoMode;
+    private int _cutoverInProgress;
+
+    public bool IsCutoverInProgress => Volatile.Read(ref _cutoverInProgress) != 0;
 
     public ControlPlaneBridge(
         ProjectCatalog? catalog = null,
@@ -44,10 +53,21 @@ public sealed class ControlPlaneBridge
         QuotaService? quotaService = null,
         ProductConfigStore? configStore = null,
         ProductStateStore? stateStore = null,
-        Func<CancellationToken, Task<string?>>? folderPicker = null)
+        Func<CancellationToken, Task<string?>>? folderPicker = null,
+        Func<CcConnectDaemonController>? daemonControllerFactory = null,
+        Func<string, CutoverConfigCommand.GenerateResult>? cutoverGenerate = null,
+        string? cutoverConfigPath = null,
+        Func<string?>? hookExecutableResolver = null,
+        bool demoMode = false)
     {
+        _demoMode = demoMode;
         // 选目录必须回到 UI 线程弹原生对话框,由宿主窗口注入;测试注入替身,不弹窗。
         _folderPicker = folderPicker;
+        _daemonControllerFactory = daemonControllerFactory ?? (() => new CcConnectDaemonController());
+        _cutoverGenerate = cutoverGenerate ?? (path => CutoverConfigCommand.Generate(
+            path, appId: null, appSecret: null, requireLoadable: true));
+        _hookExecutableResolver = hookExecutableResolver ?? HookExecutable.TryResolve;
+        _cutoverConfigPath = cutoverConfigPath ?? CutoverConfigCommand.DefaultConfigPath;
         _quota = quotaService ?? new QuotaService();
         // 与 Worker 的续跑引擎读写同一份 shadow 配置/状态:GUI 布防 → 引擎消费。
         _configStore = configStore ?? new ProductConfigStore(ShadowPaths.Root);
@@ -73,7 +93,7 @@ public sealed class ControlPlaneBridge
             id = root.TryGetProperty("id", out JsonElement idEl) ? idEl.GetString() : null;
             type = root.TryGetProperty("type", out JsonElement tEl) ? tEl.GetString() : null;
 
-            object payload = type switch
+            object payload = _demoMode ? DemoPayload(type) : type switch
             {
                 "projects.list" => await Task.Run(() => ListProjects(), cancellationToken).ConfigureAwait(false),
                 "projects.add" => await Task.Run(() => AddProject(root), cancellationToken).ConfigureAwait(false),
@@ -84,7 +104,7 @@ public sealed class ControlPlaneBridge
                 "feishu.save" => await Task.Run(() => SaveFeishu(root), cancellationToken).ConfigureAwait(false),
                 "feishu.clear" => await Task.Run(() => ClearFeishu(), cancellationToken).ConfigureAwait(false),
                 "feishu.verify" => await VerifyFeishuAsync(cancellationToken).ConfigureAwait(false),
-                "cutover.generate" => await Task.Run(() => GenerateCutoverConfig(), cancellationToken).ConfigureAwait(false),
+                "cutover.generate" => await Task.Run(() => GenerateAndRestartCutover(), cancellationToken).ConfigureAwait(false),
                 "cutover.preflight" => await Task.Run(() => Preflight(), cancellationToken).ConfigureAwait(false),
                 "app.info" => AppInfo(),
                 "notifications.list" => await Task.Run(() => ListNotifications(), cancellationToken).ConfigureAwait(false),
@@ -106,6 +126,128 @@ public sealed class ControlPlaneBridge
             return Serialize(new Envelope(id, (type ?? "unknown") + ".error", null, ex.Message));
         }
     }
+
+    private static object DemoPayload(string? type)
+    {
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        string[] selected = [@"D:\Demo\ledger-api", @"D:\Demo\atlas-docs", @"D:\Demo\pixel-sprites"];
+        return type switch
+        {
+            "projects.list" => new
+            {
+                items = new object[]
+                {
+                    new { name = "orbit-planner", path = @"D:\Demo\orbit-planner", lastUsed = "已完成", isGit = true, isCustom = false },
+                    new { name = "ledger-api", path = @"D:\Demo\ledger-api", lastUsed = "等额度", isGit = true, isCustom = false },
+                    new { name = "atlas-docs", path = @"D:\Demo\atlas-docs", lastUsed = "2026/8/7 23:05", isGit = true, isCustom = false },
+                    new { name = "pixel-sprites", path = @"D:\Demo\pixel-sprites", lastUsed = "2026/8/7 18:31", isGit = false, isCustom = true },
+                    new { name = "kettle-firmware", path = @"D:\Demo\kettle-firmware", lastUsed = "2026/8/7 11:02", isGit = true, isCustom = false },
+                    new { name = "tide-charts", path = @"D:\Demo\tide-charts", lastUsed = "2026/8/6 21:44", isGit = true, isCustom = false },
+                },
+                elapsedMs = 37,
+                hidden = Array.Empty<object>(),
+            },
+            "quota.local" => new
+            {
+                active = true,
+                startUnix = now - 9_000,
+                endUnix = now + 9_000,
+                totalTokens = 18_420,
+                messageCount = 6,
+                elapsedMs = 21,
+            },
+            "quota.get" => new
+            {
+                provider = "claude",
+                capturedAtUnix = now,
+                hasData = true,
+                allowed = false,
+                limitReached = true,
+                unavailableReason = (string?)null,
+                storageWarning = (string?)null,
+                windows = new object[]
+                {
+                    new { name = "five_hour", label = "5 小时", status = "available", usedPercent = 41, windowSeconds = 18_000, resetAtUnix = now + 9_000, resetAfterSeconds = 9_000, windowStartUnix = now - 9_000, carriedForward = false },
+                    new { name = "seven_day", label = "7 天", status = "available", usedPercent = 88, windowSeconds = 604_800, resetAtUnix = now + 180_000, resetAfterSeconds = 180_000, windowStartUnix = now - 424_800, carriedForward = false },
+                    new { name = "weekly_scoped:fable", label = "Fable", status = "blocked", usedPercent = 100, windowSeconds = 604_800, resetAtUnix = now + 180_000, resetAfterSeconds = 180_000, windowStartUnix = now - 424_800, carriedForward = false },
+                },
+            },
+            "providers.probe" => new
+            {
+                deep = false,
+                items = new object[]
+                {
+                    new { name = "DeepSeek", state = "ok", text = "¥47.77", detail = "余额接口已验证" },
+                    new { name = "Codex", state = "ok", text = "已验证", detail = "凭据与最小推理已验证" },
+                },
+            },
+            "arm.get" => new
+            {
+                armed = true,
+                continuous = true,
+                cycleId = "demo-cycle",
+                phase = "waiting",
+                sawLimited = true,
+                selected,
+                projectStatus = new object[]
+                {
+                    new { path = selected[0], status = "limited" },
+                    new { path = selected[1], status = "limited" },
+                    new { path = selected[2], status = "limited" },
+                },
+                engine = "Healthy",
+                engineText = "运行中",
+                probeAgeSeconds = 12,
+            },
+            "feishu.status" => new
+            {
+                hasCredentials = false,
+                appIdMasked = (string?)null,
+                allowFrom = (string?)null,
+                configPath = @"D:\Demo\.cc-connect\config.toml",
+                configExists = true,
+                configState = "ok",
+                configSummary = "配置可加载",
+                configProblems = Array.Empty<string>(),
+                configWarnings = Array.Empty<string>(),
+            },
+            "notifications.list" => new
+            {
+                items = new object[]
+                {
+                    DemoNotification("ClaudeCode", "Claude Code"),
+                    DemoNotification("Codex", "Codex"),
+                    DemoNotification("Cline", "Cline"),
+                    DemoNotification("Qoder", "Qoder"),
+                    DemoNotification("OpenCode", "OpenCode"),
+                },
+            },
+            "app.info" => new { version = "2.0.0", shadowRoot = @"D:\Demo\AI Resume\state", quotaRefreshMinutes = 15 },
+            "agent.get" => new
+            {
+                current = "claudecode",
+                options = new object[]
+                {
+                    new { id = "claudecode", display = "Claude Code", installed = true },
+                    new { id = "codex", display = "Codex", installed = true },
+                    new { id = "qoder", display = "Qoder", installed = true },
+                    new { id = "opencode", display = "OpenCode", installed = true },
+                },
+            },
+            _ => throw new NotSupportedException($"截图合成模式不支持请求:{type}"),
+        };
+    }
+
+    private static object DemoNotification(string kind, string displayName) => new
+    {
+        kind,
+        displayName,
+        isInstalled = true,
+        isEnabled = true,
+        configPath = @"D:\Demo\notifications",
+        detail = "已安装 AI Resume 通知钩子",
+        hookBroken = false,
+    };
 
     private ProjectsPayload ListProjects()
     {
@@ -344,28 +486,19 @@ public sealed class ControlPlaneBridge
 
         bool enabled = root.TryGetProperty("enabled", out JsonElement enabledEl) && enabledEl.GetBoolean();
 
-        // 构造 hook 命令:exe 完整路径 + 空格 + 小写 source 参数。
-        //
-        // 原本只在 AppContext.BaseDirectory 下找,而开发布局里 Hook 输出在它自己的
-        // bin 目录、根本不会被复制过来 —— 于是这里恒抛 FileNotFound,启用永远失败。
-        // 改用统一解析器(同目录 → 开发布局的同级项目 bin → PATH)。
-        string hookExe = HookExecutable.TryResolve()
-            ?? throw new FileNotFoundException(
-                $"未找到 {HookExecutable.FileName}。请先构建 AiResume.Hook 项目;" +
-                "钩子必须写绝对路径,写不存在的路径会表现为「已启用但永远收不到通知」。");
-
-        string sourceArg = kind switch
+        // 注册表契约是“可执行文件路径”,各适配器再按自己的配置格式追加固定 source。
+        // GUI 不能提前拼 source:Cline/OpenCode 会把整串当成一个文件名,再追加一次参数。
+        // 停用完全不需要 Hook 文件;即使安装目录被手工删坏,用户也必须仍能关闭坏开关。
+        string hookExe = string.Empty;
+        if (enabled)
         {
-            NotificationProviderKind.ClaudeCode => "claudecode",
-            NotificationProviderKind.Codex => "codex",
-            NotificationProviderKind.Cline => "cline",
-            NotificationProviderKind.Qoder => "qoder",
-            NotificationProviderKind.OpenCode => "opencode",
-            _ => throw new NotSupportedException($"不支持的提供程序类型: {kind}"),
-        };
-        string hookCommand = $"{hookExe} {sourceArg}";
+            hookExe = _hookExecutableResolver()
+                ?? throw new FileNotFoundException(
+                    $"未找到 {HookExecutable.FileName}。请先构建 AiResume.Hook 项目;" +
+                    "钩子必须写绝对路径,写不存在的路径会表现为「已启用但永远收不到通知」。");
+        }
 
-        _notificationRegistry.SetEnabled(kind, enabled, hookCommand);
+        _notificationRegistry.SetEnabled(kind, enabled, hookExe);
 
         // 把开关记进配置。这条记录是重装后恢复通知源的**唯一依据**——
         // 卸载会把 ~/.claude 之类里的现状清空,清空之后就再没有东西能说出
@@ -402,14 +535,17 @@ public sealed class ControlPlaneBridge
             w.WindowSeconds,
             w.ResetAtUnix,
             w.ResetAfterSeconds,
-            w.DerivedWindowStart?.ToUnixTimeSeconds())).ToList();
+            w.DerivedWindowStart?.ToUnixTimeSeconds(),
+            w.CarriedForward)).ToList();
 
         return new QuotaPayload(
             snapshot.Provider,
             snapshot.CapturedAt.ToUnixTimeSeconds(),
             snapshot.HasData,
+            bucket?.Allowed ?? false,
             bucket?.LimitReached ?? false,
             snapshot.UnavailableReason,
+            _quota.StorageWarning,
             windows);
     }
 
@@ -620,14 +756,174 @@ public sealed class ControlPlaneBridge
     }
 
 
-    /// <summary>生成 cc-connect 配置。凭据由 <see cref="CutoverConfigCommand"/> 从 DPAPI 取,不经过本类。</summary>
-    private CutoverPayload GenerateCutoverConfig()
+    /// <summary>
+    /// 生成、验证并重启 cc-connect。凭据由 <see cref="CutoverConfigCommand"/> 从 DPAPI 取,
+    /// 不经过本类;整个操作用仓库外文件锁跨窗口串行化。
+    /// </summary>
+    private CutoverPayload GenerateAndRestartCutover()
     {
-        CutoverConfigCommand.GenerateResult r = CutoverConfigCommand.Generate(
-            CutoverConfigCommand.DefaultConfigPath, appId: null, appSecret: null);
+        if (Interlocked.CompareExchange(ref _cutoverInProgress, 1, 0) != 0)
+        {
+            return new CutoverPayload(
+                false, "已有一次 cc-connect 配置切换正在进行,请等待其完成。", 0, null,
+                _cutoverConfigPath, ConfigWritten: false, RestartVerified: false,
+                Agent: null, Pid: null, Phase: "busy");
+        }
 
-        // SanitizedToml 里的 app_secret 已是 [REDACTED],可以安全展示给用户复核。
-        return new CutoverPayload(r.Ok, r.Message, r.ProjectCount, r.SanitizedToml, r.OutPath);
+        bool configWritten = false;
+        int projectCount = 0;
+        string? sanitizedToml = null;
+        string outPath = _cutoverConfigPath;
+        string? expectedAgent = null;
+        string? candidatePath = null;
+
+        try
+        {
+            using CcConnectApplyLock applyLock = CcConnectApplyLock.Acquire(outPath);
+            string directory = Path.GetDirectoryName(Path.GetFullPath(outPath))!;
+            Directory.CreateDirectory(directory);
+            candidatePath = Path.Combine(directory, ".config.toml.ai-resume-candidate-" + Guid.NewGuid().ToString("N"));
+            byte[]? original = File.Exists(outPath) ? File.ReadAllBytes(outPath) : null;
+            byte[]? originalHash = original is null ? null : SHA256.HashData(original);
+            if (original is not null)
+            {
+                File.WriteAllBytes(candidatePath, original);
+            }
+
+            CutoverConfigCommand.GenerateResult r = _cutoverGenerate(candidatePath);
+            projectCount = r.ProjectCount;
+            sanitizedToml = r.SanitizedToml;
+
+            if (!r.Ok || string.IsNullOrWhiteSpace(r.OutPath))
+            {
+                return new CutoverPayload(
+                    false, r.Message, r.ProjectCount, r.SanitizedToml, outPath,
+                    ConfigWritten: false, RestartVerified: false, Agent: null, Pid: null, Phase: "generate");
+            }
+
+            string candidateToml = File.ReadAllText(candidatePath);
+            byte[] candidateHash = SHA256.HashData(File.ReadAllBytes(candidatePath));
+            expectedAgent = CcConnectConfigValidator
+                .ReadProjectAgentTriple(candidateToml, CutoverConfigCommand.ProjectName).Agent;
+            if (expectedAgent.Length == 0)
+            {
+                return new CutoverPayload(
+                    false, "候选配置无法读出 ai-resume 项目的 agent,生产配置未改动。",
+                    r.ProjectCount, r.SanitizedToml, outPath,
+                    ConfigWritten: false, RestartVerified: false, Agent: null, Pid: null, Phase: "validate");
+            }
+
+            CcConnectDaemonRestartResult restart = _daemonControllerFactory().ActivateAndVerify(
+                outPath,
+                candidatePath,
+                CutoverConfigCommand.ProjectName,
+                expectedAgent,
+                commitConfiguration: () =>
+                {
+                    EnsureProductionConfigUnchanged(outPath, originalHash);
+                    File.Move(candidatePath, outPath, overwrite: true);
+                    configWritten = true;
+                },
+                rollbackConfiguration: () =>
+                {
+                    EnsureProductionConfigMatches(outPath, candidateHash);
+                    if (original is null)
+                    {
+                        File.Delete(outPath);
+                    }
+                    else
+                    {
+                        WriteBytesAtomically(outPath, original);
+                    }
+                    configWritten = false;
+                });
+
+            // SanitizedToml 里的 app_secret 已是 [REDACTED],可以安全展示给用户复核。
+            return new CutoverPayload(
+                restart.Ok,
+                restart.Message,
+                r.ProjectCount,
+                r.SanitizedToml,
+                outPath,
+                ConfigWritten: restart.ConfigWritten,
+                RestartVerified: restart.Ok,
+                Agent: expectedAgent,
+                Pid: restart.CurrentPid,
+                Phase: restart.Phase);
+        }
+        catch (Exception ex)
+        {
+            return new CutoverPayload(
+                false, ex.Message, projectCount, sanitizedToml, outPath,
+                ConfigWritten: configWritten, RestartVerified: false, Agent: expectedAgent, Pid: null, Phase: "exception");
+        }
+        finally
+        {
+            if (!string.IsNullOrWhiteSpace(candidatePath) && File.Exists(candidatePath))
+            {
+                try { File.Delete(candidatePath); } catch (Exception) { }
+            }
+            Volatile.Write(ref _cutoverInProgress, 0);
+        }
+    }
+
+    private static void EnsureProductionConfigUnchanged(string path, byte[]? expectedHash)
+    {
+        if (expectedHash is null)
+        {
+            if (File.Exists(path))
+            {
+                throw new InvalidOperationException("候选校验期间生产 config.toml 被外部创建,拒绝覆盖。请重新生成。");
+            }
+
+            return;
+        }
+
+        if (!File.Exists(path))
+        {
+            throw new InvalidOperationException("候选校验期间生产 config.toml 被外部删除,拒绝提交。请重新生成。");
+        }
+
+        byte[] currentHash = SHA256.HashData(File.ReadAllBytes(path));
+        if (!CryptographicOperations.FixedTimeEquals(currentHash, expectedHash))
+        {
+            throw new InvalidOperationException("候选校验期间生产 config.toml 已被外部修改,拒绝覆盖。请重新生成。");
+        }
+    }
+
+    private static void EnsureProductionConfigMatches(string path, byte[] expectedHash)
+    {
+        if (!File.Exists(path))
+        {
+            throw new InvalidOperationException("准备回滚时生产 config.toml 已被外部删除,拒绝覆盖。请人工核对。");
+        }
+
+        byte[] currentHash = SHA256.HashData(File.ReadAllBytes(path));
+        if (!CryptographicOperations.FixedTimeEquals(currentHash, expectedHash))
+        {
+            throw new InvalidOperationException("准备回滚时生产 config.toml 已被外部修改,拒绝覆盖。请人工核对。");
+        }
+    }
+
+    private static void WriteBytesAtomically(string path, byte[] content)
+    {
+        string temp = path + ".rollback-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                stream.Write(content);
+                stream.Flush(flushToDisk: true);
+            }
+            File.Move(temp, path, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temp))
+            {
+                try { File.Delete(temp); } catch (Exception) { }
+            }
+        }
     }
 
     /// <summary>单消费者预检。只读,不停任何进程。</summary>
@@ -677,16 +973,8 @@ public sealed class ControlPlaneBridge
         // bad=红(需要动手修) / idle=灰(没验证过)。
         // **被限流不是故障** —— 拿红色标它,真出问题时的红就不值钱了。
         // 默认探测现在也做**带凭据的真实请求**(1.3 秒、0 token),
-        // 所以 DeepChecked 为真就给绿 —— 不再需要用户点一下才敢点亮。
-        // DeepChecked 为假只可能是"读不到配置"或"网络失败",那仍然是灰的。
-        static string CodexState(CodexProbeResult r, bool deep) => r.Readiness switch
-        {
-            CodexReadiness.Ok => r.DeepChecked ? "ok" : "idle",
-            CodexReadiness.Limited => "wait",
-            CodexReadiness.Auth or CodexReadiness.Unreachable => "bad",
-            _ => "idle",
-        };
-
+        // 所以 DeepChecked 为真才给绿 —— 不再需要用户点一下才敢点亮。
+        // 读不到配置、网络失败或推理未核实都会保持灰色。
         static string DeepSeekState(DeepSeekProbeResult r) => r.Readiness switch
         {
             ProviderReadiness.Ok => "ok",
@@ -715,7 +1003,7 @@ public sealed class ControlPlaneBridge
                 new
                 {
                     name = "Codex",
-                    state = CodexState(codex, deep),
+                    state = CodexProviderState(codex),
                     // 侧栏只有一行的宽度,长句必然被省略号截掉 ——
                     // 而被截掉的恰恰是结论那几个字(实测显示成"可用 · 凭据与推理已…")。
                     // 所以这里给**短标签**,完整那句放 detail,由前端挂到 title 上。
@@ -743,6 +1031,7 @@ public sealed class ControlPlaneBridge
         "http-429" or "limited" => "被限流",
         "server-error" => "服务端异常",
         "unverified" => "未验证",
+        "inference-unverified" => "未验推理",
         "no-cli" => "未安装",
         "timeout" => "探测超时",
         "unreachable" => "网络不可达",
@@ -751,6 +1040,14 @@ public sealed class ControlPlaneBridge
         "Insufficient" => "余额不足",
         "Unreachable" => "网络不可达",
         _ => string.IsNullOrWhiteSpace(summary) ? "未探测" : "未探测",
+    };
+
+    public static string CodexProviderState(CodexProbeResult result) => result.Readiness switch
+    {
+        CodexReadiness.Ok => result.DeepChecked ? "ok" : "idle",
+        CodexReadiness.Limited => "wait",
+        CodexReadiness.Auth or CodexReadiness.Unreachable => "bad",
+        _ => "idle",
     };
 
     private object GetAgent()
@@ -846,7 +1143,12 @@ public sealed class ControlPlaneBridge
         [property: JsonPropertyName("message")] string Message,
         [property: JsonPropertyName("projectCount")] int ProjectCount,
         [property: JsonPropertyName("sanitizedToml")] string? SanitizedToml,
-        [property: JsonPropertyName("outPath")] string? OutPath);
+        [property: JsonPropertyName("outPath")] string? OutPath,
+        [property: JsonPropertyName("configWritten")] bool ConfigWritten,
+        [property: JsonPropertyName("restartVerified")] bool RestartVerified,
+        [property: JsonPropertyName("agent")] string? Agent,
+        [property: JsonPropertyName("pid")] int? Pid,
+        [property: JsonPropertyName("phase")] string Phase);
 
     private sealed record PreflightPayload(
         [property: JsonPropertyName("verdict")] string Verdict,
@@ -895,8 +1197,10 @@ public sealed class ControlPlaneBridge
         [property: JsonPropertyName("provider")] string Provider,
         [property: JsonPropertyName("capturedAtUnix")] long CapturedAtUnix,
         [property: JsonPropertyName("hasData")] bool HasData,
+        [property: JsonPropertyName("allowed")] bool Allowed,
         [property: JsonPropertyName("limitReached")] bool LimitReached,
         [property: JsonPropertyName("unavailableReason")] string? UnavailableReason,
+        [property: JsonPropertyName("storageWarning")] string? StorageWarning,
         [property: JsonPropertyName("windows")] IReadOnlyList<QuotaWindow> Windows);
 
     private sealed record QuotaWindow(
@@ -907,7 +1211,8 @@ public sealed class ControlPlaneBridge
         [property: JsonPropertyName("windowSeconds")] int WindowSeconds,
         [property: JsonPropertyName("resetAtUnix")] long? ResetAtUnix,
         [property: JsonPropertyName("resetAfterSeconds")] int? ResetAfterSeconds,
-        [property: JsonPropertyName("windowStartUnix")] long? WindowStartUnix);
+        [property: JsonPropertyName("windowStartUnix")] long? WindowStartUnix,
+        [property: JsonPropertyName("carriedForward")] bool CarriedForward);
 
     private sealed record NotificationItem(
         [property: JsonPropertyName("kind")] string Kind,

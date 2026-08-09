@@ -1,6 +1,6 @@
-# Stage 11 收尾门禁
+# Stage 11 收尾门禁(历史)
 
-**状态(2026-08-07):运行时退役已完成。仓库内 16 个现役模块尚未删除,见 §5。**
+> 历史收尾记录。仓库内 v1 PowerShell + Node 运行时已在后续提交 `2584139` 删除，Stage 11 已完成;当前终态见 `docs/MIGRATION-PROGRESS.md`。
 
 ## 1. 运行时退役(2026-08-07 执行完毕)
 
@@ -72,7 +72,7 @@ cc-connect 的 `UsageReport`(它依赖 `creack/pty`,构建约束命中 Windows)�
 | 完成通知 | Claude Code Stop hook,**绝对路径** |
 | 管理台 | http://localhost:9820 |
 
-## 5. 尚未做的:删除仓库内 16 个现役模块
+## 5. 历史删除清单(后续已完成)
 
 `src/*.js` 11 个 + `src/*.ps1` 5 个:`authorization-policy` `channel-adapter`
 `completion-events` `completion-notify` `conversation-store` `feishu-agent`

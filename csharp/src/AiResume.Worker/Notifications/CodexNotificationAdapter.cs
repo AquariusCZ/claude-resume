@@ -22,8 +22,8 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
 
     /// <summary>单行 notify 数组匹配正则:捕获前缀、数组文本、行尾后缀。</summary>
     private static readonly Regex NotifyLineRegex = new(
-        @"^(?<prefix>[ \t]*notify[ \t]*=[ \t]*)(?<array>\[.*?\])(?<suffix>[ \t]*(?:#.*)?)$",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        @"^(?<prefix>[ \t]*(?:notify|""notify""|'notify')[ \t]*=[ \t]*)(?<array>\[.*?\])(?<suffix>[ \t]*(?:#.*)?)$",
+        RegexOptions.Compiled);
 
     /// <summary>
     /// notify 键的宽松匹配(不要求单行数组)。**定位必须用它,不能用 NotifyLineRegex**——
@@ -31,8 +31,8 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
     /// 使配置出现同名重复键、行为未定义。定位到之后再用 NotifyLineRegex 校验形态。
     /// </summary>
     private static readonly Regex NotifyKeyRegex = new(
-        @"^[ \t]*notify[ \t]*=",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        @"^[ \t]*(?:notify|""notify""|'notify')[ \t]*=",
+        RegexOptions.Compiled);
 
     /// <summary>
     /// 解析 notify 数组文本。TOML 基本字符串与 JSON 转义规则一致(反斜杠须写成 \\),
@@ -116,13 +116,13 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
 
             var arrayText = match.Groups["array"].Value;
             var existing = ParseNotifyArray(arrayText);
-            var marked = existing.FirstOrDefault(e => e.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase));
-            var isEnabled = marked is not null;
+            string? ownCommand = FindOwnCommand(existing, 0);
+            bool isEnabled = ownCommand is not null;
 
             return new NotificationProviderStatus(
                 Kind, DisplayName, IsInstalled: true, IsEnabled: isEnabled,
                 ConfigPath: _configPath, Detail: isEnabled ? "已安装 AI Resume 通知钩子" : "未安装 AI Resume 通知钩子",
-                HookCommand: marked is null ? null : ResolveOwnCommand(marked));
+                HookCommand: ownCommand);
         }
         catch (Exception ex)
         {
@@ -268,8 +268,8 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
         var arrayText = match.Groups["array"].Value;
         var existing = ParseNotifyArray(arrayText);
 
-        // 检查是否含标记
-        if (!existing.Any(e => e.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase)))
+        // 只有可验证的我方命令层才允许摘除;参数里碰巧出现文件名不构成所有权。
+        if (!HasOwnInChain(existing, 0))
         {
             return; // 不含我方标记,不做任何事
         }
@@ -326,32 +326,13 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
     /// </summary>
     private static string[] MergeNotify(string[] existing, string hookExe)
     {
-        // 情况 0:先剪掉链子里**指向不存在可执行文件**的层。
-        //
-        // 2026-08-08 实测事故:安装目录改名成含空格的 "AI Resume" 之后,
-        // 写进去的钩子路径在空格处断成 `…\AppData\Local\AI`。断掉的条目不含标记
-        // AiResume.Hook.exe,于是 IsOwnCommand 认不出它是我们自己写的,
-        // **每次启用都再套一层而不是替换** —— 套到第 8 层撞上 MaxChainDepth,
-        // 适配器从此拒绝处理,界面只报"notify 链深度超过上限"。
-        // 用户看到的是"Codex 通知打不开了",而根因在七层之外。
-        //
-        // 判据取"可执行文件不存在":这样的层永远不可能被执行,留着只会让链子长大。
-        // 剪枝放在最前面,后面所有分支拿到的都是干净的链。
-        existing = PruneDeadLinks(existing);
-
         // 情况 1:刷新已托管链
-        if (IsOwnCommand(existing) || HasOwnInChain(existing, 0))
+        if (HasOwnInChain(existing, 0))
         {
             return RefreshChain(existing, hookExe, 0);
         }
 
-        // 情况 2:已包含标记但不匹配结构 → 原样返回
-        if (existing.Any(e => e.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase)))
-        {
-            return existing;
-        }
-
-        // 情况 3:Codex Desktop wrapper 特判
+        // 情况 2:Codex Desktop wrapper 特判
         if (existing.Length > 0)
         {
             var firstExe = existing[0];
@@ -362,7 +343,7 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
             }
         }
 
-        // 情况 4:批处理拒绝
+        // 情况 3:批处理拒绝
         if (existing.Length > 0)
         {
             var firstExe = existing[0];
@@ -374,7 +355,8 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
             }
         }
 
-        // 其余情况:用我方命令包装 existing
+        // 其余情况:用我方命令包装 existing。即使用户参数文本中出现
+        // AiResume.Hook.exe 也只作为普通 previous 保留,不会被误删或误刷新。
         var previousJson = JsonSerializer.Serialize(existing);
         return new[] { hookExe, "codex", "--previous-notify", previousJson };
     }
@@ -409,15 +391,17 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
     public static string? ResolveOwnCommand(string? element, int depth = 0)
     {
         string s = element?.Trim() ?? string.Empty;
-        if (s.Length == 0 || !s.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase))
+        if (s.Length == 0)
         {
             return null;
         }
 
-        // 不是数组形状 = 已经是命令本身。
+        // 不是数组形状时也必须验证“首个 exe + codex 参数”的完整命令形状。
         if (!s.StartsWith('['))
         {
-            return s;
+            return HookCommand.IsManaged(s, MarkerFileName, "codex")
+                ? HookCommand.ExtractExecutable(s)
+                : null;
         }
 
         // MaxChainDepth 同源的保险:链子理论上可以套很深,但不该无限递归。
@@ -429,9 +413,7 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
         try
         {
             string[]? inner = JsonSerializer.Deserialize<string[]>(s);
-            string? next = inner?.FirstOrDefault(
-                e => e.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase));
-            return next is null ? null : ResolveOwnCommand(next, depth + 1);
+            return inner is null ? null : FindOwnCommand(inner, depth + 1);
         }
         catch (JsonException)
         {
@@ -448,71 +430,61 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
             throw new ArgumentException("hookCommand 不能为空", nameof(hookCommand));
         }
 
-        const string ext = ".exe";
-        int i = s.IndexOf(ext, StringComparison.OrdinalIgnoreCase);
-        if (i < 0)
-        {
-            // 没有 .exe(如 node 脚本形式):整串就是命令,交给上层原样处理。
-            return s;
-        }
-
-        return s[..(i + ext.Length)].Trim();
+        return HookCommand.ExtractExecutable(s) ?? s;
     }
 
     /// <summary>
-    /// 剪掉链子里**我方写坏了的**层,逐层往里找第一个该保留的命令。
-    ///
-    /// 判据故意收得很紧,必须**同时**满足两条:
-    /// <list type="number">
-    /// <item>可执行文件不存在(这一层永远不可能被执行);</item>
-    /// <item>形状是我方的包装 —— <c>[exe, "codex", "--previous-notify", json]</c>。</item>
-    /// </list>
-    /// 只看第 1 条是不行的:用户自己配的 notify 可能指向网络盘上、或暂时没装的程序,
-    /// **那是他的配置,不是我们的**,不能因为此刻找不到就替他删掉。
-    /// 加上第 2 条之后,被剪掉的只可能是我们自己写出来的坏条目。
-    ///
-    /// 用 <paramref name="fileExists"/> 注入是为了能测;生产传 null 走 File.Exists。
-    /// 整条链都是坏条目时返回空数组(调用方当作"没有既有 notify")。
+    /// 兼容旧测试/调用入口。没有不可伪造的所有权证据时,任何 notify 命令都必须保留。
+    /// 历史上 <c>["%LOCALAPPDATA%\\AI", "codex"]</c> 可能是旧版本写坏的路径,
+    /// 也可能是用户自己的离线命令;仅凭形状无法区分,因此不再自动删除。
     /// </summary>
     public static string[] PruneDeadLinks(string[] array, Func<string, bool>? fileExists = null)
     {
-        Func<string, bool> exists = fileExists ?? File.Exists;
+        _ = fileExists;
+        return (string[])array.Clone();
+    }
 
-        for (int depth = 0; depth < MaxChainDepth && array.Length > 0; depth++)
+    /// <summary>判断当前数组层是否为我方命令。</summary>
+    private static bool IsOwnCommand(string[] array)
+    {
+        return array.Length >= 2 &&
+               HookCommand.IsManaged($"\"{array[0]}\" {array[1]}", MarkerFileName, "codex");
+    }
+
+    private static string? FindOwnCommand(string[] array, int depth)
+    {
+        if (depth >= MaxChainDepth)
         {
-            string exe = array[0];
-            int i = Array.IndexOf(array, "--previous-notify");
+            return null;
+        }
 
-            // 不带路径分隔符的裸命令(PATH 上的 node、python 之类)判不了存在性,一律保留。
-            bool bare = !exe.Contains(Path.DirectorySeparatorChar) &&
-                        !exe.Contains(Path.AltDirectorySeparatorChar);
-            bool ourShape = i == 2 && array.Length > 3 &&
-                            string.Equals(array[1], "codex", StringComparison.OrdinalIgnoreCase);
+        if (IsOwnCommand(array))
+        {
+            return HookCommand.ExtractExecutable(array[0]);
+        }
 
-            if (bare || !ourShape || exists(exe))
+        for (int i = 0; i < array.Length - 1; i++)
+        {
+            if (!string.Equals(array[i], "--previous-notify", StringComparison.Ordinal))
             {
-                return array;
+                continue;
             }
 
-            // 确认是我方写坏的一层:把它包着的下一层提上来接着看。
             try
             {
-                array = JsonSerializer.Deserialize<string[]>(array[i + 1]) ?? Array.Empty<string>();
+                string[]? previous = JsonSerializer.Deserialize<string[]>(array[i + 1]);
+                string? own = previous is null ? null : FindOwnCommand(previous, depth + 1);
+                if (own is not null)
+                {
+                    return own;
+                }
             }
             catch (JsonException)
             {
-                // 内层解不开就停在这:不猜结构,交给上层按"没有既有 notify"处理。
-                return Array.Empty<string>();
             }
         }
 
-        return array;
-    }
-
-    /// <summary>判断数组是否为我方命令(含标记)。</summary>
-    private static bool IsOwnCommand(string[] array)
-    {
-        return array.Any(e => e.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase));
+        return null;
     }
 
     /// <summary>递归检查链中是否含我方命令。</summary>
@@ -560,7 +532,7 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
         }
 
         // 如果当前层是我方命令,更新 exe 路径
-        if (array.Length >= 2 && array[0].Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase))
+        if (IsOwnCommand(array))
         {
             var result = (string[])array.Clone();
             result[0] = hookExe;
@@ -575,7 +547,7 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
                 try
                 {
                     var previous = JsonSerializer.Deserialize<string[]>(array[i + 1]);
-                    if (previous != null)
+                    if (previous != null && HasOwnInChain(previous, depth + 1))
                     {
                         var refreshed = RefreshChain(previous, hookExe, depth + 1);
                         var result = (string[])array.Clone();
@@ -634,7 +606,7 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
     private static string[]? RemoveOwnLayer(string[] array)
     {
         // 如果当前层是我方命令
-        if (array.Length >= 2 && array[0].Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase))
+        if (IsOwnCommand(array))
         {
             // 查找 --previous-notify
             for (int i = 0; i < array.Length - 1; i++)
@@ -662,7 +634,7 @@ public sealed class CodexNotificationAdapter : INotificationAdapter
                 try
                 {
                     var previous = JsonSerializer.Deserialize<string[]>(array[i + 1]);
-                    if (previous != null && IsOwnCommand(previous))
+                    if (previous != null && HasOwnInChain(previous, 0))
                     {
                         var restored = RemoveOwnLayer(previous);
                         if (restored == null)

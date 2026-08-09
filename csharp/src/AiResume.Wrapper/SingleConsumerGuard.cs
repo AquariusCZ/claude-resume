@@ -54,8 +54,12 @@ public interface IRunningProcessLister
 /// </summary>
 public sealed class SingleConsumerGuard
 {
-    private const string LegacyAgentMarker = "feishu-agent.js";
+    private static readonly string[] LegacyAgentMarkers = { "feishu-agent.js", "feishu-launch.vbs" };
     private const string CcConnectName = "cc-connect";
+    private static readonly HashSet<string> LegacyHostNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "node", "wscript", "cscript", "cmd",
+    };
 
     private readonly IRunningProcessLister _lister;
     private readonly int _selfPid;
@@ -84,7 +88,9 @@ public sealed class SingleConsumerGuard
     /// <see cref="ConsumerGuardVerdict.Unverifiable"/>(fail-closed)。
     /// </summary>
     /// <param name="feishuPlatformConfigured">本次启动的配置是否声明了飞书平台。</param>
-    public ConsumerGuardResult Check(bool feishuPlatformConfigured)
+    public ConsumerGuardResult Check(
+        bool feishuPlatformConfigured,
+        IReadOnlySet<int>? allowedCcConnectPids = null)
     {
         // 不接飞书平台就不消费飞书事件,不可能与谁抢事件。
         // 这一步刻意在枚举进程之前:bridge-only 启动不该为一次无意义的核验付出代价。
@@ -135,16 +141,27 @@ public sealed class SingleConsumerGuard
             // 进程名统一取文件名并去掉 .exe:传进来的可能是全路径。
             string name = SafeFileName(proc.Name);
 
-            bool legacy = !string.IsNullOrEmpty(proc.CommandLine)
-                && proc.CommandLine.Contains(LegacyAgentMarker, StringComparison.OrdinalIgnoreCase);
+            if (LegacyHostNames.Contains(name) && string.IsNullOrWhiteSpace(proc.CommandLine))
+            {
+                return new ConsumerGuardResult(
+                    ConsumerGuardVerdict.Unverifiable,
+                    Array.Empty<ConflictingProcess>(),
+                    "存在无法读取命令行的脚本宿主进程,不能排除现役 feishu-agent.js 仍在消费同一飞书应用;拒绝启动。");
+            }
+
+            string? legacyMarker = LegacyAgentMarkers.FirstOrDefault(marker =>
+                !string.IsNullOrEmpty(proc.CommandLine) &&
+                proc.CommandLine.Contains(marker, StringComparison.OrdinalIgnoreCase));
+            bool legacy = legacyMarker is not null;
             bool otherCcConnect = string.Equals(name, CcConnectName, StringComparison.OrdinalIgnoreCase)
-                && proc.Pid != _selfPid;
+                && proc.Pid != _selfPid
+                && !(allowedCcConnectPids?.Contains(proc.Pid) ?? false);
 
             // Detail 只由**进程名与固定文案**拼成。
             // 命令行里可能带飞书 app_secret,一旦进入结果就会流进日志与界面。
             if (legacy)
             {
-                conflicts.Add(new ConflictingProcess(proc.Pid, "legacy-node-agent", name + "(命令行含 " + LegacyAgentMarker + ")"));
+                conflicts.Add(new ConflictingProcess(proc.Pid, "legacy-node-agent", name + "(命令行含 " + legacyMarker + ")"));
             }
             else if (otherCcConnect)
             {

@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.Text;
+using Tomlyn;
+using Tomlyn.Model;
 
 namespace AiResume.Wrapper;
 
@@ -124,7 +126,7 @@ public static class CcConnectConfigValidator
     ///
     /// 判据都取"确凿冲突"这一档,不猜:没写 agent_types、base_url 看不出方言的,一律不报。
     /// </summary>
-    public static IReadOnlyList<string> CheckAgentCoherence(string? toml)
+    public static IReadOnlyList<string> CheckAgentCoherence(string? toml, string projectName = "")
     {
         var problems = new List<string>();
         string text = toml ?? string.Empty;
@@ -137,7 +139,7 @@ public static class CcConnectConfigValidator
         // `provider = ""`,而它在文件里排在项目区之前 —— 取全文第一个会拿到空串,
         // 于是整段 provider 判断被静默跳过,一条都不报。
         // 判据自己出这种错,比不做检查更糟:它看起来在检查。
-        (string agent, string provider, string model) = ReadProjectAgentTriple(text);
+        (string agent, string provider, string model) = ReadProjectAgentTriple(text, projectName);
 
         if (agent.Length == 0)
         {
@@ -146,24 +148,32 @@ public static class CcConnectConfigValidator
 
         if (provider.Length > 0)
         {
-            (string? agentTypes, string? baseUrl) = ReadProviderBlock(text, provider);
-
-            if (agentTypes is { Length: > 0 } &&
-                !agentTypes.Contains(agent, StringComparison.OrdinalIgnoreCase))
+            CcConnectProviderDescriptor? descriptor;
+            try
             {
-                problems.Add(
-                    $"provider「{provider}」声明只支持 {agentTypes},而当前 agent 是「{agent}」——" +
-                    "这两个对不上,回复不会走这个 provider。");
+                descriptor = CcConnectProviderCatalog.Parse(text).Find(provider);
             }
-
-            // …/anthropic 是给 Claude Code 用的端点形状。
-            if (baseUrl is { Length: > 0 } &&
-                baseUrl.Contains("/anthropic", StringComparison.OrdinalIgnoreCase) &&
-                !agent.Equals("claudecode", StringComparison.OrdinalIgnoreCase))
+            catch (Exception)
+            {
+                return problems;
+            }
+            if (descriptor is null)
             {
                 problems.Add(
-                    $"provider「{provider}」的端点是 Anthropic 形状(…/anthropic)," +
-                    $"只有 agent=claudecode 说得通;当前是「{agent}」。");
+                    $"项目选择了 provider「{provider}」,但全局 [[providers]] 中找不到它。");
+            }
+            else if (!descriptor.SupportsAgent(agent))
+            {
+                string endpoint = descriptor.Endpoints.TryGetValue(agent, out string? overrideEndpoint) &&
+                    overrideEndpoint.Length > 0
+                    ? overrideEndpoint
+                    : descriptor.BaseUrl;
+                string reason = descriptor.AgentTypes.Count > 0 &&
+                    !descriptor.AgentTypes.Contains(agent, StringComparer.Ordinal)
+                    ? $"它声明只支持 {string.Join(", ", descriptor.AgentTypes)}"
+                    : $"它对 {agent} 的有效端点是 Anthropic 形状({endpoint})";
+                problems.Add(
+                    $"provider「{provider}」与当前 agent「{agent}」对不上:{reason}。");
             }
         }
 
@@ -173,7 +183,7 @@ public static class CcConnectConfigValidator
         {
             problems.Add(
                 $"当前模型是「{model}」——这是 Claude Code 的别名,而 agent 是「{agent}」。" +
-                "换 agent 不会重置模型,需要在聊天里再 /model switch 一次。");
+                "换 agent 不会重置模型;这是上一 agent 的残留选择,生成配置时应清除后再激活。");
         }
 
         return problems;
@@ -187,92 +197,48 @@ public static class CcConnectConfigValidator
     /// <c>provider</c> / <c>model</c> 是 cc-connect 自己写回项目区的顶格键。
     /// 取最后一次出现:同名键重复时,后写的才是当前值。
     /// </summary>
-    public static (string Agent, string Provider, string Model) ReadProjectAgentTriple(string toml)
+    public static (string Agent, string Provider, string Model) ReadProjectAgentTriple(
+        string toml,
+        string projectName = "")
     {
-        string agent = string.Empty, provider = string.Empty, model = string.Empty;
-        bool inProjects = false, inAgent = false, inPlatform = false;
-
-        foreach (string raw in (toml ?? string.Empty).Replace("\r\n", "\n").Split('\n'))
+        try
         {
-            string line = raw.Trim();
-
-            if (line.StartsWith('['))
+            TomlTable root = TomlSerializer.Deserialize<TomlTable>(toml ?? string.Empty)
+                ?? new TomlTable();
+            if (!root.TryGetValue("projects", out object? rawProjects) ||
+                rawProjects is not TomlTableArray projects)
             {
-                inProjects = line.StartsWith("[[projects]]", StringComparison.Ordinal) ||
-                             line.StartsWith("[projects.", StringComparison.Ordinal) ||
-                             line.StartsWith("[[projects.", StringComparison.Ordinal);
-                inAgent = line.StartsWith("[projects.agent]", StringComparison.Ordinal);
-                inPlatform = line.StartsWith("[[projects.platforms", StringComparison.Ordinal) ||
-                             line.StartsWith("[projects.platforms", StringComparison.Ordinal);
-                continue;
+                return (string.Empty, string.Empty, string.Empty);
             }
 
-            if (!inProjects || inPlatform || line.Length == 0 || line.StartsWith('#'))
+            TomlTable? selected = projects.OfType<TomlTable>()
+                .FirstOrDefault(project => projectName.Length == 0 ||
+                    ReadTableString(project, "name").Equals(projectName, StringComparison.Ordinal));
+            if (selected is null)
             {
-                continue;
+                return (string.Empty, string.Empty, string.Empty);
             }
 
-            if (inAgent && ReadFirstStringValue(line, "type") is { Length: > 0 } t)
-            {
-                agent = t;
-            }
+            TomlTable? agentTable = selected.TryGetValue("agent", out object? rawAgent) && rawAgent is TomlTable parsedAgent
+                ? parsedAgent
+                : null;
+            TomlTable? options = agentTable is not null &&
+                agentTable.TryGetValue("options", out object? rawOptions) && rawOptions is TomlTable parsedOptions
+                ? parsedOptions
+                : null;
+            string provider = options is null ? string.Empty : ReadTableString(options, "provider");
+            string model = options is null ? string.Empty : ReadTableString(options, "model");
 
-            if (ReadFirstStringValue(line, "provider") is { Length: > 0 } p)
-            {
-                provider = p;
-            }
-
-            if (ReadFirstStringValue(line, "model") is { Length: > 0 } m)
-            {
-                model = m;
-            }
+            return (agentTable is null ? string.Empty : ReadTableString(agentTable, "type"), provider, model);
         }
-
-        return (agent, provider, model);
+        catch (Exception)
+        {
+            return (string.Empty, string.Empty, string.Empty);
+        }
     }
 
-    /// <summary>读全局 <c>[[providers]]</c> 里指定名字那一块的 agent_types 与 base_url。</summary>
-    private static (string? AgentTypes, string? BaseUrl) ReadProviderBlock(string toml, string name)
-    {
-        string? agentTypes = null, baseUrl = null;
-        bool inBlock = false;
-
-        foreach (string raw in toml.Replace("\r\n", "\n").Split('\n'))
-        {
-            string line = raw.Trim();
-            if (line.StartsWith('['))
-            {
-                // 只认顶层 [[providers]];[[projects…]] 之类一律退出。
-                inBlock = line.StartsWith("[[providers]]", StringComparison.Ordinal);
-                continue;
-            }
-
-            if (!inBlock || line.Length == 0 || line.StartsWith('#'))
-            {
-                continue;
-            }
-
-            if (ReadFirstStringValue(line, "name") is { } n &&
-                !n.Equals(name, StringComparison.OrdinalIgnoreCase))
-            {
-                inBlock = false;   // 是别的 provider 的块
-                continue;
-            }
-
-            if (line.StartsWith("agent_types", StringComparison.OrdinalIgnoreCase))
-            {
-                int eq = line.IndexOf('=');
-                if (eq > 0)
-                {
-                    agentTypes = line[(eq + 1)..].Trim();
-                }
-            }
-
-            baseUrl ??= ReadFirstStringValue(line, "base_url");
-        }
-
-        return (agentTypes, baseUrl);
-    }
+    private static string ReadTableString(TomlTable table, string key) =>
+        table.TryGetValue(key, out object? value) && value is string text ? text : string.Empty;
 
     /// <summary>
     /// 校验磁盘上的配置。<paramref name="runner"/> 供测试注入(返回退出码与合并输出)。

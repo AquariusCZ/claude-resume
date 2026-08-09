@@ -1,237 +1,811 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
+using System.Diagnostics;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace AiResume.Hook;
 
 /// <summary>
-/// AiResume.Hook 处理器可执行文件。
-/// 由各 provider 的 hook 配置指向,从 stdin 读取事件负载(JSON),
-/// 经抑制判定、字段提取、稳定事件 ID 计算后,幂等写入事件队列。
-/// 绝不阻断宿主:任何异常均以 exit code 0 结束,stdout 保持干净。
+/// 各 AI 客户端完成钩子的统一入口。只做事件准入与落盘,不读取凭据、不联网。
 /// </summary>
 public static class Program
 {
-    /// <summary>
-    /// 抑制判定:stop_hook_active 为 true、AI_RESUME_INTERNAL_RUN=1、
-    /// stdin 为空或非法 JSON 时返回 true(不产出事件)。
-    /// </summary>
-    public static bool ShouldSuppress(string? stdinJson, IDictionary<string, string?> env)
+    private const int MaxRolloutScanDepth = 6;
+    private static readonly Regex CodexThreadIdRegex = new(
+        "^[0-9a-z][0-9a-z-]{0,99}$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly Regex CodexGeneratedDateRegex = new(
+        "^\\d{4}-\\d{2}-\\d{2}$", RegexOptions.CultureInvariant);
+
+    private sealed record NormalizedEvent(
+        string Source,
+        string? SessionId,
+        string? TurnId,
+        string? TaskId,
+        string Cwd,
+        string? TranscriptPath,
+        string? ExplicitEventId,
+        string? Timestamp,
+        string? LastAssistantMessage,
+        bool Smoke);
+
+    /// <summary>内部任务、递归 Stop、空负载或非法 JSON 一律不入队。</summary>
+    public static bool ShouldSuppress(string? payloadJson, IDictionary<string, string?> env)
     {
-        // 内部运行抑制(最高优先级)
-        if (env != null &&
-            env.TryGetValue("AI_RESUME_INTERNAL_RUN", out var internalRun) &&
+        if (env.TryGetValue("AI_RESUME_INTERNAL_RUN", out string? internalRun) &&
             string.Equals(internalRun, "1", StringComparison.Ordinal))
         {
             return true;
         }
 
-        // stdin 为空或非法 JSON 时抑制
-        if (string.IsNullOrWhiteSpace(stdinJson))
+        if (string.IsNullOrWhiteSpace(payloadJson))
         {
             return true;
         }
 
         try
         {
-            using var doc = JsonDocument.Parse(stdinJson);
-            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
-                doc.RootElement.TryGetProperty("stop_hook_active", out var stopHook) &&
-                stopHook.ValueKind == JsonValueKind.True)
-            {
-                return true;
-            }
+            using JsonDocument doc = JsonDocument.Parse(payloadJson);
+            return doc.RootElement.ValueKind != JsonValueKind.Object ||
+                   (doc.RootElement.TryGetProperty("stop_hook_active", out JsonElement active) &&
+                    active.ValueKind == JsonValueKind.True);
         }
         catch (JsonException)
         {
             return true;
         }
+    }
+
+    /// <summary>
+    /// 解析上游负载。Codex 官方把 JSON 作为 notify 命令最后一个参数传入;
+    /// 其余客户端把 JSON 放在 stdin。为兼容包装器,stdin 无效时也会从参数末尾回退。
+    /// </summary>
+    public static string? ResolvePayload(string source, IReadOnlyList<string> args, string? stdinJson)
+    {
+        if (!string.Equals(source, "codex", StringComparison.OrdinalIgnoreCase) && IsJsonObject(stdinJson))
+        {
+            return stdinJson;
+        }
+
+        for (int i = args.Count - 1; i >= 0; i--)
+        {
+            if (IsJsonObject(args[i]))
+            {
+                return args[i];
+            }
+        }
+
+        return IsJsonObject(stdinJson) ? stdinJson : null;
+    }
+
+    /// <summary>保留既有测试/调用方使用的稳定 ID 入口。</summary>
+    public static string ComputeEventId(string source, string? sessionId, string? cwd, string? transcriptPath)
+        => ComputeEventId(source, sessionId, null, null, cwd, transcriptPath, null, null, null);
+
+    /// <summary>规范化并原子写入事件。返回 false 表示被抑制、被准入拒绝或已存在。</summary>
+    public static bool TryWriteEvent(
+        string eventsDirectory,
+        string source,
+        string? payloadJson,
+        IDictionary<string, string?> env,
+        out string eventId)
+        => TryWriteEvent(eventsDirectory, source, payloadJson, env, out eventId, out _);
+
+    /// <summary>同上,额外返回稳定的拒绝原因,供测试与诊断使用。</summary>
+    public static bool TryWriteEvent(
+        string eventsDirectory,
+        string source,
+        string? payloadJson,
+        IDictionary<string, string?> env,
+        out string eventId,
+        out string reason)
+    {
+        eventId = string.Empty;
+        reason = "suppressed";
+        string normalizedSource = NormalizeSource(source);
+
+        if (ShouldSuppress(payloadJson, env))
+        {
+            return false;
+        }
+
+        using JsonDocument doc = JsonDocument.Parse(payloadJson!);
+        if (!TryNormalize(normalizedSource, doc.RootElement, env, out NormalizedEvent? item, out reason) || item is null)
+        {
+            return false;
+        }
+
+        if (string.Equals(item.Source, "codex", StringComparison.Ordinal) &&
+            !AdmitCodex(item, env, out reason))
+        {
+            return false;
+        }
+
+        eventId = ComputeEventId(
+            item.Source, item.SessionId, item.TurnId, item.TaskId, item.Cwd,
+            item.TranscriptPath, item.ExplicitEventId, item.Timestamp, item.LastAssistantMessage);
+        string targetPath = Path.Combine(eventsDirectory, eventId + ".json");
+        if (File.Exists(targetPath))
+        {
+            reason = "duplicate";
+            return false;
+        }
+
+        var eventPayload = new Dictionary<string, object?>
+        {
+            ["version"] = 1,
+            ["eventId"] = eventId,
+            ["source"] = item.Source,
+            ["sessionId"] = item.SessionId,
+            ["turnId"] = item.TurnId,
+            ["taskId"] = item.TaskId,
+            ["cwd"] = item.Cwd,
+            ["transcriptPath"] = item.TranscriptPath,
+            ["smoke"] = item.Smoke,
+            ["atUtc"] = DateTimeOffset.UtcNow.ToString("o", CultureInfo.InvariantCulture),
+        };
+
+        try
+        {
+            Directory.CreateDirectory(eventsDirectory);
+            string tempPath = Path.Combine(eventsDirectory, eventId + ".tmp-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                string json = JsonSerializer.Serialize(eventPayload, new JsonSerializerOptions { WriteIndented = true });
+                using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
+                {
+                    writer.Write(json);
+                    writer.Flush();
+                    stream.Flush(true);
+                }
+
+                File.Move(tempPath, targetPath, overwrite: false);
+                reason = "written";
+                return true;
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(tempPath))
+                    {
+                        File.Delete(tempPath);
+                    }
+                }
+                catch (IOException)
+                {
+                }
+            }
+        }
+        catch (IOException)
+        {
+            reason = File.Exists(targetPath) ? "duplicate" : "write_failed";
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            reason = "write_denied";
+            return false;
+        }
+    }
+
+    /// <summary>进程入口。任何异常都返回 0,不阻断宿主客户端。</summary>
+    public static int Main(string[] args)
+    {
+        try
+        {
+            string source = NormalizeSource(args.Length > 0 ? args[0] : string.Empty);
+            string[] sourceArgs = args.Skip(1).ToArray();
+            // Codex 官方把 JSON 作为最后一个 argv。若先无条件 ReadToEnd(stdin),
+            // 宿主继承了未关闭的控制台输入时会永久等待 EOF,完成通知进程也就不退出。
+            // 只有 argv 没有可用 JSON 时才做兼容性 stdin 回退。
+            string? stdinJson = string.Equals(source, "codex", StringComparison.Ordinal) &&
+                                sourceArgs.Any(IsJsonObject)
+                ? null
+                : Console.In.ReadToEnd();
+            string? payload = ResolvePayload(source, sourceArgs, stdinJson);
+            Dictionary<string, string?> env = SnapshotEnvironment();
+
+            string eventsDirectory = Path.Combine(AiResume.Worker.ShadowPaths.Root, "completion-events");
+            TryWriteEvent(eventsDirectory, source, payload, env, out _, out _);
+
+            if (string.Equals(source, "codex", StringComparison.Ordinal))
+            {
+                ForwardPreviousNotify(sourceArgs, payload);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"AiResume.Hook error: {ex.Message}");
+        }
+
+        return 0;
+    }
+
+    /// <summary>把 Codex 既有 notify 链继续向后转发;失败不影响本次 AI Resume 入队。</summary>
+    public static bool ForwardPreviousNotify(
+        IReadOnlyList<string> args,
+        string? rawPayload,
+        int timeoutMilliseconds = 5000)
+    {
+        int marker = -1;
+        for (int i = 0; i < args.Count; i++)
+        {
+            if (string.Equals(args[i], "--previous-notify", StringComparison.Ordinal))
+            {
+                marker = i;
+                break;
+            }
+        }
+
+        if (marker < 0 || marker + 1 >= args.Count)
+        {
+            return false;
+        }
+
+        string[]? command;
+        try
+        {
+            command = JsonSerializer.Deserialize<string[]>(args[marker + 1]);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+
+        if (command is null || command.Length == 0 ||
+            command[0].EndsWith(".cmd", StringComparison.OrdinalIgnoreCase) ||
+            command[0].EndsWith(".bat", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        try
+        {
+            var psi = new ProcessStartInfo(command[0])
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            foreach (string arg in command.Skip(1))
+            {
+                psi.ArgumentList.Add(arg);
+            }
+            if (!string.IsNullOrWhiteSpace(rawPayload))
+            {
+                psi.ArgumentList.Add(rawPayload);
+            }
+
+            using Process? process = Process.Start(psi);
+            if (process is null)
+            {
+                return false;
+            }
+
+            Task<string> stdout = process.StandardOutput.ReadToEndAsync();
+            Task<string> stderr = process.StandardError.ReadToEndAsync();
+            bool exited = process.WaitForExit(timeoutMilliseconds);
+            if (!exited)
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                    process.WaitForExit(1000);
+                }
+                catch (Exception)
+                {
+                }
+            }
+            Task.WaitAll([stdout, stderr], 1000);
+            return exited;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryNormalize(
+        string source,
+        JsonElement root,
+        IDictionary<string, string?> env,
+        out NormalizedEvent? item,
+        out string reason)
+    {
+        item = null;
+        reason = "source_unsupported";
+        if (source is not ("codex" or "claudecode" or "cline" or "qoder" or "opencode"))
+        {
+            return false;
+        }
+
+        string? eventName = GetString(root, "hook_event_name") ?? GetString(root, "hookEventName");
+        if (source == "codex")
+        {
+            eventName = GetString(root, "type");
+            if (!string.Equals(eventName, "agent-turn-complete", StringComparison.Ordinal))
+            {
+                reason = "codex_event_not_complete";
+                return false;
+            }
+        }
+        else if ((source == "claudecode" || source == "qoder") &&
+                 !string.Equals(eventName, "Stop", StringComparison.Ordinal))
+        {
+            reason = "stop_event_mismatch";
+            return false;
+        }
+        else if (source == "cline" && eventName is not null &&
+                 !string.Equals(eventName, "TaskComplete", StringComparison.Ordinal))
+        {
+            reason = "cline_event_mismatch";
+            return false;
+        }
+        else if (source == "opencode" &&
+                 !string.Equals(eventName, "session.idle", StringComparison.Ordinal))
+        {
+            reason = "opencode_event_mismatch";
+            return false;
+        }
+
+        string? sessionId = GetFirstString(root, "thread-id", "thread_id", "threadId", "session_id", "sessionId");
+        string? turnId = GetFirstString(root, "turn-id", "turn_id", "turnId");
+        string? taskId = GetFirstString(root, "task_id", "taskId");
+        string? cwd = GetFirstString(root, "cwd", "working_directory", "workingDirectory") ??
+                      GetFirstArrayString(root, "workspaceRoots", "workspace_roots");
+        string? transcriptPath = GetFirstString(root, "transcript_path", "transcriptPath");
+
+        // Qoder 的环境变量是该客户端专属补充字段。宿主进程可能长期保留这些变量,
+        // 不能让它们替 Claude/Cline/OpenCode 的缺失字段“补出”一个伪事件。
+        if (source == "qoder" && string.IsNullOrWhiteSpace(sessionId))
+        {
+            env.TryGetValue("QODER_SESSION_ID", out sessionId);
+        }
+        if (source == "qoder" && string.IsNullOrWhiteSpace(cwd))
+        {
+            env.TryGetValue("QODER_CWD", out cwd);
+        }
+        if (source == "qoder" && string.IsNullOrWhiteSpace(transcriptPath))
+        {
+            env.TryGetValue("QODER_TRANSCRIPT_PATH", out transcriptPath);
+        }
+
+        if (string.IsNullOrWhiteSpace(cwd))
+        {
+            reason = "workspace_missing";
+            return false;
+        }
+
+        if (!Path.IsPathFullyQualified(cwd))
+        {
+            reason = "workspace_not_absolute";
+            return false;
+        }
+
+        if (source == "codex" && string.IsNullOrWhiteSpace(sessionId))
+        {
+            reason = "thread_id_missing";
+            return false;
+        }
+        if (source == "codex" && string.IsNullOrWhiteSpace(turnId))
+        {
+            reason = "turn_id_missing";
+            return false;
+        }
+
+        bool smoke = root.TryGetProperty("smoke", out JsonElement smokeElement) &&
+                     smokeElement.ValueKind == JsonValueKind.True;
+        item = new NormalizedEvent(
+            source,
+            NullIfBlank(sessionId),
+            NullIfBlank(turnId),
+            NullIfBlank(taskId),
+            cwd,
+            NullIfBlank(transcriptPath),
+            GetFirstString(root, "event_id", "eventId"),
+            GetFirstString(root, "timestamp", "created_at", "createdAt"),
+            GetFirstString(root, "last_assistant_message", "lastAssistantMessage"),
+            smoke);
+        reason = "normalized";
+        return true;
+    }
+
+    private static bool AdmitCodex(
+        NormalizedEvent item,
+        IDictionary<string, string?> env,
+        out string reason)
+    {
+        if (!Path.IsPathFullyQualified(item.Cwd))
+        {
+            reason = "workspace_not_absolute";
+            return false;
+        }
+
+        if (IsCodexProjectlessRoot(item.Cwd, env))
+        {
+            reason = "projectless_workspace";
+            return false;
+        }
+
+        if (!TryFindCodexRollout(item.SessionId!, env, out string? rollout, out reason))
+        {
+            return false;
+        }
+
+        if (!TryReadSessionMeta(
+                rollout!, out string? id, out string? parentId, out string? threadSource,
+                out bool sourceSubagent, out bool sourceInternal))
+        {
+            reason = "rollout_meta_missing";
+            return false;
+        }
+
+        if (!string.Equals(id, item.SessionId, StringComparison.OrdinalIgnoreCase))
+        {
+            reason = "rollout_meta_mismatch";
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(parentId) ||
+            string.Equals(threadSource, "subagent", StringComparison.OrdinalIgnoreCase) ||
+            sourceSubagent)
+        {
+            reason = "subagent_thread";
+            return false;
+        }
+
+        if (sourceInternal || IsInternalThreadSource(threadSource))
+        {
+            reason = "internal_thread";
+            return false;
+        }
+
+        reason = "ok";
+        return true;
+    }
+
+    private static bool TryFindCodexRollout(
+        string threadId,
+        IDictionary<string, string?> env,
+        out string? file,
+        out string reason)
+    {
+        file = null;
+        if (!CodexThreadIdRegex.IsMatch(threadId))
+        {
+            reason = "thread_id_invalid";
+            return false;
+        }
+
+        string codexHome = GetEnv(env, "AI_RESUME_CODEX_HOME") ?? GetEnv(env, "CODEX_HOME") ??
+                           Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
+        string suffix = "-" + threadId + ".jsonl";
+        var roots = new List<(string Path, int Depth)>();
+        if (TryCodexThreadDate(threadId, out string[]? dateParts))
+        {
+            roots.Add((Path.Combine([codexHome, "sessions", .. dateParts!]), 1));
+        }
+        roots.Add((Path.Combine(codexHome, "sessions"), MaxRolloutScanDepth));
+        roots.Add((Path.Combine(codexHome, "archived_sessions"), MaxRolloutScanDepth));
+
+        bool scanFailed = false;
+        foreach ((string root, int depth) in roots)
+        {
+            if (TryFindFile(root, suffix, depth, out file, out bool failed))
+            {
+                reason = "ok";
+                return true;
+            }
+            scanFailed |= failed;
+        }
+
+        reason = scanFailed ? "rollout_scan_error" : "rollout_missing";
+        return false;
+    }
+
+    private static bool TryFindFile(
+        string root,
+        string suffix,
+        int maxDepth,
+        out string? file,
+        out bool scanFailed)
+    {
+        file = null;
+        scanFailed = false;
+        var stack = new Stack<(string Path, int Depth)>();
+        stack.Push((root, 0));
+
+        while (stack.Count > 0)
+        {
+            (string current, int depth) = stack.Pop();
+            IEnumerable<string> entries;
+            try
+            {
+                entries = Directory.EnumerateFileSystemEntries(current).ToArray();
+            }
+            catch (DirectoryNotFoundException)
+            {
+                continue;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                scanFailed = true;
+                continue;
+            }
+
+            foreach (string entry in entries)
+            {
+                try
+                {
+                    FileAttributes attributes = File.GetAttributes(entry);
+                    if ((attributes & FileAttributes.Directory) == 0)
+                    {
+                        if (entry.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                        {
+                            file = entry;
+                            return true;
+                        }
+                    }
+                    else if (depth < maxDepth && (attributes & FileAttributes.ReparsePoint) == 0)
+                    {
+                        stack.Push((entry, depth + 1));
+                    }
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    scanFailed = true;
+                }
+            }
+        }
 
         return false;
     }
 
-    /// <summary>
-    /// 计算稳定事件 ID:对 source、sessionId、cwd、transcriptPath 最后写入时间
-    /// 四项用竖线连接后取 SHA256 前 16 位十六进制。
-    /// transcript 文件不存在时该分量记为空串。
-    /// </summary>
-    public static string ComputeEventId(string source, string? sessionId, string? cwd, string? transcriptPath)
+    private static bool TryReadSessionMeta(
+        string file,
+        out string? id,
+        out string? parentId,
+        out string? threadSource,
+        out bool sourceSubagent,
+        out bool sourceInternal)
+    {
+        id = parentId = threadSource = null;
+        sourceSubagent = sourceInternal = false;
+        try
+        {
+            using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, leaveOpen: true);
+            while (stream.Position <= 256 * 1024 && reader.ReadLine() is { } line)
+            {
+                if (!IsJsonObject(line))
+                {
+                    continue;
+                }
+
+                using JsonDocument doc = JsonDocument.Parse(line);
+                JsonElement root = doc.RootElement;
+                if (!string.Equals(GetString(root, "type"), "session_meta", StringComparison.Ordinal) ||
+                    !root.TryGetProperty("payload", out JsonElement payload) ||
+                    payload.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                id = GetString(payload, "id") ?? GetString(payload, "session_id");
+                parentId = GetString(payload, "parent_thread_id");
+                threadSource = GetString(payload, "thread_source");
+                if (payload.TryGetProperty("source", out JsonElement source) &&
+                    source.ValueKind == JsonValueKind.Object)
+                {
+                    sourceSubagent = source.TryGetProperty("subagent", out _);
+                    sourceInternal = source.TryGetProperty("internal", out _);
+                }
+                return true;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+        }
+
+        return false;
+    }
+
+    private static bool IsInternalThreadSource(string? threadSource)
+    {
+        string value = threadSource?.Trim() ?? string.Empty;
+        return string.Equals(value, "internal", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "memory_consolidation", StringComparison.OrdinalIgnoreCase) ||
+               value.StartsWith("memory_", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsCodexProjectlessRoot(string cwd, IDictionary<string, string?> env)
+    {
+        string documentsRoot = GetEnv(env, "AI_RESUME_CODEX_DOCUMENTS_ROOT") ??
+                               Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Codex");
+        string resolved;
+        string relative;
+        try
+        {
+            resolved = Path.GetFullPath(cwd);
+            relative = Path.GetRelativePath(Path.GetFullPath(documentsRoot), resolved);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+
+        if (string.IsNullOrEmpty(relative) || Path.IsPathFullyQualified(relative) ||
+            relative == ".." || relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        string[] parts = relative.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
+        return parts.Length >= 2 && CodexGeneratedDateRegex.IsMatch(parts[0]) &&
+               !HasGitBoundary(resolved, documentsRoot);
+    }
+
+    private static bool HasGitBoundary(string start, string stop)
+    {
+        string current = Path.GetFullPath(start).TrimEnd(Path.DirectorySeparatorChar);
+        string boundary = Path.GetFullPath(stop).TrimEnd(Path.DirectorySeparatorChar);
+        while (!string.IsNullOrEmpty(current))
+        {
+            if (Directory.Exists(Path.Combine(current, ".git")) || File.Exists(Path.Combine(current, ".git")))
+            {
+                return true;
+            }
+            if (string.Equals(current, boundary, StringComparison.OrdinalIgnoreCase))
+            {
+                break;
+            }
+            string? parent = Directory.GetParent(current)?.FullName;
+            if (parent is null || !parent.StartsWith(boundary, StringComparison.OrdinalIgnoreCase))
+            {
+                break;
+            }
+            current = parent;
+        }
+        return false;
+    }
+
+    private static bool TryCodexThreadDate(string threadId, out string[]? parts)
+    {
+        parts = null;
+        string hex = threadId.Replace("-", string.Empty, StringComparison.Ordinal);
+        if (hex.Length < 12 || !long.TryParse(hex[..12], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out long ms))
+        {
+            return false;
+        }
+
+        try
+        {
+            DateTimeOffset date = DateTimeOffset.FromUnixTimeMilliseconds(ms);
+            if (date.Year is < 2020 or > 2200)
+            {
+                return false;
+            }
+            parts = [date.Year.ToString("0000", CultureInfo.InvariantCulture),
+                     date.Month.ToString("00", CultureInfo.InvariantCulture),
+                     date.Day.ToString("00", CultureInfo.InvariantCulture)];
+            return true;
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return false;
+        }
+    }
+
+    private static string ComputeEventId(
+        string source,
+        string? sessionId,
+        string? turnId,
+        string? taskId,
+        string? cwd,
+        string? transcriptPath,
+        string? explicitEventId,
+        string? timestamp,
+        string? lastAssistantMessage)
     {
         string transcriptTime = string.Empty;
         if (!string.IsNullOrWhiteSpace(transcriptPath) && File.Exists(transcriptPath))
         {
             try
             {
-                transcriptTime = File.GetLastWriteTimeUtc(transcriptPath)
-                    .ToString("o", System.Globalization.CultureInfo.InvariantCulture);
+                transcriptTime = File.GetLastWriteTimeUtc(transcriptPath).ToString("o", CultureInfo.InvariantCulture);
             }
-            catch (IOException)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                // 文件可能被占用或已删除,记为空串
-            }
-            catch (UnauthorizedAccessException)
-            {
-                // 无权限访问,记为空串
             }
         }
 
-        string raw = string.Join("|", source ?? string.Empty, sessionId ?? string.Empty, cwd ?? string.Empty, transcriptTime);
+        string raw = string.Join("|", source, sessionId, turnId, taskId, cwd, transcriptTime,
+            explicitEventId, timestamp, lastAssistantMessage);
         byte[] hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(raw));
-        var sb = new StringBuilder(16);
-        for (int i = 0; i < 8; i++)
-        {
-            sb.Append(hashBytes[i].ToString("x2"));
-        }
-        return sb.ToString();
+        return Convert.ToHexString(hashBytes.AsSpan(0, 8)).ToLowerInvariant();
     }
 
-    /// <summary>
-    /// 尝试写入事件文件。先做抑制判定;被抑制返回 false。
-    /// 提取字段、计算事件 ID;同 ID 文件已存在则返回 false(幂等)。
-    /// 否则以临时文件 + 原子替换方式写入。
-    /// </summary>
-    public static bool TryWriteEvent(string eventsDirectory, string source, string? stdinJson,
-                                     IDictionary<string, string?> env, out string eventId)
-    {
-        eventId = string.Empty;
+    private static string NormalizeSource(string source)
+        => source.Trim().ToLowerInvariant() switch
+        {
+            "claude" or "claude-code" or "claudecode" => "claudecode",
+            "codex" => "codex",
+            "cline" => "cline",
+            "qoder" => "qoder",
+            "opencode" => "opencode",
+            _ => source.Trim().ToLowerInvariant(),
+        };
 
-        // 抑制判定
-        if (ShouldSuppress(stdinJson, env))
+    private static Dictionary<string, string?> SnapshotEnvironment()
+    {
+        var env = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
+        {
+            env[entry.Key?.ToString() ?? string.Empty] = entry.Value?.ToString();
+        }
+        return env;
+    }
+
+    private static string? GetEnv(IDictionary<string, string?> env, string name)
+        => env.TryGetValue(name, out string? value) && !string.IsNullOrWhiteSpace(value) ? value : null;
+
+    private static bool IsJsonObject(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
         {
             return false;
         }
-
-        // 提取字段
-        string? sessionId = null;
-        string? cwd = null;
-        string? transcriptPath = null;
-
         try
         {
-            using var doc = JsonDocument.Parse(stdinJson!);
-            var root = doc.RootElement;
-            if (root.ValueKind == JsonValueKind.Object)
-            {
-                sessionId = GetStringProperty(root, "session_id") ?? GetStringProperty(root, "sessionId");
-                cwd = GetStringProperty(root, "cwd");
-                transcriptPath = GetStringProperty(root, "transcript_path") ?? GetStringProperty(root, "transcriptPath");
-            }
+            using JsonDocument doc = JsonDocument.Parse(value);
+            return doc.RootElement.ValueKind == JsonValueKind.Object;
         }
         catch (JsonException)
         {
-            // 已由 ShouldSuppress 处理,此处不会到达
-        }
-
-        // 环境变量回退
-        if (string.IsNullOrEmpty(sessionId) && env != null)
-        {
-            env.TryGetValue("QODER_SESSION_ID", out sessionId);
-        }
-        if (string.IsNullOrEmpty(cwd) && env != null)
-        {
-            env.TryGetValue("QODER_CWD", out cwd);
-        }
-
-        // 计算事件 ID
-        eventId = ComputeEventId(source, sessionId, cwd, transcriptPath);
-        if (string.IsNullOrEmpty(eventId))
-        {
-            return false;
-        }
-
-        // 目标文件路径
-        string targetPath = Path.Combine(eventsDirectory, eventId + ".json");
-
-        // 幂等:同 ID 已存在则不重写
-        if (File.Exists(targetPath))
-        {
-            return false;
-        }
-
-        // 构造事件对象
-        var eventPayload = new Dictionary<string, object?>
-        {
-            ["eventId"] = eventId,
-            ["source"] = source,
-            ["sessionId"] = sessionId,
-            ["cwd"] = cwd,
-            ["transcriptPath"] = transcriptPath,
-            ["atUtc"] = DateTime.UtcNow.ToString("o", System.Globalization.CultureInfo.InvariantCulture)
-        };
-
-        try
-        {
-            // 确保目录存在
-            Directory.CreateDirectory(eventsDirectory);
-
-            // 临时文件 + 原子替换
-            string tempPath = Path.Combine(eventsDirectory, eventId + ".tmp" + Guid.NewGuid().ToString("N"));
-            string json = JsonSerializer.Serialize(eventPayload, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(tempPath, json, new UTF8Encoding(false));
-            File.Move(tempPath, targetPath, overwrite: false);
-            return true;
-        }
-        catch (IOException)
-        {
-            // 并发写入时目标可能已存在,视为幂等成功
-            return File.Exists(targetPath);
-        }
-        catch (UnauthorizedAccessException)
-        {
             return false;
         }
     }
 
-    /// <summary>
-    /// 入口:读取 stdin 与环境变量,调用核心逻辑。
-    /// 任何异常均以 exit code 0 结束,绝不阻断宿主;stdout 全程无输出。
-    /// </summary>
-    public static int Main(string[] args)
+    private static string? GetFirstString(JsonElement root, params string[] names)
     {
-        try
+        foreach (string name in names)
         {
-            // 读取 source(缺失用 unknown)
-            string source = args.Length > 0 ? args[0] : "unknown";
-
-            // 读取 stdin
-            string? stdinJson = Console.In.ReadToEnd();
-
-            // 环境变量快照
-            var env = new Dictionary<string, string?>();
-            foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
+            string? value = GetString(root, name);
+            if (!string.IsNullOrWhiteSpace(value))
             {
-                env[entry.Key?.ToString() ?? string.Empty] = entry.Value?.ToString();
+                return value;
             }
-
-            // 事件目录
-            string eventsDirectory = Path.Combine(AiResume.Worker.ShadowPaths.Root, "completion-events");
-
-            // 写入事件
-            TryWriteEvent(eventsDirectory, source, stdinJson, env, out _);
-
-            return 0;
-        }
-        catch (Exception ex)
-        {
-            // 诊断信息只写 stderr,绝不写 stdout
-            Console.Error.WriteLine($"AiResume.Hook error: {ex.Message}");
-            return 0;
-        }
-    }
-
-    /// <summary>
-    /// 从 JSON 对象中安全读取字符串属性,不存在或类型不符时返回 null。
-    /// </summary>
-    private static string? GetStringProperty(JsonElement root, string propertyName)
-    {
-        if (root.TryGetProperty(propertyName, out var element) &&
-            element.ValueKind == JsonValueKind.String)
-        {
-            return element.GetString();
         }
         return null;
     }
+
+    private static string? GetFirstArrayString(JsonElement root, params string[] names)
+    {
+        foreach (string name in names)
+        {
+            if (!root.TryGetProperty(name, out JsonElement array) || array.ValueKind != JsonValueKind.Array)
+            {
+                continue;
+            }
+            foreach (JsonElement item in array.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(item.GetString()))
+                {
+                    return item.GetString();
+                }
+            }
+        }
+        return null;
+    }
+
+    private static string? GetString(JsonElement root, string propertyName)
+        => root.TryGetProperty(propertyName, out JsonElement element) && element.ValueKind == JsonValueKind.String
+            ? element.GetString()
+            : null;
+
+    private static string? NullIfBlank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
 }

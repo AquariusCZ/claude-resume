@@ -1,4 +1,6 @@
 using AiResume.Wrapper;
+using Tomlyn;
+using Tomlyn.Model;
 using Xunit;
 
 namespace AiResume.Tests;
@@ -227,6 +229,50 @@ public sealed class CcConnectConfigPreserveTests : IDisposable
         Assert.Contains("[[projects.platforms]]", result, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void 合法尾注释和引号式项目表头不会丢失用户资产()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [["projects"]] # user project
+            "name" = "pilot"
+            custom_project = "keep-project"
+
+            ["projects"."agent"] # user agent
+            "type" = "claudecode"
+            custom_agent = "keep-agent"
+
+            ["projects"."agent"."options"] # user options
+            "mode" = "default"
+            "work_dir" = "C:\\old"
+            custom_option = "keep-option"
+
+            [["projects"."platforms"]] # user platform
+            "type" = "weixin"
+            ["projects"."platforms"."options"] # credential-bearing options
+            token = "keep-weixin-token"
+
+              [log]
+              level = "debug"
+            """);
+
+        CcConnectConfigGenerator.Write(path, SampleConfig());
+        string result = File.ReadAllText(path);
+        TomlTable root = TomlSerializer.Deserialize<TomlTable>(result)!;
+        TomlTable project = Assert.IsType<TomlTable>(Assert.IsType<TomlTableArray>(root["projects"])[0]);
+        TomlTable agent = Assert.IsType<TomlTable>(project["agent"]);
+        TomlTable options = Assert.IsType<TomlTable>(agent["options"]);
+        TomlTableArray platforms = Assert.IsType<TomlTableArray>(project["platforms"]);
+        TomlTable weixin = Assert.Single(platforms.OfType<TomlTable>(), platform =>
+            string.Equals(platform["type"] as string, "weixin", StringComparison.Ordinal));
+
+        Assert.Equal("keep-project", project["custom_project"]);
+        Assert.Equal("keep-agent", agent["custom_agent"]);
+        Assert.Equal("keep-option", options["custom_option"]);
+        Assert.Equal("keep-weixin-token", Assert.IsType<TomlTable>(weixin["options"])["token"]);
+        Assert.Contains("level = \"debug\"", result, StringComparison.Ordinal);
+    }
+
     // ---- 用例 6:重复写入不累积 ----
 
     /// <summary>
@@ -359,5 +405,581 @@ public sealed class CcConnectConfigPreserveTests : IDisposable
         string result = File.ReadAllText(path);
         Assert.Equal(existing, result);
         Assert.DoesNotContain("[[projects]]", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Write_validates_candidate_before_replacing_existing_file()
+    {
+        string dir = NewDir();
+        string path = Path.Combine(dir, "config.toml");
+        const string existing = "[management]\nenabled = true\n";
+        File.WriteAllText(path, existing);
+
+        InvalidDataException error = Assert.Throws<InvalidDataException>(() =>
+            CcConnectConfigGenerator.Write(
+                path,
+                SampleConfig(),
+                validateCandidate: _ => "上游解析器拒绝候选配置"));
+
+        Assert.Contains("上游解析器拒绝", error.Message, StringComparison.Ordinal);
+        Assert.Equal(existing, File.ReadAllText(path));
+        Assert.Empty(Directory.EnumerateFiles(dir, "*.tmp-*"));
+    }
+
+    [Fact]
+    public void 第三方relay只补它明确配置的默认模型()
+    {
+        string dir = NewDir();
+        string path = Path.Combine(dir, "config.toml");
+        File.WriteAllText(path, """
+            [[providers]]
+              name = "chatpt-monthly"
+              api_key = "secret"
+              base_url = "https://router.example/v1"
+              model = "gpt-5.6"
+              agent_types = ["codex"]
+
+            [[providers]]
+              name = "deepseek"
+              api_key = "secret"
+              base_url = "https://api.deepseek.com/anthropic"
+              model = "deepseek-v4"
+            """);
+
+        CcConnectConfig sample = SampleConfig() with
+        {
+            Projects = new[]
+            {
+                SampleConfig().Projects[0] with
+                {
+                    Agent = "codex",
+                    ProviderRefs = new[] { "chatpt-monthly" },
+                },
+            },
+        };
+
+        CcConnectConfigGenerator.Write(path, sample);
+        string result = File.ReadAllText(path);
+
+        Assert.Contains("name = \"chatpt-monthly\"", result, StringComparison.Ordinal);
+        Assert.Contains("[[providers.agent_model_lists.codex]]", result, StringComparison.Ordinal);
+        Assert.Contains("model = \"gpt-5.6\"", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("model = \"gpt-5.6-sol\"", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("model = \"gpt-5.6-terra\"", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("model = \"gpt-5.6-luna\"", result, StringComparison.Ordinal);
+        Assert.Contains("alias = \"[AI Resume] GPT-5.6（当前默认）\"", result, StringComparison.Ordinal);
+        Assert.Equal(1, CountOccurrences(result, "[[providers.agent_model_lists.codex]]"));
+    }
+
+    [Fact]
+    public void 当前Codex模型列表连续生成保持四项且字节幂等()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [[providers]]
+              name = "router"
+              model = "gpt-5.6"
+            """);
+        CcConnectConfig sample = SampleConfig() with
+        {
+            Projects = new[] { SampleConfig().Projects[0] with { Agent = "codex", ProviderRefs = new[] { "router" } } },
+        };
+
+        CcConnectConfigGenerator.Write(path, sample);
+        byte[] first = File.ReadAllBytes(path);
+        CcConnectConfigGenerator.Write(path, sample);
+        byte[] second = File.ReadAllBytes(path);
+
+        Assert.Equal(first, second);
+        Assert.Equal(4, CountOccurrences(File.ReadAllText(path), "[[providers.agent_model_lists.codex]]"));
+    }
+
+    [Fact]
+    public void provider尾注释仍能为官方端点补当前Codex模型()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [[providers]] # official OpenAI
+              name = "openai"
+              base_url = "https://api.openai.com/v1"
+              model = "gpt-5.6"
+            """);
+        CcConnectConfig sample = SampleConfig() with
+        {
+            Projects = new[]
+            {
+                SampleConfig().Projects[0] with { Agent = "codex", ProviderRefs = new[] { "openai" } },
+            },
+        };
+
+        CcConnectConfigGenerator.Write(path, sample);
+        string result = File.ReadAllText(path);
+
+        Assert.Equal(4, CountOccurrences(result, "[[providers.agent_model_lists.codex]]"));
+        Assert.Contains("alias = \"[AI Resume] GPT-5.6 Sol（旗舰）\"", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void 无所有权标记的用户单项列表原样保留()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [[providers]]
+              name = "router"
+              model = "gpt-5.6"
+
+              [[providers.agent_model_lists.codex]]
+                model = "gpt-5.6"
+            """);
+        CcConnectConfig sample = SampleConfig() with
+        {
+            Projects = new[] { SampleConfig().Projects[0] with { Agent = "codex", ProviderRefs = new[] { "router" } } },
+        };
+
+        CcConnectConfigGenerator.Write(path, sample);
+        string result = File.ReadAllText(path);
+
+        Assert.Equal(1, CountOccurrences(result, "[[providers.agent_model_lists.codex]]"));
+        Assert.DoesNotContain("[AI Resume]", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("model = \"gpt-5.6-sol\"", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void 上游CRUD重编码剥掉注释后仍按语义alias识别并刷新目录()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [[providers]]
+              name = "openai"
+              base_url = "https://api.openai.com/v1"
+              model = "gpt-5.6"
+            """);
+        CcConnectConfig sample = SampleConfig() with
+        {
+            Projects = new[]
+            {
+                SampleConfig().Projects[0] with { Agent = "codex", ProviderRefs = new[] { "openai" } },
+            },
+        };
+        CcConnectConfigGenerator.Write(path, sample);
+
+        TomlTable reencoded = TomlSerializer.Deserialize<TomlTable>(File.ReadAllText(path))!;
+        TomlTable provider = Assert.IsType<TomlTable>(
+            Assert.IsType<TomlTableArray>(reencoded["providers"])[0]);
+        provider["model"] = "gpt-5.6-luna";
+        File.WriteAllText(path, TomlSerializer.Serialize(reencoded));
+
+        CcConnectConfigGenerator.Write(path, sample);
+        string result = File.ReadAllText(path);
+
+        Assert.Equal(3, CountOccurrences(result, "[[providers.agent_model_lists.codex]]"));
+        Assert.DoesNotContain("alias = \"[AI Resume] GPT-5.6（当前默认）\"", result, StringComparison.Ordinal);
+        Assert.Contains("alias = \"[AI Resume] GPT-5.6 Luna（经济高吞吐）\"", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void agentModels覆盖值用于补当前agent菜单且其它agent列表不阻塞()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [[providers]]
+              name = "router"
+              model = "claude-default"
+              agent_models = { codex = "gpt-custom" }
+
+              [[providers.agent_model_lists.claudecode]]
+                model = "sonnet"
+            """);
+        CcConnectConfig sample = SampleConfig() with
+        {
+            Projects = new[]
+            {
+                SampleConfig().Projects[0] with
+                {
+                    Agent = "codex",
+                    ProviderRefs = new[] { "router" },
+                },
+            },
+        };
+
+        CcConnectConfigGenerator.Write(path, sample);
+        string result = File.ReadAllText(path);
+
+        Assert.Contains("[[providers.agent_model_lists.codex]]", result, StringComparison.Ordinal);
+        Assert.Contains("model = \"gpt-custom\"", result, StringComparison.Ordinal);
+        Assert.Contains("[[providers.agent_model_lists.claudecode]]", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void 用户自定义当前agent模型列表原样保留且不追加生成块()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [[providers]]
+              name = "router"
+              model = "gpt-default"
+
+              [[providers.agent_model_lists.codex]]
+                model = "gpt-user"
+                alias = "User Choice"
+            """);
+        CcConnectConfig sample = SampleConfig() with
+        {
+            Projects = new[] { SampleConfig().Projects[0] with { Agent = "codex", ProviderRefs = new[] { "router" } } },
+        };
+
+        CcConnectConfigGenerator.Write(path, sample);
+        string result = File.ReadAllText(path);
+
+        Assert.Contains("alias = \"User Choice\"", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("Generated by AI Resume from the provider", result, StringComparison.Ordinal);
+        Assert.Equal(1, CountOccurrences(result, "[[providers.agent_model_lists.codex]]"));
+    }
+
+    [Fact]
+    public void AIResume生成的模型列表会随有效默认模型刷新()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [[providers]]
+              name = "router"
+              model = "gpt-old"
+            """);
+        CcConnectConfig sample = SampleConfig() with
+        {
+            Projects = new[] { SampleConfig().Projects[0] with { Agent = "codex", ProviderRefs = new[] { "router" } } },
+        };
+        CcConnectConfigGenerator.Write(path, sample);
+
+        string first = File.ReadAllText(path);
+        int scalar = first.IndexOf("model = \"gpt-old\"", StringComparison.Ordinal);
+        Assert.True(scalar >= 0);
+        string changed = first.Remove(scalar, "model = \"gpt-old\"".Length)
+            .Insert(scalar, "model = \"gpt-new\"");
+        File.WriteAllText(path, changed);
+
+        CcConnectConfigGenerator.Write(path, sample);
+        string result = File.ReadAllText(path);
+
+        Assert.Contains("model = \"gpt-new\"", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("model = \"gpt-old\"", result, StringComparison.Ordinal);
+        Assert.Equal(1, CountOccurrences(result, "[[providers.agent_model_lists.codex]]"));
+    }
+
+    [Fact]
+    public void 项目级字段agentOptions与inlineProvider按原层级保留()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [[projects]]
+            name = 'ai-resume'
+            disabled_commands = ["restart"]
+
+            [projects.agent]
+            type = "codex"
+            custom_agent_flag = true
+
+            [projects.agent.options]
+            mode = "default"
+            work_dir = "C:\\old"
+            provider = "router"
+            model = "gpt-user"
+            custom_option = "keep"
+
+            [[projects.agent.providers]]
+            name = "inline-local"
+            base_url = "https://inline.example/v1"
+
+            [projects.display]
+            mode = "quiet"
+
+            [[projects.platforms]]
+            type = "feishu"
+            [projects.platforms.options]
+            app_id = "old"
+            app_secret = "old"
+            allow_from = "old"
+            """);
+
+        CcConnectConfig config = SampleConfig() with
+        {
+            Projects = new[]
+            {
+                SampleConfig().Projects[0] with
+                {
+                    Name = "ai-resume",
+                    Agent = "codex",
+                    WorkDir = @"C:\new",
+                },
+            },
+        };
+        CcConnectConfigGenerator.Write(path, config, preserveAgentSelection: true);
+
+        TomlTable root = TomlSerializer.Deserialize<TomlTable>(File.ReadAllText(path))!;
+        TomlTable project = Assert.IsType<TomlTable>(Assert.IsType<TomlTableArray>(root["projects"])[0]);
+        TomlTable agent = Assert.IsType<TomlTable>(project["agent"]);
+        TomlTable options = Assert.IsType<TomlTable>(agent["options"]);
+
+        Assert.True(project.ContainsKey("disabled_commands"));
+        Assert.False(options.ContainsKey("disabled_commands"));
+        Assert.Equal(true, agent["custom_agent_flag"]);
+        Assert.Equal("router", options["provider"]);
+        Assert.Equal("gpt-user", options["model"]);
+        Assert.Equal("keep", options["custom_option"]);
+        Assert.Single(Assert.IsType<TomlTableArray>(agent["providers"]));
+        Assert.Equal("quiet", Assert.IsType<TomlTable>(project["display"])["mode"]);
+    }
+
+    [Fact]
+    public void 唯一兼容provider选择写入agentOptions而不是项目顶层()
+    {
+        CcConnectConfig config = SampleConfig() with
+        {
+            Projects = new[]
+            {
+                SampleConfig().Projects[0] with
+                {
+                    Agent = "codex",
+                    SelectedProvider = "router",
+                    SelectedModel = "gpt-5.6",
+                },
+            },
+        };
+
+        string result = CcConnectConfigGenerator.Render(config);
+        int options = result.IndexOf("[projects.agent.options]", StringComparison.Ordinal);
+        int platform = result.IndexOf("[[projects.platforms]]", StringComparison.Ordinal);
+        string optionBlock = result[options..platform];
+
+        Assert.Contains("provider = \"router\"", optionBlock, StringComparison.Ordinal);
+        Assert.Contains("model = \"gpt-5.6\"", optionBlock, StringComparison.Ordinal);
+        Assert.DoesNotContain("provider = \"router\"", result[..options], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void 连续生成字节幂等且内联模型列表不被扩展成非法TOML()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [[providers]]
+            name = "router"
+            model = "gpt-default"
+            agent_model_lists = { codex = [{ model = "gpt-user" }] }
+            """);
+        CcConnectConfig config = SampleConfig() with
+        {
+            Projects = new[] { SampleConfig().Projects[0] with { Agent = "codex", ProviderRefs = new[] { "router" } } },
+        };
+
+        CcConnectConfigGenerator.Write(path, config);
+        byte[] first = File.ReadAllBytes(path);
+        CcConnectConfigGenerator.Write(path, config);
+        byte[] second = File.ReadAllBytes(path);
+
+        Assert.Equal(first, second);
+        Assert.Equal(1, CountOccurrences(File.ReadAllText(path), "agent_model_lists"));
+        Assert.Single(CcConnectProviderCatalog.Parse(File.ReadAllText(path)).Providers[0].EffectiveModels("codex"));
+    }
+
+    [Fact]
+    public void 引号式内联模型列表同样封闭且不会追加Codex子表()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [[providers]]
+            name = "router"
+            model = "gpt-default"
+            "agent_model_lists" = { claudecode = [{ model = "sonnet" }] }
+            """);
+        CcConnectConfig config = SampleConfig() with
+        {
+            Projects = new[] { SampleConfig().Projects[0] with { Agent = "codex", ProviderRefs = new[] { "router" } } },
+        };
+
+        CcConnectConfigGenerator.Write(path, config);
+
+        string result = File.ReadAllText(path);
+        Assert.Equal(1, CountOccurrences(result, "agent_model_lists"));
+        Assert.DoesNotContain("[[providers.agent_model_lists.codex]]", result, StringComparison.Ordinal);
+        Assert.Empty(CcConnectProviderCatalog.Parse(result).Providers[0].EffectiveModels("codex"));
+    }
+
+    [Theory]
+    [InlineData("models = []")]
+    [InlineData("agent_model_lists = { codex = [] }")]
+    public void 用户显式空模型列表不被自动补全(string explicitList)
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, $$"""
+            [[providers]]
+            name = "router"
+            model = "gpt-default"
+            {{explicitList}}
+            """);
+        CcConnectConfig config = SampleConfig() with
+        {
+            Projects = new[]
+            {
+                SampleConfig().Projects[0] with
+                {
+                    Agent = "codex",
+                    ProviderRefs = new[] { "router" },
+                },
+            },
+        };
+
+        CcConnectConfigGenerator.Write(path, config);
+
+        string result = File.ReadAllText(path);
+        Assert.DoesNotContain("# AI Resume generated model list: begin", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void 切换agent时存在内联provider必须失败关闭而不是静默带入()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [[projects]]
+            name = "ai-resume"
+            [projects.agent]
+            type = "claudecode"
+
+            [[projects.agent.providers]]
+            name = "deepseek-inline"
+            base_url = "https://api.example/anthropic"
+            """);
+        CcConnectConfig config = SampleConfig() with
+        {
+            Projects = new[]
+            {
+                SampleConfig().Projects[0] with { Name = "ai-resume", Agent = "codex" },
+            },
+        };
+
+        InvalidDataException error = Assert.Throws<InvalidDataException>(() =>
+            CcConnectConfigGenerator.Write(
+                path,
+                config,
+                preserveAgentSelection: false,
+                preserveInlineAgentProviders: false));
+
+        Assert.Contains("内联 provider", error.Message, StringComparison.Ordinal);
+        Assert.Contains("claudecode", File.ReadAllText(path), StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("[[projects.agent.\"providers\"]]")]
+    [InlineData("[[projects.\"agent\".providers]]")]
+    public void 切换agent时合法引号式内联provider同样失败关闭(string providerHeader)
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, $$"""
+            [[projects]]
+            name = "ai-resume"
+            [projects.agent]
+            type = "claudecode"
+
+            {{providerHeader}}
+            name = "deepseek-inline"
+            base_url = "https://api.example/anthropic"
+            """);
+        CcConnectConfig config = SampleConfig() with
+        {
+            Projects = new[]
+            {
+                SampleConfig().Projects[0] with { Name = "ai-resume", Agent = "codex" },
+            },
+        };
+
+        InvalidDataException error = Assert.Throws<InvalidDataException>(() =>
+            CcConnectConfigGenerator.Write(
+                path,
+                config,
+                preserveAgentSelection: false,
+                preserveInlineAgentProviders: false));
+
+        Assert.Contains("内联 provider", error.Message, StringComparison.Ordinal);
+        Assert.Contains("claudecode", File.ReadAllText(path), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void 截断的生成标记不删除后续用户配置()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [[providers]]
+            name = "router"
+            model = "gpt-default"
+            # AI Resume generated model list: begin
+
+            [management]
+            enabled = true
+            port = 9820
+            token = "keep-me"
+            """);
+        CcConnectConfig config = SampleConfig() with
+        {
+            Projects = new[] { SampleConfig().Projects[0] with { Agent = "codex", ProviderRefs = new[] { "router" } } },
+        };
+
+        CcConnectConfigGenerator.Write(path, config);
+
+        string result = File.ReadAllText(path);
+        Assert.Contains("token = \"keep-me\"", result, StringComparison.Ordinal);
+        Assert.Contains("# AI Resume generated model list: begin", result, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void 生成配置把内部运行标记合并进已有嵌套env且保留用户变量()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [[projects]]
+            name = "pilot"
+            [projects.agent]
+            type = "claudecode"
+            [projects.agent.options]
+            mode = "default"
+            work_dir = "C:\\old"
+            [projects.agent.options.env]
+            AI_RESUME_INTERNAL_RUN = "wrong"
+            CUSTOM_FLAG = "keep"
+            "KEY-WITH-DASH" = "also-keep"
+            """);
+
+        CcConnectConfigGenerator.Write(path, SampleConfig());
+
+        string result = File.ReadAllText(path);
+        Assert.Equal(1, CountOccurrences(result, "[projects.agent.options.env]"));
+        Assert.Equal(1, CountOccurrences(result, "AI_RESUME_INTERNAL_RUN = \"1\""));
+        Assert.Contains("\"CUSTOM_FLAG\" = \"keep\"", result, StringComparison.Ordinal);
+        Assert.Contains("\"KEY-WITH-DASH\" = \"also-keep\"", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("AI_RESUME_INTERNAL_RUN = \"wrong\"", result, StringComparison.Ordinal);
+        Assert.NotNull(TomlSerializer.Deserialize<TomlTable>(result));
+    }
+
+    [Fact]
+    public void 生成配置把内联env规范为单一表且不丢用户变量()
+    {
+        string path = Path.Combine(NewDir(), "config.toml");
+        File.WriteAllText(path, """
+            [[projects]]
+            name = "pilot"
+            [projects.agent]
+            type = "codex"
+            [projects.agent.options]
+            mode = "default"
+            work_dir = "C:\\old"
+            env = { CUSTOM_FLAG = "keep", AI_RESUME_INTERNAL_RUN = "0" }
+            """);
+
+        CcConnectConfigGenerator.Write(path, SampleConfig());
+
+        string result = File.ReadAllText(path);
+        Assert.DoesNotContain("env = {", result, StringComparison.Ordinal);
+        Assert.Equal(1, CountOccurrences(result, "[projects.agent.options.env]"));
+        Assert.Contains("AI_RESUME_INTERNAL_RUN = \"1\"", result, StringComparison.Ordinal);
+        Assert.Contains("\"CUSTOM_FLAG\" = \"keep\"", result, StringComparison.Ordinal);
+        Assert.NotNull(TomlSerializer.Deserialize<TomlTable>(result));
     }
 }

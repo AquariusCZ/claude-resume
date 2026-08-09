@@ -4,6 +4,8 @@ using System.Text.Json;
 
 namespace AiResume.Ipc;
 
+public sealed record WorkerPingInfo(string Version, int? ProcessId);
+
 /// <summary>
 /// Named Pipe 客户端(Stage 2-G,GUI 探测 Worker 用)。
 ///
@@ -32,6 +34,10 @@ public sealed class PipeClient : IDisposable
 
     /// <summary>发送 ping 并返回 Worker 应答的协议版本;连接/解析失败返回 null。</summary>
     public async Task<string?> PingAsync(CancellationToken cancellationToken)
+        => (await PingIdentityAsync(cancellationToken))?.Version;
+
+    /// <summary>发送 ping 并返回协议版本与响应 Worker 的 PID。</summary>
+    public async Task<WorkerPingInfo?> PingIdentityAsync(CancellationToken cancellationToken)
     {
         await EnsureConnectedAsync(cancellationToken);
 
@@ -83,7 +89,18 @@ public sealed class PipeClient : IDisposable
                 return null; // 非 pong(如 error 帧)视为探测失败。
             }
 
-            return response.Payload?.GetProperty("version").GetString() ?? null;
+            if (response.Payload is not JsonElement payload ||
+                !payload.TryGetProperty("version", out JsonElement versionElement) ||
+                versionElement.GetString() is not { } version)
+            {
+                return null;
+            }
+
+            int? processId = payload.TryGetProperty("processId", out JsonElement pidElement) &&
+                             pidElement.TryGetInt32(out int parsedPid)
+                ? parsedPid
+                : null;
+            return new WorkerPingInfo(version, processId);
         }
         catch (OperationCanceledException)
         {

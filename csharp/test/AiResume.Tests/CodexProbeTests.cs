@@ -167,4 +167,16 @@ public sealed class CodexProbeTests
 
         Assert.Equal(CodexReadiness.Ok, CodexProbe.ClassifyDoctorJson(json).Readiness);
     }
+
+    [Fact]
+    public void 鉴权通过但推理未核实不得成为绿色可用()
+    {
+        CodexProbeResult result = CodexProbe.FromAuthResult(new CodexAuthResult(
+            CodexAuthOutcome.InferenceUnverified,
+            "凭据已验证,推理权限未核实"));
+
+        Assert.Equal(CodexReadiness.Ok, result.Readiness);
+        Assert.False(result.DeepChecked);
+        Assert.Equal("inference-unverified", result.Reason);
+    }
 }

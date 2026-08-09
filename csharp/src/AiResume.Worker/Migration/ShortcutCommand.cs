@@ -47,9 +47,12 @@ public static class ShortcutCommand
         {
             if (uninstall)
             {
-                Remove(Path.Combine(StartMenuDir, GuiLinkName));
-                Remove(Path.Combine(StartupDir, WorkerLinkName));
-                Remove(Path.Combine(DesktopDir, DesktopLinkName));
+                RemoveShortcutsTransaction(
+                [
+                    Path.Combine(StartMenuDir, GuiLinkName),
+                    Path.Combine(StartupDir, WorkerLinkName),
+                    Path.Combine(DesktopDir, DesktopLinkName),
+                ]);
                 Console.WriteLine("已移除 AI Resume 的快捷方式。");
                 return 0;
             }
@@ -75,6 +78,11 @@ public static class ShortcutCommand
                 Console.Error.WriteLine($"找不到控制面可执行文件:{guiExe}");
                 return 1;
             }
+            if (!File.Exists(workerExe))
+            {
+                Console.Error.WriteLine($"找不到续跑引擎可执行文件:{workerExe}");
+                return 1;
+            }
 
             // 图标缺失只警告不中止:没有图标的快捷方式仍然可用,
             // 但必须说出来 —— 否则用户只会看到"图标没了"却不知道为什么。
@@ -83,21 +91,47 @@ public static class ShortcutCommand
                 Console.Error.WriteLine($"警告:找不到图标 {icon},快捷方式将使用默认图标。");
             }
 
-            CreateShortcut(
-                Path.Combine(StartMenuDir, GuiLinkName), guiExe, string.Empty,
-                Path.GetDirectoryName(guiExe) ?? baseDir, icon,
-                "AI Resume 控制面:额度、续跑队列与完成通知");
+            var shortcuts = new[]
+            {
+                new ShortcutSpec(
+                    Path.Combine(StartMenuDir, GuiLinkName), guiExe,
+                    Path.GetDirectoryName(guiExe) ?? baseDir, icon,
+                    "AI Resume 控制面:额度、续跑队列与完成通知"),
+                new ShortcutSpec(
+                    Path.Combine(StartupDir, WorkerLinkName), workerExe,
+                    Path.GetDirectoryName(workerExe) ?? baseDir, icon,
+                    "AI Resume 续跑引擎(后台):限额恢复后按队列顺序继续"),
+                // 桌面入口就地覆盖旧安装器留下的同名 .lnk —— 它指向 launcher.vbs(旧系统)。
+                new ShortcutSpec(
+                    Path.Combine(DesktopDir, DesktopLinkName), guiExe,
+                    Path.GetDirectoryName(guiExe) ?? baseDir, icon,
+                    "AI Resume 控制面:额度、续跑队列与完成通知"),
+            };
+            var staged = new List<(string Staged, string Destination)>();
+            try
+            {
+                foreach (ShortcutSpec shortcut in shortcuts)
+                {
+                    string directory = Path.GetDirectoryName(shortcut.Destination)!;
+                    Directory.CreateDirectory(directory);
+                    string temp = Path.Combine(
+                        directory,
+                        "." + Path.GetFileNameWithoutExtension(shortcut.Destination) + "." +
+                        Guid.NewGuid().ToString("N") + ".new.lnk");
+                    CreateShortcut(
+                        temp, shortcut.Target, string.Empty, shortcut.WorkDir, shortcut.Icon, shortcut.Description);
+                    staged.Add((temp, shortcut.Destination));
+                }
 
-            CreateShortcut(
-                Path.Combine(StartupDir, WorkerLinkName), workerExe, string.Empty,
-                Path.GetDirectoryName(workerExe) ?? baseDir, icon,
-                "AI Resume 续跑引擎(后台):限额恢复后按队列顺序继续");
-
-            // 桌面入口就地覆盖旧安装器留下的同名 .lnk —— 它指向 launcher.vbs(旧系统)。
-            CreateShortcut(
-                Path.Combine(DesktopDir, DesktopLinkName), guiExe, string.Empty,
-                Path.GetDirectoryName(guiExe) ?? baseDir, icon,
-                "AI Resume 控制面:额度、续跑队列与完成通知");
+                CommitStagedShortcuts(staged);
+            }
+            finally
+            {
+                foreach ((string temp, _) in staged)
+                {
+                    TryDelete(temp);
+                }
+            }
 
             Console.WriteLine($"已创建:{Path.Combine(StartMenuDir, GuiLinkName)}");
             Console.WriteLine($"已创建:{Path.Combine(StartupDir, WorkerLinkName)}(开机自启,续跑引擎)");
@@ -111,17 +145,201 @@ public static class ShortcutCommand
         }
     }
 
+    private sealed record ShortcutSpec(
+        string Destination,
+        string Target,
+        string WorkDir,
+        string Icon,
+        string Description);
+
+    /// <summary>
+    /// 三个入口作为一个事务提交。任一步失败时恢复原文件或删除本轮新建文件，
+    /// 避免安装运行时回滚后留下指向已删除 exe 的半套快捷方式。
+    /// </summary>
+    public static void CommitStagedShortcuts(
+        IReadOnlyList<(string Staged, string Destination)> staged,
+        Action<string, string, bool>? moveFile = null,
+        Action<string, string, bool>? copyFile = null,
+        Action<string>? deleteFile = null)
+    {
+        ArgumentNullException.ThrowIfNull(staged);
+        moveFile ??= (source, destination, overwrite) => File.Move(source, destination, overwrite);
+        copyFile ??= (source, destination, overwrite) => File.Copy(source, destination, overwrite);
+        deleteFile ??= File.Delete;
+        string operationId = Guid.NewGuid().ToString("N");
+        var snapshots = new List<(string Destination, string Backup, bool Existed)>();
+        bool preserveBackups = false;
+
+        try
+        {
+            foreach ((string _, string destination) in staged)
+            {
+                string backup = destination + ".airesume-backup-" + operationId;
+                bool existed = File.Exists(destination);
+                if (existed)
+                {
+                    copyFile(destination, backup, false);
+                }
+                snapshots.Add((destination, backup, existed));
+            }
+
+            foreach ((string source, string destination) in staged)
+            {
+                moveFile(source, destination, true);
+            }
+        }
+        catch (Exception commitError)
+        {
+            var rollbackErrors = new List<Exception>();
+            foreach ((string destination, string backup, bool existed) in snapshots.AsEnumerable().Reverse())
+            {
+                try
+                {
+                    if (existed)
+                    {
+                        copyFile(backup, destination, true);
+                    }
+                    else if (File.Exists(destination))
+                    {
+                        deleteFile(destination);
+                    }
+                }
+                catch (Exception rollbackError) when (rollbackError is IOException or UnauthorizedAccessException)
+                {
+                    rollbackErrors.Add(rollbackError);
+                }
+            }
+
+            if (rollbackErrors.Count > 0)
+            {
+                preserveBackups = true;
+                throw new InvalidOperationException(
+                    BuildIncompleteRollbackMessage("快捷方式提交失败且回滚不完整", snapshots),
+                    new AggregateException(new[] { commitError }.Concat(rollbackErrors)));
+            }
+            throw;
+        }
+        finally
+        {
+            if (!preserveBackups)
+            {
+                foreach ((string _, string backup, _) in snapshots)
+                {
+                    TryDelete(backup);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 三个入口作为一个事务移除。删除失败时恢复原入口；若恢复也失败，
+    /// 保留同目录备份并把恢复路径放进异常，卸载器据此停止删除运行时。
+    /// </summary>
+    public static void RemoveShortcutsTransaction(
+        IReadOnlyList<string> destinations,
+        Action<string, string, bool>? copyFile = null,
+        Action<string>? deleteFile = null)
+    {
+        ArgumentNullException.ThrowIfNull(destinations);
+        copyFile ??= (source, destination, overwrite) => File.Copy(source, destination, overwrite);
+        deleteFile ??= File.Delete;
+        string operationId = Guid.NewGuid().ToString("N");
+        var snapshots = new List<(string Destination, string Backup, bool Existed)>();
+        bool preserveBackups = false;
+
+        try
+        {
+            foreach (string destination in destinations)
+            {
+                string backup = destination + ".airesume-backup-" + operationId;
+                bool existed = File.Exists(destination);
+                if (existed)
+                {
+                    copyFile(destination, backup, false);
+                }
+                snapshots.Add((destination, backup, existed));
+            }
+
+            foreach ((string destination, _, bool existed) in snapshots)
+            {
+                if (existed)
+                {
+                    deleteFile(destination);
+                }
+            }
+        }
+        catch (Exception removalError)
+        {
+            var rollbackErrors = new List<Exception>();
+            foreach ((string destination, string backup, bool existed) in snapshots.AsEnumerable().Reverse())
+            {
+                if (!existed)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    copyFile(backup, destination, true);
+                }
+                catch (Exception rollbackError) when (rollbackError is IOException or UnauthorizedAccessException)
+                {
+                    rollbackErrors.Add(rollbackError);
+                }
+            }
+
+            if (rollbackErrors.Count > 0)
+            {
+                preserveBackups = true;
+                throw new InvalidOperationException(
+                    BuildIncompleteRollbackMessage("快捷方式删除失败且回滚不完整", snapshots),
+                    new AggregateException(new[] { removalError }.Concat(rollbackErrors)));
+            }
+            throw;
+        }
+        finally
+        {
+            if (!preserveBackups)
+            {
+                foreach ((string _, string backup, _) in snapshots)
+                {
+                    TryDelete(backup);
+                }
+            }
+        }
+    }
+
+    private static string BuildIncompleteRollbackMessage(
+        string prefix,
+        IReadOnlyList<(string Destination, string Backup, bool Existed)> snapshots)
+    {
+        string[] recovery = snapshots
+            .Where(s => s.Existed && File.Exists(s.Backup))
+            .Select(s => Path.GetFullPath(s.Backup))
+            .ToArray();
+        string material = recovery.Length > 0
+            ? string.Join("; ", recovery)
+            : string.Join("; ", snapshots.Select(s => Path.GetFullPath(s.Destination)));
+        return $"{prefix};恢复材料:{material}";
+    }
+
     private static string? ReadOption(string[] args, string name)
     {
         int i = Array.FindIndex(args, a => string.Equals(a, name, StringComparison.OrdinalIgnoreCase));
         return i >= 0 && i + 1 < args.Length ? args[i + 1] : null;
     }
 
-    private static void Remove(string linkPath)
+    private static void TryDelete(string path)
     {
-        if (File.Exists(linkPath))
+        try
         {
-            File.Delete(linkPath);
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
         }
     }
 

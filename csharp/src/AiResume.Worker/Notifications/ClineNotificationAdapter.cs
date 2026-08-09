@@ -81,20 +81,20 @@ public sealed class ClineNotificationAdapter : INotificationAdapter
             var hookPath = Path.Combine(_hooksDirectory, HookFileName);
             var previousPath = Path.Combine(_hooksDirectory, PreviousFileName);
 
-            // 若已含标记,幂等空操作
-            if (File.Exists(hookPath) && FileContainsMarker(hookPath))
-            {
-                return;
-            }
-
             // 若存在用户原脚本且不含标记,先备份
             if (File.Exists(hookPath) && !FileContainsMarker(hookPath))
             {
                 File.Copy(hookPath, previousPath, overwrite: true);
             }
 
-            // 原子写入 wrapper 脚本
+            // 我方 wrapper 也重新生成:安装目录或命令形状改变时必须原位刷新,
+            // 不能依赖“先 Disable 再 Enable”这种会制造空窗的对账方式。
             var wrapperScript = BuildWrapperScript(hookCommand, previousPath);
+            if (File.Exists(hookPath) &&
+                string.Equals(File.ReadAllText(hookPath), wrapperScript, StringComparison.Ordinal))
+            {
+                return;
+            }
             var tempPath = hookPath + ".tmp";
             File.WriteAllText(tempPath, wrapperScript, new UTF8Encoding(true));
             File.Move(tempPath, hookPath, overwrite: true);
@@ -159,8 +159,17 @@ public sealed class ClineNotificationAdapter : INotificationAdapter
 
             sb.AppendLine($"$previousScript = '{escapedPreviousPath}'");
             sb.AppendLine("if (Test-Path $previousScript) {");
-            sb.AppendLine("    $previousOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $previousScript 2>&1 | Out-String");
-            sb.AppendLine("    $previousExitCode = $LASTEXITCODE");
+            sb.AppendLine("    $previousErrorPath = [IO.Path]::GetTempFileName()");
+            sb.AppendLine("    try {");
+            sb.AppendLine("        $previousOutput = $stdin | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $previousScript 2> $previousErrorPath | Out-String");
+            sb.AppendLine("        $previousExitCode = $LASTEXITCODE");
+            sb.AppendLine("        $previousError = if (Test-Path $previousErrorPath) { Get-Content -LiteralPath $previousErrorPath -Raw -ErrorAction SilentlyContinue } else { '' }");
+            sb.AppendLine("    } finally {");
+            sb.AppendLine("        Remove-Item -LiteralPath $previousErrorPath -Force -ErrorAction SilentlyContinue");
+            sb.AppendLine("    }");
+            sb.AppendLine("    if (-not [string]::IsNullOrWhiteSpace($previousError)) {");
+            sb.AppendLine("        [Console]::Error.Write($previousError)");
+            sb.AppendLine("    }");
             sb.AppendLine("    if ($previousExitCode -ne 0) {");
             sb.AppendLine("        Write-Output $previousOutput");
             sb.AppendLine("        exit $previousExitCode");
@@ -171,7 +180,7 @@ public sealed class ClineNotificationAdapter : INotificationAdapter
             sb.AppendLine("        exit 0");
             sb.AppendLine("    }");
             sb.AppendLine("    try {");
-            sb.AppendLine($"        & '{escapedHookCommand}' cline | Out-Null");
+            sb.AppendLine($"        $stdin | & '{escapedHookCommand}' cline | Out-Null");
             sb.AppendLine("    } catch {");
             sb.AppendLine("        # 忽略我方处理器异常");
             sb.AppendLine("    }");
@@ -182,7 +191,7 @@ public sealed class ClineNotificationAdapter : INotificationAdapter
             sb.AppendLine("    }");
             sb.AppendLine("} else {");
             sb.AppendLine("    try {");
-            sb.AppendLine($"        & '{escapedHookCommand}' cline | Out-Null");
+            sb.AppendLine($"        $stdin | & '{escapedHookCommand}' cline | Out-Null");
             sb.AppendLine("    } catch {");
             sb.AppendLine("        # 忽略我方处理器异常");
             sb.AppendLine("    }");
@@ -193,7 +202,7 @@ public sealed class ClineNotificationAdapter : INotificationAdapter
         {
             var escapedHookCommand = EscapePowerShellString(hookCommand);
             sb.AppendLine("try {");
-            sb.AppendLine($"    & '{escapedHookCommand}' cline | Out-Null");
+            sb.AppendLine($"    $stdin | & '{escapedHookCommand}' cline | Out-Null");
             sb.AppendLine("} catch {");
             sb.AppendLine("    # 忽略我方处理器异常");
             sb.AppendLine("}");
@@ -212,8 +221,8 @@ public sealed class ClineNotificationAdapter : INotificationAdapter
     {
         try
         {
-            var content = File.ReadAllText(filePath);
-            return content.Contains(Marker, StringComparison.Ordinal);
+            using var reader = new StreamReader(filePath, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            return string.Equals(reader.ReadLine(), $"# {Marker}", StringComparison.Ordinal);
         }
         catch
         {
@@ -253,7 +262,7 @@ public sealed class ClineNotificationAdapter : INotificationAdapter
     public static string? ParseHookCommand(string script)
     {
         var m = System.Text.RegularExpressions.Regex.Match(
-            script, @"^\s*&\s*'(?<cmd>(?:[^']|'')*)'\s+cline\b",
+            script, @"^\s*(?:\$stdin\s*\|\s*)?&\s*'(?<cmd>(?:[^']|'')*)'\s+cline\b",
             System.Text.RegularExpressions.RegexOptions.Multiline);
 
         // 单引号在 PowerShell 里靠翻倍转义,读回来要还原;

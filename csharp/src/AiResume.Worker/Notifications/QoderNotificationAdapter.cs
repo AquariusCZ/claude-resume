@@ -9,7 +9,7 @@ namespace AiResume.Worker.Notifications;
 
 /// <summary>
 /// Qoder 通知适配器:管理 ~/.qoder/settings.json 中 hooks.Stop 的合并写入/移除。
-/// 所有权标记为命令中包含 <see cref="MarkerFileName"/> 的条目。
+/// 所有权由首个可执行文件名 + 固定来源参数共同证明。
 /// </summary>
 public sealed class QoderNotificationAdapter : INotificationAdapter
 {
@@ -114,9 +114,17 @@ public sealed class QoderNotificationAdapter : INotificationAdapter
         if (root is not JsonObject rootObj)
             throw new InvalidOperationException("配置文件根节点不是 JSON 对象");
 
-        // 已存在我方条目则幂等返回
+        string desiredCommand = HookCommand.Format(hookCommand, "qoder");
+
+        // 旧版本写的是不带来源参数的裸路径;刷新后才是真正可执行的 Stop 命令。
         if (ContainsOwnEntry(rootObj))
+        {
+            if (RefreshOwnCommands(rootObj, desiredCommand))
+            {
+                AtomicWrite(rootObj);
+            }
             return;
+        }
 
         // 确保 hooks 对象存在
         if (!rootObj.TryGetPropertyValue("hooks", out var hooksNode) || hooksNode is not JsonObject hooksObj)
@@ -141,7 +149,7 @@ public sealed class QoderNotificationAdapter : INotificationAdapter
                 new JsonObject
                 {
                     ["type"] = "command",
-                    ["command"] = hookCommand,
+                    ["command"] = desiredCommand,
                     ["timeout"] = 30
                 }
             }
@@ -195,7 +203,7 @@ public sealed class QoderNotificationAdapter : INotificationAdapter
                     hookObj.TryGetPropertyValue("command", out var cmdNode) &&
                     cmdNode is JsonValue cmdValue &&
                     cmdValue.TryGetValue<string>(out var cmdStr) &&
-                    cmdStr.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase))
+                    IsOwnCommand(cmdStr))
                 {
                     entryHooks.RemoveAt(j);
                     changed = true;
@@ -264,7 +272,7 @@ public sealed class QoderNotificationAdapter : INotificationAdapter
                 if (hook.TryGetProperty("command", out var cmd) &&
                     cmd.ValueKind == JsonValueKind.String &&
                     cmd.GetString() is { } cmdStr &&
-                    cmdStr.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase))
+                    IsOwnCommand(cmdStr))
                 {
                     return cmdStr;
                 }
@@ -301,7 +309,7 @@ public sealed class QoderNotificationAdapter : INotificationAdapter
                 if (hookObj.TryGetPropertyValue("command", out var cmdNode) &&
                     cmdNode is JsonValue cmdValue &&
                     cmdValue.TryGetValue<string>(out var cmdStr) &&
-                    cmdStr.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase))
+                    IsOwnCommand(cmdStr))
                 {
                     return true;
                 }
@@ -310,6 +318,47 @@ public sealed class QoderNotificationAdapter : INotificationAdapter
 
         return false;
     }
+
+    private static bool RefreshOwnCommands(JsonObject root, string desiredCommand)
+    {
+        bool changed = false;
+        if (!root.TryGetPropertyValue("hooks", out JsonNode? hooksNode) || hooksNode is not JsonObject hooksObj ||
+            !hooksObj.TryGetPropertyValue("Stop", out JsonNode? stopNode) || stopNode is not JsonArray stopArray)
+        {
+            return false;
+        }
+
+        foreach (JsonNode? entryNode in stopArray)
+        {
+            if (entryNode is not JsonObject entryObj ||
+                !entryObj.TryGetPropertyValue("hooks", out JsonNode? entryHooksNode) ||
+                entryHooksNode is not JsonArray entryHooks)
+            {
+                continue;
+            }
+
+            foreach (JsonNode? hookNode in entryHooks)
+            {
+                if (hookNode is not JsonObject hookObj ||
+                    !hookObj.TryGetPropertyValue("command", out JsonNode? commandNode) ||
+                    commandNode is not JsonValue commandValue ||
+                    !commandValue.TryGetValue(out string? command) ||
+                    !IsOwnCommand(command) ||
+                    string.Equals(command, desiredCommand, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                hookObj["command"] = desiredCommand;
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    private static bool IsOwnCommand(string? command)
+        => HookCommand.IsManaged(command, MarkerFileName, "qoder");
 
     /// <summary>
     /// 原子写回:先备份原文件为 .bak,再写临时文件并替换。

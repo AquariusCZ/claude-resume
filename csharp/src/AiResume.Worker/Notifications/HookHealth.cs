@@ -24,20 +24,7 @@ public static class HookHealth
     /// 按空格切会把路径截成 <c>…\Local\AI</c>,这个错误本身就造成过一次事故。
     /// </summary>
     public static string? ExtractExe(string? hookCommand)
-    {
-        string s = hookCommand?.Trim() ?? string.Empty;
-        if (s.Length == 0)
-        {
-            return null;
-        }
-
-        const string ext = ".exe";
-        int i = s.IndexOf(ext, StringComparison.OrdinalIgnoreCase);
-
-        // 没有 .exe 的形式(node 脚本、shell 命令)不在本函数的判断范围内:
-        // 返回 null 表示"核对不了",由调用方按**未知**处理,而不是按坏处理。
-        return i < 0 ? null : s[..(i + ext.Length)].Trim();
-    }
+        => HookCommand.ExtractExecutable(hookCommand);
 
     /// <summary>
     /// 这条命令是不是已经执行不了了。

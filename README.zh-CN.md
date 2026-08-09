@@ -1,218 +1,172 @@
 # AI Resume
 
-[English](README.md) · **简体中文**
+[English](README.md) | **简体中文**
 
-> Windows 控制面，让 AI 编码 agent 在你睡觉的时候接着干活。Claude Code 撞到额度上限时，AI Resume 把项目排进队列，额度一恢复就按顺序继续。
+[![平台](https://img.shields.io/badge/platform-Windows-2F8A56)](#环境要求)
+[![.NET](https://img.shields.io/badge/.NET-10-512BD4)](https://dotnet.microsoft.com/)
+[![许可](https://img.shields.io/badge/license-MIT-6B665B)](LICENSE)
 
-在手机上用飞书或微信和你的项目对话；长任务跑完时桌面收到通知；额度像仪表盘上的燃料表一样看着往下走。全部跑在本机——不需要服务器，不需要公网 IP，不经过第三方中转。
+> 本地 Windows AI 编码控制面。Claude Code 触发额度限制时持有项目队列，窗口重置后按顺序续跑；同时负责项目发现和整个 agent 任务的完成通知。
 
-![控制面](docs/assets/panel.png)
+AI Resume 没有自己的云服务。GUI、队列、状态、凭据和钩子都在本机；agent 请求只发往你自己配置的 provider。
 
----
+![AI Resume 控制面](docs/assets/panel.png)
 
-## 它到底做什么
+## 它解决什么
 
-AI Resume 只做**四件事**，其余交给上游：
+AI Resume 只拥有四项职责：
 
-| | |
+| 能力 | 保证什么 |
 |---|---|
-| **限额后自动续跑** | 唯一不可替代的部分。Claude Code 报 `LimitReached` 时，AI Resume 拿着项目队列，等窗口重置后按顺序逐个续跑。上游没有这个能力——桥接层只**读取**限额信号，不排队也不续跑。 |
-| **项目发现** | 从 agent 会话历史和 Git 根找出你真正的项目，索引落盘（全量扫描 2227 ms → 35 ms）。 |
-| **完成通知** | Claude Code / Codex / Cline / Qoder / OpenCode 跑完**整个任务**时给你一条消息。逐个 provider 开关，没启用的绝不写进它的配置。 |
-| **控制面** | 额度、续跑队列、agent 选择、凭据和通知源的 Windows 图形界面。 |
+| **限额后续跑** | Claude Code 被限额时持久化项目队列，重置后按顺序续跑。 |
+| **项目发现** | 从 agent 历史与 Git 根目录生成持久索引，不维护硬编码项目名单。 |
+| **完成通知** | Claude Code、Codex、Cline、Qoder 或 OpenCode 跑完整个任务时，飞书只收到一条通知。 |
+| **Windows 控制面** | 展示额度证据、续跑队列、provider 健康、agent 选择、凭据和通知送达状态。 |
 
-消息平台协议、会话持久化、agent 生命周期和定时任务由 **[cc-connect](https://github.com/chenhg5/cc-connect)** 负责，**直接运行而不做包装**。飞书 OpenAPI 走 `lark-cli`。原则是**适配上游而不是改造它**——见 [ADR-0003](docs/adr/0003-cc-connect-direct-and-control-plane.md)。
+聊天平台、会话、agent turn 和聊天定时任务交给 [cc-connect](https://github.com/chenhg5/cc-connect)。AI Resume 适配上游，不重写它。
 
----
+## 快速开始
 
-## 环境要求
+### 环境要求
 
 - Windows 10 / 11
-- [.NET 10 SDK](https://dotnet.microsoft.com/download)（构建用）
-- [Claude Code CLI](https://claude.com/claude-code) — `npm i -g @anthropic-ai/claude-code`
-- `cc-connect` — `npm i -g cc-connect`（只有要用手机聊天时才需要）
-- 可选：Codex CLI、DeepSeek API key
+- [.NET 10 SDK](https://dotnet.microsoft.com/download)
+- [Claude Code CLI](https://claude.com/claude-code)：`npm i -g @anthropic-ai/claude-code`
+- 手机聊天可选：`npm i -g cc-connect@1.4.1`
+- 其它可选 agent/provider：Codex CLI、DeepSeek API 凭据
 
----
-
-## 安装
+### 构建与安装
 
 ```powershell
-dotnet build csharp\AiResume.sln
-csharp\src\AiResume.Worker\bin\Debug\net10.0-windows\AiResume.Worker.exe install
+git clone https://github.com/AquariusCZ/claude-resume.git
+cd claude-resume
+dotnet build csharp\AiResume.sln -c Release
+csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe install
 ```
 
-它把构建产物复制到 `%LOCALAPPDATA%\AI Resume\`，创建桌面与开始菜单快捷方式，把续跑引擎注册为登录自启，并把已启用的完成通知钩子重新指向安装目录。
+在桌面或开始菜单打开 **AI Resume**。重新构建后要再跑一次 `install`；真正运行的是 `%LOCALAPPDATA%\AI Resume\` 中的安装副本，不是 `bin\Release`。
 
-**为什么必须有这一层**：直接指向 `bin\Debug\` 的入口，只要你清一次构建、换个分支、或者把仓库目录改个名，就全断了——而 Stop 钩子断得**没有任何报错**：界面照样显示"已启用"，只是通知永远不到。安装之后仓库只是源码，跑的是安装目录里的副本。**改完代码要重新 `install` 才生效。**
+安装器只接受空目录、仅含保留状态的目录、与本次 payload 精确匹配的旧运行时、现役 AI Resume 安装根，或上次卸载留下的精确 preserved-root marker；真正卸载仍必须同时验证现役 marker 与 payload 清单。安装先 staging、备份并删除旧清单已淘汰的文件，整体替换 GUI / Worker / Hook；新 Worker 通过 Named Pipe 身份校验后才改快捷方式和通知钩子。从安装目录执行卸载时会启动受清单约束的临时 Worker，在返回成功前把全部 payload 事务性移动到私有退役区，因此立即重装也不会被旧清理误删。无结果、坏结果或 helper 异常退出时父进程只报告并保留恢复目录，不会删除唯一退役副本。状态和未知文件保留，preserved-root marker 只授权后续重装、不授权删除。回滚不完整时返回非零并保留恢复材料。
 
-卸载用 `AiResume.Worker.exe uninstall`——它逐个关闭钩子源，不会删掉你的 `settings.json`。
+卸载但保留用户状态：
 
----
+```powershell
+& "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe" uninstall
+```
 
-## 用控制面
+## 核心工作流
 
-双击桌面上的 **AI Resume**。
+### 额度与自动续跑
 
-**状态灯**（左上）只回答一个问题：它到底在不在干活？
+主数据源是 Anthropic OAuth 用量端点，请求形状与 Claude Code 一致。AI Resume 只读现有 token，绝不刷新或写回。现代 `session`、`weekly_all` 与全部 `weekly_scoped` 都会解析，Fable 等 scoped 限额单独显示。
 
-| 颜色 | 含义 |
+额度响应是稀疏观测，“本次没返回”不等于“已删除”。只有同账号、同 scope、同一未过期 reset 代次才能承接最近读数，并以琥珀色**最近服务端读数**标记。已知 `0%` 是空轨道，已知 `100%` 是满条，只有 reset 时用无定值扫描，绝不伪造百分比。
+
+勾选项目后按**布防**即可关闭窗口。Worker 持有队列，只在 reset 证据有效后续跑。
+
+完整协议：[Claude 额度获取与验证](docs/CLAUDE-QUOTA-ACQUISITION.md)。
+
+### 通过 cc-connect 用手机聊天
+
+cc-connect 配好后，在飞书或微信中使用：
+
+| 命令 | 用途 |
 |---|---|
-| 🟢 绿 | 正常工作 |
-| 🟡 琥珀 | 在等（额度还没恢复）。**不是故障。** |
-| 🔴 红 | 有问题，需要你动手 |
-| ⚪ 灰 | 没布防 |
+| `/dir <路径>` 或 `/dir <序号>` | 切换项目/工作目录 |
+| `/mode plan` / `/mode auto-edit` | 选择只读规划或允许编辑 |
+| `/model switch <名称>` | 切换模型 |
+| `/provider switch <名称>` | 切换 API provider |
+| `/new`、`/list`、`/switch <序号>` | 管理会话 |
+| `/stop` | 停止当前任务 |
+| `/cron`、`/timer` | 管理聊天定时任务 |
 
-**额度屏**显示 5 小时和 7 天两个窗口。光柱画的是**已用额度**，不是流逝的时间；窗口里"现在"的位置由另一根细刻度线单独标出。数字来自 Claude 自己的用量接口，**没有任何估算**。
+Agent、provider 和 model 是三层不同的东西：
 
-**队列**列出发现的项目。勾上要跑的，按**布防**，然后关窗口。引擎会盯着额度，恢复后按顺序续跑。
+- **Agent**：本地执行体和会话所有者，如 Claude Code 或 Codex。
+- **Provider**：agent 调用的远端端点与凭据。
+- **Model**：发往 provider 的模型标识。
 
-**服务状态**显示各 provider 是否可用。绿灯**只能来自一次真实成功的请求**——填了 API key、装了 CLI 都不算。没验证过的一律是灰的。
+控制面会生成候选 cc-connect 配置，交给 cc-connect 自己的解析器验证，原子提交后请求带认证的自重启，最后校验新进程代次。它不会只凭 CLI 退出码宣布成功。Provider/model 保留规则和 Codex 模型目录见 [架构文档](docs/ARCHITECTURE.md#agent-provider-and-model-semantics)。
 
-Codex 那一行还多验一步：能列出模型只证明服务端**认识**这把 key，证明不了它**允许你跑活儿**。所以探测在 `/v1/models` 之后再发一次 `max_tokens=1` 的最小推理请求（个位数 token）。只能列不能推理时它是红的——因为任务一跑就会失败。
+### 完成通知
 
----
-
-## 在手机上和项目对话
-
-`cc-connect` 配好并运行之后，在飞书或微信里给机器人发消息：
-
-| 命令 | 作用 |
+| 来源 | 已验证的任务完成边界 |
 |---|---|
-| `/help` | 命令列表 |
-| `/status` | 系统状态（也能拿到自己的 User ID） |
-| `/dir <路径>` · `/dir <序号>` · `/dir -` · `/dir reset` | **切换工作目录——手机上就是这样切项目的** |
-| `/mode <名字>` | 权限模式：`plan`（近似只读）· `default` · `acceptEdits` · `auto-edit` · `yolo` |
-| `/model switch <名字>` | 切换模型 |
-| `/provider switch <名字>` | 切换 API 供应商 |
-| `/new [名称]` · `/list` · `/switch <序号>` | 新会话 · 列表 · 切换 |
-| `/stop` | 停止正在跑的任务 |
-| `/compress` | 压缩上下文 |
-| `/cron` · `/timer` | 定时任务 |
-
-**只读查询和修改项目的开关是 `/mode`，不是另一个菜单。** `/mode plan` 让 agent 只规划不动文件；`/mode auto-edit` 或 `/mode yolo` 才允许它写。
-
-**Agent 不能在聊天里切。** cc-connect 里一个项目**死绑一个 agent**（`claudecode`、`codex`、`cursor`、`gemini`、`qoder`、`opencode` 等）。要换得在控制面的 **Agent 执行体**里选，重新生成配置，再重启 cc-connect。
-
-**只有你能驱动它。** `allow_from` 和 `admin_from` 把机器人钉死在你在各平台上的用户 ID，别人发的消息直接丢弃。
-
-### 会话历史在哪
-
-- **cc-connect 的会话索引** —— `~/.cc-connect/sessions/<项目名>_<哈希>.json`
-- **真正的对话内容** —— 在 agent 那边。用 Claude Code 时是 `~/.claude/projects/<工作目录编码后的名字>/<sessionId>.jsonl`
-
-**闲聊如果不切 `/dir`，就会记在当前工作目录名下**，也就是混进那个项目的会话堆里。想分开，要么 `/dir` 切到一个专门的闲聊目录，要么用 `/new 闲聊` 起一个独立会话。
-
----
-
-## 完成通知
-
-本地 agent 跑完**整个任务**时给一条消息。准入红线很严：**只接受代表整个 agent 任务结束的边界**。代表单次模型请求结束的回调一律拒绝——否则一个任务能通知你几十次。
-
-已验证的 5 个源：
-
-| Provider | 机制 |
-|---|---|
-| Claude Code | `Stop` 钩子 |
-| Codex | `notify` |
+| Claude Code | `Stop` hook |
+| Codex | `notify` callback |
 | Cline | `TaskComplete` |
-| Qoder | `~/.qoder/settings.json` 的 `hooks.Stop` |
-| OpenCode | `session.idle` 插件 |
+| Qoder | `hooks.Stop` |
+| OpenCode | `session.idle` plugin |
 
-适配器**合并**进已有的钩子配置而不是覆盖，卸载只移除自己那条。AI Resume 自己的探测和后台续跑带 `AI_RESUME_INTERNAL_RUN=1`，不会自己通知自己。
+适配器会合并用户现有配置，只移除能证明属于 AI Resume 的条目。内部探测和续跑会直接设置 `AI_RESUME_INTERNAL_RUN=1`；生成的 cc-connect 项目通过 `projects.agent.options.env` 设置同一标记，计划任务启动脚本再提供 daemon 级兜底，因此从飞书启动的 agent 不会把 AI Resume 自己的工作重复通知回来。
 
-开关有**三**态，不是两态：关、开、以及**开着但送不到**——钩子还写在配置里，而它指向的程序已经不在了。第三态标红并挂「钩子断链」角标，因为它和"关着"是两回事：关着是你的选择，断链是坏了。
+协议与冒烟步骤：[完成通知](docs/COMPLETION-NOTIFICATIONS.md)。
 
-![完成通知源](docs/assets/panel-notify.png)
+## 安全边界
 
----
-
-## 安全
-
-让 AI 无人值守地动真实仓库，是要设防的：
-
-- **单消费者预检。** 飞书长连接是**集群模式**：同一个应用有两个进程连着时，事件会被**随机**投给其中一个——表现出来就是"机器人时灵时不灵"。控制面会扫本机有没有第二个消费者，发现了就拒绝声明可启动。
-- **一切 fail-closed。** 进程探测拿不准时按"还在跑"处理，绝不按"已经没了"。**只凭 PID 永远不杀进程**——父 PID、启动时间、命令签名必须全部对上。
-- **绿灯必须有依据。** 可用性只能由一次真实成功的请求断言。
-- **凭据不进仓库。** 飞书凭据用 Windows DPAPI 按当前用户加密，存在仓库外，界面也读不回来。
-- **AI 运行不设客户端总时限。** 只有结构化的 HTTP 408/504 算 provider 超时；DNS/TCP/TLS 失败和监控异常算本地失败。**静默是指标，不是判据。**
-- **用户停止是终态**——不会 fallback 到别的 provider，也不会重放已经产生副作用的运行。
-
----
+- **绿灯必须是真实验证。** provider 只有在真实请求成功后才可用；命令已安装或 key 已填写都不是证据。
+- **飞书只允许一个消费者。** 两个长连接会随机分流事件，预检发现冲突时 fail-closed。
+- **凭据不进 Git。** 飞书凭据存在仓库外，并用当前 Windows 用户的 DPAPI 加密。
+- **绝不只凭 PID 结束进程。** 父进程身份、启动时间和命令签名必须同时匹配。
+- **agent 工作不设客户端总时限。** 静默是指标，不是失败判据。
+- **用户停止是终态。** 已取消任务不会换 provider 重放。
 
 ## 架构
 
+```text
+飞书 / 微信
+      |
+      v
+ cc-connect ----------> Claude Code / Codex / 其它 agent
+      |                              |
+      |                              v
+      +------------------------- AiResume.Hook
+                                      |
+                                      v
+AiResume.Gui <----- Named Pipe ----- AiResume.Worker
+ WPF + WebView2                     队列、额度、项目发现、
+                                    通知与进程监督
 ```
-┌── 飞书 / 微信 ──┐
-│                 ▼
-│           cc-connect  ──►  agent（Claude Code / Codex / …）
-│                 │
-└─────────────────┼──────────────────────────────────────┐
-                  ▼                                      │
-    AiResume.Worker ── 续跑引擎、项目索引、               │
-            │          通知扫描、进程监督                 │
-            │                                            │
-    AiResume.Gui ──── WPF + WebView2 控制面 ◄─────────────┘
-            │
-    AiResume.Hook ─── agent 的钩子调用的那个可执行文件
-```
 
-**额度自行获取**，不从桥接层借。主路径是 `GET https://api.anthropic.com/api/oauth/usage`，复用 Claude Code 已有的 OAuth token——**只读、绝不刷新、绝不写回**，因为刷新会和 Claude Code 争用同一个 refresh token。剩余寿命不足 60 秒的 token 视同过期。这条路失败才降级到 `ClaudeCodeProbe` 子进程探测。
+AI Resume 状态在 `%LOCALAPPDATA%\AI Resume\state\`；cc-connect 的配置与会话在 `%USERPROFILE%\.cc-connect\`。详细所有权与数据流见 [架构文档](docs/ARCHITECTURE.md) 和 [AI 导览](AI_GUIDE.md)。
 
-延伸阅读：[ARCHITECTURE.md](docs/ARCHITECTURE.md) · [RUN-CONTRACT.md](docs/RUN-CONTRACT.md) · [ADR-0003](docs/adr/0003-cc-connect-direct-and-control-plane.md) · [LESSONS.md](docs/LESSONS.md)
+## 验证状态
 
----
+当前 Windows 安装上已验证：
 
-## 测试
+- 隔离的全量 xUnit 与警告当错误的 Release 构建；
+- OAuth 额度解析、稀疏连续性、scoped/Fable 行与 SQLite 并发；
+- 左右额度面板等高、reset-only 无定值状态与减少动态效果；
+- 五种 Hook 协议经队列、Worker、lark-cli 到飞书；
+- cc-connect 候选解析、原子激活与绑定进程代次的重启验证；
+- 安装目录 GUI / Worker / Hook 哈希与 Release 构建一致。
+
+仍未验证的边界也直接写明：
+
+- 真实账号的“限额 → 窗口重置 → 自动续跑”尚未完成一次端到端观测；
+- 五个通知源是协议级冒烟，不是为了测试而各启动一次真实 AI 任务；
+- 长时稳定性只有短采样基线，还没有完成 24 小时 soak。
+
+## 开发
 
 ```powershell
 dotnet test csharp\AiResume.sln
+dotnet build csharp\AiResume.sln -c Release --no-restore -warnaserror
 ```
 
-723 个 xUnit 用例。它们**绝不**对真实项目或真实会话启动 AI 运行，不碰 `~/.claude`、`~/.codex` 和生产状态目录，也不发任何付费 API 请求。探测判定用**录下来的真实响应**做断言，而不是猜的结构——mock 猜错结构的结果是测试全绿、线上静默失效。
+测试使用临时状态、合成会话和注入的进程/API runner，不会 resume 真实会话、修改真实项目或发付费模型请求。
 
----
+## 文档
 
-## 现状
-
-v2 就是上面这套 C# 实现。v1 的 PowerShell + Node 运行时已于 2026-08-08 删除，查阅走 `git log -- src test`。
-
-已知缺口，明说：
-
-- **真实限额下的续跑还没有端到端跑通过一次。** 内部链路（布防 → 观测限流 → 等待 → 续跑 → 解除）已在受控响应下走通，真实账户额度复位仍未验证。
-- **五个通知源没有一次性全部真实收取过。** 本机只装了其中两个的 CLI。
-- **24 小时长稳只有短采样基线**，不足以下结论。
-
----
-
-## 界面上的每一句话
-
-这一版的主要工作不是加功能，是把界面上的**肯定句**逐条追回到它背后到底验证了什么。
-
-起因是一次外部审计：七个缺陷里没有一个是崩溃，全部是**静默失败**——界面说没事，实际早就坏了。
-
-| 界面当时说 | 实际 |
-|---|---|
-| 通知源「已启用」 | 钩子指向的程序被删了，通知永远不到 |
-| 飞书「已配置」 | 凭据早被开放平台重置，每条消息被丢弃 |
-| 「cc-connect 配置已生成」 | 那份 TOML 根本解析不了 |
-| 顶部「监视中」 | 续跑引擎已经被杀掉了 |
-| Codex「凭据已验证」 | 只能列模型，一跑推理就 403 |
-| `install` 退出码 0 | 五个通知源一个都没启用 |
-
-共同点不是"写错了"，而是**判据只看配置、不看世界**。所以现在：
-
-- 通知源要核对那条命令指向的可执行文件是否还在；
-- 飞书凭据有一个真发请求换 token 的「验证」按钮；
-- cc-connect 配置交给 **cc-connect 自己的解析器**判（校验副本，绝不改动原文件）；
-- 状态灯要看引擎进程是否真的在跑，以及最近一次额度探测过去了多久；
-- 安装把"用户想开哪几个通知源"**持久化成意图**，再按意图对账——卸载会把现状清空，而现状是当时唯一的依据；
-- 核对不出结论时说"未核实"，不说"没问题"。**把未知说成正常，和把故障说成正常一样是在骗人。**
-
----
+- [English README](README.md)
+- [架构与完整配置](docs/ARCHITECTURE.md)
+- [Claude 额度获取](docs/CLAUDE-QUOTA-ACQUISITION.md)
+- [完成通知协议](docs/COMPLETION-NOTIFICATIONS.md)
+- [运行生命周期契约](docs/RUN-CONTRACT.md)
+- [上游研究](docs/UPSTREAM-ARCHITECTURE-RESEARCH.md)
+- [工程教训](docs/LESSONS.md)
+- [面向 AI 的仓库导览](AI_GUIDE.md)
 
 ## 许可
 
-MIT，见 [LICENSE](LICENSE)。
-
-界面使用 [方舟像素字体](https://github.com/TakWolf/ark-pixel-font)（12px 等宽 zh_cn），依 SIL Open Font License 1.1 分发，许可证原文见 [`fonts/OFL.txt`](csharp/src/AiResume.Gui/wwwroot/fonts/OFL.txt)。
+MIT，见 [LICENSE](LICENSE)。界面使用 [方舟像素字体](https://github.com/TakWolf/ark-pixel-font)，依 SIL Open Font License 1.1 分发；许可证见 [OFL.txt](csharp/src/AiResume.Gui/wwwroot/fonts/OFL.txt)。

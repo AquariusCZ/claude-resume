@@ -1,218 +1,172 @@
 # AI Resume
 
-**English** · [简体中文](README.zh-CN.md)
+**English** | [简体中文](README.zh-CN.md)
 
-> Windows control plane that keeps your AI coding agents working while you sleep. When Claude Code hits its usage limit, AI Resume queues your projects and continues each one the moment the limit lifts.
+[![Platform](https://img.shields.io/badge/platform-Windows-2F8A56)](#requirements)
+[![.NET](https://img.shields.io/badge/.NET-10-512BD4)](https://dotnet.microsoft.com/)
+[![License](https://img.shields.io/badge/license-MIT-6B665B)](LICENSE)
 
-Chat with your projects from Feishu or WeChat on your phone, get a notification on your desktop when a long agent task finishes, and watch quota burn down on a rack-panel dashboard. Everything runs locally — no server, no public IP, no third-party relay.
+> A local Windows control plane for AI coding agents. It queues projects when Claude Code hits a usage limit, resumes them after reset, discovers real projects, and sends one notification when a full agent task finishes.
 
-![Control panel](docs/assets/panel.png)
+AI Resume has no cloud backend of its own. The GUI, queue, state, credentials and hooks stay on your machine; agent traffic goes through the providers you configure.
 
----
+![AI Resume control panel](docs/assets/panel.png)
 
-## What it actually does
+## Why it exists
 
-AI Resume deliberately does **four** things and delegates the rest:
+AI Resume deliberately owns four responsibilities:
 
-| | |
+| Capability | What it guarantees |
 |---|---|
-| **Post-limit resume** | The one irreplaceable part. When Claude Code reports `LimitReached`, AI Resume holds a queue of projects and resumes each one in order after the window resets. Nothing upstream does this — bridges only *read* the limit signal. |
-| **Project discovery** | Finds your real projects from agent session history and Git roots, with a persisted index (full scan 2227 ms → 35 ms). |
-| **Completion notifications** | When Claude Code / Codex / Cline / Qoder / OpenCode finishes a *whole task*, you get a message. Per-provider toggles; nothing is written to a config you did not enable. |
-| **Control panel** | A Windows GUI for quota, the resume queue, agent selection, credentials and notification sources. |
+| **Post-limit resume** | Holds a project queue while Claude Code is limited, then resumes projects in order after the reset. |
+| **Project discovery** | Builds a persisted index from agent history and Git roots instead of maintaining a hard-coded project list. |
+| **Completion notifications** | Sends one Feishu message when Claude Code, Codex, Cline, Qoder or OpenCode finishes a whole task. |
+| **Windows control panel** | Shows quota evidence, queue state, provider health, agent selection, credentials and notification delivery. |
 
-Messaging-platform protocol, session persistence, agent lifecycle and cron are handled by **[cc-connect](https://github.com/chenhg5/cc-connect)**, which runs directly rather than being wrapped. Feishu OpenAPI work goes through `lark-cli`. The rule is *adapt to upstream, do not rewrite it* — see [ADR-0003](docs/adr/0003-cc-connect-direct-and-control-plane.md).
+Chat platforms, sessions, agent turns and scheduled chat tasks belong to [cc-connect](https://github.com/chenhg5/cc-connect). AI Resume integrates with that upstream instead of reimplementing it.
 
----
+## Quick start
 
-## Requirements
+### Requirements
 
-- Windows 10 / 11
-- [.NET 10 SDK](https://dotnet.microsoft.com/download) (to build)
-- [Claude Code CLI](https://claude.com/claude-code) — `npm i -g @anthropic-ai/claude-code`
-- `cc-connect` — `npm i -g cc-connect` (only if you want the phone/chat side)
-- Optional: Codex CLI, DeepSeek API key
+- Windows 10 or 11
+- [.NET 10 SDK](https://dotnet.microsoft.com/download)
+- [Claude Code CLI](https://claude.com/claude-code): `npm i -g @anthropic-ai/claude-code`
+- Optional for phone chat: `npm i -g cc-connect@1.4.1`
+- Optional agents/providers: Codex CLI, DeepSeek API credentials
 
----
-
-## Install
+### Build and install
 
 ```powershell
-dotnet build csharp\AiResume.sln
-csharp\src\AiResume.Worker\bin\Debug\net10.0-windows\AiResume.Worker.exe install
+git clone https://github.com/AquariusCZ/claude-resume.git
+cd claude-resume
+dotnet build csharp\AiResume.sln -c Release
+csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe install
 ```
 
-This copies the build output to `%LOCALAPPDATA%\AI Resume\`, creates the Desktop and Start-menu shortcuts, registers the resume engine for logon start, and re-points any enabled completion hooks at the installed copy.
+Open **AI Resume** from the Desktop or Start menu. Re-run `install` after rebuilding; the installed copy under `%LOCALAPPDATA%\AI Resume\` is the runtime, not `bin\Release`.
 
-**Why an install step exists:** entries that point straight into `bin\Debug\` break the moment you clean the build, switch branches, or rename the repo folder — and the Stop hook breaks *silently* (the UI still says "enabled", notifications just never arrive). After `install`, the repo is only source; the installed copy is what runs. Re-run `install` after code changes.
+The installer accepts only an empty directory, a preserved-state directory, an exact prior payload, an installed AI Resume root, or an exact preserved-root marker left by a prior uninstall; uninstall still requires both the active ownership marker and payload manifest. It stages and backs up the runtime, removes retired manifest files, replaces GUI/Worker/Hook together, and waits for the new Worker to answer the current Named Pipe protocol before changing shortcuts or hooks. Self-uninstall runs through a manifest-bounded temporary Worker that transactionally moves the installed payload into its private retirement area before reporting success, so an immediate reinstall cannot race old cleanup. Missing or invalid results and helper crashes leave the recovery directory untouched instead of deleting the only retired copy. State and unknown files are preserved; a preserved-root marker permits reinstall without granting delete authority. Incomplete rollback returns non-zero and keeps recovery material.
 
-Uninstall with `AiResume.Worker.exe uninstall` — it disables hook sources individually rather than deleting your `settings.json`.
+Uninstall without deleting user settings:
 
----
+```powershell
+& "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe" uninstall
+```
 
-## Using the control panel
+## Core workflows
 
-Double-click **AI Resume** on the Desktop.
+### Quota and automatic resume
 
-**Status lamp** (top left) answers one question — is it working?
+The main source is Anthropic's OAuth usage endpoint using Claude Code's real request shape. AI Resume reads the existing token but never refreshes or writes it. Modern `session`, `weekly_all` and every `weekly_scoped` limit are supported; Fable and other scoped limits appear separately.
 
-| Colour | Meaning |
+Quota responses are sparse, so absence is not treated as deletion. A recent value is carried only for the same account, scope and unexpired reset generation, then shown as an amber **recent server reading**. Known `0%` is an empty track, known `100%` is full, and reset-only data uses an indeterminate scan rather than inventing a percentage.
+
+Select projects, press **Arm**, and close the window. The Worker keeps the queue and resumes projects only after the reset evidence is valid.
+
+Detailed protocol: [Claude quota acquisition and validation](docs/CLAUDE-QUOTA-ACQUISITION.md).
+
+### Phone chat through cc-connect
+
+After cc-connect is configured, use Feishu or WeChat:
+
+| Command | Purpose |
 |---|---|
-| 🟢 Green | Working normally |
-| 🟡 Amber | Waiting (limit not yet lifted). Not a fault. |
-| 🔴 Red | Something needs your attention |
-| ⚪ Grey | Not armed |
-
-**Quota screens** show the 5-hour and 7-day windows. The bar draws **quota used**, not elapsed time; a separate hairline cursor marks where "now" sits inside the window. Numbers come from Claude's own usage endpoint — nothing is estimated.
-
-**Queue** lists discovered projects. Tick the ones you want, press **布防 (Arm)**, close the window. The engine watches for the limit and resumes them in order.
-
-**Providers** shows availability. A green light only ever comes from a **real request that succeeded** — a configured API key or an installed CLI is never treated as proof. Anything unverified stays grey.
-
-The Codex row verifies one step further. Listing models only proves the server **recognises** the key; it does not prove the key is **allowed to do work**. So after `/v1/models` the probe sends one `max_tokens=1` completion — single-digit tokens. A key that can list but not infer shows red, because any task using it will fail.
-
----
-
-## Talking to your projects from your phone
-
-Once `cc-connect` is configured and running, message the bot from Feishu or WeChat:
-
-| Command | What it does |
-|---|---|
-| `/help` | Command list |
-| `/status` | System status (also shows your user ID) |
-| `/dir <path>` · `/dir <n>` · `/dir -` · `/dir reset` | **Switch working directory — this is how you switch project** |
-| `/mode <name>` | Permission mode: `plan` (read-only-ish) · `default` · `acceptEdits` · `auto-edit` · `yolo` |
+| `/dir <path>` or `/dir <n>` | Switch project/working directory |
+| `/mode plan` / `/mode auto-edit` | Select read-only planning or editing behavior |
 | `/model switch <name>` | Switch model |
 | `/provider switch <name>` | Switch API provider |
-| `/new [name]` · `/list` · `/switch <n>` | New session · list · switch |
-| `/stop` | Stop the running task |
-| `/compress` | Compress context |
-| `/cron` · `/timer` | Scheduled tasks |
+| `/new`, `/list`, `/switch <n>` | Manage conversations |
+| `/stop` | Stop the active task |
+| `/cron`, `/timer` | Manage scheduled chat tasks |
 
-**Read-only vs. modify is `/mode`, not a separate menu.** `/mode plan` makes the agent plan without editing; `/mode auto-edit` or `/mode yolo` lets it write.
+Agent, provider and model are separate:
 
-**Agent selection is not a chat command.** In cc-connect one project is bound to exactly one agent (`claudecode`, `codex`, `cursor`, `gemini`, `qoder`, `opencode`, …). Change it in the control panel's **Agent** bank, regenerate the config, and restart cc-connect.
+- **Agent**: local executor and session owner, such as Claude Code or Codex.
+- **Provider**: remote endpoint and credential used by that agent.
+- **Model**: identifier sent to the provider.
 
-**Only you can drive it.** `allow_from` and `admin_from` pin the bot to your user ID on each platform. Messages from anyone else are dropped.
+The control panel stages a candidate cc-connect config, validates it with cc-connect's own parser, commits it atomically, requests an authenticated self-restart, and verifies a new process generation. It never reports success from a CLI exit code alone. Provider/model preservation rules and the Codex model catalog are documented in [Architecture](docs/ARCHITECTURE.md#agent-provider-and-model-semantics).
 
-### Where conversation history lives
+### Completion notifications
 
-- **cc-connect session index** — `~/.cc-connect/sessions/<project>_<hash>.json`
-- **Actual transcripts** — owned by the agent. For Claude Code: `~/.claude/projects/<encoded-workdir>/<sessionId>.jsonl`
-
-Casual chat with no `/dir` switch is filed under the current working directory. To keep it separate, `/dir` to a scratch folder or start a named session with `/new`.
-
----
-
-## Completion notifications
-
-A local agent finishing a **whole task** produces one message. The admission rule is strict: only boundaries that represent the end of an entire agent task are accepted — a callback that fires per model request is rejected, because that would notify you dozens of times per task.
-
-Verified sources:
-
-| Provider | Mechanism |
+| Source | Verified completion boundary |
 |---|---|
 | Claude Code | `Stop` hook |
-| Codex | `notify` |
+| Codex | `notify` callback |
 | Cline | `TaskComplete` |
-| Qoder | `hooks.Stop` in `~/.qoder/settings.json` |
+| Qoder | `hooks.Stop` |
 | OpenCode | `session.idle` plugin |
 
-Adapters merge into existing hook configuration rather than overwriting it, and uninstall removes only their own entries. AI Resume's own probes and background resume runs set `AI_RESUME_INTERNAL_RUN=1` so they never notify.
+Adapters merge with existing user configuration and remove only entries they can prove they own. Internal probes and resume runs set `AI_RESUME_INTERNAL_RUN=1` directly. Generated cc-connect projects set the same value in `projects.agent.options.env`, while the scheduled-task launcher also sets it as a daemon-level fallback, so Feishu-launched agent processes do not notify AI Resume about AI Resume's own work.
 
-The switch has **three** states, not two: off, on, and **on but undeliverable** — the hook is still written into the config, but the program it points at is gone. The third state turns red and carries a 「钩子断链」(broken hook) badge, because it is not the same thing as off: off is your choice, broken is a fault.
+Protocol and smoke procedure: [Completion notifications](docs/COMPLETION-NOTIFICATIONS.md).
 
-![Completion notification sources](docs/assets/panel-notify.png)
+## Safety model
 
----
-
-## Safety
-
-Running an AI unattended against real repositories is guarded deliberately:
-
-- **Single-consumer preflight.** A Feishu long connection is a *cluster*: with two consumers online, events are delivered to one of them at random — which looks like "the bot works sometimes". The panel scans for a second consumer and refuses to declare the machine ready when it finds one.
-- **Fail-closed everywhere.** An ambiguous process probe is treated as "still running", never as "gone". A PID alone is never enough to kill something — parent PID, start time and command signature must all match.
-- **Green means verified.** Availability is only ever asserted from a successful real request.
-- **Credentials never enter the repository.** Feishu credentials are encrypted with Windows DPAPI for the current user, stored outside the tree, and never read back into the UI.
-- **No client-side total timeout** for agent runs. Only a structured HTTP 408/504 counts as a provider timeout; DNS/TCP/TLS failures and monitor errors are local failures. Silence is a metric, not a verdict.
-- **User cancellation is terminal** — it never falls back to another provider or replays a run that already had side effects.
-
----
+- **Green means verified.** Provider availability requires a real successful request; installed commands and filled keys are not proof.
+- **One Feishu consumer.** Two long-connection consumers randomly split events, so preflight fails closed when another consumer is detected.
+- **No credential files in Git.** Feishu credentials are stored outside the repository with current-user Windows DPAPI.
+- **No PID-only termination.** Parent identity, start time and command signature must match before a process can be reclaimed.
+- **No client-side total timeout for agent work.** Silence is telemetry, not a failure verdict.
+- **Cancellation is terminal.** A cancelled run is not replayed through another provider.
 
 ## Architecture
 
+```text
+Feishu / WeChat
+       |
+       v
+  cc-connect ---------> Claude Code / Codex / other agents
+       |                            |
+       |                            v
+       +---------------------- AiResume.Hook
+                                    |
+                                    v
+AiResume.Gui <---- Named Pipe ---- AiResume.Worker
+   WPF + WebView2                  queue, quota, discovery,
+                                  notifications, supervision
 ```
-┌── Feishu / WeChat ──┐
-│                     ▼
-│              cc-connect  ──►  agent (Claude Code / Codex / …)
-│                     │
-└─────────────────────┼────────────────────────────────────────┐
-                      ▼                                        │
-      AiResume.Worker ── resume engine, project index,          │
-              │          notification sweep, process supervision│
-              │                                                 │
-      AiResume.Gui ──── WPF + WebView2 control panel ◄───────────┘
-              │
-      AiResume.Hook ─── the executable agents' hooks invoke
-```
 
-**Quota is read directly**, not borrowed from the bridge. The primary path is `GET https://api.anthropic.com/api/oauth/usage`, reusing the OAuth token Claude Code already holds — **read-only, never refreshed, never written back**, because refreshing it would race Claude Code for the refresh token. A token with under 60 seconds of life left is treated as expired. If that fails, a `ClaudeCodeProbe` subprocess takes over.
+State is stored under `%LOCALAPPDATA%\AI Resume\state\`; cc-connect keeps its own config and sessions under `%USERPROFILE%\.cc-connect\`. See [Architecture](docs/ARCHITECTURE.md) and [AI guide](AI_GUIDE.md) for ownership and data-flow details.
 
-Further reading: [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [RUN-CONTRACT.md](docs/RUN-CONTRACT.md) · [ADR-0003](docs/adr/0003-cc-connect-direct-and-control-plane.md) · [LESSONS.md](docs/LESSONS.md)
+## Verification status
 
----
+Verified on the current Windows installation:
 
-## Tests
+- full isolated xUnit suite and Release build with warnings treated as errors;
+- OAuth quota parsing, sparse continuity, scoped/Fable rows and SQLite concurrency;
+- equal-height quota panels, indeterminate/reset-only state and reduced-motion behavior;
+- all five hook protocols through queue, Worker, lark-cli and Feishu;
+- cc-connect candidate parsing, atomic activation and generation-bound restart checks;
+- installed GUI/Worker/Hook hashes matching the Release build.
+
+Known limits are stated rather than hidden:
+
+- a real account limit-reset-to-resume cycle has not yet been observed end to end;
+- the five notification sources have protocol-level smoke coverage, not five deliberately launched real AI tasks;
+- long-running stability has only a short-sample baseline, not a completed 24-hour soak.
+
+## Development
 
 ```powershell
 dotnet test csharp\AiResume.sln
+dotnet build csharp\AiResume.sln -c Release --no-restore -warnaserror
 ```
 
-723 xUnit tests. They never start an AI run against a real project or session, never touch `~/.claude`, `~/.codex` or the production state directory, and never make a paid API call. Probe classification is tested against recorded real responses rather than guessed shapes — a mock that guesses the wrong response shape produces an all-green suite and a silently broken product.
+The suite uses temporary state, synthetic sessions and injected process/API runners. It does not resume a real session, modify a real project or make paid model calls.
 
----
+## Documentation
 
-## Status
-
-Version 2 is the C# implementation described above. The v1 PowerShell + Node runtime was removed on 2026-08-08; read it via `git log -- src test`.
-
-Known gaps, stated plainly:
-
-- **Resume under a real rate limit has never been carried through end to end.** The internal chain (arm → observe limit → wait → resume → disarm) has been walked with a controlled agent response; a real account quota reset has not.
-- **The five notification sources have never all delivered in one run.** Only two of the five CLIs are installed on this machine.
-- **The 24-hour soak has a short-sample baseline only**, which is not enough to conclude anything.
-
----
-
-## Every claim on the screen
-
-The main work in this release is not a feature. It is walking every **affirmative sentence** in the UI back to what it actually verifies.
-
-The trigger was an external audit. None of its seven findings was a crash — all seven were **silent failures**: the panel said fine, the thing had been broken for a while.
-
-| The panel said | Reality |
-|---|---|
-| Notification source "enabled" | The program the hook points at was deleted; notifications never arrive |
-| Feishu "configured" | The credential had been reset upstream; every message was dropped |
-| "cc-connect config generated" | That TOML would not parse at all |
-| "Monitoring" in the header | The resume engine had been killed |
-| Codex "credential verified" | Could list models; inference returned 403 |
-| `install` exit code 0 | Not one of the five notification sources was enabled |
-
-The common thread is not carelessness. It is that **the test looked at the configuration and never at the world**. So now:
-
-- a notification source checks whether the executable in its command still exists;
-- Feishu credentials get a **Verify** button that really exchanges a token;
-- the cc-connect config is judged by **cc-connect's own parser** — on a copy, never touching the original;
-- the status lamp checks whether the engine process is actually running, and how long since the last quota probe;
-- install **persists the intent** ("which sources does the user want on") and reconciles against it — uninstall wipes the present state, and the present state was the only evidence there was;
-- when nothing can be concluded it says "unverified", not "fine". **Reporting the unknown as normal is the same lie as reporting a fault as normal.**
-
----
+- [Chinese README](README.zh-CN.md)
+- [Architecture and configuration](docs/ARCHITECTURE.md)
+- [Claude quota acquisition](docs/CLAUDE-QUOTA-ACQUISITION.md)
+- [Completion notification protocol](docs/COMPLETION-NOTIFICATIONS.md)
+- [Run lifecycle contract](docs/RUN-CONTRACT.md)
+- [Upstream research](docs/UPSTREAM-ARCHITECTURE-RESEARCH.md)
+- [Engineering lessons](docs/LESSONS.md)
+- [AI-oriented repository guide](AI_GUIDE.md)
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-The interface uses the [Ark Pixel Font](https://github.com/TakWolf/ark-pixel-font) (12px monospaced, zh_cn), distributed under the SIL Open Font License 1.1; the licence text ships at [`fonts/OFL.txt`](csharp/src/AiResume.Gui/wwwroot/fonts/OFL.txt).
+MIT, see [LICENSE](LICENSE). The interface uses [Ark Pixel Font](https://github.com/TakWolf/ark-pixel-font), distributed under SIL Open Font License 1.1; its license is included at [OFL.txt](csharp/src/AiResume.Gui/wwwroot/fonts/OFL.txt).

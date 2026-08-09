@@ -102,6 +102,24 @@ public sealed class CcConnectForeignPlatformTests
     }
 
     [Fact]
+    public void 平台类型值保留精确语义不得Trim后误认成Feishu()
+    {
+        const string spacedType = """
+            [[projects]]
+              [[projects.platforms]]
+                type = " feishu "
+                [projects.platforms.options]
+                  token = "keep-me"
+            """;
+
+        IReadOnlyList<string> blocks = CcConnectConfigGenerator.ExtractForeignPlatforms(spacedType);
+
+        Assert.Single(blocks);
+        Assert.Contains("type = \" feishu \"", blocks[0], StringComparison.Ordinal);
+        Assert.Contains("token = \"keep-me\"", blocks[0], StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void 脱敏回显报数但绝不包含保留块内容()
     {
         // 值取一个**不与键名重叠**的串:写成 "secret" 会和 app_secret 这个键名撞,

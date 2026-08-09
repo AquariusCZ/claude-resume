@@ -44,7 +44,7 @@ public sealed class CcConnectProjectIdentityTests
         IReadOnlyList<string> refs = CcConnectConfigGenerator.ReadGlobalProviderNames(
             ProvidersToml, "claudecode");
 
-        // deepseek 没声明 agent_types 视为通用;both 显式包含 claudecode。
+        // deepseek 是 Anthropic 端点,只适用于 claudecode;both 显式包含 claudecode。
         Assert.Equal(new[] { "deepseek", "both" }, refs);
     }
 
@@ -54,7 +54,7 @@ public sealed class CcConnectProjectIdentityTests
         IReadOnlyList<string> refs = CcConnectConfigGenerator.ReadGlobalProviderNames(
             ProvidersToml, "codex");
 
-        Assert.Equal(new[] { "chatpt-月付", "deepseek", "both" }, refs);
+        Assert.Equal(new[] { "chatpt-月付", "both" }, refs);
     }
 
     [Fact]
@@ -63,6 +63,23 @@ public sealed class CcConnectProjectIdentityTests
         IReadOnlyList<string> refs = CcConnectConfigGenerator.ReadGlobalProviderNames(ProvidersToml);
 
         Assert.Equal(new[] { "chatpt-月付", "deepseek", "both" }, refs);
+    }
+
+    [Fact]
+    public void anthropic默认端点有codex覆盖时仍可给codex引用()
+    {
+        const string toml = """
+            [[providers]]
+              name = "router"
+              base_url = "https://router.example/anthropic"
+
+              [providers.endpoints]
+                codex = "https://router.example/v1"
+            """;
+
+        IReadOnlyList<string> refs = CcConnectConfigGenerator.ReadGlobalProviderNames(toml, "codex");
+
+        Assert.Equal(new[] { "router" }, refs);
     }
 
     [Fact]

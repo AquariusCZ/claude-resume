@@ -9,7 +9,7 @@ namespace AiResume.Worker.Notifications;
 
 /// <summary>
 /// Claude Code 通知适配器:管理 ~/.claude/settings.json 中 hooks.Stop 的合并写入/移除。
-/// 所有权标记为命令中包含 <see cref="MarkerFileName"/> 的条目。
+/// 所有权由首个可执行文件名 + 固定来源参数共同证明。
 /// </summary>
 public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
 {
@@ -102,9 +102,18 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
         if (root is not JsonObject rootObj)
             throw new InvalidOperationException("配置文件根节点不是 JSON 对象");
 
-        // 已存在我方条目则幂等返回
+        string desiredCommand = HookCommand.Format(hookCommand, "claudecode");
+
+        // 已存在旧版裸路径时不能直接返回:裸路径既没有来源参数,含空格时也无法执行。
+        // 就地刷新所有我方命令,保留用户其余 hook 结构。
         if (ContainsOwnEntry(rootObj))
+        {
+            if (RefreshOwnCommands(rootObj, desiredCommand))
+            {
+                AtomicWrite(rootObj);
+            }
             return;
+        }
 
         // 确保 hooks 对象存在
         if (!rootObj.TryGetPropertyValue("hooks", out var hooksNode) || hooksNode is not JsonObject hooksObj)
@@ -129,7 +138,7 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
                 new JsonObject
                 {
                     ["type"] = "command",
-                    ["command"] = hookCommand,
+                    ["command"] = desiredCommand,
                     ["timeout"] = 30
                 }
             }
@@ -183,7 +192,7 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
                     hookObj.TryGetPropertyValue("command", out var cmdNode) &&
                     cmdNode is JsonValue cmdValue &&
                     cmdValue.TryGetValue<string>(out var cmdStr) &&
-                    cmdStr.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase))
+                    IsOwnCommand(cmdStr))
                 {
                     entryHooks.RemoveAt(j);
                     changed = true;
@@ -245,7 +254,7 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
                 if (hook.TryGetProperty("command", out var cmd) &&
                     cmd.ValueKind == JsonValueKind.String &&
                     cmd.GetString() is { } cmdStr &&
-                    cmdStr.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase))
+                    IsOwnCommand(cmdStr))
                 {
                     return cmdStr;
                 }
@@ -282,7 +291,7 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
                 if (hookObj.TryGetPropertyValue("command", out var cmdNode) &&
                     cmdNode is JsonValue cmdValue &&
                     cmdValue.TryGetValue<string>(out var cmdStr) &&
-                    cmdStr.Contains(MarkerFileName, StringComparison.OrdinalIgnoreCase))
+                    IsOwnCommand(cmdStr))
                 {
                     return true;
                 }
@@ -291,6 +300,47 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
 
         return false;
     }
+
+    private static bool RefreshOwnCommands(JsonObject root, string desiredCommand)
+    {
+        bool changed = false;
+        if (!root.TryGetPropertyValue("hooks", out JsonNode? hooksNode) || hooksNode is not JsonObject hooksObj ||
+            !hooksObj.TryGetPropertyValue("Stop", out JsonNode? stopNode) || stopNode is not JsonArray stopArray)
+        {
+            return false;
+        }
+
+        foreach (JsonNode? entryNode in stopArray)
+        {
+            if (entryNode is not JsonObject entryObj ||
+                !entryObj.TryGetPropertyValue("hooks", out JsonNode? entryHooksNode) ||
+                entryHooksNode is not JsonArray entryHooks)
+            {
+                continue;
+            }
+
+            foreach (JsonNode? hookNode in entryHooks)
+            {
+                if (hookNode is not JsonObject hookObj ||
+                    !hookObj.TryGetPropertyValue("command", out JsonNode? commandNode) ||
+                    commandNode is not JsonValue commandValue ||
+                    !commandValue.TryGetValue(out string? command) ||
+                    !IsOwnCommand(command) ||
+                    string.Equals(command, desiredCommand, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                hookObj["command"] = desiredCommand;
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    private static bool IsOwnCommand(string? command)
+        => HookCommand.IsManaged(command, MarkerFileName, "claudecode");
 
     /// <summary>
     /// 原子写回:先备份原文件为 .bak,再写临时文件并替换。

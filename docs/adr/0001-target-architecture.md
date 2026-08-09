@@ -1,4 +1,6 @@
-# ADR-0001:AI Resume 目标架构(全量迁移)
+# ADR-0001:AI Resume 目标架构(历史基线)
+
+> 本 ADR 记录从 v1 向 C# v2 迁移时的初始判断。关于 cc-connect 的边界已由 ADR-0003 修订;现役产品事实以 `docs/ARCHITECTURE.md` 为准。下文的“现役 Node”是 ADR 形成当时的历史语境，不是当前运行态。
 
 - 状态:**Accepted**
 - 日期:2026-08-01

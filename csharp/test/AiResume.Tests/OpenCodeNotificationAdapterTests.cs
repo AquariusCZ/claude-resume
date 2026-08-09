@@ -1,6 +1,8 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Text.Json;
 using AiResume.Worker.Notifications;
 using Xunit;
 
@@ -91,6 +93,13 @@ public class OpenCodeNotificationAdapterTests : IDisposable
 
         var content = File.ReadAllText(pluginPath, Encoding.UTF8);
         Assert.Contains("session.idle", content);
+        Assert.Contains("event.properties?.sessionID", content);
+        Assert.Contains("client.session.get", content);
+        Assert.Contains("session.parentID", content);
+        Assert.Contains("if (!session || session.parentID) return;", content);
+        Assert.Contains("Bun.spawn([cmd, \"opencode\"]", content);
+        Assert.Contains("new TextEncoder().encode(payload)", content);
+        Assert.DoesNotContain("Bun.$`", content);
 
         var status = _adapter.Probe();
         Assert.True(status.IsInstalled);
@@ -117,7 +126,7 @@ public class OpenCodeNotificationAdapterTests : IDisposable
     }
 
     /// <summary>
-    /// 场景5:已存在同名文件但内容不同时,Enable 先备份为 .bak 再覆盖。
+    /// 场景5:已存在我方旧版文件时,Enable 先备份为 .bak 再刷新。
     /// </summary>
     [Fact]
     public void Enable_WhenContentDifferent_CreatesBackupAndOverwrites()
@@ -126,14 +135,183 @@ public class OpenCodeNotificationAdapterTests : IDisposable
         var pluginPath = Path.Combine(_pluginsDirectory, OpenCodeNotificationAdapter.PluginFileName);
         var backupPath = pluginPath + ".bak";
 
-        // 预置不同内容的插件文件
-        File.WriteAllText(pluginPath, "// 旧内容", Encoding.UTF8);
+        // 预置含稳定所有权标记的旧版插件文件
+        string oldManaged = OpenCodeNotificationAdapter.BuildPluginSource("notify-send old-command");
+        File.WriteAllText(pluginPath, oldManaged, Encoding.UTF8);
 
         _adapter.Enable("notify-send new-command");
 
         Assert.True(File.Exists(backupPath));
-        Assert.Equal("// 旧内容", File.ReadAllText(backupPath, Encoding.UTF8));
+        Assert.Equal(oldManaged, File.ReadAllText(backupPath, Encoding.UTF8));
         Assert.Contains("notify-send new-command", File.ReadAllText(pluginPath, Encoding.UTF8));
+    }
+
+    [Fact]
+    public void Enable_WhenUserOwnsSameFileName_RefusesToOverwrite()
+    {
+        Directory.CreateDirectory(_pluginsDirectory);
+        string pluginPath = Path.Combine(_pluginsDirectory, OpenCodeNotificationAdapter.PluginFileName);
+        const string userPlugin = "// user plugin with the same filename";
+        File.WriteAllText(pluginPath, userPlugin, Encoding.UTF8);
+
+        InvalidOperationException error = Assert.Throws<InvalidOperationException>(
+            () => _adapter.Enable("notify-send test"));
+
+        Assert.Contains("拒绝覆盖", error.Message);
+        Assert.Equal(userPlugin, File.ReadAllText(pluginPath, Encoding.UTF8));
+        Assert.False(_adapter.Probe().IsEnabled);
+    }
+
+    [Fact]
+    public void Enable_UpgradesPreviousAiResumePluginWithoutNewMarker()
+    {
+        Directory.CreateDirectory(_pluginsDirectory);
+        string pluginPath = Path.Combine(_pluginsDirectory, OpenCodeNotificationAdapter.PluginFileName);
+        string legacy = LegacyPluginSource("old-hook.exe");
+        File.WriteAllText(pluginPath, legacy, Encoding.UTF8);
+
+        Assert.True(_adapter.Probe().IsEnabled);
+        _adapter.Enable("new-hook.exe");
+
+        string refreshed = File.ReadAllText(pluginPath, Encoding.UTF8);
+        Assert.StartsWith(OpenCodeNotificationAdapter.ManagedMarker, refreshed, StringComparison.Ordinal);
+        Assert.Contains("new-hook.exe", refreshed);
+    }
+
+    [Fact]
+    public void Enable_UpgradesPreviousManagedSpawnPluginBeforeParentFiltering()
+    {
+        Directory.CreateDirectory(_pluginsDirectory);
+        string pluginPath = Path.Combine(_pluginsDirectory, OpenCodeNotificationAdapter.PluginFileName);
+        string previous = PreviousManagedSpawnPluginSource("old-hook.exe");
+        File.WriteAllText(pluginPath, previous, Encoding.UTF8);
+
+        Assert.True(_adapter.Probe().IsEnabled);
+        _adapter.Enable("new-hook.exe");
+
+        string refreshed = File.ReadAllText(pluginPath, Encoding.UTF8);
+        Assert.Contains("client.session.get", refreshed);
+        Assert.Contains("session.parentID", refreshed);
+        Assert.Contains("new-hook.exe", refreshed);
+    }
+
+    [Fact]
+    public void GeneratedPlugin_NotifiesOnlyTopLevelSession()
+    {
+        string pluginPath = Path.Combine(_tempRoot, "plugin.mjs");
+        File.WriteAllText(pluginPath, OpenCodeNotificationAdapter.BuildPluginSource("hook.exe"), Encoding.UTF8);
+        string harnessPath = Path.Combine(_tempRoot, "harness.mjs");
+        string pluginUrl = new Uri(pluginPath).AbsoluteUri;
+        File.WriteAllText(harnessPath, $$"""
+            import { AiResumeNotify } from {{JsonSerializer.Serialize(pluginUrl)}};
+            let spawns = 0;
+            globalThis.Bun = { spawn() { spawns++; return { unref() {} }; } };
+            const run = async (session) => {
+              const client = { session: { get: async () => session } };
+              const plugin = await AiResumeNotify({ client, directory: "C:/project" });
+              await plugin.event({ event: { type: "session.idle", properties: { sessionID: "s1" } } });
+            };
+            await run({ data: { id: "s1", parentID: "parent" } });
+            const afterChild = spawns;
+            await run({ data: { id: "s1" } });
+            const afterTopLevel = spawns;
+            await run(null);
+            console.log(JSON.stringify([afterChild, afterTopLevel, spawns]));
+            """, Encoding.UTF8);
+
+        var psi = new ProcessStartInfo("node", harnessPath)
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        using Process process = Process.Start(psi)!;
+        Assert.True(process.WaitForExit(10_000), "Node 插件回归脚本超时");
+        string stdout = process.StandardOutput.ReadToEnd().Trim();
+        string stderr = process.StandardError.ReadToEnd();
+
+        Assert.True(process.ExitCode == 0, stderr);
+        Assert.Equal("[0,1,1]", stdout);
+    }
+
+    [Fact]
+    public void Disable_MarkerMentionOutsideFirstLineDoesNotClaimUserPlugin()
+    {
+        Directory.CreateDirectory(_pluginsDirectory);
+        string pluginPath = Path.Combine(_pluginsDirectory, OpenCodeNotificationAdapter.PluginFileName);
+        string userPlugin = "// user plugin\nconst note = \"" +
+                            OpenCodeNotificationAdapter.ManagedMarker.Replace("\"", "\\\"") +
+                            "\";\n";
+        File.WriteAllText(pluginPath, userPlugin, Encoding.UTF8);
+
+        _adapter.Disable();
+
+        Assert.Equal(userPlugin, File.ReadAllText(pluginPath, Encoding.UTF8));
+    }
+
+    private static string LegacyPluginSource(string hookCommand) => $$"""
+        {{OpenCodeNotificationAdapter.LegacyManagedMarker}}
+        // 监听 session.idle 事件,在 agent 完成响应时触发通知
+
+        export const AiResumeNotify = async ({ project, directory }) => {
+          return {
+            event: async ({ event }) => {
+              try {
+                if (event.type !== "session.idle") {
+                  return;
+                }
+                const targetDir = directory || project?.directory || process.cwd();
+                const cmd = "{{hookCommand}}";
+                await Bun.$`${cmd} ${targetDir}`.quiet();
+              } catch (err) {
+                console.error("[airesume-notify] 通知执行失败:", err);
+              }
+            }
+          };
+        };
+
+        export default AiResumeNotify;
+        """;
+
+    private static string PreviousManagedSpawnPluginSource(string hookCommand) => $$"""
+        {{OpenCodeNotificationAdapter.ManagedMarker}}
+        // 由 AI Resume 自动生成,请勿手动修改
+        export const AiResumeNotify = async ({ project, directory, worktree }) => {
+          return {
+            event: async ({ event }) => {
+              if (event.type !== "session.idle") return;
+              const sessionId = event.properties?.sessionID || "";
+              const targetDir = directory || worktree || project?.directory || process.cwd();
+              const payload = JSON.stringify({
+                hook_event_name: "session.idle",
+                session_id: sessionId,
+                cwd: targetDir
+              });
+              const cmd = "{{hookCommand}}";
+              const child = Bun.spawn([cmd, "opencode"], {
+                stdin: new TextEncoder().encode(payload),
+                stdout: "ignore",
+                stderr: "ignore"
+              });
+              child.unref();
+            }
+          };
+        };
+        export default AiResumeNotify;
+        """;
+
+    [Fact]
+    public void Disable_WhenUserOwnsSameFileName_PreservesFile()
+    {
+        Directory.CreateDirectory(_pluginsDirectory);
+        string pluginPath = Path.Combine(_pluginsDirectory, OpenCodeNotificationAdapter.PluginFileName);
+        const string userPlugin = "// user plugin with the same filename";
+        File.WriteAllText(pluginPath, userPlugin, Encoding.UTF8);
+
+        _adapter.Disable();
+
+        Assert.Equal(userPlugin, File.ReadAllText(pluginPath, Encoding.UTF8));
     }
 
     /// <summary>

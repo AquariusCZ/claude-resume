@@ -6,11 +6,18 @@ namespace AiResume.Worker.Notifications;
 /// <summary>一次投递的结果。</summary>
 public enum NotifyOutcome { Sent, Duplicate, Malformed, Failed, Skipped }
 
-public sealed record NotifyItemResult(string EventId, NotifyOutcome Outcome, string? Detail);
+public sealed record NotifyItemResult(
+    string EventId,
+    NotifyOutcome Outcome,
+    string? Detail,
+    string? Source = null);
 
 public sealed record NotifySweepResult(
     int Total, int Sent, int Duplicate, int Malformed, int Failed, int Skipped,
-    IReadOnlyList<NotifyItemResult> Items);
+    IReadOnlyList<NotifyItemResult> Items)
+{
+    public IReadOnlyList<string> Diagnostics { get; init; } = [];
+}
 
 /// <summary>
 /// 完成通知投递端(S12):消费 <c>completion-events</c> 队列,经 lark-cli 发飞书消息。
@@ -37,52 +44,66 @@ public sealed class CompletionNotifier
     private readonly string _seenPath;
     private readonly Func<string, string, string, CancellationToken, Task<bool>> _send;
     private readonly Func<DateTimeOffset> _now;
+    private readonly Func<string, string[]> _enumerateFiles;
+    private readonly Func<string, string, bool> _moveToMalformed;
 
     public CompletionNotifier(
         string eventsDir,
         string seenPath,
         Func<string, string, string, CancellationToken, Task<bool>> send,
-        Func<DateTimeOffset>? now = null)
+        Func<DateTimeOffset>? now = null,
+        Func<string, string[]>? enumerateFiles = null,
+        Func<string, string, bool>? moveToMalformed = null)
     {
         _eventsDir = eventsDir;
         _seenPath = seenPath;
         _send = send ?? throw new ArgumentNullException(nameof(send));
         _now = now ?? (() => DateTimeOffset.UtcNow);
+        _enumerateFiles = enumerateFiles ?? (path => Directory.GetFiles(path, "*.json"));
+        _moveToMalformed = moveToMalformed ?? TryMoveToMalformed;
     }
 
     /// <summary>扫一遍队列并投递。receiverOpenId 为空白时全部记 Skipped 且不删文件。</summary>
     public async Task<NotifySweepResult> SweepAsync(string receiverOpenId, CancellationToken ct = default)
     {
         var items = new List<NotifyItemResult>();
+        var diagnostics = new List<string>();
         int sent = 0, duplicate = 0, malformed = 0, failed = 0, skipped = 0;
 
-        // 目录不存在时返回全 0,不创建目录、不抛。
-        if (!Directory.Exists(_eventsDir))
-        {
-            return new NotifySweepResult(0, 0, 0, 0, 0, 0, items);
-        }
-
         // 加载去重表;文件不存在/空/无法解析 → 空表,不得抛。
-        Dictionary<string, DateTimeOffset> seen = LoadSeen();
+        Dictionary<string, DateTimeOffset> seen = LoadSeen(out string? seenDiagnostic);
+        if (seenDiagnostic is not null)
+        {
+            diagnostics.Add(seenDiagnostic);
+        }
 
         // 按文件名 Ordinal 升序处理,保证确定性。
         string[] files;
         try
         {
-            files = Directory.GetFiles(_eventsDir, "*.json")
+            files = _enumerateFiles(_eventsDir)
                 .Select(Path.GetFileName)
                 .Where(f => f is not null)
                 .OrderBy(f => f!, StringComparer.Ordinal)
                 .ToArray()!;
         }
+        catch (DirectoryNotFoundException)
+        {
+            return new NotifySweepResult(0, 0, 0, 0, 0, 0, items) { Diagnostics = diagnostics };
+        }
         catch (IOException)
         {
-            // 目录枚举失败:本轮无结果,不抛。
-            return new NotifySweepResult(0, 0, 0, 0, 0, 0, items);
+            const string code = "queue_enumeration_io";
+            diagnostics.Add(code);
+            items.Add(new NotifyItemResult("queue", NotifyOutcome.Failed, code, "worker"));
+            return new NotifySweepResult(1, 0, 0, 0, 1, 0, items) { Diagnostics = diagnostics };
         }
         catch (UnauthorizedAccessException)
         {
-            return new NotifySweepResult(0, 0, 0, 0, 0, 0, items);
+            const string code = "queue_enumeration_denied";
+            diagnostics.Add(code);
+            items.Add(new NotifyItemResult("queue", NotifyOutcome.Failed, code, "worker"));
+            return new NotifySweepResult(1, 0, 0, 0, 1, 0, items) { Diagnostics = diagnostics };
         }
 
         bool seenChanged = false;
@@ -98,15 +119,15 @@ public sealed class CompletionNotifier
             {
                 text = File.ReadAllText(fullPath);
             }
-            catch (IOException ex)
+            catch (IOException)
             {
-                items.Add(new NotifyItemResult(fileName, NotifyOutcome.Failed, ex.Message));
+                items.Add(new NotifyItemResult(fileName, NotifyOutcome.Failed, "read_io"));
                 failed++;
                 continue;
             }
-            catch (UnauthorizedAccessException ex)
+            catch (UnauthorizedAccessException)
             {
-                items.Add(new NotifyItemResult(fileName, NotifyOutcome.Failed, ex.Message));
+                items.Add(new NotifyItemResult(fileName, NotifyOutcome.Failed, "read_denied"));
                 failed++;
                 continue;
             }
@@ -116,29 +137,53 @@ public sealed class CompletionNotifier
             string? cwd;
             string? source;
             DateTimeOffset? atUtc;
+            bool smoke;
             try
             {
                 using var doc = JsonDocument.Parse(text);
                 JsonElement root = doc.RootElement;
-                eventId = root.TryGetProperty("eventId", out JsonElement e) ? e.GetString() : null;
-                cwd = root.TryGetProperty("cwd", out JsonElement c) ? c.GetString() : null;
-                source = root.TryGetProperty("source", out JsonElement s) ? s.GetString() : null;
-                string? atStr = root.TryGetProperty("atUtc", out JsonElement a) ? a.GetString() : null;
+                if (root.ValueKind != JsonValueKind.Object)
+                {
+                    throw new InvalidDataException("通知事件根节点必须是对象");
+                }
+                eventId = ReadOptionalString(root, "eventId");
+                cwd = ReadOptionalString(root, "cwd");
+                source = ReadOptionalString(root, "source");
+                string? atStr = ReadOptionalString(root, "atUtc");
                 atUtc = ParseUtc(atStr);
+                smoke = root.TryGetProperty("smoke", out JsonElement smokeElement) &&
+                        smokeElement.ValueKind == JsonValueKind.True;
             }
-            catch (JsonException)
+            catch (Exception ex) when (ex is JsonException or InvalidDataException)
             {
-                MoveToMalformed(fullPath, fileName);
-                items.Add(new NotifyItemResult(fileName, NotifyOutcome.Malformed, "JSON 解析失败"));
-                malformed++;
+                if (_moveToMalformed(fullPath, fileName))
+                {
+                    items.Add(new NotifyItemResult(fileName, NotifyOutcome.Malformed, "json_invalid"));
+                    malformed++;
+                }
+                else
+                {
+                    items.Add(new NotifyItemResult(
+                        fileName, NotifyOutcome.Failed, "malformed_move_failed:json_invalid"));
+                    failed++;
+                }
                 continue;
             }
 
             if (string.IsNullOrWhiteSpace(eventId) || string.IsNullOrWhiteSpace(cwd))
             {
-                MoveToMalformed(fullPath, fileName);
-                items.Add(new NotifyItemResult(fileName, NotifyOutcome.Malformed, "缺少 eventId 或 cwd"));
-                malformed++;
+                if (_moveToMalformed(fullPath, fileName))
+                {
+                    items.Add(new NotifyItemResult(
+                        fileName, NotifyOutcome.Malformed, "required_field_missing", source));
+                    malformed++;
+                }
+                else
+                {
+                    items.Add(new NotifyItemResult(
+                        fileName, NotifyOutcome.Failed, "malformed_move_failed:required_field_missing", source));
+                    failed++;
+                }
                 continue;
             }
 
@@ -148,7 +193,7 @@ public sealed class CompletionNotifier
                 nowUtc - recorded < DuplicateWindow)
             {
                 TryDelete(fullPath);
-                items.Add(new NotifyItemResult(eventId, NotifyOutcome.Duplicate, null));
+                items.Add(new NotifyItemResult(eventId, NotifyOutcome.Duplicate, null, source));
                 duplicate++;
                 continue;
             }
@@ -156,13 +201,13 @@ public sealed class CompletionNotifier
             // 4. receiverOpenId 为空白 → Skipped,保留文件。
             if (string.IsNullOrWhiteSpace(receiverOpenId))
             {
-                items.Add(new NotifyItemResult(eventId, NotifyOutcome.Skipped, null));
+                items.Add(new NotifyItemResult(eventId, NotifyOutcome.Skipped, "recipient_missing", source));
                 skipped++;
                 continue;
             }
 
             // 5. 投递。(变量名不能再叫 text —— 上面读文件时已占用。)
-            string message = BuildText(cwd, source, atUtc, nowUtc);
+            string message = BuildText(cwd, source, atUtc, nowUtc, smoke);
             try
             {
                 bool ok = await _send(receiverOpenId, message, eventId, ct);
@@ -171,19 +216,19 @@ public sealed class CompletionNotifier
                     seen[eventId] = nowUtc;
                     seenChanged = true;
                     TryDelete(fullPath);
-                    items.Add(new NotifyItemResult(eventId, NotifyOutcome.Sent, null));
+                    items.Add(new NotifyItemResult(eventId, NotifyOutcome.Sent, null, source));
                     sent++;
                 }
                 else
                 {
-                    items.Add(new NotifyItemResult(eventId, NotifyOutcome.Failed, null));
+                    items.Add(new NotifyItemResult(eventId, NotifyOutcome.Failed, "send_rejected", source));
                     failed++;
                 }
             }
-            catch (Exception ex)
+            catch (Exception)
             {
                 // 不得让异常逃出 SweepAsync:一条坏事件不能中断整轮。
-                items.Add(new NotifyItemResult(eventId, NotifyOutcome.Failed, ex.Message));
+                items.Add(new NotifyItemResult(eventId, NotifyOutcome.Failed, "send_exception", source));
                 failed++;
             }
         }
@@ -204,15 +249,40 @@ public sealed class CompletionNotifier
         // 只有本轮有变化时才写盘,避免每轮无谓 IO。
         if (seenChanged)
         {
-            WriteSeen(seen);
+            string? writeDiagnostic = WriteSeen(seen);
+            if (writeDiagnostic is not null)
+            {
+                diagnostics.Add(writeDiagnostic);
+            }
         }
 
         return new NotifySweepResult(
-            items.Count, sent, duplicate, malformed, failed, skipped, items);
+            items.Count, sent, duplicate, malformed, failed, skipped, items)
+        {
+            Diagnostics = diagnostics,
+        };
+    }
+
+    private static string? ReadOptionalString(JsonElement root, string propertyName)
+    {
+        if (!root.TryGetProperty(propertyName, out JsonElement value) || value.ValueKind == JsonValueKind.Null)
+        {
+            return null;
+        }
+        if (value.ValueKind != JsonValueKind.String)
+        {
+            throw new InvalidDataException($"通知字段 {propertyName} 必须是字符串");
+        }
+        return value.GetString();
     }
 
     /// <summary>构造通知文本:✅ &lt;项目名&gt; 已完成 / &lt;source&gt; · &lt;本地时间 HH:mm&gt;。</summary>
-    private static string BuildText(string cwd, string? source, DateTimeOffset? atUtc, DateTimeOffset nowUtc)
+    private static string BuildText(
+        string cwd,
+        string? source,
+        DateTimeOffset? atUtc,
+        DateTimeOffset nowUtc,
+        bool smoke)
     {
         string projectName = Path.GetFileName(cwd.TrimEnd('\\', '/'));
         if (string.IsNullOrEmpty(projectName))
@@ -221,10 +291,22 @@ public sealed class CompletionNotifier
         }
 
         DateTimeOffset localTime = atUtc?.ToLocalTime() ?? nowUtc.ToLocalTime();
-        string sourceText = string.IsNullOrWhiteSpace(source) ? "unknown" : source;
+        string sourceText = SourceDisplayName(source);
 
-        return $"✅ {projectName} 已完成\n{sourceText} · {localTime:HH:mm}";
+        string heading = smoke ? $"🧪 {projectName} 通知冒烟通过" : $"✅ {projectName} 已完成";
+        return $"{heading}\n{sourceText} · {localTime:HH:mm}";
     }
+
+    private static string SourceDisplayName(string? source)
+        => source?.Trim().ToLowerInvariant() switch
+        {
+            "claude" or "claude-code" or "claudecode" => "Claude Code",
+            "codex" => "Codex",
+            "cline" => "Cline",
+            "qoder" => "Qoder",
+            "opencode" => "OpenCode",
+            _ => "未知客户端",
+        };
 
     /// <summary>解析 ISO8601 UTC;失败返回 null。</summary>
     private static DateTimeOffset? ParseUtc(string? value)
@@ -249,7 +331,7 @@ public sealed class CompletionNotifier
     }
 
     /// <summary>把坏事件移入 malformed\ 子目录;目标已存在则加 Guid 后缀。</summary>
-    private void MoveToMalformed(string fullPath, string fileName)
+    private bool TryMoveToMalformed(string fullPath, string fileName)
     {
         try
         {
@@ -262,20 +344,24 @@ public sealed class CompletionNotifier
             }
 
             File.Move(fullPath, dest);
+            return true;
         }
         catch (IOException)
         {
             // 移动失败:保留原文件,下轮再试。
+            return false;
         }
         catch (UnauthorizedAccessException)
         {
             // 同上。
+            return false;
         }
     }
 
     /// <summary>加载去重表;文件不存在/空/无法解析 → 空表,不抛。</summary>
-    private Dictionary<string, DateTimeOffset> LoadSeen()
+    private Dictionary<string, DateTimeOffset> LoadSeen(out string? diagnostic)
     {
+        diagnostic = null;
         var result = new Dictionary<string, DateTimeOffset>(StringComparer.Ordinal);
         if (!File.Exists(_seenPath))
         {
@@ -293,9 +379,11 @@ public sealed class CompletionNotifier
             var parsed = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
             if (parsed is null)
             {
+                diagnostic = "seen_read_invalid";
                 return result;
             }
 
+            bool invalidEntry = false;
             foreach (KeyValuePair<string, string> kv in parsed)
             {
                 if (DateTimeOffset.TryParse(
@@ -306,26 +394,34 @@ public sealed class CompletionNotifier
                 {
                     result[kv.Key] = ts;
                 }
+                else
+                {
+                    invalidEntry = true;
+                }
+            }
+            if (invalidEntry)
+            {
+                diagnostic = "seen_read_invalid";
             }
         }
         catch (IOException)
         {
-            // 读失败视同空表。
+            diagnostic = "seen_read_io";
         }
         catch (UnauthorizedAccessException)
         {
-            // 同上。
+            diagnostic = "seen_read_denied";
         }
         catch (JsonException)
         {
-            // 损坏视同空表。
+            diagnostic = "seen_read_invalid";
         }
 
         return result;
     }
 
     /// <summary>原子写去重表:临时文件 → Flush(true) → Move(overwrite)。</summary>
-    private void WriteSeen(Dictionary<string, DateTimeOffset> seen)
+    private string? WriteSeen(Dictionary<string, DateTimeOffset> seen)
     {
         try
         {
@@ -369,14 +465,16 @@ public sealed class CompletionNotifier
 
                 throw;
             }
+
+            return null;
         }
         catch (IOException)
         {
-            // 写失败:本轮去重表不落盘,下轮重试;不抛。
+            return "seen_write_io";
         }
         catch (UnauthorizedAccessException)
         {
-            // 同上。
+            return "seen_write_denied";
         }
     }
 

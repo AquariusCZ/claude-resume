@@ -45,9 +45,9 @@ public sealed class CimRunningProcessLister : IRunningProcessLister
                     int pid = Convert.ToInt32(pidValue);
                     string name = item["Name"] as string ?? string.Empty;
 
-                    // 命令行为 null 是**正常情况**:系统进程与更高完整性级别的进程
-                    // 不向本会话暴露命令行。这不影响 ProvidesCommandLine 的承诺——
-                    // 我们要找的 node.exe / cc-connect 与本进程同用户同完整性,读得到。
+                    // 命令行为 null 是**可能情况**:系统进程、更高完整性级别或 S4U
+                    // 安全上下文可能不向交互会话暴露命令行。枚举器如实返回 null;
+                    // SingleConsumerGuard 遇到相关脚本宿主时会 fail-closed,不能把它当成无冲突。
                     string? commandLine = item["CommandLine"] as string;
 
                     result.Add(new RunningProcessInfo(pid, name, commandLine));

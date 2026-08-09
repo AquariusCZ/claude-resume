@@ -5,19 +5,14 @@ using Xunit;
 namespace AiResume.Tests;
 
 /// <summary>
-/// notify 链剪枝。**2026-08-08 真实事故的回归。**
-///
-/// 安装目录改名成含空格的 <c>AI Resume</c> 之后,写进 notify 的钩子路径在空格处
-/// 断成 <c>C:\Users\…\AppData\Local\AI</c>。断掉的条目**不含标记** AiResume.Hook.exe,
-/// 于是 <c>IsOwnCommand</c> 认不出它是我们自己写的,**每次启用都再套一层而不是替换** ——
-/// 套到第 8 层撞上 MaxChainDepth,适配器从此拒绝处理,
-/// 界面只报「notify 链深度超过上限」。用户看到的是「Codex 通知打不开了」,
-/// 而根因在七层之外。实测那一行长 9909 字符。
+/// notify 链所有权回归。历史截断路径与用户命令无法从形状上可靠区分,
+/// 因此兼容入口必须保守地逐字保留。
 /// </summary>
 public sealed class CodexNotifyChainPruneTests
 {
     private const string Alive = @"C:\real\node.exe";
-    private const string Dead = @"C:\Users\x\AppData\Local\AI";
+    private static readonly string Dead = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AI");
 
     private static Func<string, bool> Exists(params string[] alive)
         => p => alive.Contains(p, StringComparer.OrdinalIgnoreCase);
@@ -34,17 +29,17 @@ public sealed class CodexNotifyChainPruneTests
     }
 
     [Fact]
-    public void 剪掉断路径那层露出里面活着的命令()
+    public void 断路径外壳没有所有权证据时原样保留()
     {
         string[] arr = Wrap(Dead, [Alive, "turn-ended"]);
 
         string[] pruned = CodexNotificationAdapter.PruneDeadLinks(arr, Exists(Alive));
 
-        Assert.Equal([Alive, "turn-ended"], pruned);
+        Assert.Equal(arr, pruned);
     }
 
     [Fact]
-    public void 连续七层断路径全部剪掉()
+    public void 连续七层歧义命令也原样保留()
     {
         // 这就是用户机器上的真实形态:7 层同样的断路径,最内层是已删除的 v1 脚本。
         string[] arr = [Alive, "turn-ended"];
@@ -55,7 +50,7 @@ public sealed class CodexNotifyChainPruneTests
 
         string[] pruned = CodexNotificationAdapter.PruneDeadLinks(arr, Exists(Alive));
 
-        Assert.Equal([Alive, "turn-ended"], pruned);
+        Assert.Equal(arr, pruned);
     }
 
     [Fact]
@@ -66,7 +61,7 @@ public sealed class CodexNotifyChainPruneTests
         string[] inner = [@"C:\gone\node.exe", @"C:\gone\v1.js", "codex"];
         string[] arr = Wrap(Dead, inner);
 
-        Assert.Equal(inner, CodexNotificationAdapter.PruneDeadLinks(arr, Exists()));
+        Assert.Equal(arr, CodexNotificationAdapter.PruneDeadLinks(arr, Exists()));
     }
 
     [Fact]
@@ -97,13 +92,14 @@ public sealed class CodexNotifyChainPruneTests
     {
         string[] arr = [Dead, "codex", "--previous-notify", "{不是数组}"];
 
-        Assert.Empty(CodexNotificationAdapter.PruneDeadLinks(arr, Exists(Alive)));
+        Assert.Equal(arr, CodexNotificationAdapter.PruneDeadLinks(arr, Exists(Alive)));
     }
 
     [Fact]
-    public void 断路径但没有previous时保留()
+    public void 精确旧截断末端也因所有权不明而保留()
     {
-        // 不是完整的我方包装形状(没有 --previous-notify),不动它。
+        // 旧版最内层就是 ["%LOCALAPPDATA%\\AI", "codex"]。
+        // 形状命中历史事故并不等于可证明由 AI Resume 写入。
         string[] arr = [Dead, "codex"];
 
         Assert.Equal(arr, CodexNotificationAdapter.PruneDeadLinks(arr, Exists(Alive)));

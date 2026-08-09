@@ -1,5 +1,7 @@
 # S7-I 规格:Claude 额度改走官方 oauth/usage 接口
 
+> **历史初始设计,不再是现役契约。** 本文冻结了 2026-08-06 首版 OAuth 方案,尚未包含现代 `limits`、Claude Code User-Agent、Fable/scoped 窗口、账号指纹、稀疏合并、SQLite v5 与现役 UI 语义。当前实现与验证步骤以 [`../CLAUDE-QUOTA-ACQUISITION.md`](../CLAUDE-QUOTA-ACQUISITION.md) 为准;本文只保留设计演进证据。
+
 ## 1. 为什么(上游盘点结论)
 
 现役实现起 `claude` 子进程等约 7 秒解析 `rate_limit_event`,且 `five_hour` 只偶发下发,

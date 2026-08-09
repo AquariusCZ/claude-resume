@@ -27,6 +27,12 @@ public enum CodexAuthOutcome
     Authorized,
 
     /// <summary>
+    /// 服务端接受了凭据，但最小推理没有得到成功响应。
+    /// 这只能证明鉴权，不能证明任务可运行，因此界面必须保持非绿色。
+    /// </summary>
+    InferenceUnverified,
+
+    /// <summary>
     /// 能列模型,但不允许推理。
     ///
     /// 这一档是 2026-08-08 第二轮审计逼出来的(A6):审计方架了个假端点,
@@ -299,10 +305,10 @@ public static class CodexAuthProbe
             return new CodexAuthResult(CodexAuthOutcome.ServerError, $"服务端异常(HTTP {code})");
         }
 
-        // 端点不支持这种最小探测:凭据结论保持"已验证",但必须说清没验证到推理。
+        // 端点不支持这种最小探测:凭据已经通过，但推理没有得到成功证据。
         return new CodexAuthResult(
-            CodexAuthOutcome.Authorized,
-            $"可用 · 凭据已验证(端点未接受最小推理探测 HTTP {code},推理权限未核实)");
+            CodexAuthOutcome.InferenceUnverified,
+            $"凭据已验证 · 端点未接受最小推理探测(HTTP {code}),推理权限未核实");
     }
 
     public static async Task<CodexAuthResult> ProbeAsync(
@@ -376,7 +382,8 @@ public static class CodexAuthProbe
         {
             // 不知道该用哪个模型就别猜一个。说清"验到哪一步"比给个漂亮结论重要。
             return new CodexAuthResult(
-                CodexAuthOutcome.Authorized, "可用 · 凭据已验证(配置里没写 model,推理权限未核实)");
+                CodexAuthOutcome.InferenceUnverified,
+                "凭据已验证 · 配置里没写 model,推理权限未核实");
         }
 
         using var body = new StringContent(
@@ -405,14 +412,16 @@ public static class CodexAuthProbe
         {
             // 凭据这一关已经过了,只是推理那一步没走完 —— 不能因此把凭据判成坏的。
             return new CodexAuthResult(
-                CodexAuthOutcome.Authorized, "可用 · 凭据已验证(推理探测超时,推理权限未核实)");
+                CodexAuthOutcome.InferenceUnverified,
+                "凭据已验证 · 推理探测超时,推理权限未核实");
         }
         catch (HttpRequestException ex)
         {
             // 措辞与其它降级分支保持一致:凡是没验到推理的,都必须出现"未核实"。
             // 说法不统一等于让用户逐句去猜哪句代表"验过了"。
             return new CodexAuthResult(
-                CodexAuthOutcome.Authorized, "可用 · 凭据已验证(推理权限未核实:" + ex.Message + ")");
+                CodexAuthOutcome.InferenceUnverified,
+                "凭据已验证 · 推理权限未核实:" + ex.Message);
         }
     }
 }

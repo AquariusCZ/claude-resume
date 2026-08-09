@@ -25,6 +25,7 @@ public sealed class NotificationWorker : BackgroundService
     private readonly ILogger<NotificationWorker> _logger;
     private readonly CompletionNotifier _notifier;
     private readonly Func<string?> _recipient;
+    private readonly TimeSpan _interval;
 
     public NotificationWorker(ILogger<NotificationWorker> logger)
         : this(logger, null, null)
@@ -36,7 +37,8 @@ public sealed class NotificationWorker : BackgroundService
     public NotificationWorker(
         ILogger<NotificationWorker> logger,
         CompletionNotifier? notifier,
-        Func<string?>? recipient)
+        Func<string?>? recipient,
+        TimeSpan? interval = null)
     {
         _logger = logger;
         _notifier = notifier ?? new CompletionNotifier(
@@ -44,21 +46,30 @@ public sealed class NotificationWorker : BackgroundService
             seenPath: Path.Combine(ShadowPaths.Root, "completion-notify-seen.json"),
             send: SendViaLarkCliAsync);
         _recipient = recipient ?? ResolveOwnerOpenId;
+        _interval = interval ?? Interval;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation(
             "worker.notify.started component={Component} intervalSeconds={IntervalSeconds}",
-            "worker", Interval.TotalSeconds);
+            "worker", _interval.TotalSeconds);
 
-        using PeriodicTimer timer = new(Interval);
-        while (await timer.WaitForNextTickAsync(stoppingToken))
+        int failedRounds = 0;
+        TimeSpan nextDelay = _interval;
+
+        // 启动后先立即扫一遍。安装/崩溃恢复前积压的完成事件不该再平白等 30 秒。
+        while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
                 string receiver = _recipient() ?? string.Empty;
                 NotifySweepResult r = await _notifier.SweepAsync(receiver, stoppingToken);
+
+                foreach (string diagnostic in r.Diagnostics)
+                {
+                    _logger.LogWarning("worker.notify.diagnostic code={Code}", diagnostic);
+                }
 
                 // 空轮不记日志:每 30 秒一条"扫了 0 条"会把日志淹掉,
                 // 真正出问题时反而找不到。
@@ -67,6 +78,31 @@ public sealed class NotificationWorker : BackgroundService
                     _logger.LogInformation(
                         "worker.notify.sweep total={Total} sent={Sent} duplicate={Duplicate} malformed={Malformed} failed={Failed} skipped={Skipped}",
                         r.Total, r.Sent, r.Duplicate, r.Malformed, r.Failed, r.Skipped);
+
+                    foreach (NotifyItemResult item in r.Items)
+                    {
+                        if (item.Outcome is NotifyOutcome.Failed or NotifyOutcome.Malformed)
+                        {
+                            _logger.LogWarning(
+                                "worker.notify.item eventId={EventId} source={Source} outcome={Outcome} reason={Reason}",
+                                item.EventId, item.Source ?? "unknown", item.Outcome, item.Detail ?? "unknown");
+                        }
+                        else
+                        {
+                            _logger.LogInformation(
+                                "worker.notify.item eventId={EventId} source={Source} outcome={Outcome}",
+                                item.EventId, item.Source ?? "unknown", item.Outcome);
+                        }
+                    }
+                }
+
+                failedRounds = r.Failed > 0 ? Math.Min(failedRounds + 1, 6) : 0;
+                nextDelay = ComputeRetryDelay(_interval, failedRounds);
+                if (failedRounds > 0)
+                {
+                    _logger.LogWarning(
+                        "worker.notify.retry_backoff failedRounds={FailedRounds} nextSeconds={NextSeconds}",
+                        failedRounds, nextDelay.TotalSeconds);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -78,7 +114,35 @@ public sealed class NotificationWorker : BackgroundService
                 // 通知是辅助功能,**绝不能把 Worker 拖崩**——续跑编排才是这个进程的本职。
                 _logger.LogWarning(ex, "worker.notify.sweep_failed");
             }
+
+            try
+            {
+                await Task.Delay(nextDelay, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
         }
+    }
+
+    /// <summary>连续失败按 2^n 退避,上限 15 分钟;成功轮立即恢复基础间隔。</summary>
+    public static TimeSpan ComputeRetryDelay(TimeSpan baseInterval, int failedRounds)
+    {
+        if (baseInterval <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(baseInterval));
+        }
+
+        if (failedRounds <= 0)
+        {
+            return baseInterval;
+        }
+
+        double multiplier = Math.Pow(2, Math.Min(failedRounds - 1, 10));
+        return TimeSpan.FromMilliseconds(Math.Min(
+            baseInterval.TotalMilliseconds * multiplier,
+            TimeSpan.FromMinutes(15).TotalMilliseconds));
     }
 
     /// <summary>

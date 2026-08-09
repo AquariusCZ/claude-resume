@@ -1,6 +1,6 @@
 # AI Resume 事件 / 命令契约(EVENT-CONTRACTS)
 
-> 状态:目标跨进程契约 v2,2026-08-01。ADR-0002 与 `RUN-CONTRACT.md` 是运行生命周期真身。现役 Node/PowerShell 仍使用 JSON/marker 与旧事件形状;本文件描述迁移目标,不得冒充已部署行为。
+> 状态:历史迁移设计,2026-08-01。Node/PowerShell 已退役;本文件没有整体接线为现役协议。当前运行生命周期真身是 ADR-0002、`RUN-CONTRACT.md` 与 C# 实现,引用本文件时必须逐项核对当前代码。
 
 ## 1. 目的与原则
 

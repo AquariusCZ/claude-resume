@@ -42,7 +42,8 @@ public class ClaudeCodeNotificationAdapterTests : IDisposable
 
     // 必须含 ClaudeCodeNotificationAdapter.MarkerFileName("AiResume.Hook.exe"),
     // 否则写入的条目不会被自身的所有权判定认出,IsEnabled 与幂等断言都会失败。
-    private const string TestHookCommand = "C:\\tools\\AiResume.Hook.exe claudecode";
+    private const string TestHookCommand = "C:\\tools\\AiResume.Hook.exe";
+    private const string ExpectedStoredCommand = "\"C:\\tools\\AiResume.Hook.exe\" claudecode";
 
     /// <summary>
     /// 场景1:目录不存在 -> Probe 的 IsInstalled=false,不抛异常。
@@ -106,7 +107,7 @@ public class ClaudeCodeNotificationAdapterTests : IDisposable
 
         var hook = entryHooks[0];
         Assert.True(hook.TryGetProperty("command", out var cmd));
-        Assert.Equal(TestHookCommand, cmd.GetString());
+        Assert.Equal(ExpectedStoredCommand, cmd.GetString());
         Assert.Contains(ClaudeCodeNotificationAdapter.MarkerFileName, cmd.GetString(), StringComparison.OrdinalIgnoreCase);
     }
 
@@ -316,5 +317,67 @@ public class ClaudeCodeNotificationAdapterTests : IDisposable
         Assert.True(bakRoot.TryGetProperty("theme", out var theme));
         Assert.Equal("light", theme.GetString());
         Assert.False(bakRoot.TryGetProperty("hooks", out _));
+    }
+
+    [Fact]
+    public void Enable_RefreshesLegacyBarePathWithQuotedSourceCommand()
+    {
+        var legacy = new JsonObject
+        {
+            ["hooks"] = new JsonObject
+            {
+                ["Stop"] = new JsonArray
+                {
+                    new JsonObject
+                    {
+                        ["matcher"] = "",
+                        ["hooks"] = new JsonArray
+                        {
+                            new JsonObject
+                            {
+                                ["type"] = "command",
+                                ["command"] = TestHookCommand,
+                                ["timeout"] = 30,
+                            },
+                        },
+                    },
+                },
+            },
+        };
+        File.WriteAllText(_settingsPath, legacy.ToJsonString());
+
+        _adapter.Enable(TestHookCommand);
+
+        Assert.Equal(ExpectedStoredCommand, _adapter.Probe().HookCommand);
+    }
+
+    [Fact]
+    public void Disable_DoesNotTreatMarkerInUserArgumentsAsOwnership()
+    {
+        const string userCommand = "\"C:\\tools\\notify.exe\" --label AiResume.Hook.exe";
+        var root = new JsonObject
+        {
+            ["hooks"] = new JsonObject
+            {
+                ["Stop"] = new JsonArray
+                {
+                    new JsonObject
+                    {
+                        ["hooks"] = new JsonArray
+                        {
+                            new JsonObject { ["type"] = "command", ["command"] = userCommand },
+                        },
+                    },
+                },
+            },
+        };
+        File.WriteAllText(_settingsPath, root.ToJsonString());
+
+        _adapter.Enable(TestHookCommand);
+        _adapter.Disable();
+
+        string preserved = File.ReadAllText(_settingsPath);
+        Assert.Contains("notify.exe", preserved);
+        Assert.Contains("--label AiResume.Hook.exe", preserved);
     }
 }

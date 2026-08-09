@@ -1,5 +1,7 @@
 # AI Resume 全量迁移 · 阶段 0 文档基线(MIGRATION-BASELINE)
 
+> 历史快照:本文冻结的是 2026-08-01 迁移启动前的 v1 运行态,其中“现役”“尚未实现”等措辞只在该时间点成立。当前 v2 状态以 `docs/ARCHITECTURE.md`、`docs/MIGRATION-PROGRESS.md` 和 `AI_GUIDE.md` 为准。
+
 > 状态:阶段 0 交付物之一,2026-08-01 定稿。本文只记录**已验证**基线,不夸大、不冒充已实现;本文不修改代码/配置。
 > 归属:受控文档实现工执行,OpenAI Codex 架构监督;DeepSeek V4-flash 为主要开发执行器——这是开发流程分工,不是产品运行时密钥或依赖写入仓库。
 

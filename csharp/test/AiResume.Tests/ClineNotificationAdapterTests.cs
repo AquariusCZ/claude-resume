@@ -86,6 +86,7 @@ public class ClineNotificationAdapterTests : IDisposable
         Assert.True(File.Exists(HookPath));
         var content = File.ReadAllText(HookPath);
         Assert.Contains(ClineNotificationAdapter.Marker, content);
+        Assert.Contains("$stdin | & 'C:\\tools\\ai-resume-hook.exe' cline", content);
         var status = _adapter.Probe();
         Assert.True(status.IsInstalled);
         Assert.True(status.IsEnabled);
@@ -208,5 +209,31 @@ public class ClineNotificationAdapterTests : IDisposable
         Assert.Equal(0xEF, bytes[0]);
         Assert.Equal(0xBB, bytes[1]);
         Assert.Equal(0xBF, bytes[2]);
+    }
+
+    [Fact]
+    public void BuildWrapper_ForwardsStdinToPreviousAndAiResumeHook()
+    {
+        Directory.CreateDirectory(_hooksDirectory);
+        File.WriteAllText(PreviousPath, "# previous");
+
+        string script = ClineNotificationAdapter.BuildWrapperScript(
+            @"C:\tools\AiResume.Hook.exe", PreviousPath);
+
+        Assert.Contains("$previousOutput = $stdin | & powershell.exe", script);
+        Assert.Contains("$stdin | & 'C:\\tools\\AiResume.Hook.exe' cline", script);
+    }
+
+    [Fact]
+    public void Enable_RefreshesManagedWrapperWithoutDisablingItFirst()
+    {
+        Directory.CreateDirectory(_hooksDirectory);
+        _adapter.Enable(@"C:\old\AiResume.Hook.exe");
+
+        _adapter.Enable(@"C:\new path\AiResume.Hook.exe");
+
+        string script = File.ReadAllText(HookPath);
+        Assert.Contains("$stdin | & 'C:\\new path\\AiResume.Hook.exe' cline", script);
+        Assert.DoesNotContain("C:\\old\\AiResume.Hook.exe", script);
     }
 }

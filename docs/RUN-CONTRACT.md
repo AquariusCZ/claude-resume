@@ -1,6 +1,6 @@
 # AI Resume RunContract v1
 
-> 状态:目标运行契约,2026-08-01。由 ADR-0002 接受。现役 Node/PowerShell 尚未实现本契约;Stage 1 只抽取兼容边界,Stage 2 起由 C# Worker 实现,Stage 5/6 才逐步接管 shadow/测试运行。
+> 状态:现役运行契约。2026-08-01 由 ADR-0002 接受，随后由 C# Worker 实现；Node/PowerShell 迁移阶段的接管顺序仅作为历史背景保留。当前实现与偏差以 `docs/ARCHITECTURE.md` 和 C# 回归为准。
 
 ## 1. 目标与不变量
 

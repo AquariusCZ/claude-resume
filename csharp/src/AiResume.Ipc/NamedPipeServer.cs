@@ -308,7 +308,7 @@ public sealed class NamedPipeServer : IAsyncDisposable
                         Type = PipeProtocol.ResponsePong,
                         CorrelationId = request.CorrelationId,
                         Payload = JsonSerializer.SerializeToElement(
-                            new { version = PipeProtocol.Version }, IpcJson.Options),
+                            new { version = PipeProtocol.Version, processId = Environment.ProcessId }, IpcJson.Options),
                     };
 
                 case PipeProtocol.CommandStart:

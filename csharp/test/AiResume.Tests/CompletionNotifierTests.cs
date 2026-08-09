@@ -15,6 +15,38 @@ public sealed class CompletionNotifierTests
 {
     private static readonly DateTimeOffset FixedNow = new DateTimeOffset(2026, 8, 7, 12, 0, 0, TimeSpan.Zero);
 
+    [Theory]
+    [InlineData(false, "queue_enumeration_io")]
+    [InlineData(true, "queue_enumeration_denied")]
+    public async Task 队列枚举失败会进入诊断失败与退避而不是冒充空队列(bool denied, string code)
+    {
+        string dir = CreateTempDir();
+        try
+        {
+            var notifier = new CompletionNotifier(
+                Path.Combine(dir, "events"),
+                Path.Combine(dir, "seen.json"),
+                (_, _, _, _) => Task.FromResult(true),
+                () => FixedNow,
+                _ => denied
+                    ? throw new UnauthorizedAccessException("denied")
+                    : throw new IOException("io"));
+
+            NotifySweepResult result = await notifier.SweepAsync("ou_test");
+
+            Assert.Equal(1, result.Total);
+            Assert.Equal(1, result.Failed);
+            Assert.Contains(code, result.Diagnostics);
+            NotifyItemResult item = Assert.Single(result.Items);
+            Assert.Equal(NotifyOutcome.Failed, item.Outcome);
+            Assert.Equal(code, item.Detail);
+        }
+        finally
+        {
+            Cleanup(dir);
+        }
+    }
+
     [Fact]
     public async Task 正常事件被投递并删除文件()
     {
@@ -96,7 +128,70 @@ public sealed class CompletionNotifierTests
 
             Assert.NotNull(receivedText);
             Assert.Contains("my-proj", receivedText);
-            Assert.Contains("claudecode", receivedText);
+            Assert.Contains("Claude Code", receivedText);
+        }
+        finally
+        {
+            Cleanup(dir);
+        }
+    }
+
+    [Fact]
+    public async Task 冒烟事件使用明确测试文案()
+    {
+        string dir = CreateTempDir();
+        try
+        {
+            string eventsDir = Path.Combine(dir, "events");
+            Directory.CreateDirectory(eventsDir);
+            File.WriteAllText(
+                Path.Combine(eventsDir, "a.json"),
+                "{\"eventId\":\"abababababababab\",\"source\":\"opencode\",\"cwd\":\"C:\\\\x\\\\repo\",\"smoke\":true}");
+            string? received = null;
+            var notifier = new CompletionNotifier(
+                eventsDir,
+                Path.Combine(dir, "seen.json"),
+                (_, text, _, _) => { received = text; return Task.FromResult(true); },
+                () => FixedNow);
+
+            await notifier.SweepAsync("ou_test");
+
+            Assert.Contains("通知冒烟通过", received);
+            Assert.Contains("OpenCode", received);
+        }
+        finally
+        {
+            Cleanup(dir);
+        }
+    }
+
+    [Fact]
+    public async Task 字段类型错误会隔离且不阻塞后续正常事件()
+    {
+        string dir = CreateTempDir();
+        try
+        {
+            string eventsDir = Path.Combine(dir, "events");
+            Directory.CreateDirectory(eventsDir);
+            string bad = Path.Combine(eventsDir, "000-bad.json");
+            string good = Path.Combine(eventsDir, "001-good.json");
+            File.WriteAllText(bad, "{\"eventId\":123,\"cwd\":\"C:\\\\work\"}");
+            File.WriteAllText(good, EventJson("abababababababac", @"C:\x\repo", "codex"));
+            int sends = 0;
+            var notifier = new CompletionNotifier(
+                eventsDir,
+                Path.Combine(dir, "seen.json"),
+                (_, _, _, _) => { sends++; return Task.FromResult(true); },
+                () => FixedNow);
+
+            NotifySweepResult result = await notifier.SweepAsync("ou_test");
+
+            Assert.Equal(2, result.Total);
+            Assert.Equal(1, result.Malformed);
+            Assert.Equal(1, result.Sent);
+            Assert.Equal(1, sends);
+            Assert.False(File.Exists(good));
+            Assert.True(File.Exists(Path.Combine(eventsDir, "malformed", "000-bad.json")));
         }
         finally
         {
@@ -272,6 +367,37 @@ public sealed class CompletionNotifierTests
     }
 
     [Fact]
+    public async Task 坏JSON隔离失败按Failed退避且保留诊断()
+    {
+        string dir = CreateTempDir();
+        try
+        {
+            string eventsDir = Path.Combine(dir, "events");
+            Directory.CreateDirectory(eventsDir);
+            string file = Path.Combine(eventsDir, "bad.json");
+            File.WriteAllText(file, "{ 坏");
+
+            var notifier = new CompletionNotifier(
+                eventsDir,
+                Path.Combine(dir, "seen.json"),
+                (_, _, _, _) => Task.FromResult(true),
+                () => FixedNow,
+                moveToMalformed: (_, _) => false);
+
+            NotifySweepResult result = await notifier.SweepAsync("ou_123");
+
+            Assert.Equal(0, result.Malformed);
+            Assert.Equal(1, result.Failed);
+            Assert.Equal("malformed_move_failed:json_invalid", Assert.Single(result.Items).Detail);
+            Assert.True(File.Exists(file));
+        }
+        finally
+        {
+            Cleanup(dir);
+        }
+    }
+
+    [Fact]
     public async Task 缺少eventId或cwd视为坏事件()
     {
         string dir = CreateTempDir();
@@ -412,6 +538,7 @@ public sealed class CompletionNotifierTests
 
             Assert.Equal(1, result.Sent);
             Assert.Equal(1, sendCalls);
+            Assert.Contains("seen_read_invalid", result.Diagnostics);
         }
         finally
         {

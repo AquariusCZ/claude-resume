@@ -1,4 +1,7 @@
 using System.Text;
+using System.Text.RegularExpressions;
+using Tomlyn;
+using Tomlyn.Model;
 
 namespace AiResume.Wrapper;
 
@@ -27,7 +30,7 @@ public sealed record CcConnectPlatformOptions(string AppId, string AppSecret, st
 /// </summary>
 public sealed record CcConnectProject(
     string Name, string Agent, string WorkDir, string Mode = "default", string AdminFrom = "",
-    IReadOnlyList<string>? ProviderRefs = null);
+    IReadOnlyList<string>? ProviderRefs = null, string SelectedProvider = "", string SelectedModel = "");
 
 /// <summary>cc-connect 整体配置输入;Render 输出确定性 TOML(相同输入 → 相同字节)。</summary>
 public sealed record CcConnectConfig(IReadOnlyList<CcConnectProject> Projects, CcConnectPlatformOptions Feishu)
@@ -78,6 +81,19 @@ public sealed record CcConnectConfig(IReadOnlyList<CcConnectProject> Projects, C
 /// </summary>
 public static class CcConnectConfigGenerator
 {
+    private sealed record ProjectPreservation(
+        IReadOnlyList<string> ProjectLines,
+        IReadOnlyList<string> AgentLines,
+        IReadOnlyList<string> AgentOptionLines,
+        IReadOnlyList<KeyValuePair<string, string>> AgentEnvironment,
+        IReadOnlyList<string> AdditionalBlocks,
+        IReadOnlyList<string> ForeignPlatforms)
+    {
+        public static readonly ProjectPreservation Empty = new(
+            Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>(),
+            Array.Empty<KeyValuePair<string, string>>(), Array.Empty<string>(), Array.Empty<string>());
+    }
+
     /// <summary>
     /// 生成标记行。保留既有内容时要按它剔除上一轮写入的那行,否则每次生成都会多一行,
     /// 逐轮累积成一叠重复注释。
@@ -99,7 +115,12 @@ public static class CcConnectConfigGenerator
     /// </summary>
     public static string RenderSanitized(CcConnectConfig config, int foreignPlatformCount)
         => RenderCore(config, redact: true,
-            foreignPlatformCount > 0 ? new string[foreignPlatformCount] : null);
+            ProjectPreservation.Empty with
+            {
+                ForeignPlatforms = foreignPlatformCount > 0
+                    ? new string[foreignPlatformCount]
+                    : Array.Empty<string>(),
+            });
 
     /// <summary>
     /// 原子写入仓库外路径(临时文件 + 原子替换);路径与内容均不入仓库。
@@ -116,7 +137,12 @@ public static class CcConnectConfigGenerator
     /// 整块重写 [[projects]] 时若把它丢掉,用户下次扫码绑定就白做了。
     /// 所以这里把非飞书平台块原样抽出来,追加到生成的飞书块之后。
     /// </summary>
-    public static void Write(string path, CcConnectConfig config)
+    public static void Write(
+        string path,
+        CcConnectConfig config,
+        bool preserveAgentSelection = true,
+        Func<string, string?>? validateCandidate = null,
+        bool preserveInlineAgentProviders = true)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         CcConnectConfig.Validate(config);
@@ -127,29 +153,35 @@ public static class CcConnectConfigGenerator
         }
 
         string preserved = string.Empty;
-        IReadOnlyList<string> foreignPlatforms = Array.Empty<string>();
-        IReadOnlyList<string> extraKeys = Array.Empty<string>();
+        ProjectPreservation projectPreservation = ProjectPreservation.Empty;
         if (File.Exists(path))
         {
             try
             {
                 string existing = File.ReadAllText(path);
+                if (!preserveInlineAgentProviders &&
+                    HasInlineAgentProviders(existing, config.Projects.FirstOrDefault()?.Name ?? string.Empty))
+                {
+                    throw new InvalidDataException(
+                        "切换 agent 时发现项目内联 provider;它不受全局 agent_types 过滤。请先将该 provider 迁移为带 agent_types/endpoints 的全局 [[providers]],或手动移除后重试。");
+                }
                 preserved = ExtractNonProjectSections(existing);
-                foreignPlatforms = ExtractForeignPlatforms(existing);
-                // 用户在飞书里 /provider switch、/model switch 的结果就落在项目区里。
-                // 不捞回来,点一次「生成配置」就把他刚切的 provider 和模型无声抹掉。
-                extraKeys = ExtractProjectExtraKeys(existing);
+                projectPreservation = ExtractProjectPreservation(
+                    existing,
+                    preserveAgentSelection,
+                    preserveInlineAgentProviders,
+                    config.Projects.FirstOrDefault()?.Name ?? string.Empty);
+                preserved = EnsureSelectableProviderModels(preserved, config);
             }
             catch (IOException)
             {
                 // 读不到旧文件:退化成只写项目段。宁可少保留,也不要因此写不出配置。
                 preserved = string.Empty;
-                foreignPlatforms = Array.Empty<string>();
-                extraKeys = Array.Empty<string>();
+                projectPreservation = ProjectPreservation.Empty;
             }
         }
 
-        string content = RenderCore(config, redact: false, foreignPlatforms, extraKeys);
+        string content = RenderCore(config, redact: false, projectPreservation);
         if (!string.IsNullOrWhiteSpace(preserved))
         {
             content = preserved.TrimEnd() + Environment.NewLine + Environment.NewLine + content;
@@ -158,7 +190,23 @@ public static class CcConnectConfigGenerator
         string tmp = path + ".tmp-" + Guid.NewGuid().ToString("N");
         try
         {
-            File.WriteAllText(tmp, content, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            using (var stream = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var writer = new StreamWriter(
+                stream,
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+                bufferSize: 4096,
+                leaveOpen: true))
+            {
+                writer.Write(content);
+                writer.Flush();
+                stream.Flush(flushToDisk: true);
+            }
+            string? validationError = validateCandidate?.Invoke(tmp);
+            if (!string.IsNullOrWhiteSpace(validationError))
+            {
+                throw new InvalidDataException(validationError);
+            }
+
             File.Move(tmp, path, overwrite: true);
         }
         finally
@@ -185,75 +233,355 @@ public static class CcConnectConfigGenerator
     /// 用户的注释、段落顺序和格式就全没了——而这份文件里的注释正是 cc-connect
     /// 自带的使用说明。同理也剔除我们自己上一轮写入的生成标记行,避免逐轮累积。
     /// </summary>
-    /// <summary>我们自己生成的键。除这些之外,项目区里的键都是 cc-connect 或用户的,必须原样留下。</summary>
-    private static readonly HashSet<string> OwnedProjectKeys = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> OwnedProjectKeys = new(StringComparer.Ordinal)
     {
-        "name", "admin_from", "type", "provider_refs", "mode", "work_dir",
-        "app_id", "app_secret", "allow_from",
+        "name", "admin_from",
+    };
+
+    private static readonly HashSet<string> OwnedAgentKeys = new(StringComparer.Ordinal)
+    {
+        "type", "provider_refs",
+    };
+
+    private static readonly HashSet<string> OwnedAgentOptionKeys = new(StringComparer.Ordinal)
+    {
+        "mode", "work_dir", "env",
     };
 
     /// <summary>
-    /// 抽出项目区里**不归我们管**的键(原始行,原样返回)。
-    ///
-    /// 2026-08-08 实测:用户在飞书里跑 <c>/provider switch deepseek</c> 与 <c>/model switch</c>
-    /// 之后,cc-connect 把结果写回项目区:
-    /// <code>
-    /// provider = "deepseek"
-    /// model = "opus"
-    /// </code>
-    /// 而 <see cref="ExtractNonProjectSections"/> 把整个项目区都丢掉 ——
-    /// 于是用户下一次点「生成 cc-connect 配置」,**他刚切的 provider 和模型就没了**,
-    /// 而且没有任何提示。这和「保留 [management]」「保留微信平台块」是同一类错:
-    /// **这份配置不归我们独占,我们只拥有项目清单那一部分。**
-    ///
-    /// 只收 <c>key = value</c> 形状的行,且键不在 <see cref="OwnedProjectKeys"/> 里;
-    /// 平台子块(<c>[[projects.platforms]]</c> 之后)交给 ExtractForeignPlatforms,这里不重复收。
+    /// 按上游的精确、first-match 项目语义保留 AI Resume 不拥有的项目配置。
+    /// 项目顶层、agent、agent options 和自定义子表分别保存并写回原层级，禁止扁平化搬家。
     /// </summary>
-    public static IReadOnlyList<string> ExtractProjectExtraKeys(string existingToml)
+    private static ProjectPreservation ExtractProjectPreservation(
+        string existingToml,
+        bool preserveAgentSelection,
+        bool preserveInlineAgentProviders,
+        string projectName)
     {
-        var kept = new List<string>();
-        if (string.IsNullOrEmpty(existingToml))
+        if (!TryFindProjectBlock(existingToml, projectName, out string[] lines, out int start, out int end))
         {
-            return kept;
+            return ProjectPreservation.Empty;
         }
 
-        bool inProjects = false;
-        bool inPlatforms = false;
-
-        foreach (string line in existingToml.Replace("\r\n", "\n").Split('\n'))
+        var headers = new List<int> { start };
+        for (int i = start + 1; i < end; i++)
         {
-            string trimmed = line.Trim();
-
-            if (trimmed.StartsWith('['))
+            if (lines[i].TrimStart().StartsWith('['))
             {
-                inProjects =
-                    trimmed.StartsWith("[[projects]]", StringComparison.Ordinal) ||
-                    trimmed.StartsWith("[projects.", StringComparison.Ordinal) ||
-                    trimmed.StartsWith("[[projects.", StringComparison.Ordinal);
-                inPlatforms = trimmed.StartsWith("[[projects.platforms", StringComparison.Ordinal) ||
-                              trimmed.StartsWith("[projects.platforms", StringComparison.Ordinal);
-                continue;
+                headers.Add(i);
             }
+        }
+        headers.Add(end);
 
-            if (!inProjects || inPlatforms || trimmed.Length == 0 || trimmed.StartsWith('#'))
+        var projectLines = new List<string>();
+        var agentLines = new List<string>();
+        var optionLines = new List<string>();
+        var additional = new List<string>();
+        var foreignPlatforms = new List<string>();
+        IReadOnlyList<KeyValuePair<string, string>> agentEnvironment =
+            ReadProjectAgentEnvironment(existingToml, projectName);
+
+        for (int h = 0; h + 1 < headers.Count; h++)
+        {
+            int sectionStart = headers[h];
+            int sectionEnd = headers[h + 1];
+            string header = lines[sectionStart];
+
+            if (HeaderEquals(header, array: true, "projects"))
             {
-                continue;
+                projectLines.AddRange(FilterOwnedLines(lines, sectionStart + 1, sectionEnd, OwnedProjectKeys));
             }
-
-            int eq = trimmed.IndexOf('=');
-            if (eq <= 0)
+            else if (HeaderEquals(header, array: false, "projects", "agent"))
             {
-                continue;
+                agentLines.AddRange(FilterOwnedLines(lines, sectionStart + 1, sectionEnd, OwnedAgentKeys));
             }
-
-            string key = trimmed[..eq].Trim();
-            if (key.Length > 0 && !OwnedProjectKeys.Contains(key) && !kept.Contains(trimmed, StringComparer.Ordinal))
+            else if (HeaderEquals(header, array: false, "projects", "agent", "options"))
             {
-                kept.Add(trimmed);
+                var owned = new HashSet<string>(OwnedAgentOptionKeys, StringComparer.Ordinal);
+                if (!preserveAgentSelection)
+                {
+                    owned.Add("provider");
+                    owned.Add("model");
+                }
+                optionLines.AddRange(FilterOwnedLines(lines, sectionStart + 1, sectionEnd, owned));
+            }
+            else if (HeaderEquals(header, array: false, "projects", "agent", "options", "env"))
+            {
+                // 结构化读取并在渲染时合并;不能把旧表原文再追加一次形成重复表。
+            }
+            else if (HeaderEquals(header, array: true, "projects", "platforms"))
+            {
+                int platformEnd = sectionEnd;
+                while (h + 2 < headers.Count &&
+                       HeaderStartsWithPath(lines[headers[h + 1]], "projects", "platforms") &&
+                       !HeaderEquals(lines[headers[h + 1]], array: true, "projects", "platforms"))
+                {
+                    h++;
+                    platformEnd = headers[h + 1];
+                }
+
+                string block = JoinTrimmedBlock(lines, sectionStart, platformEnd);
+                string? platformType = ReadStringAssignment(block, "type");
+                if (!string.Equals(platformType, "feishu", StringComparison.Ordinal))
+                {
+                    foreignPlatforms.Add(block);
+                }
+            }
+            else if (HeaderStartsWithPath(header, "projects", "agent", "providers"))
+            {
+                if (!preserveInlineAgentProviders)
+                {
+                    throw new InvalidDataException(
+                        "切换 agent 时发现项目内联 provider;它不受全局 agent_types 过滤。请先将该 provider 迁移为带 agent_types/endpoints 的全局 [[providers]],或手动移除后重试。");
+                }
+                additional.Add(JoinTrimmedBlock(lines, sectionStart, sectionEnd));
+            }
+            else if (!HeaderStartsWithPath(header, "projects", "platforms"))
+            {
+                additional.Add(JoinTrimmedBlock(lines, sectionStart, sectionEnd));
             }
         }
 
-        return kept;
+        return new ProjectPreservation(
+            TrimBlankEdges(projectLines),
+            TrimBlankEdges(agentLines),
+            TrimBlankEdges(optionLines),
+            agentEnvironment,
+            additional.Where(block => block.Length > 0).ToArray(),
+            foreignPlatforms.Where(block => block.Length > 0).ToArray());
+    }
+
+    private static IReadOnlyList<KeyValuePair<string, string>> ReadProjectAgentEnvironment(
+        string existingToml,
+        string projectName)
+    {
+        TomlTable root = TomlSerializer.Deserialize<TomlTable>(existingToml) ?? new TomlTable();
+        if (!root.TryGetValue("projects", out object? rawProjects) || rawProjects is not TomlTableArray projects)
+        {
+            return Array.Empty<KeyValuePair<string, string>>();
+        }
+
+        TomlTable? project = projects.OfType<TomlTable>().FirstOrDefault(candidate =>
+            projectName.Length == 0 ||
+            (candidate.TryGetValue("name", out object? rawName) && rawName is string name &&
+             name.Equals(projectName, StringComparison.Ordinal)));
+        if (project is null || !project.TryGetValue("agent", out object? rawAgent) || rawAgent is not TomlTable agent ||
+            !agent.TryGetValue("options", out object? rawOptions) || rawOptions is not TomlTable options ||
+            !options.TryGetValue("env", out object? rawEnvironment))
+        {
+            return Array.Empty<KeyValuePair<string, string>>();
+        }
+
+        if (rawEnvironment is not TomlTable environment)
+        {
+            throw new InvalidDataException("projects.agent.options.env 必须是字符串键值表");
+        }
+
+        var result = new List<KeyValuePair<string, string>>();
+        foreach ((string key, object? value) in environment)
+        {
+            if (key.Equals("AI_RESUME_INTERNAL_RUN", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            if (value is not string text)
+            {
+                throw new InvalidDataException($"projects.agent.options.env.{key} 必须是字符串");
+            }
+            result.Add(new KeyValuePair<string, string>(key, text));
+        }
+        return result;
+    }
+
+    private static bool HasInlineAgentProviders(string existingToml, string projectName)
+    {
+        TomlTable root = TomlSerializer.Deserialize<TomlTable>(existingToml) ?? new TomlTable();
+        if (!root.TryGetValue("projects", out object? rawProjects) ||
+            rawProjects is not TomlTableArray projects)
+        {
+            return false;
+        }
+
+        TomlTable? project = projects.OfType<TomlTable>().FirstOrDefault(candidate =>
+            candidate.TryGetValue("name", out object? rawName) && rawName is string name &&
+            name.Equals(projectName, StringComparison.Ordinal));
+        if (project is null || !project.TryGetValue("agent", out object? rawAgent) ||
+            rawAgent is not TomlTable agent)
+        {
+            return false;
+        }
+
+        return agent.ContainsKey("providers");
+    }
+
+    /// <summary>兼容旧测试/调用方：仅返回仍保留的赋值行，不参与生产渲染。</summary>
+    public static IReadOnlyList<string> ExtractProjectExtraKeys(
+        string existingToml,
+        bool preserveAgentSelection = true,
+        string projectName = "")
+    {
+        ProjectPreservation p = ExtractProjectPreservation(
+            existingToml, preserveAgentSelection, preserveInlineAgentProviders: true, projectName: projectName);
+        return p.ProjectLines.Concat(p.AgentLines).Concat(p.AgentOptionLines)
+            .Select(line => line.Trim())
+            .Where(line => line.Contains('=') && !line.StartsWith('#'))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static bool TryFindProjectBlock(
+        string toml,
+        string projectName,
+        out string[] lines,
+        out int start,
+        out int end)
+    {
+        lines = (toml ?? string.Empty).Replace("\r\n", "\n").Split('\n');
+        start = end = -1;
+        try
+        {
+            TomlTable root = TomlSerializer.Deserialize<TomlTable>(toml ?? string.Empty) ?? new TomlTable();
+            if (!root.TryGetValue("projects", out object? raw) || raw is not TomlTableArray projects)
+            {
+                return false;
+            }
+
+            int projectIndex = -1;
+            for (int i = 0; i < projects.Count; i++)
+            {
+                if (projects[i] is TomlTable project &&
+                    (projectName.Length == 0 ||
+                     (project.TryGetValue("name", out object? rawName) && rawName is string name &&
+                      name.Equals(projectName, StringComparison.Ordinal))))
+                {
+                    projectIndex = i;
+                    break;
+                }
+            }
+
+            if (projectIndex < 0)
+            {
+                return false;
+            }
+
+            int seen = -1;
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (!HeaderEquals(lines[i], array: true, "projects"))
+                {
+                    continue;
+                }
+
+                seen++;
+                if (seen == projectIndex)
+                {
+                    start = i;
+                    break;
+                }
+            }
+
+            if (start < 0)
+            {
+                return false;
+            }
+
+            end = lines.Length;
+            for (int i = start + 1; i < lines.Length; i++)
+            {
+                string header = lines[i].TrimStart();
+                if (!header.StartsWith('['))
+                {
+                    continue;
+                }
+
+                if (HeaderEquals(header, array: true, "projects") ||
+                    !HeaderStartsWithPath(header, "projects"))
+                {
+                    end = i;
+                    break;
+                }
+            }
+
+            return true;
+        }
+        catch (Exception)
+        {
+            start = end = -1;
+            return false;
+        }
+    }
+
+    private static IReadOnlyList<string> FilterOwnedLines(
+        string[] lines,
+        int start,
+        int end,
+        IReadOnlySet<string> owned)
+    {
+        var result = new List<string>();
+        for (int i = start; i < end; i++)
+        {
+            string trimmed = lines[i].Trim();
+            if (!trimmed.StartsWith('#') && owned.Any(key => AssignmentKeyEquals(trimmed, key)))
+            {
+                continue;
+            }
+            result.Add(lines[i]);
+        }
+        return result;
+    }
+
+    private static IReadOnlyList<string> TrimBlankEdges(IReadOnlyList<string> lines)
+    {
+        int start = 0;
+        int end = lines.Count;
+        while (start < end && string.IsNullOrWhiteSpace(lines[start])) start++;
+        while (end > start && string.IsNullOrWhiteSpace(lines[end - 1])) end--;
+        return lines.Skip(start).Take(end - start).ToArray();
+    }
+
+    private static string JoinTrimmedBlock(string[] lines, int start, int end) =>
+        string.Join(Environment.NewLine, TrimBlankEdges(lines[start..end])).Trim();
+
+    private static bool HeaderEquals(string line, bool array, params string[] path)
+    {
+        string open = array ? @"\[\[" : @"\[";
+        string close = array ? @"\]\]" : @"\]";
+        return Regex.IsMatch(
+            line,
+            @"^\s*" + open + @"\s*" + HeaderPathPattern(path) + @"\s*" + close + @"\s*(?:#.*)?$",
+            RegexOptions.CultureInvariant);
+    }
+
+    private static bool HeaderStartsWithPath(string line, params string[] path) => Regex.IsMatch(
+        line,
+        @"^\s*\[\[?\s*" + HeaderPathPattern(path) +
+        @"(?:\s*\.\s*[^\]]+)?\s*\]\]?\s*(?:#.*)?$",
+        RegexOptions.CultureInvariant);
+
+    private static string HeaderPathPattern(IEnumerable<string> path) => string.Join(
+        @"\s*\.\s*",
+        path.Select(segment =>
+            "(?:" + Regex.Escape(segment) + "|\"" + Regex.Escape(segment) + "\"|'" +
+            Regex.Escape(segment) + "')"));
+
+    private static bool AssignmentKeyEquals(string line, string key) => Regex.IsMatch(
+        line,
+        @"^\s*" + QuotedOrBareKeyPattern(key) + @"\s*=",
+        RegexOptions.CultureInvariant);
+
+    private static string QuotedOrBareKeyPattern(string key) =>
+        "(?:" + Regex.Escape(key) + "|\"" + Regex.Escape(key) + "\"|'" + Regex.Escape(key) + "')";
+
+    private static string? ReadStringAssignment(string text, string key)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(
+            text,
+            "^\\s*" + QuotedOrBareKeyPattern(key) +
+            "\\s*=\\s*(?:\"(?<double>[^\"]*)\"|'(?<single>[^']*)')",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+        return !match.Success
+            ? null
+            : match.Groups["double"].Success ? match.Groups["double"].Value : match.Groups["single"].Value;
     }
 
     internal static string ExtractNonProjectSections(string existingToml)
@@ -268,10 +596,7 @@ public static class CcConnectConfigGenerator
             if (trimmed.StartsWith('['))
             {
                 // 顶层表头出现:重新判定是否落在 projects 区域内。
-                inProjectBlock =
-                    trimmed.StartsWith("[[projects]]", StringComparison.Ordinal) ||
-                    trimmed.StartsWith("[projects.", StringComparison.Ordinal) ||
-                    trimmed.StartsWith("[[projects.", StringComparison.Ordinal);
+                inProjectBlock = HeaderStartsWithPath(line, "projects");
             }
 
             if (inProjectBlock)
@@ -300,92 +625,11 @@ public static class CcConnectConfigGenerator
     ///
     /// 为什么未知类型也保留:取不到 type 时宁可多留不可丢——丢了等于用户白扫一次码。
     /// </summary>
-    public static IReadOnlyList<string> ExtractForeignPlatforms(string existingToml)
+    public static IReadOnlyList<string> ExtractForeignPlatforms(string existingToml, string projectName = "")
     {
-        if (string.IsNullOrEmpty(existingToml))
-        {
-            return Array.Empty<string>();
-        }
-
-        var result = new List<string>();
-        var currentBlock = new List<string>();
-        bool inBlock = false;
-        string? platformType = null;
-
-        void FlushBlock()
-        {
-            if (!inBlock)
-            {
-                return;
-            }
-
-            // 去掉块尾的连续空行。
-            while (currentBlock.Count > 0 && string.IsNullOrWhiteSpace(currentBlock[currentBlock.Count - 1]))
-            {
-                currentBlock.RemoveAt(currentBlock.Count - 1);
-            }
-
-            // 类型等于 feishu(忽略大小写)的块丢弃:飞书那块由生成器自己产出。
-            // 取不到类型视为未知类型,一并保留。
-            if (currentBlock.Count > 0 &&
-                !string.Equals(platformType, "feishu", StringComparison.OrdinalIgnoreCase))
-            {
-                result.Add(string.Join(Environment.NewLine, currentBlock));
-            }
-
-            currentBlock.Clear();
-            platformType = null;
-            inBlock = false;
-        }
-
-        foreach (string line in existingToml.Replace("\r\n", "\n").Split('\n'))
-        {
-            string trimmedStart = line.TrimStart();
-            string trimmed = line.Trim();
-
-            if (trimmedStart.StartsWith("[[projects.platforms]]", StringComparison.Ordinal))
-            {
-                // 新块开始:先冲刷上一个块。
-                FlushBlock();
-                inBlock = true;
-                currentBlock.Add(line);
-                continue;
-            }
-
-            if (inBlock)
-            {
-                // 块的结束:下一个去掉行首空白后以 "[[" 开头的行,
-                // 或者下一个不以 "[projects.platforms" 开头的 "[" 表头行。
-                if (trimmedStart.StartsWith("[[", StringComparison.Ordinal) ||
-                    (trimmedStart.StartsWith('[') &&
-                     !trimmedStart.StartsWith("[projects.platforms", StringComparison.Ordinal)))
-                {
-                    FlushBlock();
-                    // 这个表头行不属于当前块,交给后续逻辑处理(但这里不重新进入块)。
-                    continue;
-                }
-
-                // 块内查找类型:去掉空白后以 "type" 开头且含 "=" 的行,
-                // 取第一个双引号对之间的值作为平台类型。
-                if (platformType is null &&
-                    trimmed.StartsWith("type", StringComparison.Ordinal) &&
-                    trimmed.Contains('='))
-                {
-                    int q1 = trimmed.IndexOf('"');
-                    int q2 = q1 >= 0 ? trimmed.IndexOf('"', q1 + 1) : -1;
-                    if (q1 >= 0 && q2 > q1)
-                    {
-                        platformType = trimmed.Substring(q1 + 1, q2 - q1 - 1);
-                    }
-                }
-
-                currentBlock.Add(line);
-            }
-        }
-
-        // 文件结束:冲刷最后一个块。
-        FlushBlock();
-        return result;
+        return ExtractProjectPreservation(
+            existingToml, preserveAgentSelection: true, preserveInlineAgentProviders: true, projectName: projectName)
+            .ForeignPlatforms;
     }
 
     /// <summary>
@@ -399,145 +643,412 @@ public static class CcConnectConfigGenerator
     /// **不可写成跨行正则**:真实文件里 [[projects.platforms]] 等表头夹在中间,
     /// 跨行匹配会越过表边界读到别的表的值。
     /// </summary>
-    public static string? TryReadExistingWorkDir(string existingToml)
+    public static string? TryReadExistingWorkDir(string existingToml, string projectName = "")
     {
         if (string.IsNullOrEmpty(existingToml))
         {
             return null;
         }
 
-        bool inAgentOptions = false;
-        foreach (string line in existingToml.Replace("\r\n", "\n").Split('\n'))
+        try
         {
-            string trimmed = line.Trim();
-            if (trimmed.StartsWith('['))
+            TomlTable root = TomlSerializer.Deserialize<TomlTable>(existingToml) ?? new TomlTable();
+            TomlTable? project = null;
+            if (root.TryGetValue("projects", out object? rawProjects))
             {
-                // 表头行:重新判定是否落在 [projects.agent.options] 区域内。
-                inAgentOptions = trimmed.StartsWith("[projects.agent.options]", StringComparison.Ordinal);
-                continue;
+                if (rawProjects is TomlTableArray projects)
+                {
+                    project = projects.OfType<TomlTable>().FirstOrDefault(candidate =>
+                        projectName.Length == 0 ||
+                        (candidate.TryGetValue("name", out object? rawName) && rawName is string name &&
+                         name.Equals(projectName, StringComparison.Ordinal)));
+                }
+                else if (rawProjects is TomlTable single)
+                {
+                    project = single;
+                }
             }
 
-            if (!inAgentOptions)
+            if (project is null ||
+                !project.TryGetValue("agent", out object? rawAgent) || rawAgent is not TomlTable agent ||
+                !agent.TryGetValue("options", out object? rawOptions) || rawOptions is not TomlTable options ||
+                !options.TryGetValue("work_dir", out object? rawWorkDir) || rawWorkDir is not string workDir ||
+                string.IsNullOrWhiteSpace(workDir))
             {
-                continue;
+                return null;
             }
 
-            if (trimmed.StartsWith("work_dir", StringComparison.Ordinal))
-            {
-                int eq = trimmed.IndexOf('=');
-                if (eq < 0)
-                {
-                    return null;
-                }
-
-                string value = trimmed.Substring(eq + 1).Trim();
-                if (value.Length < 2 || value[0] != '"' || value[value.Length - 1] != '"')
-                {
-                    return null;
-                }
-
-                string inner = value.Substring(1, value.Length - 2);
-                if (string.IsNullOrWhiteSpace(inner))
-                {
-                    return null;
-                }
-
-                // 只处理 \\ → \ 与 \" → " 两种转义,其它原样保留。
-                var sb = new StringBuilder(inner.Length);
-                for (int i = 0; i < inner.Length; i++)
-                {
-                    if (inner[i] == '\\' && i + 1 < inner.Length)
-                    {
-                        char next = inner[i + 1];
-                        if (next == '\\')
-                        {
-                            sb.Append('\\');
-                            i++;
-                            continue;
-                        }
-
-                        if (next == '"')
-                        {
-                            sb.Append('"');
-                            i++;
-                            continue;
-                        }
-                    }
-
-                    sb.Append(inner[i]);
-                }
-
-                return sb.ToString();
-            }
+            return workDir;
         }
-
-        return null;
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
-    /// <summary>读回顶层 <c>[[providers]]</c> 的名字,供 provider_refs 引用。</summary>
+    /// <summary>
+    /// 读回当前 agent 真正可用的全局 provider 名称,供 provider_refs 引用。
+    /// TOML 由 Tomlyn 结构化解析;重复名称遵循 cc-connect 的 last-wins 语义。
+    /// </summary>
     public static IReadOnlyList<string> ReadGlobalProviderNames(string existingToml, string agentType = "")
     {
-        var names = new List<string>();
-        bool inProviders = false;
-        string? pendingName = null;
-        bool pendingApplies = true;
+        CcConnectProviderCatalog catalog = CcConnectProviderCatalog.Parse(existingToml);
+        return catalog.Providers
+            .Where(provider => agentType.Length == 0 || provider.SupportsAgent(agentType))
+            .Select(provider => provider.Name)
+            .ToArray();
+    }
 
-        void Flush()
+    /// <summary>
+    /// cc-connect 的默认 <c>model</c> 与模型菜单是两套字段。Provider 只有标量 model、
+    /// 没有 <c>[[providers.models]]</c> 时,Claude Code/Codex 都可能回退到内置菜单,
+    /// 让用户误以为自定义服务商没有生效。这里只给当前项目实际引用的 provider 补候选:
+    /// 一般 provider 补有效默认 model;只有官方 OpenAI 端点的当前 GPT-5.6 家族
+    /// 才额外补官方推荐的 Sol/Terra/Luna。第三方 relay 不推断未声明能力。
+    /// </summary>
+    private const string GeneratedModelListMarker =
+        "# Generated by AI Resume from the provider effective default model.";
+    private const string GeneratedModelListBegin = "# AI Resume generated model list: begin";
+    private const string GeneratedModelListEnd = "# AI Resume generated model list: end";
+    private const string ManagedAliasPrefix = "[AI Resume] ";
+
+    private static readonly CcConnectProviderModel[] CurrentCodexModels =
+    {
+        new("gpt-5.6-sol", ManagedAliasPrefix + "GPT-5.6 Sol（旗舰）"),
+        new("gpt-5.6-terra", ManagedAliasPrefix + "GPT-5.6 Terra（均衡）"),
+        new("gpt-5.6-luna", ManagedAliasPrefix + "GPT-5.6 Luna（经济高吞吐）"),
+    };
+
+    internal static string EnsureSelectableProviderModels(string preservedToml, CcConnectConfig config)
+    {
+        if (string.IsNullOrWhiteSpace(preservedToml))
         {
-            if (pendingName is not null && pendingApplies)
-            {
-                names.Add(pendingName);
-            }
-
-            pendingName = null;
-            pendingApplies = true;
+            return preservedToml;
         }
 
-        foreach (string line in existingToml.Replace("\r\n", "\n").Split('\n'))
+        string withoutGenerated = RemoveGeneratedModelLists(preservedToml);
+        CcConnectProviderCatalog catalog = CcConnectProviderCatalog.Parse(withoutGenerated);
+        HashSet<string> managedCodexProviders = FindManagedCodexProviders(catalog, config);
+        if (managedCodexProviders.Count > 0)
         {
-            string t = line.Trim();
-            if (t.StartsWith('['))
+            // 上游部分 CRUD 会经 TOML decode/encode 重写配置并剥掉注释 marker,
+            // 但 alias 是模型表的正式语义字段。
+            // 只重建每一项都带明确 [AI Resume] 前缀的目录;无 alias 的单项表
+            // 无法证明所有权,必须视为用户配置原样保留。
+            withoutGenerated = RemoveManagedCodexModelLists(withoutGenerated, managedCodexProviders);
+            catalog = CcConnectProviderCatalog.Parse(withoutGenerated);
+        }
+        var required = new Dictionary<string, Dictionary<string, IReadOnlyList<CcConnectProviderModel>>>(
+            StringComparer.Ordinal);
+        foreach (CcConnectProject project in config.Projects)
+        {
+            foreach (string providerName in project.ProviderRefs ?? Array.Empty<string>())
             {
-                Flush();
-                inProviders = t.StartsWith("[[providers]]", StringComparison.Ordinal);
-                continue;
-            }
-
-            if (!inProviders)
-            {
-                continue;
-            }
-
-            if (t.StartsWith("name", StringComparison.Ordinal))
-            {
-                int q1 = t.IndexOf('"');
-                int q2 = q1 >= 0 ? t.IndexOf('"', q1 + 1) : -1;
-                if (q1 >= 0 && q2 > q1)
+                CcConnectProviderDescriptor? provider = catalog.Find(providerName);
+                if (provider is null ||
+                    provider.AgentModelLists.ContainsKey(project.Agent) ||
+                    provider.HasModelsDefinition)
                 {
-                    pendingName = t.Substring(q1 + 1, q2 - q1 - 1);
+                    continue;
+                }
+
+                string model = provider.EffectiveModel(project.Agent);
+                if (model.Length == 0)
+                {
+                    continue;
+                }
+
+                if (!required.TryGetValue(
+                        provider.Name,
+                        out Dictionary<string, IReadOnlyList<CcConnectProviderModel>>? agents))
+                {
+                    agents = new Dictionary<string, IReadOnlyList<CcConnectProviderModel>>(StringComparer.Ordinal);
+                    required[provider.Name] = agents;
+                }
+
+                agents[project.Agent] = GeneratedModels(provider, project.Agent, model);
+            }
+        }
+
+        if (required.Count == 0)
+        {
+            return withoutGenerated.Trim();
+        }
+
+        string[] lines = withoutGenerated.Replace("\r\n", "\n").Split('\n');
+        List<ProviderTextBlock> blocks = FindProviderBlocks(lines);
+        var lastByName = blocks
+            .Where(block => block.Name.Length > 0)
+            .GroupBy(block => block.Name, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Last(), StringComparer.Ordinal);
+        var insertions = new Dictionary<int, List<string>>();
+        foreach ((string providerName, Dictionary<string, IReadOnlyList<CcConnectProviderModel>> agents) in required)
+        {
+            if (!lastByName.TryGetValue(providerName, out ProviderTextBlock? block) || block is null)
+            {
+                continue;
+            }
+            if (block.HasInlineAgentModelLists)
+            {
+                continue;
+            }
+
+            var generated = new List<string> { string.Empty };
+            foreach ((string agent, IReadOnlyList<CcConnectProviderModel> models) in
+                     agents.OrderBy(item => item.Key, StringComparer.Ordinal))
+            {
+                foreach (CcConnectProviderModel model in models)
+                {
+                    generated.Add("  " + GeneratedModelListBegin);
+                    generated.Add($"  [[providers.agent_model_lists.{agent}]]");
+                    generated.Add("    model = " + TomlString(model.Model));
+                    if (model.Alias.Length > 0)
+                    {
+                        generated.Add("    alias = " + TomlString(model.Alias));
+                    }
+                    generated.Add("  " + GeneratedModelListEnd);
                 }
             }
-            else if (t.StartsWith("agent_types", StringComparison.Ordinal) && agentType.Length > 0)
+
+            insertions[block.End] = generated;
+        }
+
+        var output = new List<string>(lines.Length + insertions.Values.Sum(items => items.Count));
+        for (int i = 0; i <= lines.Length; i++)
+        {
+            if (insertions.TryGetValue(i, out List<string>? generated))
             {
-                // 服务商可以声明只适用于某些 agent(如 chatpt-月付 是 agent_types = ["codex"])。
-                // 从 claudecode 项目去 provider_refs 引用一个 codex-only 的服务商,
-                // 在飞书里表现为 `/provider switch` 列得出来却切不过去。
-                // 没声明 agent_types 视为通用,照引。
-                pendingApplies = t.Contains('"' + agentType + '"', StringComparison.Ordinal);
+                output.AddRange(generated);
+            }
+
+            if (i < lines.Length)
+            {
+                output.Add(lines[i]);
             }
         }
 
-        Flush();
-        return names;
+        return string.Join(Environment.NewLine, output).Trim();
     }
+
+    private static HashSet<string> FindManagedCodexProviders(
+        CcConnectProviderCatalog catalog,
+        CcConnectConfig config)
+    {
+        var referenced = config.Projects
+            .Where(project => project.Agent.Equals("codex", StringComparison.Ordinal))
+            .SelectMany(project => project.ProviderRefs ?? Array.Empty<string>())
+            .ToHashSet(StringComparer.Ordinal);
+        return catalog.Providers
+            .Where(provider => referenced.Contains(provider.Name))
+            .Where(provider => provider.AgentModelLists.TryGetValue(
+                "codex", out IReadOnlyList<CcConnectProviderModel>? models) &&
+                models.Count > 0 &&
+                models.All(model => model.Alias.StartsWith(ManagedAliasPrefix, StringComparison.Ordinal)))
+            .Select(provider => provider.Name)
+            .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private static string RemoveManagedCodexModelLists(string toml, HashSet<string> providerNames)
+    {
+        string[] lines = toml.Replace("\r\n", "\n").Split('\n');
+        var remove = new HashSet<int>();
+        foreach (ProviderTextBlock block in FindProviderBlocks(lines))
+        {
+            if (!providerNames.Contains(block.Name))
+            {
+                continue;
+            }
+
+            for (int i = block.Start + 1; i < block.End; i++)
+            {
+                if (!HeaderEquals(lines[i], array: true, "providers", "agent_model_lists", "codex"))
+                {
+                    continue;
+                }
+
+                int end = i + 1;
+                while (end < block.End && !lines[end].TrimStart().StartsWith('['))
+                {
+                    end++;
+                }
+
+                for (int line = i; line < end; line++)
+                {
+                    remove.Add(line);
+                }
+                i = end - 1;
+            }
+        }
+
+        return string.Join(Environment.NewLine,
+            lines.Where((_, index) => !remove.Contains(index))).Trim();
+    }
+
+    private static IReadOnlyList<CcConnectProviderModel> GeneratedModels(
+        CcConnectProviderDescriptor provider,
+        string agent,
+        string effectiveModel)
+    {
+        if (!agent.Equals("codex", StringComparison.Ordinal) ||
+            !IsCurrentCodexFamily(effectiveModel))
+        {
+            return new[] { new CcConnectProviderModel(effectiveModel, ManagedAliasPrefix + effectiveModel) };
+        }
+
+        var result = new List<CcConnectProviderModel>
+        {
+            new(effectiveModel,
+                effectiveModel.Equals("gpt-5.6", StringComparison.Ordinal)
+                    ? ManagedAliasPrefix + "GPT-5.6（当前默认）"
+                    : CurrentCodexModels.First(model => model.Model.Equals(
+                        effectiveModel, StringComparison.Ordinal)).Alias),
+        };
+        // 官方模型目录只能证明 OpenAI API 的能力。第三方 relay 即使默认名叫
+        // gpt-5.6,也不等于支持 Sol/Terra/Luna 的独立 slug;不得替它宣称能力。
+        if (!IsOfficialOpenAiEndpoint(provider))
+        {
+            return result;
+        }
+
+        foreach (CcConnectProviderModel model in CurrentCodexModels)
+        {
+            if (!result.Any(existing => existing.Model.Equals(model.Model, StringComparison.Ordinal)))
+            {
+                result.Add(model);
+            }
+        }
+
+        return result;
+    }
+
+    private static bool IsCurrentCodexFamily(string model) =>
+        model.Equals("gpt-5.6", StringComparison.Ordinal) ||
+        CurrentCodexModels.Any(candidate => candidate.Model.Equals(model, StringComparison.Ordinal));
+
+    private static bool IsOfficialOpenAiEndpoint(CcConnectProviderDescriptor provider)
+    {
+        string endpoint = provider.Endpoints.TryGetValue("codex", out string? overrideEndpoint) &&
+                          overrideEndpoint.Length > 0
+            ? overrideEndpoint
+            : provider.BaseUrl;
+        if (endpoint.Length == 0)
+        {
+            return true;
+        }
+
+        return Uri.TryCreate(endpoint, UriKind.Absolute, out Uri? uri) &&
+               uri.Host.Equals("api.openai.com", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string RemoveGeneratedModelLists(string toml)
+    {
+        string[] lines = toml.Replace("\r\n", "\n").Split('\n');
+        var output = new List<string>(lines.Length);
+        for (int i = 0; i < lines.Length; i++)
+        {
+            if (lines[i].Trim().Equals(GeneratedModelListBegin, StringComparison.Ordinal))
+            {
+                int end = i + 3;
+                if (i + 3 < lines.Length &&
+                    HeaderStartsWithPath(lines[i + 1], "providers", "agent_model_lists") &&
+                    lines[i + 2].Trim().StartsWith("model =", StringComparison.Ordinal) &&
+                    lines[i + 3].TrimStart().StartsWith("alias =", StringComparison.Ordinal))
+                {
+                    end = i + 4;
+                }
+
+                if (end < lines.Length &&
+                    lines[end].Trim().Equals(GeneratedModelListEnd, StringComparison.Ordinal))
+                {
+                    // 生成块前的单个空行也是本生成器加的。若不一并收回,
+                    // 每次重建多模型列表都会多积一行,破坏确定性字节输出。
+                    if (output.Count > 0 && string.IsNullOrWhiteSpace(output[^1]))
+                    {
+                        output.RemoveAt(output.Count - 1);
+                    }
+                    i = end;
+                    continue;
+                }
+
+                output.Add(lines[i]);
+                continue;
+            }
+
+            if (!lines[i].Trim().Equals(GeneratedModelListMarker, StringComparison.Ordinal))
+            {
+                output.Add(lines[i]);
+                continue;
+            }
+
+            int header = i + 1;
+            if (header >= lines.Length ||
+                !HeaderStartsWithPath(lines[header], "providers", "agent_model_lists"))
+            {
+                output.Add(lines[i]);
+                continue;
+            }
+
+            i = header;
+            while (i + 1 < lines.Length && !lines[i + 1].TrimStart().StartsWith('['))
+            {
+                i++;
+            }
+        }
+
+        return string.Join(Environment.NewLine, output);
+    }
+
+    private static List<ProviderTextBlock> FindProviderBlocks(string[] lines)
+    {
+        var result = new List<ProviderTextBlock>();
+        int start = -1;
+        for (int i = 0; i <= lines.Length; i++)
+        {
+            string trimmed = i < lines.Length ? lines[i].Trim() : string.Empty;
+            bool providerStart = i < lines.Length && HeaderEquals(lines[i], array: true, "providers");
+            bool foreignTable = i == lines.Length ||
+                (trimmed.StartsWith('[') &&
+                 !HeaderStartsWithPath(lines[i], "providers") &&
+                 !providerStart);
+
+            if (start >= 0 && (providerStart || foreignTable))
+            {
+                string blockText = string.Join("\n", lines[start..i]);
+                string name = string.Empty;
+                try
+                {
+                    name = CcConnectProviderCatalog.Parse(blockText).Providers.LastOrDefault()?.Name ?? string.Empty;
+                }
+                catch (Exception)
+                {
+                    // Upstream validation will report malformed TOML; model supplementation stays no-op.
+                }
+
+                bool hasInlineAgentModelLists = blockText
+                    .Split('\n')
+                    .Any(line => AssignmentKeyEquals(line, "agent_model_lists"));
+                result.Add(new ProviderTextBlock(start, i, name, hasInlineAgentModelLists));
+                start = -1;
+            }
+
+            if (providerStart)
+            {
+                start = i;
+            }
+        }
+
+        return result;
+    }
+
+    private sealed record ProviderTextBlock(int Start, int End, string Name, bool HasInlineAgentModelLists);
 
     private static string RenderCore(
         CcConnectConfig config,
         bool redact,
-        IReadOnlyList<string>? foreignPlatforms = null,
-        IReadOnlyList<string>? extraKeys = null)
+        ProjectPreservation? preservation = null)
     {
         CcConnectConfig.Validate(config);
+        preservation ??= ProjectPreservation.Empty;
         var sb = new StringBuilder();
         sb.Append("# Generated by AiResume.Wrapper (S6-A). Deterministic; do not edit by hand.")
           .Append(Environment.NewLine);
@@ -551,8 +1062,10 @@ public static class CcConnectConfigGenerator
         //   parse config: type mismatch for config.AgentConfig: expected table but found string。
         // 这个错误从 S6-A 起就存在,而当时的测试只断言了我们自己臆想的输出格式,
         // 从未拿真的 cc-connect 跑过一次,所以一直没暴露。**契约要以对方的解析器为准。**
-        foreach (CcConnectProject project in config.Projects)
+        for (int projectIndex = 0; projectIndex < config.Projects.Count; projectIndex++)
         {
+            CcConnectProject project = config.Projects[projectIndex];
+            ProjectPreservation current = projectIndex == 0 ? preservation : ProjectPreservation.Empty;
             sb.Append(Environment.NewLine);
             sb.Append("[[projects]]").Append(Environment.NewLine);
             sb.Append("  name = ").Append(TomlString(project.Name)).Append(Environment.NewLine);
@@ -561,6 +1074,7 @@ public static class CcConnectConfigGenerator
                 // **必须在这一层**:上游文档明确写了放进 platforms.options 会被忽略。
                 sb.Append("  admin_from = ").Append(TomlString(project.AdminFrom)).Append(Environment.NewLine);
             }
+            AppendPreservedLines(sb, current.ProjectLines);
 
             sb.Append(Environment.NewLine);
             sb.Append("  [projects.agent]").Append(Environment.NewLine);
@@ -573,20 +1087,35 @@ public static class CcConnectConfigGenerator
                   .Append(string.Join(", ", refs.Select(TomlString)))
                   .Append(']').Append(Environment.NewLine);
             }
+            AppendPreservedLines(sb, current.AgentLines);
             sb.Append(Environment.NewLine);
             sb.Append("    [projects.agent.options]").Append(Environment.NewLine);
             sb.Append("      mode = ").Append(TomlString(project.Mode)).Append(Environment.NewLine);
             sb.Append("      work_dir = ").Append(TomlString(project.WorkDir)).Append(Environment.NewLine);
+            if (project.SelectedProvider.Length > 0)
+            {
+                sb.Append("      provider = ").Append(TomlString(project.SelectedProvider)).Append(Environment.NewLine);
+            }
+            if (project.SelectedModel.Length > 0)
+            {
+                sb.Append("      model = ").Append(TomlString(project.SelectedModel)).Append(Environment.NewLine);
+            }
+            AppendPreservedLines(sb, current.AgentOptionLines);
 
-            // cc-connect 自己写进项目区的键(/provider switch、/model switch 的结果)原样带回。
-            // 位置与它写的时候一致 —— 我们不知道它按哪张表读,挪位置等于替它做决定。
-            if (extraKeys is { Count: > 0 })
+            sb.Append(Environment.NewLine);
+            sb.Append("      [projects.agent.options.env]").Append(Environment.NewLine);
+            sb.Append("        AI_RESUME_INTERNAL_RUN = \"1\"").Append(Environment.NewLine);
+            foreach ((string key, string value) in current.AgentEnvironment)
+            {
+                sb.Append("        ").Append(TomlString(key)).Append(" = ")
+                  .Append(redact ? "\"[REDACTED]\"" : TomlString(value))
+                  .Append(Environment.NewLine);
+            }
+
+            foreach (string block in current.AdditionalBlocks)
             {
                 sb.Append(Environment.NewLine);
-                foreach (string extra in extraKeys)
-                {
-                    sb.Append(extra).Append(Environment.NewLine);
-                }
+                sb.Append(block).Append(Environment.NewLine);
             }
 
             sb.Append(Environment.NewLine);
@@ -604,9 +1133,9 @@ public static class CcConnectConfigGenerator
             // 追加在飞书块之后,同属于该项目。缩进保持原样,块之间空一行。
             // 注意:脱敏输出绝不能包含这些块——微信平台的 options 里有 bearer token,
             // 属于凭据,不得回显到界面或日志。
-            if (!redact && foreignPlatforms is { Count: > 0 })
+            if (!redact && current.ForeignPlatforms.Count > 0)
             {
-                foreach (string block in foreignPlatforms)
+                foreach (string block in current.ForeignPlatforms)
                 {
                     sb.Append(Environment.NewLine);
                     sb.Append(block).Append(Environment.NewLine);
@@ -616,14 +1145,27 @@ public static class CcConnectConfigGenerator
 
         // 脱敏输出末尾追加一行注释,说明有多少个非飞书平台被保留但未回显。
         // 这样日志/界面能看出"有东西被藏起来了",又不泄露凭据内容。
-        if (redact && foreignPlatforms is { Count: > 0 })
+        if (redact && preservation.ForeignPlatforms.Count > 0)
         {
             sb.Append(Environment.NewLine);
-            sb.Append("# 另保留 ").Append(foreignPlatforms.Count)
+            sb.Append("# 另保留 ").Append(preservation.ForeignPlatforms.Count)
               .Append(" 个非飞书平台(内容含凭据,不在此回显)").Append(Environment.NewLine);
         }
 
         return sb.ToString();
+    }
+
+    private static void AppendPreservedLines(StringBuilder sb, IReadOnlyList<string> lines)
+    {
+        if (lines.Count == 0)
+        {
+            return;
+        }
+
+        foreach (string line in lines)
+        {
+            sb.Append(line).Append(Environment.NewLine);
+        }
     }
 
     /// <summary>TOML 基础字符串转义(反斜杠/双引号/控制字符)。</summary>

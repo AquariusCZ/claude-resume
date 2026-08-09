@@ -63,7 +63,12 @@ public static class CutoverConfigCommand
     /// **返回值里绝不含 app_secret 实值**:只有脱敏 TOML。
     /// GUI 与 CLI 共用这一条路径,避免两处逻辑各自漂移。
     /// </summary>
-    public static GenerateResult Generate(string outPath, string? appId, string? appSecret, string? workDir = null)
+    public static GenerateResult Generate(
+        string outPath,
+        string? appId,
+        string? appSecret,
+        string? workDir = null,
+        bool requireLoadable = false)
     {
         // 授权名单只从 DPAPI 取:它是安全边界,不接受命令行/环境变量覆盖。
         string allowFrom;
@@ -114,9 +119,20 @@ public static class CutoverConfigCommand
         // 直接导致 provider list --project 报 project not found。
         // 现在固定为 ProjectName,不再从任何目录名派生。
         string existingToml = File.Exists(outPath) ? SafeRead(outPath) : string.Empty;
-        string? existingWorkDir = CcConnectConfigGenerator.TryReadExistingWorkDir(existingToml);
+        (string existingAgent, string existingProvider, string existingModel) =
+            CcConnectConfigValidator.ReadProjectAgentTriple(existingToml, ProjectName);
+        bool sameAgent = existingAgent.Length > 0 &&
+            existingAgent.Equals(agentType, StringComparison.Ordinal);
+        IReadOnlyList<string> existingCoherence = CcConnectConfigValidator.CheckAgentCoherence(
+            existingToml, ProjectName);
+        bool hasAgentSelection = existingProvider.Length > 0 || existingModel.Length > 0;
+        bool preserveAgentSelection = sameAgent && hasAgentSelection && existingCoherence.Count == 0;
+        bool projectSelectionReset = existingAgent.Length > 0 && hasAgentSelection && !preserveAgentSelection;
+        string? existingWorkDir = CcConnectConfigGenerator.TryReadExistingWorkDir(existingToml, ProjectName);
         // 顶层 [[providers]] 的全局服务商必须经 provider_refs 引用,否则项目用不到它们。
         IReadOnlyList<string> providerRefs = CcConnectConfigGenerator.ReadGlobalProviderNames(existingToml, agentType);
+        (string selectedProvider, string selectedModel) = ResolveUnambiguousProviderSelection(
+            existingToml, agentType, providerRefs, preserveAgentSelection);
 
         // 解析 work_dir:显式参数 > 既有配置(目录仍存在) > 已布防项目 > 发现结果(按名排序)。
         // 发现结果要扫盘,所以只在前三级全部落空时才求值——先不传,拿到 null 再补一次。
@@ -152,14 +168,21 @@ public static class CutoverConfigCommand
                 Agent: agentType,
                 WorkDir: resolvedWorkDir,
                 AdminFrom: allowFrom,
-                ProviderRefs: providerRefs),
+                ProviderRefs: providerRefs,
+                SelectedProvider: selectedProvider,
+                SelectedModel: selectedModel),
         };
 
         var config = new CcConnectConfig(projects, new CcConnectPlatformOptions(appId, appSecret, allowFrom));
 
         try
         {
-            CcConnectConfigGenerator.Write(outPath, config);
+            CcConnectConfigGenerator.Write(
+                outPath,
+                config,
+                preserveAgentSelection,
+                requireLoadable ? ValidateCandidateForActivation : null,
+                preserveInlineAgentProviders: sameAgent);
         }
         catch (Exception ex)
         {
@@ -168,13 +191,40 @@ public static class CutoverConfigCommand
 
         // 保留下来的非飞书平台(如 `cc-connect weixin setup` 扫码绑的微信)要在回显里报数,
         // 否则用户看不出它还在,会以为被这次生成抹掉了。
-        int foreignCount = CcConnectConfigGenerator.ExtractForeignPlatforms(existingToml).Count;
+        int foreignCount = CcConnectConfigGenerator.ExtractForeignPlatforms(existingToml, ProjectName).Count;
+
+        string resetNote = projectSelectionReset
+            ? $" 已为 {agentType} 清除项目配置中不一致的默认 provider/model 选择。"
+            : string.Empty;
+        string selectionNote = selectedProvider.Length > 0
+            ? $" 已自动选择唯一兼容 provider「{selectedProvider}」"
+              + (selectedModel.Length > 0 ? $"及模型「{selectedModel}」。" : "。")
+            : string.Empty;
 
         return new GenerateResult(true,
-            $"已写入 {outPath}({projects.Count} 个项目)。以下为**脱敏**回显:",
+            $"已写入 {outPath}({projects.Count} 个项目)。{resetNote}{selectionNote} 以下为**脱敏**回显:",
             projects.Count,
             CcConnectConfigGenerator.RenderSanitized(config, foreignCount),
             outPath);
+    }
+
+    private static string? ValidateCandidateForActivation(string candidatePath)
+    {
+        CcConnectConfigCheck check = CcConnectConfigValidator.CheckFile(candidatePath);
+        if (check.State != CcConnectConfigState.Ok)
+        {
+            string details = string.Join("; ", check.Problems);
+            return details.Length > 0
+                ? $"候选配置未通过 cc-connect 解析验证:{check.Summary} {details}"
+                : $"候选配置未通过 cc-connect 解析验证:{check.Summary}";
+        }
+
+        if (check.Warnings.Count > 0)
+        {
+            return "候选配置存在 agent/provider/model 不一致:" + string.Join("; ", check.Warnings);
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -237,6 +287,30 @@ public static class CutoverConfigCommand
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// 上游只有在 <c>agent.options.provider</c> 明确存在时才激活 provider 并读取模型表。
+    /// 唯一兼容候选没有歧义,可以安全自动选;零个或多个候选都返回空,不得猜第一个。
+    /// </summary>
+    /// <remarks>仅为可测性公开:测试项目未配 InternalsVisibleTo。</remarks>
+    public static (string Provider, string Model) ResolveUnambiguousProviderSelection(
+        string existingToml,
+        string agentType,
+        IReadOnlyList<string> providerRefs,
+        bool preserveAgentSelection)
+    {
+        if (preserveAgentSelection)
+        {
+            return (string.Empty, string.Empty);
+        }
+
+        CcConnectProviderDescriptor[] compatible = CcConnectProviderCatalog.Parse(existingToml).Providers
+            .Where(provider => providerRefs.Contains(provider.Name, StringComparer.Ordinal))
+            .ToArray();
+        return compatible.Length == 1
+            ? (compatible[0].Name, compatible[0].EffectiveModel(agentType))
+            : (string.Empty, string.Empty);
     }
 
     private static string SafeRead(string path)

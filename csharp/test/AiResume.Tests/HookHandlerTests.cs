@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Text.Json;
 using Xunit;
@@ -171,8 +172,16 @@ public class HookHandlerTests : IDisposable
     public void TryWriteEvent_ValidPayload_WritesEventFile()
     {
         // Arrange
-        string source = "test-source";
-        string stdinJson = """{"session_id": "sess-123", "cwd": "/tmp/work", "stop_hook_active": false}""";
+        string source = "claudecode";
+        string cwd = Path.Combine(_tempDir, "work");
+        Directory.CreateDirectory(cwd);
+        string stdinJson = JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["hook_event_name"] = "Stop",
+            ["session_id"] = "sess-123",
+            ["cwd"] = cwd,
+            ["stop_hook_active"] = false,
+        });
         var env = new Dictionary<string, string?>();
 
         // Act
@@ -189,7 +198,7 @@ public class HookHandlerTests : IDisposable
         var root = doc.RootElement;
         Assert.Equal(source, root.GetProperty("source").GetString());
         Assert.Equal("sess-123", root.GetProperty("sessionId").GetString());
-        Assert.Equal("/tmp/work", root.GetProperty("cwd").GetString());
+        Assert.Equal(cwd, root.GetProperty("cwd").GetString());
     }
 
     /// <summary>
@@ -199,8 +208,16 @@ public class HookHandlerTests : IDisposable
     public void TryWriteEvent_SamePayloadTwice_IsIdempotent()
     {
         // Arrange
-        string source = "test-source";
-        string stdinJson = """{"session_id": "sess-456", "cwd": "/tmp/work2", "stop_hook_active": false}""";
+        string source = "claudecode";
+        string cwd = Path.Combine(_tempDir, "work2");
+        Directory.CreateDirectory(cwd);
+        string stdinJson = JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["hook_event_name"] = "Stop",
+            ["session_id"] = "sess-456",
+            ["cwd"] = cwd,
+            ["stop_hook_active"] = false,
+        });
         var env = new Dictionary<string, string?>();
 
         // Act
@@ -296,26 +313,284 @@ public class HookHandlerTests : IDisposable
     }
 
     /// <summary>
-    /// 测试8:字段缺失(无 session_id/cwd)时不抛异常。
+    /// 测试8:缺少工作目录时不抛异常,但拒绝产生无法归属项目的事件。
     /// </summary>
     [Fact]
     public void TryWriteEvent_MissingFields_DoesNotThrow()
     {
         // Arrange
-        string source = "test-source";
+        string source = "claudecode";
         string stdinJson = """{"some_other_field": "value"}""";
         var env = new Dictionary<string, string?>();
 
         // Act & Assert:out 变量需在 lambda 外声明,否则其作用域不出 lambda。
         string capturedId = string.Empty;
+        string capturedReason = string.Empty;
         var exception = Record.Exception(() =>
         {
-            Program.TryWriteEvent(_tempDir, source, stdinJson, env, out string id);
+            Program.TryWriteEvent(_tempDir, source, stdinJson, env, out string id, out string reason);
             capturedId = id;
+            capturedReason = reason;
         });
 
         Assert.Null(exception);
-        Assert.False(string.IsNullOrEmpty(capturedId));
-        Assert.True(File.Exists(Path.Combine(_tempDir, capturedId + ".json")));
+        Assert.Equal(string.Empty, capturedId);
+        Assert.Equal("stop_event_mismatch", capturedReason);
+        Assert.Empty(Directory.GetFiles(_tempDir, "*.json"));
     }
+
+    [Theory]
+    [InlineData("claudecode")]
+    [InlineData("qoder")]
+    public void TryWriteEvent_StopSourceWithoutStopEvent_IsRejected(string source)
+    {
+        string cwd = Path.Combine(_tempDir, "missing-stop-" + source);
+        Directory.CreateDirectory(cwd);
+        string payload = JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["session_id"] = "session",
+            ["cwd"] = cwd,
+        });
+
+        bool written = Program.TryWriteEvent(
+            _tempDir, source, payload, new Dictionary<string, string?>(),
+            out _, out string reason);
+
+        Assert.False(written);
+        Assert.Equal("stop_event_mismatch", reason);
+    }
+
+    [Fact]
+    public void TryWriteEvent_RelativeWorkspace_IsRejectedForEverySource()
+    {
+        string payload = JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["hook_event_name"] = "TaskComplete",
+            ["session_id"] = "session",
+            ["cwd"] = "relative-project",
+        });
+
+        bool written = Program.TryWriteEvent(
+            _tempDir, "cline", payload, new Dictionary<string, string?>(),
+            out _, out string reason);
+
+        Assert.False(written);
+        Assert.Equal("workspace_not_absolute", reason);
+    }
+
+    [Fact]
+    public void TryWriteEvent_ClaudeDoesNotBorrowQoderEnvironment()
+    {
+        string payload = JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["hook_event_name"] = "Stop",
+            ["session_id"] = "claude-session",
+        });
+        var env = new Dictionary<string, string?>
+        {
+            ["QODER_CWD"] = Path.Combine(_tempDir, "qoder-only"),
+        };
+
+        bool written = Program.TryWriteEvent(
+            _tempDir, "claudecode", payload, env, out _, out string reason);
+
+        Assert.False(written);
+        Assert.Equal("workspace_missing", reason);
+    }
+
+    [Fact]
+    public void ResolvePayload_CodexReadsJsonFromLastArgument()
+    {
+        const string payload = """{"type":"agent-turn-complete","thread-id":"t","turn-id":"x","cwd":"C:\\work"}""";
+
+        string? resolved = Program.ResolvePayload(
+            "codex",
+            ["--previous-notify", "[\"other.exe\"]", payload],
+            string.Empty);
+
+        Assert.Equal(payload, resolved);
+    }
+
+    [Fact]
+    public void TryWriteEvent_CodexTopLevelPersistedThread_IsAccepted()
+    {
+        const string threadId = "019fe5b6-f28b-7e60-a01a-79c6ce5e1acc";
+        string codexHome = CreateCodexRollout(threadId, subagent: false);
+        string cwd = Path.Combine(_tempDir, "real-project");
+        Directory.CreateDirectory(cwd);
+        var env = new Dictionary<string, string?>
+        {
+            ["AI_RESUME_CODEX_HOME"] = codexHome,
+            ["AI_RESUME_CODEX_DOCUMENTS_ROOT"] = Path.Combine(_tempDir, "Codex"),
+        };
+
+        bool written = Program.TryWriteEvent(
+            _tempDir,
+            "codex",
+            CodexPayload(threadId, "turn-1", cwd),
+            env,
+            out string eventId,
+            out string reason);
+
+        Assert.True(written);
+        Assert.Equal("written", reason);
+        Assert.True(File.Exists(Path.Combine(_tempDir, eventId + ".json")));
+    }
+
+    [Fact]
+    public void TryWriteEvent_CodexSubagentThread_IsRejected()
+    {
+        const string threadId = "019fe5ed-ce08-7b93-8a41-f342eeee9aff";
+        string codexHome = CreateCodexRollout(threadId, subagent: true);
+        string cwd = Path.Combine(_tempDir, "real-project");
+        Directory.CreateDirectory(cwd);
+        var env = new Dictionary<string, string?>
+        {
+            ["AI_RESUME_CODEX_HOME"] = codexHome,
+            ["AI_RESUME_CODEX_DOCUMENTS_ROOT"] = Path.Combine(_tempDir, "Codex"),
+        };
+
+        bool written = Program.TryWriteEvent(
+            _tempDir,
+            "codex",
+            CodexPayload(threadId, "turn-2", cwd),
+            env,
+            out _,
+            out string reason);
+
+        Assert.False(written);
+        Assert.Equal("subagent_thread", reason);
+    }
+
+    [Theory]
+    [InlineData("internal", false)]
+    [InlineData("memory_consolidation", false)]
+    [InlineData("user", true)]
+    public void TryWriteEvent_CodexInternalThread_IsRejected(string threadSource, bool sourceInternal)
+    {
+        const string threadId = "019fe5ed-ce08-7b93-8a41-f342eeee9aff";
+        string codexHome = CreateCodexRollout(
+            threadId, subagent: false, threadSource: threadSource, sourceInternal: sourceInternal);
+        string cwd = Path.Combine(_tempDir, "internal-project");
+        Directory.CreateDirectory(cwd);
+        var env = new Dictionary<string, string?>
+        {
+            ["AI_RESUME_CODEX_HOME"] = codexHome,
+            ["AI_RESUME_CODEX_DOCUMENTS_ROOT"] = Path.Combine(_tempDir, "Codex"),
+        };
+
+        bool written = Program.TryWriteEvent(
+            _tempDir, "codex", CodexPayload(threadId, "turn-internal", cwd), env,
+            out _, out string reason);
+
+        Assert.False(written);
+        Assert.Equal("internal_thread", reason);
+    }
+
+    [Fact]
+    public void TryWriteEvent_CodexGeneratedProjectlessDirectory_IsRejectedUnlessGitRootExists()
+    {
+        const string threadId = "019fe5b6-f28b-7e60-a01a-79c6ce5e1acc";
+        string codexHome = CreateCodexRollout(threadId, subagent: false);
+        string documentsRoot = Path.Combine(_tempDir, "Codex");
+        string cwd = Path.Combine(documentsRoot, "2026-08-09", "generated-task");
+        Directory.CreateDirectory(cwd);
+        var env = new Dictionary<string, string?>
+        {
+            ["AI_RESUME_CODEX_HOME"] = codexHome,
+            ["AI_RESUME_CODEX_DOCUMENTS_ROOT"] = documentsRoot,
+        };
+
+        bool rejected = Program.TryWriteEvent(
+            _tempDir, "codex", CodexPayload(threadId, "turn-3", cwd), env,
+            out _, out string rejectedReason);
+
+        Directory.CreateDirectory(Path.Combine(cwd, ".git"));
+        bool accepted = Program.TryWriteEvent(
+            _tempDir, "codex", CodexPayload(threadId, "turn-4", cwd), env,
+            out _, out string acceptedReason);
+
+        Assert.False(rejected);
+        Assert.Equal("projectless_workspace", rejectedReason);
+        Assert.True(accepted);
+        Assert.Equal("written", acceptedReason);
+    }
+
+    [Fact]
+    public void TryWriteEvent_OpenCodeExplicitEventId_DistinguishesTwoIdleTurns()
+    {
+        string cwd = Path.Combine(_tempDir, "open-project");
+        Directory.CreateDirectory(cwd);
+        var env = new Dictionary<string, string?>();
+        string First(string id) => JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["hook_event_name"] = "session.idle",
+            ["session_id"] = "session-1",
+            ["cwd"] = cwd,
+            ["event_id"] = id,
+        });
+
+        Assert.True(Program.TryWriteEvent(_tempDir, "opencode", First("idle-1"), env, out string first));
+        Assert.True(Program.TryWriteEvent(_tempDir, "opencode", First("idle-2"), env, out string second));
+        Assert.NotEqual(first, second);
+    }
+
+    [Fact]
+    public void ForwardPreviousNotify_TerminatesTimedOutProcessTree()
+    {
+        string pidPath = Path.Combine(_tempDir, "previous-notify.pid");
+        string script = "require('fs').writeFileSync(" + JsonSerializer.Serialize(pidPath) +
+                        ", String(process.pid)); setTimeout(() => {}, 30000);";
+        string command = JsonSerializer.Serialize(new[] { "node", "-e", script });
+        var stopwatch = Stopwatch.StartNew();
+
+        bool forwarded = Program.ForwardPreviousNotify(
+            ["--previous-notify", command], rawPayload: null, timeoutMilliseconds: 500);
+
+        stopwatch.Stop();
+        Assert.False(forwarded);
+        Assert.InRange(stopwatch.Elapsed, TimeSpan.Zero, TimeSpan.FromSeconds(5));
+        Assert.True(File.Exists(pidPath), "旧通知进程没有启动到可观测阶段");
+        int pid = int.Parse(File.ReadAllText(pidPath));
+        Assert.Throws<ArgumentException>(() => Process.GetProcessById(pid));
+    }
+
+    private string CreateCodexRollout(
+        string threadId,
+        bool subagent,
+        string? threadSource = null,
+        bool sourceInternal = false)
+    {
+        string codexHome = Path.Combine(_tempDir, "codex-home-" + threadId);
+        string sessions = Path.Combine(codexHome, "sessions", "2026", "08", "09");
+        Directory.CreateDirectory(sessions);
+        var payload = new Dictionary<string, object?>
+        {
+            ["id"] = threadId,
+            ["session_id"] = threadId,
+            ["parent_thread_id"] = subagent ? "019fe5b6-f28b-7e60-a01a-79c6ce5e1acc" : null,
+            ["thread_source"] = threadSource ?? (subagent ? "subagent" : "user"),
+            ["source"] = subagent
+                ? new Dictionary<string, object?> { ["subagent"] = new { } }
+                : sourceInternal
+                    ? new Dictionary<string, object?> { ["internal"] = new { } }
+                    : "vscode",
+        };
+        string line = JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["type"] = "session_meta",
+            ["payload"] = payload,
+        });
+        File.WriteAllText(Path.Combine(sessions, $"rollout-test-{threadId}.jsonl"), line + Environment.NewLine);
+        return codexHome;
+    }
+
+    private static string CodexPayload(string threadId, string turnId, string cwd)
+        => JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["type"] = "agent-turn-complete",
+            ["thread-id"] = threadId,
+            ["turn-id"] = turnId,
+            ["cwd"] = cwd,
+        });
 }

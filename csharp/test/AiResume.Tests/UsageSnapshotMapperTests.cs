@@ -149,7 +149,7 @@ public sealed class UsageSnapshotMapperTests
     }
 
     [Fact]
-    public void ReasonLimited_WindowStatusBlocked()
+    public void ReasonLimited_OnlyGlobalSignal_DoesNotMarkSpecificWindowBlocked()
     {
         var result = new ClaudeProbeResult
         {
@@ -161,7 +161,44 @@ public sealed class UsageSnapshotMapperTests
         var snapshot = UsageSnapshotMapper.FromProbe(result, FixedNow);
 
         var window = snapshot.Buckets[0].Windows.Single(w => w.Name == "five_hour");
+        Assert.Equal(string.Empty, window.Status);
+        Assert.True(snapshot.Buckets[0].LimitReached);
+    }
+
+    [Fact]
+    public void TransientFailure_WithPartialWindow_IsNotAllowedOrHealthy()
+    {
+        var result = new ClaudeProbeResult
+        {
+            Ready = false,
+            Reason = "transient",
+            FiveHourResetUtc = FixedReset,
+        };
+
+        var snapshot = UsageSnapshotMapper.FromProbe(result, FixedNow);
+
+        Assert.True(snapshot.HasData);
+        Assert.False(Assert.Single(snapshot.Buckets).Allowed);
+        Assert.False(Assert.Single(snapshot.Buckets).LimitReached);
+        Assert.Contains("仅取得部分窗口信息", snapshot.UnavailableReason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WindowUtilization100_MarksThatWindowBlocked()
+    {
+        var result = new ClaudeProbeResult
+        {
+            Ready = false,
+            Reason = "limited",
+            FiveHourResetUtc = FixedReset,
+            FiveHourUtil = 1.0,
+        };
+
+        var snapshot = UsageSnapshotMapper.FromProbe(result, FixedNow);
+
+        var window = snapshot.Buckets[0].Windows.Single(w => w.Name == "five_hour");
         Assert.Equal("blocked", window.Status);
+        Assert.Equal(100, window.UsedPercent);
     }
 
     [Fact]

@@ -8,7 +8,7 @@ namespace AiResume.Storage;
 /// </summary>
 public static class StorageDatabase
 {
-    public const int CurrentSchemaVersion = 3;
+    public const int CurrentSchemaVersion = 5;
 
     public static SqliteConnection Open(string databasePath)
     {
@@ -62,6 +62,20 @@ public static class StorageDatabase
         {
             ApplyV3(connection, tx);
             Execute(connection, "INSERT INTO schema_version(version, applied_at) VALUES (3, $now);", tx,
+                ("$now", DateTimeOffset.UtcNow.ToString("o")));
+        }
+
+        if (applied < 4)
+        {
+            ApplyV4(connection, tx);
+            Execute(connection, "INSERT INTO schema_version(version, applied_at) VALUES (4, $now);", tx,
+                ("$now", DateTimeOffset.UtcNow.ToString("o")));
+        }
+
+        if (applied < 5)
+        {
+            ApplyV5(connection, tx);
+            Execute(connection, "INSERT INTO schema_version(version, applied_at) VALUES (5, $now);", tx,
                 ("$now", DateTimeOffset.UtcNow.ToString("o")));
         }
 
@@ -153,6 +167,41 @@ public static class StorageDatabase
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 state_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            """, tx);
+    }
+
+    /// <summary>
+    /// v4:第一版最近权威额度快照。该版只有 provider 主键,无法区分账号;
+    /// v5 会显式替换它。保留原始形状是为了让已部署 v4 能可靠升级。
+    /// </summary>
+    private static void ApplyV4(SqliteConnection connection, SqliteTransaction tx)
+    {
+        Execute(connection, """
+            CREATE TABLE quota_snapshots (
+                provider TEXT PRIMARY KEY,
+                snapshot_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """, tx);
+    }
+
+    /// <summary>
+    /// v5:额度快照按 provider + 不可逆账号指纹隔离,并记录服务端观察时间。
+    /// v4 的旧行没有账号身份,无法证明属于当前登录账号;安全迁移只能丢弃,
+    /// 不能把旧 Fable 状态错误承接给另一个账号。
+    /// </summary>
+    private static void ApplyV5(SqliteConnection connection, SqliteTransaction tx)
+    {
+        Execute(connection, """
+            DROP TABLE IF EXISTS quota_snapshots;
+            CREATE TABLE quota_snapshots (
+                provider TEXT NOT NULL,
+                credential_fingerprint TEXT NOT NULL,
+                captured_at INTEGER NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (provider, credential_fingerprint)
             );
             """, tx);
     }

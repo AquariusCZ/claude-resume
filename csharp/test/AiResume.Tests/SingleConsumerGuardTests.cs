@@ -240,6 +240,42 @@ namespace AiResume.Tests
             Assert.Equal(ConsumerGuardVerdict.Conflict, result.Verdict);
             Assert.Single(result.Conflicts);
         }
+
+        [Fact]
+        public void 可读Vbs守护命令行也必须判为旧消费者冲突()
+        {
+            var lister = new FakeProcessLister(new List<RunningProcessInfo>
+            {
+                new RunningProcessInfo(101, "wscript.exe", "wscript.exe C:\\ClaudeResume\\feishu-launch.vbs")
+            });
+
+            ConsumerGuardResult result = CreateGuard(lister).Check(true);
+
+            Assert.Equal(ConsumerGuardVerdict.Conflict, result.Verdict);
+            ConflictingProcess conflict = Assert.Single(result.Conflicts);
+            Assert.Equal(101, conflict.Pid);
+            Assert.Equal("legacy-node-agent", conflict.Kind);
+            Assert.Contains("feishu-launch.vbs", conflict.Detail, StringComparison.OrdinalIgnoreCase);
+        }
+
+        [Theory]
+        [InlineData("node")]
+        [InlineData("wscript.exe")]
+        [InlineData("cscript")]
+        [InlineData("cmd.exe")]
+        public void 脚本宿主命令行不可读时必须failClosed(string processName)
+        {
+            var lister = new FakeProcessLister(new List<RunningProcessInfo>
+            {
+                new RunningProcessInfo(444, processName, null)
+            });
+
+            var result = CreateGuard(lister).Check(true);
+
+            Assert.Equal(ConsumerGuardVerdict.Unverifiable, result.Verdict);
+            Assert.False(result.CanStart);
+            Assert.Empty(result.Conflicts);
+        }
     
         /// <summary>
         /// 安全红线:枚举器读不到命令行时,无法排除现役 node agent 仍在消费同一飞书应用,

@@ -96,13 +96,19 @@ public sealed class CodexProbe
         CodexAuthResult auth = await CodexAuthProbe
             .ProbeAsync(_codexHome, _authHandler, ct).ConfigureAwait(false);
 
+        return FromAuthResult(auth);
+    }
+
+    public static CodexProbeResult FromAuthResult(CodexAuthResult auth)
+    {
         return auth.Outcome switch
         {
-            // 带凭据请求成功 = 真的验证过了,给绿灯(DeepChecked=true)。
-            // **文案直接用 auth.Detail**:探测已经区分了"凭据+推理都验过"和
-            // "凭据验过但推理没核实"(端点不支持/没配 model),拼一句固定话会把这个区别抹掉。
+            // 只有最小推理真实成功才是可用证据，允许给绿灯。
             CodexAuthOutcome.Authorized =>
                 new CodexProbeResult(CodexReadiness.Ok, "authorized", auth.Detail, true),
+            // 鉴权成功但推理没有核实，不把凭据说成坏的，也绝不冒充绿色可用。
+            CodexAuthOutcome.InferenceUnverified =>
+                new CodexProbeResult(CodexReadiness.Ok, "inference-unverified", auth.Detail, false),
             // 能列模型、不能推理:凭据没坏,但**任务跑不了**,所以归 Auth(红)而不是 Ok。
             // 给绿灯等于告诉用户"随时可以跑",而它一跑就失败(审计 A6)。
             CodexAuthOutcome.NoInference =>

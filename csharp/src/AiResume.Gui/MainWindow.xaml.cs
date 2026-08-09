@@ -18,13 +18,34 @@ public partial class MainWindow : Window
 
     private readonly ControlPlaneBridge _bridge;
     private readonly CancellationTokenSource _cts = new();
+    private readonly bool _screenshotMode;
 
     public MainWindow()
     {
         InitializeComponent();
-        _bridge = new ControlPlaneBridge(folderPicker: PickFolderAsync);
+        _screenshotMode = Environment.GetCommandLineArgs().Any(
+            arg => string.Equals(arg, "--screenshot", StringComparison.OrdinalIgnoreCase));
+        // 公开截图必须使用合成数据，不能读取或展示真实项目、用户名、凭据和本机路径。
+        _bridge = new ControlPlaneBridge(folderPicker: PickFolderAsync, demoMode: _screenshotMode);
         Loaded += async (_, _) => await InitializeHostAsync();
+        Closing += OnClosing;
         Closed += (_, _) => _cts.Cancel();
+    }
+
+    private void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        if (!_bridge.IsCutoverInProgress)
+        {
+            return;
+        }
+
+        e.Cancel = true;
+        MessageBox.Show(
+            this,
+            "cc-connect 正在切换配置并验证新进程。为保证失败时可以完成回滚,请等待操作结束后再关闭窗口。",
+            "正在切换 cc-connect",
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
     }
 
     /// <summary>
@@ -95,7 +116,12 @@ public partial class MainWindow : Window
                 }
             };
 
-            core.Navigate($"https://{VirtualHost}/index.html");
+            // WebView2 的用户数据目录是持久的。固定 URL 会在重新安装 HTML 后仍命中旧缓存，
+            // 表现成“源码和安装哈希已更新，但界面还是上一版”。文件时间戳只用于换缓存键，
+            // 页面仍由本机虚拟主机加载，不引入任何网络请求。
+            string indexPath = Path.Combine(wwwroot, "index.html");
+            long cacheVersion = File.GetLastWriteTimeUtc(indexPath).Ticks;
+            core.Navigate($"https://{VirtualHost}/index.html?v={cacheVersion}");
         }
         catch (Exception ex) when (ex is WebView2RuntimeNotFoundException)
         {
@@ -110,7 +136,7 @@ public partial class MainWindow : Window
     /// <summary>
     /// 自测支持:`--screenshot &lt;png 路径&gt;` 时,等页面数据填充后截取 WebView 内容并退出。
     /// 经 CapturePreviewAsync 截图,不依赖窗口是否在前台(Windows 前台锁定会让屏幕抓取失效),
-    /// 因此可在无人值守下产出可复核的界面证据(对应现役 picker.ps1 的 -RenderTo)。
+    /// 因此可在无人值守下产出可复核的界面证据(替代 v1 picker.ps1 的 -RenderTo)。
     /// </summary>
     private async Task CaptureIfRequestedAsync()
     {
@@ -127,7 +153,7 @@ public partial class MainWindow : Window
             // 给前端时间完成首次数据拉取与渲染,否则截到的是骨架态。
             // 12 秒是被额度探测抬上来的:它要拉起 claude 子进程,冷缓存实测约 7 秒
             // (项目发现只要几十毫秒)。截图是自测通道,宁可慢也不要截出"正在探测"。
-            await Task.Delay(20000).ConfigureAwait(true);
+            await Task.Delay(_screenshotMode ? 2000 : 20000).ConfigureAwait(true);
             Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(target))!);
             await using var fs = new FileStream(target, FileMode.Create, FileAccess.Write);
             await Host.CoreWebView2.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png, fs)

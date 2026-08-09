@@ -10,5 +10,10 @@
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="System.Management" Version="10.0.10" />
+    <PackageReference Include="Tomlyn" Version="2.10.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- User-owned untracked legacy probe contradicts cc-connect v1.4.1 InvalidateForAgent semantics. -->
+    <Compile Remove="CcConnectSessionAgent.cs" />
   </ItemGroup>
 </Project>

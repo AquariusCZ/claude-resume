@@ -129,6 +129,35 @@ public class CodexNotificationAdapterTests : IDisposable
         Assert.Equal(original, array);
     }
 
+    [Theory]
+    [InlineData("\"notify\"")]
+    [InlineData("'notify'")]
+    public void EnableDisable_PreservesQuotedNotifyKeyWithoutAddingSemanticDuplicate(string key)
+    {
+        Directory.CreateDirectory(_configDir);
+        string[] original = ["C:\\tools\\existing-notify.exe"];
+        File.WriteAllText(
+            _configPath,
+            $"{key} = {JsonSerializer.Serialize(original)} # keep\r\n[model]\r\nname = \"gpt\"\r\n");
+
+        _adapter.Enable("C:\\tools\\AiResume.Hook.exe codex");
+
+        string[] lines = File.ReadAllLines(_configPath);
+        string quotedLine = Assert.Single(
+            lines, line => line.TrimStart().StartsWith(key, StringComparison.Ordinal));
+        Assert.DoesNotContain(lines, line => line.TrimStart().StartsWith("notify =", StringComparison.Ordinal));
+        Assert.Contains("# keep", quotedLine, StringComparison.Ordinal);
+        Assert.True(_adapter.Probe().IsEnabled);
+
+        _adapter.Disable();
+
+        lines = File.ReadAllLines(_configPath);
+        quotedLine = Assert.Single(
+            lines, line => line.TrimStart().StartsWith(key, StringComparison.Ordinal));
+        Assert.Equal(original, ParseNotifyArray(quotedLine));
+        Assert.Contains("# keep", quotedLine, StringComparison.Ordinal);
+    }
+
     /// <summary>
     /// 测试 4:幂等 — 连续两次 Enable,不产生嵌套两层我方命令。
     /// </summary>
@@ -305,6 +334,73 @@ public class CodexNotificationAdapterTests : IDisposable
 
         // 验证 .bak 文件存在
         Assert.True(File.Exists(_configPath + ".bak"));
+    }
+
+    [Fact]
+    public void Enable_RefreshesOwnedLayerButPreservesAmbiguousPreviousCommand()
+    {
+        Directory.CreateDirectory(_configDir);
+        string broken = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AI");
+        string[] legacyBroken = [broken, "codex"];
+        string[] own =
+        [
+            @"C:\old\AiResume.Hook.exe",
+            "codex",
+            "--previous-notify",
+            JsonSerializer.Serialize(legacyBroken),
+        ];
+        string[] desktop =
+        [
+            @"C:\codex\codex-computer-use.exe",
+            "turn-ended",
+            "--previous-notify",
+            JsonSerializer.Serialize(own),
+        ];
+        File.WriteAllText(_configPath, "notify = " + JsonSerializer.Serialize(desktop) + "\r\n");
+
+        _adapter.Enable(@"C:\new path\AiResume.Hook.exe");
+
+        string[] outer = ParseNotifyArray(FindNotifyLine(File.ReadAllLines(_configPath))!);
+        int marker = Array.IndexOf(outer, "--previous-notify");
+        string[] refreshed = JsonSerializer.Deserialize<string[]>(outer[marker + 1])!;
+        Assert.Equal(@"C:\new path\AiResume.Hook.exe", refreshed[0]);
+        Assert.Equal("codex", refreshed[1]);
+        int previousMarker = Array.IndexOf(refreshed, "--previous-notify");
+        Assert.True(previousMarker >= 0);
+        Assert.Equal(legacyBroken, JsonSerializer.Deserialize<string[]>(refreshed[previousMarker + 1]));
+    }
+
+    [Fact]
+    public void PruneDeadLinks_DoesNotDeleteUserOwnedOfflineCommand()
+    {
+        string[] user =
+        [
+            @"Z:\offline\user-notify.exe",
+            "codex",
+            "--previous-notify",
+            JsonSerializer.Serialize(new[] { @"C:\other\notify.exe" }),
+        ];
+
+        string[] result = CodexNotificationAdapter.PruneDeadLinks(user, _ => false);
+
+        Assert.Equal(user, result);
+    }
+
+    [Fact]
+    public void EnableDisable_MarkerInUserArgumentIsPreservedAsPreviousCommand()
+    {
+        Directory.CreateDirectory(_configDir);
+        string[] user = [@"C:\tools\notify.exe", "--label", "AiResume.Hook.exe"];
+        File.WriteAllText(_configPath, "notify = " + JsonSerializer.Serialize(user) + "\r\n");
+
+        Assert.False(_adapter.Probe().IsEnabled);
+        _adapter.Enable(@"C:\tools\AiResume.Hook.exe");
+        Assert.True(_adapter.Probe().IsEnabled);
+        _adapter.Disable();
+
+        string[] restored = ParseNotifyArray(FindNotifyLine(File.ReadAllLines(_configPath))!);
+        Assert.Equal(user, restored);
     }
 
     /// <summary>在行集合中查找 notify 行。</summary>

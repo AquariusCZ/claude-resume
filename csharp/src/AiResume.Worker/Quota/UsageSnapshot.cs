@@ -18,8 +18,12 @@ public sealed record UsageSnapshot(
     IReadOnlyList<UsageBucket> Buckets,
     string? UnavailableReason)
 {
-    /// <summary>是否拿到了任何一条服务端下发的限额窗口。</summary>
-    public bool HasData => Buckets.Count > 0 && Buckets.Any(b => b.Windows.Count > 0);
+    /// <summary>
+    /// 是否拿到了至少一条有事实内容的限额窗口。空对象不是额度证据:
+    /// percent/reset 都缺失时不能仅凭一个窗口壳把 provider 点成绿色。
+    /// </summary>
+    public bool HasData => Buckets.Count > 0 && Buckets.Any(bucket => bucket.Windows.Any(window =>
+        window.UsedPercent is not null || window.ResetAtUnix is not null));
 
     /// <summary>构造一个"取不到数据"的快照。GUI 据此如实显示不可用,禁止伪造进度。</summary>
     public static UsageSnapshot Unavailable(string provider, DateTimeOffset capturedAt, string reason) =>
@@ -46,7 +50,9 @@ public sealed record UsageWindow(
     int WindowSeconds,
     long? ResetAtUnix,
     int? ResetAfterSeconds,
-    int? UsedPercent)
+    int? UsedPercent,
+    bool CarriedForward = false,
+    string? Identity = null)
 {
     /// <summary>Claude 5 小时窗口的秒数。</summary>
     public const int FiveHourSeconds = 5 * 60 * 60;

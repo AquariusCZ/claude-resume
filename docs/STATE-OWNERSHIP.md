@@ -1,5 +1,7 @@
 # AI Resume 状态所有权(STATE-OWNERSHIP)
 
+> 历史快照:本文冻结的是 2026-08-01 迁移设计中的 current/shadow/target 所有权。迁移完成后的现役所有权以 `docs/ARCHITECTURE.md` 为准;下文的 PowerShell/Node “current” 不是当前运行态。
+
 > 状态:阶段 0 交付物,2026-08-01 定稿并由 ADR-0002 补充。本文定义现役(current)/影子(shadow)/目标(target)三类状态的真身、迁移方式与回滚真身;核心原则:**任意时刻每类状态只有一个 writer,禁止双写**。目标运行状态字段与恢复语义以 `RUN-CONTRACT.md` 为准。
 
 ## 1. 术语

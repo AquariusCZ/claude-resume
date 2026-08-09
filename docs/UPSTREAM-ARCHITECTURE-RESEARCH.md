@@ -44,6 +44,51 @@ cc-connect 是 Go 实现的多 Agent、多消息平台桥接器。当前源码�
 - 直接迁移会引入 Go sidecar、第二份配置和会话数据迁移问题。若同时让旧 Node agent 与 cc-connect 接收飞书事件，会产生重复回复和双写会话。
 - cc-connect 自身也有较大的核心文件，不能把“采用上游”误解成“上游没有复杂度”。它的价值主要在已经稳定下来的接口、测试矩阵和运维契约。
 
+### 2026-08-08 固定 v1.4.1 平台复核
+
+本轮以已安装二进制对应源码 `5d4c96dd12774574369e75b60084140101c9a59a` 为准，补齐 Windows 平台级结论：
+
+- 裸 `cc-connect daemon restart` 在 Windows 可能退出 0，但旧进程没有退出；`daemon status` 只反映计划任务状态，也不能证明 API、配置或飞书已就绪。`restart --force` 只按锁 PID 硬杀 daemon，不能作为 AI Resume 的成功判据。
+- v1.4.1 上游安装器创建的是 `Interactive + Limited` 登录任务，Windows 默认还会带来 `PT72H`、电池停机、无崩溃恢复和无无限重复 watchdog；这些值不满足常驻机器人边界。生产任务通过仓库的硬化脚本改为当前用户 `S4U + Limited`、`PT0S`、两项电池停机关闭、`RestartCount=3`/`PT1M`、`IgnoreNew`，并保留单一登录触发器的无限 `PT5M` repetition。GUI 必须验证这份产品级契约，不能把“上游任务存在”当成守护有效。
+- 生产 S4U 任务中的 daemon 对交互式 GUI 隔离；本机实证进程路径、启动时间、句柄和 WMI `CommandLine` 均可能拒绝访问或为空。自行实现“核验后强杀进程树”在目标平台不可用，因此不采用；进程归属只能作为组合证据，不能替代锁/API/日志与完整任务定义。
+- 上游已有带 token 的 `POST /api/v1/restart`。主进程收到后会执行 `Engine.Stop`，关闭平台、agent session 与 agent，释放实例锁，再在原安全上下文启动新 OS 进程。`RestartCh` 先入队、HTTP 响应后写，因此连接重置属于结果未知而不是明确拒绝。AI Resume 只做薄编排：候选验证与原子提交、调用该接口、验证不同锁 PID/本次启动时间/目标 agent/按锁 PID 分代的本次日志，再验证根路径唯一任务的 action/脚本/SID/principal/settings/trigger、LastRunTime/进程归属，并在返回前复核同一 PID/version/agent 仍在线。
+- `provider.agent_types` 缺失或为空表示上游对所有 agent 开放；provider 名称和值、agent 类型和 `endpoints` / `agent_models` / `agent_model_lists` 的键均保留原字符串并区分大小写。`ResolveForAgent` 已提供按 agent 覆盖，无需自研第二套 provider 状态机。项目内联 provider 不走全局 `agent_types` 过滤，因此切 agent 时必须单独处理或失败关闭。
+- Claude Code 可使用 Anthropic 兼容的 DeepSeek endpoint；Codex 需要 OpenAI/Codex 兼容 endpoint。默认标量 `model` 与可选模型列表是两套字段，Claude adapter 缺少列表时会回退 Claude 内置名称，Codex 还会优先本地 `model_catalog_json`。
+- 新 Engine 会调用 `sessions.InvalidateForAgent` 清理旧 agent 的原生 session ID，因此 agent 生效不要求 `/new`；但 `Session.ActiveProvider` 不会清空，同名且仍兼容的 provider 可能恢复。
+
+自研成立的边界仅限上游没有提供的“产品级激活事务”：跨窗口互斥、生产文件哈希对账、失败时条件回滚、单消费者门禁、计划任务重新布防，以及把锁 PID/API/agent/日志证据组合成用户可见的完成判据。
+
+### 2026-08-09 Codex 模型目录复核
+
+本轮继续以 cc-connect v1.4.1 对应提交 `5d4c96dd12774574369e75b60084140101c9a59a` 为平台真身，并核对 [OpenAI Codex models](https://developers.openai.com/codex/models) 与 [OpenAI API models](https://developers.openai.com/api/docs/models)：
+
+- cc-connect Codex `AvailableModels` 的顺序是本地 `model_catalog_json` → 当前活动 provider 的配置模型 → `/v1/models` 白名单 → Codex `models_cache.json` → 内置回退。v1.4.1 的内置回退仍是 `o4-mini`、`o3`、`gpt-4.1*`、`codex-mini-latest`,不能代表 2026-08-09 的现行推荐。
+- provider 即使已出现在 `provider_refs`,只要 `[projects.agent.options].provider` 为空,上游 `activeIdx` 仍是 `-1`,配置模型表不会被读取。这正是截图中旧菜单出现的直接原因。
+- OpenAI 当前推荐 Codex 模型是 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`;`gpt-5.6` 仍作为 Codex 默认模型标识使用。`gpt-5.3-codex-spark` 有产品/账号可用性限制,不作为通用 provider 候选自动下发。
+- 因而采用薄配置适配而非 fork cc-connect:唯一兼容 provider 自动写入活动选择;官方 OpenAI 端点的 `gpt-5.6` 家族且无用户列表时生成默认值加三项官方候选;第三方 relay 不继承官方能力假设,只保留有效默认值或自身显式列表;零个或多个 provider 不猜选;用户列表与本地 model catalog 继续优先。生成 alias 使用 `[AI Resume] ` 作为可跨上游 CRUD TOML 重编码的所有权证据,无标记列表不迁移。`config format` 本身保留注释;候选已用该命令实测通过,另有结构化重编码回归覆盖注释消失后的刷新。
+
+- 目标机当前第三方 Codex relay 的 `/models` 直连实测返回 HTTP 200,并明确列出 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`;三项已通过候选 `config format` 验证并原子激活到该 provider 的显式模型列表,守护进程换代、目标 agent、飞书 ready 与计划任务 watchdog 均已核验。该证据只属于这一个 relay,不得泛化到其它 OpenAI-compatible 服务。
+
+这项能力上游“部分已有但默认回退过时且需要活动 provider 才生效”,所以正确做法是补齐上游要求的配置形状,不是在 AI Resume 里另写一套模型菜单或修改 cc-connect 源码。
+
+### 2026-08-09 Claude 额度读取生态复核
+
+现役请求、解析、稀疏合并、SQLite 并发、GUI 语义与验证步骤已收敛到 [`CLAUDE-QUOTA-ACQUISITION.md`](CLAUDE-QUOTA-ACQUISITION.md);本节只保留上游与平台证据。
+
+本轮先回看 AI Resume 旧 PowerShell `Test-ClaudeReady` / `Save-RealResetFromProbe`:它通过 Claude CLI 的 `rate_limit_event` 读取窗口,而且只有探测明确给出百分比时才覆盖旧值,缺字段不会清空。这说明“进度条以前能连续显示”来自稀疏合并语义,不是本地估算。随后通过 v2rayN `127.0.0.1:10808` 只读核对三个同类实现与目标机 Claude Code 2.1.185 二进制:
+
+- [llm-cost-bar `SubscriptionProvider.swift`](https://github.com/kpnemo/llm-cost-bar/blob/378786c55ae4830de4c864592d679a3b44eaedad/Core/Sources/LLMCostBarCore/SubscriptionProvider.swift) 明确同时发送 `anthropic-beta: oauth-2025-04-20` 和 `User-Agent: claude-code/2.0.0`;其设计文档记录其它 UA 会进入更激进的限流桶,并采用“stale beats blank”:网络、429、5xx 时保留最后读数并标记陈旧。
+- [CodexBar `ClaudeOAuthUsageFetcher.swift`](https://github.com/steipete/CodexBar/blob/171c2dce44d1e48cb1e9fab57c24df2a773fba2b/Sources/CodexBarCore/Providers/Claude/ClaudeOAuth/ClaudeOAuthUsageFetcher.swift) 同样生成 `claude-code/<version>` User-Agent;其变更记录明确按账号保留 429 前最后一次 OAuth 读数,并展示 `weekly_scoped` / Fable 窗口。
+- [ClaudeTimer `ClaudeUsageClient.cs`](https://github.com/TimeWinder-dk/ClaudeTimer/blob/9b09a72d86b7f51241de7d61a2df71c59ef2294e/src/ClaudeTimer/Services/ClaudeUsageClient.cs) 优先遍历现代 `limits` 数组,让 `session`、`weekly_all`、`weekly_scoped` 等新增窗口无需硬编码响应顶层字段;旧顶层窗口只作兼容回退。
+
+目标机实证与上述结论一致:同一 OAuth token 用普通 .NET 请求形状得到 HTTP 429;补齐 `Accept`、OAuth beta、Anthropic version 与 `claude-code/2.1.185` User-Agent 后立即得到 HTTP 200,并返回 `session=0%`、`weekly_all=100%`、`weekly_scoped:Fable=100%`。因此正确实现不是改成估算或只依赖 CLI,而是薄复现 Claude Code 请求协议,优先解析现代 `limits`,再按“账号 + 窗口名 + resetAt 代次”合并稀疏观测。当前明确值优先;缺字段可承接到同一未来 reset,账号变化、reset 换代或到期立即失效并以琥珀色“最近服务端读数”标记。
+
+### 2026-08-09 GUI 微动画生态复核
+
+本轮按“先查上游”盘点 [Motion](https://github.com/motiondivision/motion)、[Anime.js](https://github.com/juliangarnier/anime) 与 [GSAP](https://github.com/greensock/GSAP)。三者都能实现旋转、入场和状态过渡,但 AI Resume 的现役前端是随程序集离线分发的单个 `index.html`,没有 npm 打包链、模块加载器或外网运行依赖;为少量状态微动画引入库会新增版本、许可证、打包和供应链表面,却不提供当前 CSS Keyframes / Web Animations API 缺少的能力。
+
+因此采用平台原生实现:刷新、provider 探测和保存等进行态使用 transform/opacity 动画;列表、状态行和弹窗只做 160-260ms 的短促入场;额度仍以真实数据直接决定宽度。目标机 Windows 当前报告 `ClientAreaAnimation=False`,WebView2 因而命中 `prefers-reduced-motion: reduce`;旧规则连刷新 spinner 一起停掉,才会把旋转环显示成静态字母 C。现役规则关闭扫光、位移等装饰性运动,把入场降级为短促透明度变化,必要的忙碌反馈改为更慢的分段旋转/明灭,不修改 Windows 全局动画设置。
+
 ## 飞书官方 lark-cli
 
 lark-cli 是 larksuite 团队维护的官方 CLI。README 当前声明 18 个业务域、200+ 命令和 26 个 Agent Skills；本次固定快照的 `skills/` 代码树实际包含 27 个顶层 `SKILL.md`，说明该仓库仍在快速更新。当前机器已安装 1.0.81,但尚未配置应用或用户授权。
@@ -131,6 +176,14 @@ lark-cli 是 larksuite 团队维护的官方 CLI。README 当前声明 18 个业
 - 非 owner 无文件、执行和高风险飞书写入能力。
 - API Key、飞书密钥和授权令牌在仓库与日志中出现次数为 0。
 - Codex、Claude Code、Cline 完成通知保持；DeepSeek Copilot Chat 不伪造任务完成边界。
+
+### 完成通知上游盘点（2026-08-09）
+
+- Codex 官方 `notify` 是 argv 数组，当前完成事件 `agent-turn-complete` 的 JSON 追加在最后一个参数；不能按 stdin 实现，也不能按空格拆含空格路径。
+- Claude Code 与 Qoder 的 command Hook 从 stdin 读取 JSON，主 agent 完成边界为 `Stop`；`stop_hook_active` 必须抑制递归。
+- Cline 的本机稳定边界是 `TaskComplete.ps1`，wrapper 必须把同一 stdin 继续传给用户旧脚本并保留其取消输出。
+- OpenCode 已有插件事件系统和 `session.idle`，Windows 桌面版使用 Bun 运行插件；应使用 `Bun.spawn` argv 数组加 stdin，不能用 shell 模板字符串拼 JSON。
+- 飞书投递继续复用项目已有的 `LarkCliInvoker` 与官方 `lark-cli`，没有自研 SDK 请求的必要。完整证据、准入和冒烟见 `docs/COMPLETION-NOTIFICATIONS.md`。
 - 动态项目发现不依赖当前项目数量。
 
 ### 执行与成本熔断

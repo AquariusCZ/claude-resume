@@ -4,7 +4,8 @@ using Xunit;
 namespace AiResume.Tests;
 
 /// <summary>
-/// 「生成 cc-connect 配置」不得抹掉用户在聊天里切好的 provider 与模型。
+/// 同一 agent 下「生成 cc-connect 配置」不得抹掉用户在聊天里切好的 provider 与模型;
+/// 切换 agent 时则必须清掉,避免把 opus/deepseek 等旧选择带给 Codex。
 ///
 /// 2026-08-08 在真机配置里看到的形状:用户跑过 <c>/provider switch deepseek</c> 之后,
 /// cc-connect 把结果写回项目区(顶格,紧跟在 <c>[projects.agent.options]</c> 之后):
@@ -157,6 +158,50 @@ public sealed class CcConnectProjectExtraKeysTests
         Assert.Contains("model = \"opus\"", after, StringComparison.Ordinal);
         // 顺带确认没把它们复制成两份。
         Assert.Equal(1, CountOccurrences(after, "provider = \"deepseek\""));
+    }
+
+    [Fact]
+    public void 切换agent时只清provider与model并保留其它扩展键()
+    {
+        string toml = RealShape.Replace(
+            "model = \"opus\"",
+            "model = \"opus\"\nthinking = \"disabled\"");
+
+        var extras = CcConnectConfigGenerator.ExtractProjectExtraKeys(
+            toml, preserveAgentSelection: false);
+
+        Assert.DoesNotContain(extras, e => e.StartsWith("provider ", StringComparison.Ordinal));
+        Assert.DoesNotContain(extras, e => e.StartsWith("model ", StringComparison.Ordinal));
+        Assert.Contains("thinking = \"disabled\"", extras);
+    }
+
+    [Fact]
+    public void 多项目配置只捞指定项目的扩展键()
+    {
+        const string toml = """
+            [[projects]]
+            name = "other"
+            provider = "other-provider"
+            model = "other-model"
+            [projects.agent]
+            type = "claudecode"
+
+            [[projects]]
+            name = "ai-resume"
+            provider = "chatpt"
+            model = "gpt-5.6"
+            thinking = "medium"
+            [projects.agent]
+            type = "codex"
+            """;
+
+        IReadOnlyList<string> extras = CcConnectConfigGenerator.ExtractProjectExtraKeys(
+            toml, preserveAgentSelection: true, projectName: "ai-resume");
+
+        Assert.Contains("provider = \"chatpt\"", extras);
+        Assert.Contains("model = \"gpt-5.6\"", extras);
+        Assert.Contains("thinking = \"medium\"", extras);
+        Assert.DoesNotContain(extras, line => line.Contains("other-", StringComparison.Ordinal));
     }
 
     private static int CountOccurrences(string haystack, string needle)

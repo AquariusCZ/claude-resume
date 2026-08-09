@@ -15,6 +15,12 @@ public sealed class OpenCodeNotificationAdapter : INotificationAdapter
     /// <summary>我方插件文件名,用于识别所有权。</summary>
     public const string PluginFileName = "airesume-notify.ts";
 
+    /// <summary>文件内容中的稳定所有权标记。文件名相同不能证明文件属于 AI Resume。</summary>
+    public const string ManagedMarker = "// AI Resume managed OpenCode notification plugin";
+
+    /// <summary>2026-08-09 之前生成文件的精确首行,仅用于一次性原位升级。</summary>
+    public const string LegacyManagedMarker = "// AI Resume 通知插件 - 由 AI Resume 自动生成,请勿手动修改";
+
     private readonly string _pluginsDirectory;
 
     /// <summary>
@@ -41,7 +47,8 @@ public sealed class OpenCodeNotificationAdapter : INotificationAdapter
             var configDirectory = Path.GetDirectoryName(_pluginsDirectory);
             var isInstalled = !string.IsNullOrEmpty(configDirectory) && Directory.Exists(configDirectory);
             var pluginPath = Path.Combine(_pluginsDirectory, PluginFileName);
-            var isEnabled = File.Exists(pluginPath);
+            bool pluginExists = File.Exists(pluginPath);
+            bool isEnabled = pluginExists && IsManagedPlugin(pluginPath);
 
             string? detail = null;
             if (!isInstalled)
@@ -50,7 +57,11 @@ public sealed class OpenCodeNotificationAdapter : INotificationAdapter
             }
             else if (isEnabled)
             {
-                detail = $"插件文件已存在: {pluginPath}";
+                detail = $"已安装 AI Resume 通知插件: {pluginPath}";
+            }
+            else if (pluginExists)
+            {
+                detail = $"同名插件属于用户或其他工具,未接管: {pluginPath}";
             }
             else
             {
@@ -98,7 +109,13 @@ public sealed class OpenCodeNotificationAdapter : INotificationAdapter
                     return;
                 }
 
-                // 内容不同,先备份再覆盖
+                if (!IsManagedSource(existing))
+                {
+                    throw new InvalidOperationException(
+                        $"同名插件已存在且不属于 AI Resume,拒绝覆盖: {pluginPath}");
+                }
+
+                // 只有已证实属于我方的旧版本才允许备份并刷新。
                 var backupPath = pluginPath + ".bak";
                 File.Copy(pluginPath, backupPath, overwrite: true);
             }
@@ -147,7 +164,7 @@ public sealed class OpenCodeNotificationAdapter : INotificationAdapter
         try
         {
             var pluginPath = Path.Combine(_pluginsDirectory, PluginFileName);
-            if (File.Exists(pluginPath))
+            if (File.Exists(pluginPath) && IsManagedPlugin(pluginPath))
             {
                 File.Delete(pluginPath);
             }
@@ -169,10 +186,11 @@ public sealed class OpenCodeNotificationAdapter : INotificationAdapter
     {
         // 注意:逐行拼接,确保 C# 字符串中的引号转义正确
         var sb = new StringBuilder();
-        sb.AppendLine("// AI Resume 通知插件 - 由 AI Resume 自动生成,请勿手动修改");
+        sb.AppendLine(ManagedMarker);
+        sb.AppendLine("// 由 AI Resume 自动生成,请勿手动修改");
         sb.AppendLine("// 监听 session.idle 事件,在 agent 完成响应时触发通知");
         sb.AppendLine();
-        sb.AppendLine("export const AiResumeNotify = async ({ project, directory }) => {");
+        sb.AppendLine("export const AiResumeNotify = async ({ client, project, directory, worktree }) => {");
         sb.AppendLine("  return {");
         sb.AppendLine("    event: async ({ event }) => {");
         sb.AppendLine("      try {");
@@ -181,12 +199,43 @@ public sealed class OpenCodeNotificationAdapter : INotificationAdapter
         sb.AppendLine("          return;");
         sb.AppendLine("        }");
         sb.AppendLine();
-        sb.AppendLine("        // 确定项目目录:优先使用事件提供的目录,其次使用插件注入的目录");
-        sb.AppendLine("        const targetDir = directory || project?.directory || process.cwd();");
+        sb.AppendLine("        const sessionId = event.properties?.sessionID || \"\";");
+        sb.AppendLine("        if (!sessionId) return;");
         sb.AppendLine();
-        sb.AppendLine("        // 通过 Bun 的 $ 执行通知命令,传入项目目录");
+        sb.AppendLine("        // Task 工具会创建带 parentID 的子 session,它们也会发布 session.idle。");
+        sb.AppendLine("        // 只有查证为顶层 session 才能代表整个用户任务完成;查询失败时 fail-closed。");
+        sb.AppendLine("        const targetDir = directory || worktree || project?.directory || process.cwd();");
+        sb.AppendLine("        const unwrapSession = (response) => response?.data || (response?.id ? response : null);");
+        sb.AppendLine("        let session = null;");
+        sb.AppendLine("        try {");
+        sb.AppendLine("          session = unwrapSession(await client.session.get({");
+        sb.AppendLine("            path: { id: sessionId }, query: { directory: targetDir }");
+        sb.AppendLine("          }));");
+        sb.AppendLine("        } catch {}");
+        sb.AppendLine("        if (!session) {");
+        sb.AppendLine("          try {");
+        sb.AppendLine("            session = unwrapSession(await client.session.get({ sessionID: sessionId, directory: targetDir }));");
+        sb.AppendLine("          } catch {}");
+        sb.AppendLine("        }");
+        sb.AppendLine("        if (!session || session.parentID) return;");
+        sb.AppendLine();
+        sb.AppendLine("        const timestamp = new Date().toISOString();");
+        sb.AppendLine("        const payload = JSON.stringify({");
+        sb.AppendLine("          hook_event_name: \"session.idle\",");
+        sb.AppendLine("          session_id: sessionId,");
+        sb.AppendLine("          cwd: targetDir,");
+        sb.AppendLine("          event_id: `session.idle:${sessionId}:${timestamp}`,");
+        sb.AppendLine("          timestamp");
+        sb.AppendLine("        });");
+        sb.AppendLine();
+        sb.AppendLine("        // Bun.spawn 使用 argv 数组,路径含空格时不会被 shell 再拆分;JSON 经 stdin 传给统一 Hook。");
         sb.AppendLine("        const cmd = " + QuoteForTs(hookCommand) + ";");
-        sb.AppendLine("        await Bun.$`" + "${cmd}" + " ${targetDir}`.quiet();");
+        sb.AppendLine("        const child = Bun.spawn([cmd, \"opencode\"], {");
+        sb.AppendLine("          stdin: new TextEncoder().encode(payload),");
+        sb.AppendLine("          stdout: \"ignore\",");
+        sb.AppendLine("          stderr: \"ignore\"");
+        sb.AppendLine("        });");
+        sb.AppendLine("        await child.exited;");
         sb.AppendLine("      } catch (err) {");
         sb.AppendLine("        // 吞掉所有异常,不影响 OpenCode 主流程");
         sb.AppendLine("        console.error(\"[airesume-notify] 通知执行失败:\", err);");
@@ -243,6 +292,46 @@ public sealed class OpenCodeNotificationAdapter : INotificationAdapter
             .Replace("\\n", "\n")
             .Replace("\\\"", "\"")
             .Replace("\\\\", "\\");
+    }
+
+    private static bool IsManagedPlugin(string pluginPath)
+    {
+        try
+        {
+            return IsManagedSource(File.ReadAllText(pluginPath, Encoding.UTF8));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsManagedSource(string source)
+    {
+        using var reader = new StringReader(source);
+        string? firstLine = reader.ReadLine();
+        bool current = string.Equals(firstLine, ManagedMarker, StringComparison.Ordinal);
+        bool legacy = string.Equals(firstLine, LegacyManagedMarker, StringComparison.Ordinal);
+        if (!current && !legacy)
+        {
+            return false;
+        }
+
+        // 文件名和首行仍不够:再核对我方生成器的稳定结构,避免用户文档或字符串常量碰撞。
+        bool sharedShape = source.Contains("export const AiResumeNotify", StringComparison.Ordinal) &&
+                           source.Contains("event.type !== \"session.idle\"", StringComparison.Ordinal) &&
+                           source.Contains("const cmd = ", StringComparison.Ordinal);
+        if (!sharedShape)
+        {
+            return false;
+        }
+
+        return current
+            ? source.Contains("hook_event_name: \"session.idle\"", StringComparison.Ordinal) &&
+              source.Contains("new TextEncoder().encode(payload)", StringComparison.Ordinal) &&
+              source.Contains("Bun.spawn([cmd, \"opencode\"]", StringComparison.Ordinal)
+            : source.Contains("export const AiResumeNotify = async ({ project, directory })", StringComparison.Ordinal) &&
+              source.Contains("await Bun.$`${cmd} ${targetDir}`.quiet();", StringComparison.Ordinal);
     }
 
     /// <summary>

@@ -30,11 +30,15 @@ public static class UsageSnapshotMapper
             result.SevenDayResetUtc, result.SevenDayUtil, result, now);
 
         bool limitReached = result.IsLimited;
-        var bucket = new UsageBucket("Usage", !limitReached, limitReached, windows);
+        // “不是 limited”不等于“探测成功”。CLI 可能先收到部分 rate_limit_info,
+        // 随后因网络/认证/进程错误失败;这种快照可展示窗口,但绝不能变成绿色可用。
+        var bucket = new UsageBucket("Usage", result.Ready && !limitReached, limitReached, windows);
 
         // 窗口为空时仍返回 bucket:LimitReached 本身就是有效信息(限流但服务端未附窗口时尤其如此)。
         // HasData 会因此为 false,由 GUI 据 UnavailableReason 如实显示,禁止渲染成 0%。
-        string? unavailable = windows.Count > 0 ? null : DescribeMissingWindows(result);
+        string? unavailable = windows.Count > 0
+            ? DescribePartialObservation(result)
+            : DescribeMissingWindows(result);
 
         return new UsageSnapshot(ProviderName, now, new[] { bucket }, unavailable);
     }
@@ -72,7 +76,7 @@ public static class UsageSnapshotMapper
 
         windows.Add(new UsageWindow(
             name,
-            DescribeStatus(result),
+            DescribeStatus(result, usedPercent),
             windowSeconds,
             resetAtUnix,
             resetAfterSeconds,
@@ -80,18 +84,41 @@ public static class UsageSnapshotMapper
     }
 
     /// <summary>
-    /// 窗口级状态。
-    /// **探测结果只带全局判定,不区分是哪个窗口被限流**,因此这里给的是探测级状态;
-    /// 精确到窗口的限流事实以 <see cref="UsageBucket.LimitReached"/> 为准。
+    /// 窗口级状态。CLI 探测的 <c>result.IsLimited</c> 只有全局语义,不知道究竟
+    /// 是 5 小时、7 天还是按模型额度触发,因此不能把它复制到每个窗口。
+    /// 只有窗口自己的 utilization 到 100% 才标 blocked;全局结论留在 bucket。
     /// </summary>
-    private static string DescribeStatus(ClaudeProbeResult result)
+    private static string DescribeStatus(ClaudeProbeResult result, int? usedPercent)
     {
-        if (result.IsLimited)
+        if (usedPercent is >= 100)
         {
             return "blocked";
         }
 
-        return result.Ready ? "allowed" : string.Empty;
+        // 有低于 100% 的窗口读数,或者最小真实请求已经成功,都足以证明该窗口
+        // 当前不是满额。只有 reset + 全局 limited 时保持未知,不猜是哪一窗触发。
+        return usedPercent is not null || result.Ready ? "allowed" : string.Empty;
+    }
+
+    private static string? DescribePartialObservation(ClaudeProbeResult result)
+    {
+        if (result.Ready || result.IsLimited)
+        {
+            return null;
+        }
+
+        return result.Reason switch
+        {
+            "auth" => "Claude 未登录或凭据无效,仅取得部分窗口信息",
+            "billing" => "订阅或账单异常,仅取得部分窗口信息",
+            "model_unavailable" => "探测所用模型不可用,仅取得部分窗口信息",
+            "transient" => "网络异常,仅取得部分窗口信息",
+            "no-claude" => "未检测到 claude CLI,仅取得部分窗口信息",
+            "timeout" => "探测超时,仅取得部分窗口信息",
+            "spawn-failed" => "无法启动 claude 进程,仅取得部分窗口信息",
+            "cancelled" => "探测已取消,仅取得部分窗口信息",
+            _ => "探测失败,仅取得部分窗口信息:" + result.Reason,
+        };
     }
 
     /// <summary>没有任何窗口时,说明为什么——GUI 据此如实显示,不得回退成"空闲"。</summary>
