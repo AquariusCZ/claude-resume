@@ -22,7 +22,7 @@ namespace AiResume.Ipc;
 public sealed class NamedPipeServer : IAsyncDisposable
 {
     private readonly string _pipeName;
-    private readonly string _mutexName;
+    private string _mutexName;
     private readonly ITaskOrchestrator _orchestrator;
     private readonly Func<CancellationToken, Task<IReadOnlyList<RunSnapshot>>> _listRuns;
     private readonly ConcurrentDictionary<long, ClientConnection> _connections = new();
@@ -151,9 +151,30 @@ public sealed class NamedPipeServer : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 取单实例互斥体,**优先内核全局作用域**。
+    ///
+    /// `Local\` 前缀按终端会话隔离。当自启走 S4U 计划任务时 Worker 跑在非交互会话,
+    /// 而残留快捷方式、用户手动启动或 Launcher 去重误判起来的 Worker 在交互会话 ——
+    /// 两者看不见对方的互斥体,"第二个实例会被拒绝"这道兜底直接失效,
+    /// 两个 ResumeEngine 会同时压同一份 SQLite 和同一个全局 pipe 名。
+    ///
+    /// `Global\` 需要 SeCreateGlobalPrivilege,标准用户不一定有,所以失败时退回
+    /// `Local\`:退回后跨会话保护没有了,但同会话保护仍在,**比直接起不来好**。
+    /// </summary>
     private void AcquireSingleInstanceMutex()
     {
-        _mutex = new Mutex(initiallyOwned: false, _mutexName, out bool createdNew);
+        bool createdNew;
+        try
+        {
+            _mutex = new Mutex(initiallyOwned: false, @"Global\" + _pipeName + "-mutex", out createdNew);
+            _mutexName = @"Global\" + _pipeName + "-mutex";
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or NotSupportedException)
+        {
+            _mutex = new Mutex(initiallyOwned: false, _mutexName, out createdNew);
+        }
+
         if (!createdNew)
         {
             _mutex.Dispose();
