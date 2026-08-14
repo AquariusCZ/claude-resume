@@ -81,6 +81,109 @@ public class ClaudeCodeNotificationAdapterTests : IDisposable
 
     /// <summary>
     /// 场景3:Enable 后 IsEnabled=true 且 settings.json 中出现含 MarkerFileName 的 command。
+    private static (string Matcher, string Command) ReadOwnEntry(string json, string eventName)
+    {
+        using JsonDocument doc = JsonDocument.Parse(json);
+        JsonElement group = doc.RootElement.GetProperty("hooks").GetProperty(eventName);
+        foreach (JsonElement entry in group.EnumerateArray())
+        {
+            foreach (JsonElement hook in entry.GetProperty("hooks").EnumerateArray())
+            {
+                string command = hook.GetProperty("command").GetString() ?? string.Empty;
+                if (command.Contains("AiResume.Hook", StringComparison.OrdinalIgnoreCase))
+                {
+                    return (entry.GetProperty("matcher").GetString() ?? string.Empty, command);
+                }
+            }
+        }
+
+        throw new Xunit.Sdk.XunitException($"{eventName} 下没有我方条目");
+    }
+
+    [Fact]
+    public void Enable_同时写入完成与决策两类条目()
+    {
+        _adapter.Enable(TestHookCommand);
+
+        string json = File.ReadAllText(_settingsPath);
+        (string stopMatcher, string stopCommand) = ReadOwnEntry(json, "Stop");
+        (string notifyMatcher, string notifyCommand) = ReadOwnEntry(json, "Notification");
+
+        Assert.Equal(string.Empty, stopMatcher);
+        Assert.DoesNotContain("--kind=", stopCommand, StringComparison.Ordinal);
+
+        // 只订阅"AI 在等你"的那几种;permission_prompt 与 idle_prompt 会变成噪音。
+        Assert.Equal("agent_needs_input|elicitation_dialog|elicitation_url_dialog", notifyMatcher);
+        Assert.EndsWith("--kind=decision", notifyCommand, StringComparison.Ordinal);
+        Assert.DoesNotContain("permission_prompt", notifyMatcher, StringComparison.Ordinal);
+        Assert.DoesNotContain("idle_prompt", notifyMatcher, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Enable_两类命令互不覆盖且重复调用不再改动()
+    {
+        _adapter.Enable(TestHookCommand);
+        string first = File.ReadAllText(_settingsPath);
+        _adapter.Enable(TestHookCommand);
+        string second = File.ReadAllText(_settingsPath);
+
+        // 刷新逻辑若不按事件分别进行,第二次会把两条刷成同一个命令。
+        Assert.Equal(first, second);
+        Assert.NotEqual(ReadOwnEntry(second, "Stop").Command, ReadOwnEntry(second, "Notification").Command);
+    }
+
+    [Fact]
+    public void Enable_就地刷新陈旧命令而不新增第二条()
+    {
+        File.WriteAllText(_settingsPath, """
+            {
+              "hooks": {
+                "Stop": [
+                  {"matcher":"","hooks":[{"type":"command","command":"C:/old/AiResume.Hook.exe claudecode"}]}
+                ],
+                "Notification": [
+                  {"matcher":"idle_prompt","hooks":[{"type":"command","command":"C:/old/AiResume.Hook.exe claudecode --kind=decision"}]}
+                ]
+              }
+            }
+            """);
+
+        _adapter.Enable(TestHookCommand);
+
+        string json = File.ReadAllText(_settingsPath);
+        using JsonDocument doc = JsonDocument.Parse(json);
+        JsonElement hooks = doc.RootElement.GetProperty("hooks");
+        Assert.Single(hooks.GetProperty("Stop").EnumerateArray());
+        Assert.Single(hooks.GetProperty("Notification").EnumerateArray());
+        // matcher 也要对齐:后来新增的通知类型不能因为旧配置而永远收不到。
+        Assert.Equal("agent_needs_input|elicitation_dialog|elicitation_url_dialog",
+            ReadOwnEntry(json, "Notification").Matcher);
+        Assert.EndsWith("--kind=decision", ReadOwnEntry(json, "Notification").Command, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Disable_两类条目一起清掉并保留用户自己的钩子()
+    {
+        _adapter.Enable(TestHookCommand);
+        JsonNode root = JsonNode.Parse(File.ReadAllText(_settingsPath))!;
+        ((JsonObject)root["hooks"]!)["Notification"]!.AsArray().Add(new JsonObject
+        {
+            ["matcher"] = "idle_prompt",
+            ["hooks"] = new JsonArray { new JsonObject { ["type"] = "command", ["command"] = "user-own.exe" } },
+        });
+        File.WriteAllText(_settingsPath, root.ToJsonString());
+
+        _adapter.Disable();
+
+        string json = File.ReadAllText(_settingsPath);
+        using JsonDocument doc = JsonDocument.Parse(json);
+        JsonElement hooks = doc.RootElement.GetProperty("hooks");
+        Assert.False(hooks.TryGetProperty("Stop", out _));
+        // 用户自己的条目必须留着,而我方那条必须没了。
+        Assert.Contains("user-own.exe", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("--kind=decision", json, StringComparison.Ordinal);
+    }
+
     /// </summary>
     [Fact]
     public void Enable_CreatesEntry_IsEnabledTrue()

@@ -104,48 +104,17 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
 
         string desiredCommand = HookCommand.Format(hookCommand, "claudecode");
 
-        // 已存在旧版裸路径时不能直接返回:裸路径既没有来源参数,含空格时也无法执行。
-        // 就地刷新所有我方命令,保留用户其余 hook 结构。
-        if (ContainsOwnEntry(rootObj))
+        // 两类条目都要保证存在,且**各自刷新各自的命令**:
+        // Stop 说"跑完了",Notification 说"停下来等你决定",命令不同(后者带 --kind=decision),
+        // 所以刷新必须按事件分别进行 —— 全局刷成同一条会让两者互相覆盖。
+        bool changed = EnsureEventEntry(rootObj, StopEvent, string.Empty, desiredCommand);
+        changed |= EnsureEventEntry(
+            rootObj, NotificationEvent, DecisionMatcher, desiredCommand + " " + DecisionArgument);
+
+        if (changed)
         {
-            if (RefreshOwnCommands(rootObj, desiredCommand))
-            {
-                AtomicWrite(rootObj);
-            }
-            return;
+            AtomicWrite(rootObj);
         }
-
-        // 确保 hooks 对象存在
-        if (!rootObj.TryGetPropertyValue("hooks", out var hooksNode) || hooksNode is not JsonObject hooksObj)
-        {
-            hooksObj = new JsonObject();
-            rootObj["hooks"] = hooksObj;
-        }
-
-        // 确保 Stop 数组存在
-        if (!hooksObj.TryGetPropertyValue("Stop", out var stopNode) || stopNode is not JsonArray stopArray)
-        {
-            stopArray = new JsonArray();
-            hooksObj["Stop"] = stopArray;
-        }
-
-        // 追加我方条目
-        var entry = new JsonObject
-        {
-            ["matcher"] = "",
-            ["hooks"] = new JsonArray
-            {
-                new JsonObject
-                {
-                    ["type"] = "command",
-                    ["command"] = desiredCommand,
-                    ["timeout"] = 30
-                }
-            }
-        };
-        stopArray.Add(entry);
-
-        AtomicWrite(rootObj);
     }
 
     /// <inheritdoc />
@@ -171,8 +140,27 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
         if (!rootObj.TryGetPropertyValue("hooks", out var hooksNode) || hooksNode is not JsonObject hooksObj)
             return;
 
-        if (!hooksObj.TryGetPropertyValue("Stop", out var stopNode) || stopNode is not JsonArray stopArray)
+        bool changed = false;
+        foreach (string eventName in ManagedEvents)
+        {
+            changed |= RemoveOwnEntriesFrom(hooksObj, eventName);
+        }
+
+        if (!changed)
             return;
+
+        // 若 hooks 对象为空则移除 hooks 键
+        if (hooksObj.Count == 0)
+            rootObj.Remove("hooks");
+
+        AtomicWrite(rootObj);
+    }
+
+    /// <summary>从某个事件的分组里移除我方条目;返回是否有改动。</summary>
+    private static bool RemoveOwnEntriesFrom(JsonObject hooksObj, string eventName)
+    {
+        if (!hooksObj.TryGetPropertyValue(eventName, out var stopNode) || stopNode is not JsonArray stopArray)
+            return false;
 
         bool changed = false;
 
@@ -199,7 +187,7 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
                 }
             }
 
-            // 若 hooks 数组为空则移除整个 Stop 分组
+            // 若 hooks 数组为空则移除整个分组
             if (entryHooks.Count == 0)
             {
                 stopArray.RemoveAt(i);
@@ -207,18 +195,11 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
             }
         }
 
-        if (!changed)
-            return;
-
-        // 若 Stop 数组为空则移除 Stop 键
+        // 数组空了就把事件键也去掉,不留一个空壳
         if (stopArray.Count == 0)
-            hooksObj.Remove("Stop");
+            hooksObj.Remove(eventName);
 
-        // 若 hooks 对象为空则移除 hooks 键
-        if (hooksObj.Count == 0)
-            rootObj.Remove("hooks");
-
-        AtomicWrite(rootObj);
+        return changed;
     }
 
     /// <summary>
@@ -337,6 +318,101 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
         }
 
         return changed;
+    }
+
+    /// <summary>任务跑完。</summary>
+    private const string StopEvent = "Stop";
+
+    /// <summary>AI 停下来等人。种类由 matcher 选定,不依赖 payload 里的字段名。</summary>
+    private const string NotificationEvent = "Notification";
+
+    /// <summary>
+    /// 只订阅"AI 在等你"的那几种。**不含 permission_prompt 与 idle_prompt** ——
+    /// 前者多数被自动放行、通知了也没事可做,后者按时间触发,最容易变成噪音;
+    /// 通知一旦变吵,人就会开始无视它,那比不通知更糟。
+    /// </summary>
+    private const string DecisionMatcher = "agent_needs_input|elicitation_dialog|elicitation_url_dialog";
+
+    private const string DecisionArgument = "--kind=decision";
+
+    private static readonly string[] ManagedEvents = [StopEvent, NotificationEvent];
+
+    /// <summary>
+    /// 保证某个事件下有一条我方条目且命令是最新的。已存在就地刷新(保留用户其余结构),
+    /// 不存在则追加。返回是否有改动。
+    /// </summary>
+    private static bool EnsureEventEntry(
+        JsonObject root, string eventName, string matcher, string desiredCommand)
+    {
+        if (!root.TryGetPropertyValue("hooks", out var hooksNode) || hooksNode is not JsonObject hooksObj)
+        {
+            hooksObj = new JsonObject();
+            root["hooks"] = hooksObj;
+        }
+
+        if (!hooksObj.TryGetPropertyValue(eventName, out var arrayNode) || arrayNode is not JsonArray array)
+        {
+            array = new JsonArray();
+            hooksObj[eventName] = array;
+        }
+
+        bool found = false;
+        bool changed = false;
+        foreach (JsonNode? entryNode in array)
+        {
+            if (entryNode is not JsonObject entryObj ||
+                !entryObj.TryGetPropertyValue("hooks", out JsonNode? entryHooksNode) ||
+                entryHooksNode is not JsonArray entryHooks)
+            {
+                continue;
+            }
+
+            foreach (JsonNode? hookNode in entryHooks)
+            {
+                if (hookNode is not JsonObject hookObj ||
+                    !hookObj.TryGetPropertyValue("command", out JsonNode? commandNode) ||
+                    commandNode is not JsonValue commandValue ||
+                    !commandValue.TryGetValue(out string? command) ||
+                    !IsOwnCommand(command))
+                {
+                    continue;
+                }
+
+                found = true;
+                if (!string.Equals(command, desiredCommand, StringComparison.Ordinal))
+                {
+                    hookObj["command"] = desiredCommand;
+                    changed = true;
+                }
+
+                // matcher 也可能是旧值(比如后来加了新的通知类型),一并对齐。
+                if (!string.Equals(entryObj["matcher"]?.GetValue<string>(), matcher, StringComparison.Ordinal))
+                {
+                    entryObj["matcher"] = matcher;
+                    changed = true;
+                }
+            }
+        }
+
+        if (found)
+        {
+            return changed;
+        }
+
+        array.Add(new JsonObject
+        {
+            ["matcher"] = matcher,
+            ["hooks"] = new JsonArray
+            {
+                new JsonObject
+                {
+                    ["type"] = "command",
+                    ["command"] = desiredCommand,
+                    ["timeout"] = 30,
+                },
+            },
+        });
+        return true;
     }
 
     private static bool IsOwnCommand(string? command)

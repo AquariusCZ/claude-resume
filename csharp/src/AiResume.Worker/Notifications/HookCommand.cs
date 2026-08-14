@@ -62,7 +62,36 @@ public static class HookCommand
         }
 
         string remainder = value[executableEnd..].Trim();
-        return remainder.Length == 0 || string.Equals(remainder, source, StringComparison.OrdinalIgnoreCase);
+        if (remainder.Length == 0)
+        {
+            return true;
+        }
+
+        // 允许来源参数后面再跟我们自己的开关(目前只有 --kind=),否则决策类那条
+        // `… claudecode --kind=decision` 会被判成"不是我方条目" —— 后果是既删不掉、
+        // 也每次安装都再追加一条。但**只认已知开关**:仅凭 exe 名就认领,会把用户
+        // 自己写的、恰好也调用这个 exe 的命令一并改掉。
+        string[] tokens = Tokenize(remainder);
+        if (tokens.Length == 0 || !string.Equals(tokens[0], source, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return tokens.Skip(1).All(IsOwnSwitch);
+    }
+
+    private static string[] Tokenize(string value) => value.Split(
+        (char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    /// <summary>目前只有 <c>--kind=</c>。新增开关时必须同步这里,否则旧条目会被当成用户自己的。</summary>
+    private static bool IsOwnSwitch(string token) =>
+        token.StartsWith("--kind=", StringComparison.Ordinal);
+
+    /// <summary>尾部是否形如「来源名 + 若干我方开关」——不校验来源名具体是什么,只看形状。</summary>
+    private static bool IsOwnArgumentTail(string remainder)
+    {
+        string[] tokens = Tokenize(remainder);
+        return tokens.Length >= 1 && tokens.Skip(1).All(IsOwnSwitch);
     }
 
     private static int FindExecutableEnd(string value)
@@ -91,7 +120,11 @@ public static class HookCommand
             if (candidateEnd == value.Length || char.IsWhiteSpace(value[candidateEnd]))
             {
                 string remainder = value[candidateEnd..].Trim();
-                if (remainder.Length == 0 || !remainder.Any(char.IsWhiteSpace))
+                // "尾部不含空格"是用来避免在带空格的路径里切错 .exe 的启发式。
+                // 但我方决策命令尾部本来就有两段(`claudecode --kind=decision`),
+                // 一刀切会把它判成找不到边界。放宽到"多出来的都是我们自己的开关"为止:
+                // 真切错位置时 tokens[0] 会是路径片段而不是来源名,循环会继续找下一个 .exe。
+                if (remainder.Length == 0 || IsOwnArgumentTail(remainder))
                 {
                     return candidateEnd;
                 }
