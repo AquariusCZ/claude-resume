@@ -12,6 +12,7 @@
     <!-- 随产物拷出:创建快捷方式时要指向它 -->
     <None Include="icon.ico" CopyToOutputDirectory="PreserveNewest" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.10" />
+    <PackageReference Include="Tomlyn" Version="2.10.1" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\AiResume.Core\AiResume.Core.csproj" />

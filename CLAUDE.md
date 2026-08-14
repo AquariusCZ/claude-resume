@@ -35,8 +35,8 @@ csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe insta
 
 `install` 把三个项目(Gui / Worker / Hook)的产物合并复制到 `%LOCALAPPDATA%\AI Resume\`,
 重建桌面/开始菜单/开机自启入口,并按持久化的通知意图(`ProductConfig.NotifySources`)
-对账重建五个完成通知钩子。安装必须先 staging 校验并备份将覆盖的运行文件,之后才停止旧 Worker；
-新 Worker 必须存活且 Named Pipe pong 的 PID 精确等于本次启动 PID。回滚不完整时保留 staging/backup,
+对账重建五个完成通知钩子。同一规范化目标目录的完整安装事务必须由目标哈希命名互斥体跨进程串行化；安装必须先 staging 校验并备份将覆盖的运行文件,之后才停止旧 Worker；
+安装还必须冻结 staging 的逐文件 SHA-256,提交只复制冻结清单并逐项复核；后台 Worker 不得继承 install 调用方的 stdout/stderr 重定向句柄。新 Worker 必须存活且 Named Pipe pong 的 PID 精确等于本次启动 PID。回滚不完整时保留 staging/backup,
 禁止在 finally 删除唯一恢复材料。通知源原位刷新,失败项仍保留在持久意图中供下次重试。
 **通知源未能对齐时返回 2,Worker 未启动时返回 3,回滚不完整时返回 4,均不得当成功处理。**
 
@@ -54,12 +54,13 @@ GUI 是 WPF + WebView2,前端在 `csharp/src/AiResume.Gui/wwwroot/`。
   「监视中」必须同时满足 `config.Armed`、引擎进程存活与探测新鲜度(`EngineLiveness`),引擎不在时压过一切阶段文案显红。
   核对不出结论时一律显示「未核实」,**绝不显示「没问题」**。
 - **通知源意图必须持久化。** `ProductConfig.NotifySources` 记录"用户想开哪几个",`install` 按 `NotifyIntent.Targets`(意图 ∪ 现状 ∩ 本机已装)对账重建,`uninstall` 关闭前先记录现状。只按现状恢复必然失败——卸载会把现状清空。安装未能对齐通知源时**不得返回 0**。
-- OpenAI / DeepSeek / Claude 的绿色「可用」只能来自启动时或手动刷新的**真实最小请求成功**;API Key 已填写、CLI 命令存在只能说明“可探测”,绝不能显示成可用。
-- **Codex 探测必须两步**:`/v1/models` 只证明服务端接受这把 key,不证明允许推理;之后再发一次 `max_tokens=1` 的最小推理请求。能列不能推理(`NoInference`)归红;端点不支持该形状(400/404/422)不得判成无权限,只能降级为"推理权限未核实"。
+- Codex `notify` 修改只证明磁盘配置已就绪；写入时已运行的 Codex Desktop/app-server 不保证热加载,必须提示用户重启后再验证真实完成事件。旧配置修复扫描不得把多行字符串、数组或内联表内容中的 `notify = [...]` 文本当成可删除键。
+- OpenAI / DeepSeek / Claude 的绿色「可用」必须来自启动时或手动刷新的**真实外部请求证据**;API Key 已填写、CLI 命令存在只能说明“可探测”,绝不能显示成可用。对配置了 CC Switch 风格用量查询的 Sub2API provider,成功返回、账户未显式失效且余额大于 0 的 `/v1/usage` 是其 provider/account 可用证据,可直接点绿;这不等于对每一次未来推理请求作绝对保证。
+- **Codex 探测分 shallow/deep 两档**:开窗、定时和过期补刷的 shallow 跑 `codex doctor --json`、带凭据的 `{base_url}/models` 与第三方 provider 的零 token `/v1/usage`;Sub2API 有效正余额按 CC Switch 语义直接点绿,没有这类余额证据时仍保持未核实。只有用户主动点“刷新额度”的 deep 才额外向 `{base_url}/responses` 发一次 `max_output_tokens=1` 的最小推理请求。`base_url` 已含 `/v1` 时不得重复补 `/v1`;能列不能推理(`NoInference`)归红;端点不支持该形状(400/404/422)不得判成无权限,只能降级为"推理权限未核实"。
 - **前端字号一律走 rem,1rem = 点阵字设计尺寸 12px。** 开机脚本按 `devicePixelRatio` 把 `html` 的基准挪到"乘上缩放率正好是 12 的整数倍"的值(150% → 16px);字距用 rem 折算的整数设计像素;`font-synthesis:none` 与 `-webkit-font-smoothing:none` 是点阵字清晰的前提,不得移除。布局尺寸仍用 px,不随字号缩放。
 - Claude 探测必须区分未登录、订阅/额度、网络/超时、模型不可用和未安装;探测失败时额度区不得回退成「空闲」。
 - OAuth usage 请求必须复现 Claude Code 的协议形状:`Accept: application/json`、`anthropic-beta: oauth-2025-04-20`、`anthropic-version: 2023-06-01` 与 `User-Agent: claude-code/<本机版本>`;普通 UA 会进入更激进的 429 桶。解析逐字段优先使用现代 `limits` 的 `session` / `weekly_all` / `weekly_scoped`,兼容旧顶层窗口。权威额度快照在后台请求中延迟写入 SQLite `quota_snapshots`,不得阻塞 WPF 首帧;以 `organizationUuid` 的不可逆账号指纹隔离,缺失时才退回 token 指纹。跨进程更新必须在同一个 SQLite `IMMEDIATE` 事务内重读、合并并写回,禁止锁外读旧快照后整体覆盖。OAuth 与 CLI 都按稀疏观测处理:当前明确字段优先,缺字段/缺窗口不是 tombstone;仅在同账号、同稳定窗口身份、同一未来 `resetAtUnix` 周期内承接并标记“最近服务端读数”。主窗口身份是协议 kind;scoped 身份是规范化完整 scope 的 SHA-256,不能按显示名或数组序号猜。账号变化、身份变化、reset 换代或到期立即失效;纯承接值不得渲染成绿色实时正常。详细协议、故障边界和真机验证手册见 `docs/CLAUDE-QUOTA-ACQUISITION.md`。
-- GUI 的 provider 行由现役 C# `CodexProbe` / `DeepSeekProbe` 产生:Codex 只有完成相应真实校验后才能绿,DeepSeek 只有余额接口成功后才能绿;认证、余额不足和网络错误必须分别表达。provider 可用性与 Claude 额度是两套证据,不得相互代替。正式任务一旦可能产生副作用,不得在失败时换 provider 自动重放。
+- GUI 的 provider 行由现役 C# `CodexProbe` / `CodexBalanceProbe` / `DeepSeekProbe` 产生。第三方 OpenAI-compatible provider 的余额按当前 Codex provider 只读请求 `/v1/usage`(根地址补 `/v1`,已含 `/v1` 不重复),兼容 CC Switch usage_script 的 `remaining` / `quota.remaining` / `balance`,默认 USD;成功、账户有效且余额大于 0 时按 CC Switch 语义直接显示绿色,余额为 0、账户失效、401/403、402/429 等明确失败优先。没有有效余额证据的 Codex provider 仍需 deep 最小推理成功才能点绿。官方 OpenAI/ChatGPT 端点不请求该第三方路由,ChatGPT OAuth token 也不得发往额外余额接口;这不是 ChatGPT Plus/Pro 订阅额度。DeepSeek 只有余额接口成功后才能绿。任一探针异常只降级自身,不得拖垮整个 provider 面板。provider 可用性与 Claude 额度是两套证据,不得相互代替。正式任务一旦可能产生副作用,不得在失败时换 provider 自动重放。
 - 现役 GUI 只提供 `AiResume.Gui.exe --screenshot <png>` 离屏证据入口;公开截图必须使用合成数据,不得上传真实项目名、app_id 或本机路径。改服务状态逻辑后必须跑 `dotnet test`,并在部署后的真实窗口核验状态行。
 
 ## 自测(改完必跑)

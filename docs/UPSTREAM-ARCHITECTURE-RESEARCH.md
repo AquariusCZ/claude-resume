@@ -67,7 +67,7 @@ cc-connect 是 Go 实现的多 Agent、多消息平台桥接器。当前源码�
 - OpenAI 当前推荐 Codex 模型是 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`;`gpt-5.6` 仍作为 Codex 默认模型标识使用。`gpt-5.3-codex-spark` 有产品/账号可用性限制,不作为通用 provider 候选自动下发。
 - 因而采用薄配置适配而非 fork cc-connect:唯一兼容 provider 自动写入活动选择;官方 OpenAI 端点的 `gpt-5.6` 家族且无用户列表时生成默认值加三项官方候选;第三方 relay 不继承官方能力假设,只保留有效默认值或自身显式列表;零个或多个 provider 不猜选;用户列表与本地 model catalog 继续优先。生成 alias 使用 `[AI Resume] ` 作为可跨上游 CRUD TOML 重编码的所有权证据,无标记列表不迁移。`config format` 本身保留注释;候选已用该命令实测通过,另有结构化重编码回归覆盖注释消失后的刷新。
 
-- 目标机当前第三方 Codex relay 的 `/models` 直连实测返回 HTTP 200,并明确列出 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`;三项已通过候选 `config format` 验证并原子激活到该 provider 的显式模型列表,守护进程换代、目标 agent、飞书 ready 与计划任务 watchdog 均已核验。该证据只属于这一个 relay,不得泛化到其它 OpenAI-compatible 服务。
+- 目标机当前第三方 Codex relay 的 `/models` 与 `/usage` 直连实测均返回 HTTP 200,前者明确列出 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`,后者返回正余额；三项模型已通过候选 `config format` 验证并原子激活到该 provider 的显式模型列表,守护进程换代、目标 agent、飞书 ready 与计划任务 watchdog 均已核验。对这个 Sub2API provider,产品按 CC Switch 语义把有效正余额作为绿色 provider/account 证据；该结论只属于这一 relay,未调用 `/responses`,不得泛化为所有 OpenAI-compatible 服务都具备同样推理能力。
 
 这项能力上游“部分已有但默认回退过时且需要活动 provider 才生效”,所以正确做法是补齐上游要求的配置形状,不是在 AI Resume 里另写一套模型菜单或修改 cc-connect 源码。
 

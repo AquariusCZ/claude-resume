@@ -46,7 +46,7 @@ csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe insta
 
 在桌面或开始菜单打开 **AI Resume**。重新构建后要再跑一次 `install`；真正运行的是 `%LOCALAPPDATA%\AI Resume\` 中的安装副本，不是 `bin\Release`。
 
-安装器只接受空目录、仅含保留状态的目录、与本次 payload 精确匹配的旧运行时、现役 AI Resume 安装根，或上次卸载留下的精确 preserved-root marker；真正卸载仍必须同时验证现役 marker 与 payload 清单。安装先 staging、备份并删除旧清单已淘汰的文件，整体替换 GUI / Worker / Hook；新 Worker 通过 Named Pipe 身份校验后才改快捷方式和通知钩子。从安装目录执行卸载时会启动受清单约束的临时 Worker，在返回成功前把全部 payload 事务性移动到私有退役区，因此立即重装也不会被旧清理误删。无结果、坏结果或 helper 异常退出时父进程只报告并保留恢复目录，不会删除唯一退役副本。状态和未知文件保留，preserved-root marker 只授权后续重装、不授权删除。回滚不完整时返回非零并保留恢复材料。
+安装器只接受空目录、仅含保留状态的目录、与本次 payload 精确匹配的旧运行时、现役 AI Resume 安装根，或上次卸载留下的精确 preserved-root marker；真正卸载仍必须同时验证现役 marker 与 payload 清单。安装先 staging、备份并冻结逐文件 SHA-256，整体替换 GUI / Worker / Hook 后再逐字节核对提交结果，并删除旧清单已淘汰的文件；新 Worker 的精确 PID 通过 Named Pipe 身份校验后才改快捷方式和通知钩子。Worker 启动不继承 install 调用方的重定向管道，因此脚本能及时观察到安装命令退出。从安装目录执行卸载时会启动受清单约束的临时 Worker，在返回成功前把全部 payload 事务性移动到私有退役区，因此立即重装也不会被旧清理误删。无结果、坏结果或 helper 异常退出时父进程只报告并保留恢复目录，不会删除唯一退役副本。状态和未知文件保留，preserved-root marker 只授权后续重装、不授权删除。回滚不完整时返回非零并保留恢复材料。
 
 卸载但保留用户状态：
 
@@ -65,6 +65,12 @@ csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe insta
 勾选项目后按**布防**即可关闭窗口。Worker 持有队列，只在 reset 证据有效后续跑。
 
 完整协议：[Claude 额度获取与验证](docs/CLAUDE-QUOTA-ACQUISITION.md)。
+
+### Provider 健康与第三方余额
+
+Codex 会组合 provider 鉴权、余额和最小推理三类证据。开窗和定时检查运行 `codex doctor --json`、带凭据的 `{base_url}/models`，并对第三方 provider 读取零 token 的 `/v1/usage`。只有用户主动点击**刷新额度**时，才会额外向 `{base_url}/responses` 发一次 `max_output_tokens=1` 的最小推理请求。所有 Codex 路径统一解析同一个 home（`AI_RESUME_CODEX_HOME` → `CODEX_HOME` → `%USERPROFILE%\.codex`），并复现 provider 的查询参数和自定义请求头。
+
+对于 Sub2API 这类配置了 CC Switch 风格用量查询的第三方 OpenAI-compatible provider，AI Resume 按相同优先级读取 `remaining`、`quota.remaining` 或 `balance`。请求成功、账户未显式失效且余额大于 0 时直接显示绿色；余额为 0、账户失效、鉴权失败、402 或 429 仍优先显示故障或限流。没有有效余额证据的 provider 才需要最小 `/responses` 成功后点绿。绿色表示当前 provider/account 证据可用，不是对每一次未来请求的绝对保证。官方 OpenAI/ChatGPT 端点和 ChatGPT OAuth 凭据不会访问这条额外接口，因此这里显示的不是 ChatGPT Plus/Pro 订阅余额。
 
 ### 通过 cc-connect 用手机聊天
 
@@ -99,6 +105,8 @@ Agent、provider 和 model 是三层不同的东西：
 | OpenCode | `session.idle` plugin |
 
 适配器会合并用户现有配置，只移除能证明属于 AI Resume 的条目。内部探测和续跑会直接设置 `AI_RESUME_INTERNAL_RUN=1`；生成的 cc-connect 项目通过 `projects.agent.options.env` 设置同一标记，计划任务启动脚本再提供 daemon 级兜底，因此从飞书启动的 agent 不会把 AI Resume 自己的工作重复通知回来。
+
+当前 Codex Desktop/app-server 不能假设会热加载后来写入的 `notify`。AI Resume 安装或刷新该配置后，写入时已经运行的 Codex Desktop 必须重启；“配置健康”本身不能证明旧进程已经重新加载。
 
 协议与冒烟步骤：[完成通知](docs/COMPLETION-NOTIFICATIONS.md)。
 
@@ -136,6 +144,7 @@ AI Resume 状态在 `%LOCALAPPDATA%\AI Resume\state\`；cc-connect 的配置与�
 
 - 隔离的全量 xUnit 与警告当错误的 Release 构建；
 - OAuth 额度解析、稀疏连续性、scoped/Fable 行与 SQLite 并发；
+- Codex shallow/deep 校验、第三方余额解析与 provider 级故障隔离；
 - 左右额度面板等高、reset-only 无定值状态与减少动态效果；
 - 五种 Hook 协议经队列、Worker、lark-cli 到飞书；
 - cc-connect 候选解析、原子激活与绑定进程代次的重启验证；

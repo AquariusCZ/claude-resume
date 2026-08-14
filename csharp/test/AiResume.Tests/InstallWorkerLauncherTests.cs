@@ -46,8 +46,8 @@ public sealed class InstallWorkerLauncherTests
             Assert.NotNull(captured);
             Assert.Equal(worker, captured.FileName);
             Assert.Equal(root, captured.WorkingDirectory);
-            Assert.False(captured.UseShellExecute);
-            Assert.True(captured.CreateNoWindow);
+            Assert.True(captured.UseShellExecute);
+            Assert.Equal(ProcessWindowStyle.Hidden, captured.WindowStyle);
         }
         finally
         {

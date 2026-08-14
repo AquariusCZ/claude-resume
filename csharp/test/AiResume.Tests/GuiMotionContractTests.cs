@@ -38,10 +38,72 @@ public sealed class GuiMotionContractTests
         Assert.Contains(".pv.probing .led::after", html, StringComparison.Ordinal);
         Assert.Contains("let providerProbeBusy = true;", html, StringComparison.Ordinal);
         Assert.Contains("providerProbeBusy = false;", html, StringComparison.Ordinal);
-        Assert.Contains(".modal:not([hidden]) .sheet{animation:sheet-in", html, StringComparison.Ordinal);
-        Assert.Contains(".pv{animation:statein", html, StringComparison.Ordinal);
+        Assert.Contains(".modal.open .sheet{opacity:1;transform:none}", html, StringComparison.Ordinal);
+        Assert.Contains("transform:translateY(6px) scale(.98);transform-origin:center", html,
+            StringComparison.Ordinal);
+        Assert.Contains("transition:opacity .16s var(--ease-out),transform .2s var(--ease-out)", html,
+            StringComparison.Ordinal);
+        Assert.Contains("void modal.offsetWidth;", html, StringComparison.Ordinal);
+        Assert.Contains("modal.classList.remove('open');", html, StringComparison.Ordinal);
+        Assert.Contains("fsModalCloseTimer = window.setTimeout", html, StringComparison.Ordinal);
+        Assert.Contains(".modal.instant,.modal.instant .sheet{transition:none}", html,
+            StringComparison.Ordinal);
+        Assert.Contains("const instant = ev?.detail === 0;", html, StringComparison.Ordinal);
+        Assert.Contains("closeFsModal({ instant: true });", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("@keyframes sheet-in", html, StringComparison.Ordinal);
+        Assert.Contains(".pv.enter{animation:statein", html, StringComparison.Ordinal);
         Assert.Contains("btn.textContent = '扫描中';", html, StringComparison.Ordinal);
         Assert.DoesNotContain("<script src=", html, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void 信息密集面板只保留有目的且GPU友好的动效()
+    {
+        string html = File.ReadAllText(FindRepositoryFile(
+            Path.Combine("csharp", "src", "AiResume.Gui", "wwwroot", "index.html")));
+
+        Assert.Contains("--ease-out:cubic-bezier(.23,1,.32,1)", html, StringComparison.Ordinal);
+        Assert.Contains(".qc .fill{position:absolute;left:0;top:0;bottom:0;width:100%;transform:scaleX(0)", html,
+            StringComparison.Ordinal);
+        Assert.Contains("transition:transform .18s var(--ease-out)", html, StringComparison.Ordinal);
+        Assert.Contains("style.transform = `scaleX(${hasPercent ? used : 1})`;", html, StringComparison.Ordinal);
+        Assert.Contains("mark.style.transform = `translateX(${Math.round(elapsed * travel)}px)`;", html,
+            StringComparison.Ordinal);
+        Assert.Contains("@media (hover:hover) and (pointer:fine)", html, StringComparison.Ordinal);
+        Assert.Contains("Math.min(i * 24, 120)", html, StringComparison.Ordinal);
+        Assert.Contains(".qc .bar.unknown .fill::after", html, StringComparison.Ordinal);
+        Assert.Contains("@keyframes quota-unknown{from{transform:translateX(-100%)}", html,
+            StringComparison.Ordinal);
+        Assert.Contains("animation:probe-ring 1.15s var(--ease-out) infinite", html,
+            StringComparison.Ordinal);
+        Assert.Contains("transform .12s var(--ease-out),box-shadow .12s var(--ease-out)", html,
+            StringComparison.Ordinal);
+        Assert.Contains("transition:transform .15s var(--ease-in-out)", html,
+            StringComparison.Ordinal);
+        Assert.Contains(".modal,.modal .sheet{transition-duration:.12s}", html,
+            StringComparison.Ordinal);
+        Assert.Contains(".modal .sheet{transform:none}", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("animation:drift", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("@keyframes chipbeat", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("@keyframes beat", html, StringComparison.Ordinal);
+        Assert.DoesNotContain(".beacon.run .lamp", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("background-position:130%", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("transition:width", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("transition:left", html, StringComparison.Ordinal);
+        Assert.Contains("transition:background .12s,color .12s,box-shadow .12s", html,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(".bank .k.on{background:var(--sunk);color:var(--ink);transform", html,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void 安装态默认关闭DevTools且只能由显式环境变量开启()
+    {
+        Assert.False(AiResume.Gui.MainWindow.ShouldEnableDevTools(_ => null));
+        Assert.False(AiResume.Gui.MainWindow.ShouldEnableDevTools(_ => "0"));
+        Assert.False(AiResume.Gui.MainWindow.ShouldEnableDevTools(_ => "false"));
+        Assert.True(AiResume.Gui.MainWindow.ShouldEnableDevTools(_ => "1"));
+        Assert.True(AiResume.Gui.MainWindow.ShouldEnableDevTools(_ => "true"));
     }
 
     [Fact]

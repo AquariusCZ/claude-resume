@@ -3,13 +3,22 @@
 > 这是 Stage 8 中**唯一被单独立包**的适配器。原因不是工作量,而是风险:Codex 的 `notify` 是
 > TOML 单行数组,且必须**链式包装用户既有 notify**,误改会破坏在用配置。语义严格照现役
 > `src/install-completion-hooks.js` 的 `wrapNotify` / `mergeCodexNotify` / `installCodex` 复刻。
+>
+> **现役修订(2026-08-13):** 本文件保留 Stage 8 的设计背景,现役行为以
+> `docs/COMPLETION-NOTIFICATIONS.md` 与 C# 代码为准。外层 `notify` 必须用 Tomlyn 按 TOML
+> 解析,因为合法配置可混用 basic/literal string；`--previous-notify` 的字符串值才是 JSON。
+> 所有权也已收紧为首个 exe + `codex` 参数的完整托管命令形状,不再按“任意元素含文件名”判断。
 
 ## 1. 配置位置与形状
 
-- 文件:`%USERPROFILE%\.codex\config.toml`(构造函数可注入,测试须能指定临时路径)。
+- 文件:活动 Codex home 下的 `config.toml`(显式参数 → `AI_RESUME_CODEX_HOME` → `CODEX_HOME` → `%USERPROFILE%\.codex`;构造函数可注入,测试须能指定临时路径)。
 - 目标键:`notify`,**必须是位于首个 `[section]` 之前(顶部区)的单行 TOML 数组**,
   形如 `notify = ["C:\\path\\AiResume.Hook.exe", "codex"]`。
-- 该数组同时是 JSON 兼容数组,故用 `System.Text.Json` 解析/序列化其值。
+- 外层数组用 Tomlyn 解析并要求每项都是字符串；写回使用 `System.Text.Json` 序列化字符串数组,
+  因其输出是合法 TOML basic-string 数组子集。`--previous-notify` 对应元素内部仍保存 JSON 数组文本。
+- 旧配置清理只在 TOML 语句边界识别键；多行字符串、数组和内联表内部形似
+  `notify = [...]` 的文本是用户值内容,必须保留。当前 Codex Desktop/app-server 不能假设
+  会热加载后来写入的配置,写入后需重启已运行客户端再验证真实事件。
 
 ## 2. 我方命令的形状
 
@@ -18,7 +27,8 @@
 [ <hookExe>, "codex", "--previous-notify", "<既有命令的 JSON 文本>" ]  # 包装既有 notify
 ```
 
-所有权判定:数组中**任一元素包含** `MarkerFileName`(常量 `"AiResume.Hook.exe"`,大小写不敏感)。
+所有权判定:当前数组层的首个可执行文件名精确为 `MarkerFileName`(常量
+`"AiResume.Hook.exe"`,大小写不敏感),且下一项为 `"codex"`;普通参数文本中偶然出现文件名不算所有权。
 
 ## 3. 合并算法(逐条复刻,顺序不可变)
 
@@ -42,10 +52,11 @@
 ## 4. 文件写入规则
 
 - **只操作顶部区**(首个 `[section]` 之前的内容),section 内的同名键一律不动。
-- 顶部区不存在 `notify` 行 → 在顶部区末尾追加一行。
+- 顶部区不存在 `notify` 行 → 在首个表头之前插入一行(当前实现置于文件首行,语义仍属顶部区)。
 - 存在**单行数组**形式 → 原地替换该行的数组部分,保留行内前后缀(缩进、行尾注释)。
 - 存在 `notify =` 但**不是单行数组**(多行、非数组) → **抛异常拒绝**,不猜测不改写。
-- 写入前把原文件复制为 `config.toml.bak`(覆盖式);临时文件 + 原子替换;换行 CRLF。
+- 按配置路径获取跨进程命名互斥体；基于锁内读取的原文生成候选，提交前再次逐字比较。
+- 临时文件 flush 后用 `File.Replace` 原子替换，`config.toml.bak` 是实际被替换版本的提交见证；若它不等于读取快照，恢复外部版本、保留 `.conflict-*` 并抛异常。换行统一为 CRLF。
 
 ## 5. 接口
 

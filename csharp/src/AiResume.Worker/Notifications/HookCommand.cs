@@ -23,7 +23,7 @@ public static class HookCommand
         return $"\"{exe}\" {source}";
     }
 
-    /// <summary>从引号命令或裸路径中提取第一个 .exe 路径。</summary>
+    /// <summary>从引号命令或裸路径中提取可执行文件路径。</summary>
     public static string? ExtractExecutable(string? command)
     {
         string value = command?.Trim() ?? string.Empty;
@@ -32,17 +32,13 @@ public static class HookCommand
             return null;
         }
 
-        if (value[0] == '"')
+        int executableEnd = FindExecutableEnd(value);
+        if (executableEnd < 0)
         {
-            int closing = value.IndexOf('"', 1);
-            if (closing > 1)
-            {
-                return value[1..closing];
-            }
+            return null;
         }
 
-        int exeEnd = value.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
-        return exeEnd < 0 ? null : value[..(exeEnd + 4)].Trim().Trim('"');
+        return value[..executableEnd].Trim().Trim('"');
     }
 
     /// <summary>
@@ -59,29 +55,51 @@ public static class HookCommand
             return false;
         }
 
-        int executableEnd;
-        if (value.StartsWith('"'))
+        int executableEnd = FindExecutableEnd(value);
+        if (executableEnd < 0)
         {
-            executableEnd = value.IndexOf('"', 1);
-            if (executableEnd < 0)
-            {
-                return false;
-            }
-
-            executableEnd++;
-        }
-        else
-        {
-            int exeEnd = value.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
-            if (exeEnd < 0)
-            {
-                return false;
-            }
-
-            executableEnd = exeEnd + 4;
+            return false;
         }
 
         string remainder = value[executableEnd..].Trim();
         return remainder.Length == 0 || string.Equals(remainder, source, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int FindExecutableEnd(string value)
+    {
+        if (value.StartsWith('"'))
+        {
+            int closing = value.IndexOf('"', 1);
+            return closing > 1 ? closing + 1 : -1;
+        }
+
+        if (value.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+        {
+            return value.Length;
+        }
+
+        int searchStart = 0;
+        while (searchStart < value.Length)
+        {
+            int exeEnd = value.IndexOf(".exe", searchStart, StringComparison.OrdinalIgnoreCase);
+            if (exeEnd < 0)
+            {
+                return -1;
+            }
+
+            int candidateEnd = exeEnd + 4;
+            if (candidateEnd == value.Length || char.IsWhiteSpace(value[candidateEnd]))
+            {
+                string remainder = value[candidateEnd..].Trim();
+                if (remainder.Length == 0 || !remainder.Any(char.IsWhiteSpace))
+                {
+                    return candidateEnd;
+                }
+            }
+
+            searchStart = candidateEnd;
+        }
+
+        return -1;
     }
 }

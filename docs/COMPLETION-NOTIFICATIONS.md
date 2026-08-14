@@ -1,6 +1,6 @@
 # 完成通知协议、实现与验证手册
 
-最后验证：2026-08-09（Windows 11，AI Resume v2）
+最后验证：2026-08-13（Windows 11，AI Resume v2）
 
 ## 1. 从第一性原理定义“可用”
 
@@ -77,12 +77,13 @@ cc-connect 使用两层抑制，缺一层都不能把激活报告为完整成功
 ## 4. 配置所有权
 
 - Claude Code / Qoder：只有“首个可执行文件名精确为 `AiResume.Hook.exe`，且后面无参数或只有对应来源参数”才算我方 command；参数文本里偶然出现文件名不算所有权。
-- Codex：只改顶层单行 `notify`，把已有命令串在 `--previous-notify` 后；多行或无法安全解析时拒绝修改。
+- Codex：只改顶层单行 `notify`，用 Tomlyn 解析外层 TOML argv 数组，支持 basic/literal string 混用和字符串内部的嵌套 JSON 方括号；数组必须全部是字符串。已有命令作为 JSON 文本串在 `--previous-notify` 后；多行、非字符串数组或无法安全解析时拒绝修改。
+- Codex 配置修复只在 TOML 语句边界识别 `notify`；多行字符串、数组和内联表内容中的同形文本必须逐字保留。当前版本不能假设已经运行的 Codex app-server 会自动重载该写入，安装或切换后需重启当时已打开的 Codex Desktop。
 - Cline：用户原 `TaskComplete.ps1` 备份为 `TaskComplete.airesume-previous.ps1`，wrapper 先执行原脚本；stdout 与 stderr 分开保留，只用 stdout 解析 `cancel`，原脚本要求取消时不再发我方通知。
 - OpenCode：文件名和文件内稳定 marker 必须同时匹配才算我方插件；同名用户插件拒绝覆盖，停用时也不删除。
 - `ProductConfig.NotifySources` 保存用户意图；重装按意图对账，卸载只移除 AI Resume 自己的条目。
 
-路径含空格必须作为一个可执行文件参数处理。Claude/Qoder 写入带引号的命令；Codex 使用 JSON argv 数组；Cline 使用 PowerShell 单引号；OpenCode 使用 `Bun.spawn([cmd, "opencode"], ...)`，不走 shell 字符串拆分。
+路径含空格必须作为一个可执行文件参数处理。Claude/Qoder 写入带引号的命令；Codex 配置是 TOML argv 数组，AI Resume 写回使用其合法的 JSON 字符串数组子集，只有 `--previous-notify` 的值是嵌套 JSON 文本；Cline 使用 PowerShell 单引号；OpenCode 使用 `Bun.spawn([cmd, "opencode"], ...)`，不走 shell 字符串拆分。
 
 ## 5. 队列、投递与进程生命周期
 
@@ -93,11 +94,11 @@ cc-connect 使用两层抑制，缺一层都不能把激活报告为完整成功
 - 收件人：DPAPI 飞书凭据中 `allow_from` 的第一个 `ou_...`。
 - 投递：`lark-cli im +messages-send --as bot --user-id ... --idempotency-key <eventId>`。
 
-`install` 先把三个项目的完整产物复制到同级 staging 目录并校验 GUI/Worker/Hook，写入 payload 清单，再备份本次会覆盖或由新清单淘汰的旧运行文件；只有 staging 与备份都成功后才停止旧 GUI/Worker。新 Worker 必须同时满足“进程未退出”和“Named Pipe `ping` 返回当前协议版本，且 pong PID 等于本次启动 PID”才算就绪；在此之前不修改快捷方式或用户级 Hook。复制、入口创建或就绪核验失败会回滚已替换和已淘汰文件，并在原来有 Worker 时重新启动旧 Worker。回滚不完整时返回独立错误码并保留 staging/backup 的绝对路径。安装目录内的 Worker 不能在 Windows 上删除自己，因此卸载会复制清单拥有的临时运行时：helper 先处理快捷方式和通知源，再把全部 payload、marker 与 manifest 事务性移动到私有退役区，完成后才向父进程返回成功。移动失败原路恢复，恢复不完整则保留 helper 目录；成功后的清理只碰 temp 退役区，不会与立即重装竞争。未知文件存在时写 preserved-root marker，使后续重装可继续，但该 marker 不能授权卸载。
+`install` 先按规范化目标目录获取跨进程命名互斥体，再把三个项目的完整产物复制到同级 staging 目录并校验 GUI/Worker/Hook，写入 payload 清单，再备份本次会覆盖或由新清单淘汰的旧运行文件；只有 staging 与备份都成功后才停止旧 GUI/Worker。新 Worker 必须同时满足“进程未退出”和“Named Pipe `ping` 返回当前协议版本，且 pong PID 等于本次启动 PID”才算就绪；在此之前不修改快捷方式或用户级 Hook。复制、入口创建或就绪核验失败会回滚已替换和已淘汰文件，并在原来有 Worker 时重新启动旧 Worker。回滚不完整时返回独立错误码并保留 staging/backup 的绝对路径。安装目录内的 Worker 不能在 Windows 上删除自己，因此卸载会复制清单拥有的临时运行时：helper 先处理快捷方式和通知源，再把全部 payload、marker 与 manifest 事务性移动到私有退役区，完成后才向父进程返回成功。移动失败原路恢复，恢复不完整则保留 helper 目录；成功后的清理只碰 temp 退役区，不会与立即重装竞争。未知文件存在时写 preserved-root marker，使后续重装可继续，但该 marker 不能授权卸载。
 
 投递成功后删除事件并写入七天去重表；发送失败保留事件供下轮重试；坏 JSON 移入 `completion-events\malformed\`。日志为每个事件记录脱敏后的 `eventId/source/outcome/reason`，去重表损坏、拒绝访问或写入失败也记录稳定诊断码；不会写入消息正文、路径或凭据。通知异常不得拖垮负责额度续跑的 Worker。
 
-当前收件人语义是 `allow_from` 中第一个 `ou_...`。多 owner 的广播、显式通知收件人和排序稳定性属于产品选择，尚未扩展；改变前必须先定义去重与权限语义。配置适配器在单次进程内串行并原子替换，但多个外部进程同时编辑同一客户端配置仍可能产生最后写入者覆盖，运维上应避免并发启停通知源。
+当前收件人语义是 `allow_from` 中第一个 `ou_...`。多 owner 的广播、显式通知收件人和排序稳定性属于产品选择，尚未扩展；改变前必须先定义去重与权限语义。Codex 配置适配器按配置路径跨进程串行，提交前比较原文并用 `File.Replace` 的备份核对“实际被替换版本”；若外部写入恰好落在最终比较与原子替换之间，适配器恢复该外部版本、拒绝报告成功，并保留冲突文件。外部编辑器不共享 AI Resume 的锁，运维上仍应避免同时启停通知源和保存 `config.toml`。
 
 ## 6. 验证层级
 
@@ -129,12 +130,14 @@ dotnet test csharp\AiResume.sln
 
 2026-08-09 最终安装版实证：仓库全量回归为 `972/972`。安装目录 Worker/Hook 与本次构建哈希一致；`notify list` 五源均为 `可送达=True`；`feishu-check` 返回 `code=0`；协议冒烟分别记录 `claudecode/cline/qoder/opencode` 的 `total=4 sent=4 failed=0` 与 Codex 的 `total=1 sent=1 failed=0`，五个来源均出现 `outcome=Sent`，队列归零。Codex 单独一轮是为了使用与真实客户端一致的现代 argv 传递，避免 Windows PowerShell 5.1 改写 JSON 参数。这里验证的是五种真实 Hook 协议到飞书的完整链路，不代表为了测试而让五个客户端各执行了一次真实 AI 任务。
 
+2026-08-13 当前安装版复核：Release 构建 `0 warning / 0 error`，全量回归 `1089/1089`、0 skipped；在 stdout/stderr 被父进程捕获的环境中执行 `install` 约 3.7 秒正常返回，安装清单 108 项与 Release 合并产物逐文件 SHA-256 全部一致，新 Worker 只有一个稳定 PID。`notify list` 五源仍全部 `可送达=True`，`feishu-check` 为 `code=0`。按现役 `config.toml` 的完整 `codex-computer-use.exe → --previous-notify → AiResume.Hook.exe` argv 链注入合成 `smoke=true` 事件，Hook 入队、Worker `outcome=Sent`、队列归零；未启动真实 agent，也未调用模型推理端点。
+
 ## 7. 故障定位
 
 | 现象 | 首查 | 判据 |
 |---|---|---|
 | 开关打开但从未入队 | 客户端配置和 Hook 命令 | 来源参数正确，路径有引号/argv 保护，Hook 文件存在 |
-| Codex 独有不通知 | `~/.codex/config.toml` 与 rollout | JSON 位于最后一个 argv，顶层 persisted rollout 可找到 |
+| Codex 独有不通知 | `~/.codex/config.toml`、主进程启动时间与 rollout | JSON 位于最后一个 argv，顶层 persisted rollout 可找到；主进程早于配置写入时先重启 Codex Desktop |
 | Cline 独有不通知 | `TaskComplete.ps1` | `$stdin` 同时管道给旧脚本和 `AiResume.Hook.exe cline` |
 | OpenCode 独有不通知 | `airesume-notify.ts` | 监听 `session.idle`，查询 session 后拒绝 `parentID` 子会话，使用 `Bun.spawn` + stdin，而不是 shell 模板字符串 |
 | 队列有文件但飞书没有 | Worker、凭据、lark-cli、日志 | Worker 进程存在；`feishu-check` 成功；日志无持续 `failed/skipped` |

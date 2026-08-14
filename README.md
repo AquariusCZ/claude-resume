@@ -46,7 +46,7 @@ csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe insta
 
 Open **AI Resume** from the Desktop or Start menu. Re-run `install` after rebuilding; the installed copy under `%LOCALAPPDATA%\AI Resume\` is the runtime, not `bin\Release`.
 
-The installer accepts only an empty directory, a preserved-state directory, an exact prior payload, an installed AI Resume root, or an exact preserved-root marker left by a prior uninstall; uninstall still requires both the active ownership marker and payload manifest. It stages and backs up the runtime, removes retired manifest files, replaces GUI/Worker/Hook together, and waits for the new Worker to answer the current Named Pipe protocol before changing shortcuts or hooks. Self-uninstall runs through a manifest-bounded temporary Worker that transactionally moves the installed payload into its private retirement area before reporting success, so an immediate reinstall cannot race old cleanup. Missing or invalid results and helper crashes leave the recovery directory untouched instead of deleting the only retired copy. State and unknown files are preserved; a preserved-root marker permits reinstall without granting delete authority. Incomplete rollback returns non-zero and keeps recovery material.
+The installer accepts only an empty directory, a preserved-state directory, an exact prior payload, an installed AI Resume root, or an exact preserved-root marker left by a prior uninstall; uninstall still requires both the active ownership marker and payload manifest. It stages and backs up the runtime, freezes per-file SHA-256 digests, removes retired manifest files, replaces GUI/Worker/Hook together, verifies the committed bytes against the staging snapshot, and waits for the exact new Worker PID to answer the current Named Pipe protocol before changing shortcuts or hooks. The Worker is launched without inheriting redirected installer pipes, so scripted installs can observe process exit promptly. Self-uninstall runs through a manifest-bounded temporary Worker that transactionally moves the installed payload into its private retirement area before reporting success, so an immediate reinstall cannot race old cleanup. Missing or invalid results and helper crashes leave the recovery directory untouched instead of deleting the only retired copy. State and unknown files are preserved; a preserved-root marker permits reinstall without granting delete authority. Incomplete rollback returns non-zero and keeps recovery material.
 
 Uninstall without deleting user settings:
 
@@ -65,6 +65,12 @@ Quota responses are sparse, so absence is not treated as deletion. A recent valu
 Select projects, press **Arm**, and close the window. The Worker keeps the queue and resumes projects only after the reset evidence is valid.
 
 Detailed protocol: [Claude quota acquisition and validation](docs/CLAUDE-QUOTA-ACQUISITION.md).
+
+### Provider health and third-party balance
+
+Codex combines provider authentication, balance and minimal-inference evidence. Window-open and periodic checks run `codex doctor --json`, authenticated `{base_url}/models`, and a zero-token `/v1/usage` request for eligible third-party providers. Only the user's **Refresh quota** action adds one `{base_url}/responses` request with `max_output_tokens=1`. All Codex paths resolve the same home (`AI_RESUME_CODEX_HOME`, then `CODEX_HOME`, then `%USERPROFILE%\.codex`) and reproduce provider query parameters and custom headers.
+
+For a Sub2API-style third-party OpenAI-compatible provider, AI Resume follows the CC Switch-compatible `/v1/usage` precedence: `remaining`, `quota.remaining`, then `balance`. A successful response with no explicit invalid-account signal and a positive balance turns Codex green; zero balance, invalid account, authentication failure, HTTP 402, and HTTP 429 still take precedence. Providers without valid balance evidence require a successful minimal `/responses` probe for green. Green represents current provider/account evidence, not an absolute guarantee for every future request. Official OpenAI/ChatGPT endpoints and ChatGPT OAuth credentials do not use that extra route, so this is not a ChatGPT Plus/Pro subscription balance.
 
 ### Phone chat through cc-connect
 
@@ -99,6 +105,8 @@ The control panel stages a candidate cc-connect config, validates it with cc-con
 | OpenCode | `session.idle` plugin |
 
 Adapters merge with existing user configuration and remove only entries they can prove they own. Internal probes and resume runs set `AI_RESUME_INTERNAL_RUN=1` directly. Generated cc-connect projects set the same value in `projects.agent.options.env`, while the scheduled-task launcher also sets it as a daemon-level fallback, so Feishu-launched agent processes do not notify AI Resume about AI Resume's own work.
+
+The current Codex Desktop/app-server cannot be assumed to hot-reload a later `notify` write. After AI Resume installs or refreshes that entry, restart any Codex Desktop process that was already running; configuration health alone cannot prove that an older process has reloaded it.
 
 Protocol and smoke procedure: [Completion notifications](docs/COMPLETION-NOTIFICATIONS.md).
 
@@ -136,6 +144,7 @@ Verified on the current Windows installation:
 
 - full isolated xUnit suite and Release build with warnings treated as errors;
 - OAuth quota parsing, sparse continuity, scoped/Fable rows and SQLite concurrency;
+- shallow/deep Codex verification, third-party balance parsing and per-provider failure isolation;
 - equal-height quota panels, indeterminate/reset-only state and reduced-motion behavior;
 - all five hook protocols through queue, Worker, lark-cli and Feishu;
 - cc-connect candidate parsing, atomic activation and generation-bound restart checks;

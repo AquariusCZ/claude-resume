@@ -32,10 +32,10 @@ public sealed class GuiQuotaContractTests
         Assert.Contains(".concat(scopedRows)", html, StringComparison.Ordinal);
         Assert.Contains("const hasPercent = Number.isFinite(o.used);", html, StringComparison.Ordinal);
         Assert.Contains("el.classList.toggle('stale', !!o.carried);", html, StringComparison.Ordinal);
-        Assert.Contains("hasPercent && !o.blocked && !o.carried", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("classList.toggle('live'", html, StringComparison.Ordinal);
         Assert.Contains(".qc.stale:not(.blocked) .bar:not(.unknown) .fill", html,
             StringComparison.Ordinal);
-        Assert.Contains(".qc.stale:not(.blocked) .bar.unknown .fill{animation:none;background:var(--amber)",
+        Assert.Contains(".qc.stale:not(.blocked) .bar.unknown .fill{background:var(--amber)",
             html, StringComparison.Ordinal);
         Assert.Contains("carried: !!w7.carriedForward", html, StringComparison.Ordinal);
         Assert.Contains("carried: !!w5.carriedForward", html, StringComparison.Ordinal);
@@ -50,13 +50,12 @@ public sealed class GuiQuotaContractTests
         Assert.Contains("`${quotaName}：用量百分比未报告`", html,
             StringComparison.Ordinal);
         Assert.Contains("bar.removeAttribute('aria-valuenow');", html, StringComparison.Ordinal);
-        Assert.Contains("$(id).querySelector('.fill').style.width = hasPercent", html,
+        Assert.Contains("$(id).querySelector('.fill').style.transform = `scaleX(${hasPercent ? used : 1})`;", html,
             StringComparison.Ordinal);
-        Assert.Contains(": '100%';", html, StringComparison.Ordinal);
-        Assert.Contains(".qc .bar.unknown .fill{width:100%;box-shadow:none;", html,
+        Assert.Contains(".qc .bar.unknown .fill{transform:scaleX(1);box-shadow:none;", html,
             StringComparison.Ordinal);
         Assert.Contains("@keyframes quota-unknown", html, StringComparison.Ordinal);
-        Assert.Contains(".qc .bar.unknown .fill{animation:none;background:#0D2C1E}", html,
+        Assert.Contains(".qc .bar.unknown .fill{background:#0D2C1E}", html,
             StringComparison.Ordinal);
         Assert.Contains("const staleRefreshNextAt = new Map();", html, StringComparison.Ordinal);
         Assert.Contains("Math.max(60, refreshMinutes * 60)", html, StringComparison.Ordinal);
@@ -70,6 +69,11 @@ public sealed class GuiQuotaContractTests
         Assert.Contains("warn: false,", html, StringComparison.Ordinal);
         Assert.Contains("同一重置周期的最近一次服务端读数", html, StringComparison.Ordinal);
         Assert.Contains("if (p.storageWarning) lastQuotaDetail", html, StringComparison.Ordinal);
+        Assert.Contains("$('refreshBtn').addEventListener('click', () => refreshQuota(true, true));", html,
+            StringComparison.Ordinal);
+        Assert.Contains("refreshQuota(false, false);", html, StringComparison.Ordinal);
+        Assert.Contains("setInterval(() => refreshQuota(true, false)", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("deep 会跑 `codex exec`", html, StringComparison.Ordinal);
         Assert.Contains(".qc{position:relative;padding:5px;background:var(--panel-lo);display:flex;", html,
             StringComparison.Ordinal);
         Assert.Contains(".qc .scr{position:relative;overflow:hidden;background:var(--crt);flex:1;min-width:0;", html,
@@ -85,6 +89,11 @@ public sealed class GuiQuotaContractTests
         Assert.Contains("File.GetLastWriteTimeUtc(indexPath).Ticks", host, StringComparison.Ordinal);
         Assert.Contains("index.html?v={cacheVersion}", host, StringComparison.Ordinal);
         Assert.Contains("demoMode: _screenshotMode", host, StringComparison.Ordinal);
+        Assert.Contains("exception_type={ExceptionType}", host, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "_logger.LogError(\n                exception,",
+            host.Replace("\r\n", "\n", StringComparison.Ordinal),
+            StringComparison.Ordinal);
     }
 
     private static string FindRepositoryFile(string relativePath)

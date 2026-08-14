@@ -16,14 +16,18 @@ namespace AiResume.Worker.Logging;
 public sealed class DailyJsonFileLoggerProvider : ILoggerProvider
 {
     private readonly string _logsDirectory;
+    private readonly string _filePrefix;
 
-    public DailyJsonFileLoggerProvider(string logsDirectory)
+    public DailyJsonFileLoggerProvider(string logsDirectory, string filePrefix = "worker")
     {
         ArgumentNullException.ThrowIfNull(logsDirectory);
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePrefix);
         _logsDirectory = logsDirectory;
+        _filePrefix = filePrefix;
     }
 
-    public ILogger CreateLogger(string categoryName) => new DailyJsonFileLogger(_logsDirectory, categoryName);
+    public ILogger CreateLogger(string categoryName) =>
+        new DailyJsonFileLogger(_logsDirectory, _filePrefix, categoryName);
 
     public void Dispose()
     {
@@ -34,11 +38,13 @@ public sealed class DailyJsonFileLoggerProvider : ILoggerProvider
     {
         private static readonly object WriteLock = new();
         private readonly string _logsDirectory;
+        private readonly string _filePrefix;
         private readonly string _category;
 
-        public DailyJsonFileLogger(string logsDirectory, string category)
+        public DailyJsonFileLogger(string logsDirectory, string filePrefix, string category)
         {
             _logsDirectory = logsDirectory;
+            _filePrefix = filePrefix;
             _category = category;
         }
 
@@ -74,7 +80,7 @@ public sealed class DailyJsonFileLoggerProvider : ILoggerProvider
             });
 
             Directory.CreateDirectory(_logsDirectory);
-            string path = Path.Combine(_logsDirectory, $"worker-{now:yyyyMMdd}.log");
+            string path = Path.Combine(_logsDirectory, $"{_filePrefix}-{now:yyyyMMdd}.log");
             lock (WriteLock)
             {
                 File.AppendAllText(path, line + Environment.NewLine, Encoding.UTF8);

@@ -121,6 +121,12 @@ public sealed class CodexNotifyChainPruneTests
                 @"C:\Users\x\AppData\Local\AI Resume\AiResume.Hook.exe")]
     [InlineData(@"C:\tools\AiResume.Hook.exe codex", @"C:\tools\AiResume.Hook.exe")]
     [InlineData(@"C:\tools\AiResume.Hook.exe", @"C:\tools\AiResume.Hook.exe")]
+    [InlineData(@"C:\Tools.exe\AI Resume\AiResume.Hook.exe codex",
+                @"C:\Tools.exe\AI Resume\AiResume.Hook.exe")]
+    [InlineData(@"C:\Tools.exe Folder\AI Resume\AiResume.Hook.exe",
+                @"C:\Tools.exe Folder\AI Resume\AiResume.Hook.exe")]
+    [InlineData(@"C:\Tools.exe Folder\AI Resume\AiResume.Hook.exe codex",
+                @"C:\Tools.exe Folder\AI Resume\AiResume.Hook.exe")]
     [InlineData(@"  C:\a b\hook.exe  codex  ", @"C:\a b\hook.exe")]
     public void 按exe边界切而不是按空格(string input, string expected)
     {

@@ -47,6 +47,7 @@ public static class ShortcutCommand
         {
             if (uninstall)
             {
+                // Startup 里的 .lnk 是旧版入口,现役自启走计划任务;两个都要清。
                 RemoveShortcutsTransaction(
                 [
                     Path.Combine(StartMenuDir, GuiLinkName),
@@ -91,22 +92,41 @@ public static class ShortcutCommand
                 Console.Error.WriteLine($"警告:找不到图标 {icon},快捷方式将使用默认图标。");
             }
 
-            var shortcuts = new[]
+            // 开机自启指向 WinExe 垫片(无窗口拉起 Worker);垫片缺席时直指 Worker,
+            // 会弹控制台窗口 —— 但没有自启才是真故障,不能因此不装。
+            WorkerAutostart.AutostartTarget autostart = WorkerAutostart.Resolve(workerExe);
+            if (!autostart.Hidden && !WorkerAutostart.IsScheduledTaskRegistered())
+            {
+                Console.Error.WriteLine(
+                    $"警告:找不到 {WorkerAutostart.LauncherFileName},开机自启将直接启动控制台程序 —— " +
+                    "登录时会短暂弹出控制台窗口。");
+            }
+
+            var shortcuts = new List<ShortcutSpec>
             {
                 new ShortcutSpec(
                     Path.Combine(StartMenuDir, GuiLinkName), guiExe,
                     Path.GetDirectoryName(guiExe) ?? baseDir, icon,
                     "AI Resume 控制面:额度、续跑队列与完成通知"),
-                new ShortcutSpec(
-                    Path.Combine(StartupDir, WorkerLinkName), workerExe,
-                    Path.GetDirectoryName(workerExe) ?? baseDir, icon,
-                    "AI Resume 续跑引擎(后台):限额恢复后按队列顺序继续"),
+                // **登录自启不再放这里。** Worker 是控制台程序,Explorer 启动 Startup 里的
+                // .lnk 会给它配一个控制台窗口,每次开机弹黑框。自启改由
+                // WorkerAutostart 的 S4U 计划任务负责(隐藏运行),旧 .lnk 在下面删除。
                 // 桌面入口就地覆盖旧安装器留下的同名 .lnk —— 它指向 launcher.vbs(旧系统)。
                 new ShortcutSpec(
                     Path.Combine(DesktopDir, DesktopLinkName), guiExe,
                     Path.GetDirectoryName(guiExe) ?? baseDir, icon,
                     "AI Resume 控制面:额度、续跑队列与完成通知"),
             };
+            // 已升级成计划任务时不能再建快捷方式:两条链路都在,登录时会各拉起一个 Worker。
+            bool managedByTask = WorkerAutostart.IsScheduledTaskRegistered();
+            if (!managedByTask)
+            {
+                shortcuts.Add(new ShortcutSpec(
+                    Path.Combine(StartupDir, WorkerLinkName), autostart.Target,
+                    Path.GetDirectoryName(workerExe) ?? baseDir, icon,
+                    autostart.Description));
+            }
+
             var staged = new List<(string Staged, string Destination)>();
             try
             {
@@ -134,8 +154,18 @@ public static class ShortcutCommand
             }
 
             Console.WriteLine($"已创建:{Path.Combine(StartMenuDir, GuiLinkName)}");
-            Console.WriteLine($"已创建:{Path.Combine(StartupDir, WorkerLinkName)}(开机自启,续跑引擎)");
             Console.WriteLine($"已创建:{Path.Combine(DesktopDir, DesktopLinkName)}(覆盖旧入口)");
+            if (managedByTask)
+            {
+                Console.WriteLine("开机自启已由计划任务接管,未创建开机快捷方式(避免双启动)。");
+            }
+            else
+            {
+                Console.WriteLine(
+                    $"已创建:{Path.Combine(StartupDir, WorkerLinkName)}(开机自启,续跑引擎" +
+                    (autostart.Hidden ? ",无窗口)" : ",会弹控制台窗口)"));
+            }
+
             return 0;
         }
         catch (Exception ex)

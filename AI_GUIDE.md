@@ -1,4 +1,4 @@
-<!-- project-tour · generated 2026-08-09 16:01 · git cb18546 -->
+<!-- project-tour · refreshed 2026-08-14 · git d38dabc + working tree -->
 # AI Resume — AI 导览(AI_GUIDE.md)
 
 > 一句话:AI Resume 是 Windows 本地控制面,在 Claude Code 额度恢复后按队列续跑项目,并整合项目发现、完成通知、cc-connect 聊天接入与运行安全验证。
@@ -77,7 +77,7 @@ ResumeEngine 获取 Claude 用量/限流状态
                    解除布防或连续模式
 ```
 
-额度主路径是官方 `GET https://api.anthropic.com/api/oauth/usage`,只读 Claude Code 已有 OAuth access token;请求按 Claude Code 协议携带 OAuth beta、Anthropic version 与本机 `claude-code/<version>` User-Agent,避免普通 UA 的激进 429。解析逐字段优先使用现代 `limits` 的 `session` / `weekly_all` / 全部 `weekly_scoped`,同时兼容旧顶层窗口;percent/reset 都缺失的空对象不算数据。失败时降级到 `ClaudeCodeProbe`。权威快照延迟写入 SQLite `quota_snapshots` 并按 `organizationUuid` 的 SHA-256 指纹隔离;跨窗口更新在单个 SQLite `IMMEDIATE` 事务内重读、合并、写回。OAuth 与 CLI 都视为稀疏观测,缺字段不作删除;同一 reset 代次的已用百分比单调不回退,旧观测也不能把新 reset 代次倒写成旧代次。scoped 以规范化完整 scope 的 SHA-256 作内部身份,同名模型重排不会串窗。只在同账号、同身份、同一未来重置周期内承接并标记 `carriedForward`;账号变化、reset 换代或到期立即清除,承接值显示琥珀“最近读数”而非“已限流”或绿色实时正常。窗口只有 reset、没有百分比时,GUI 保留分段轨道并显示无数值含义的移动未知扫描,不伪造 0%/100%;CLI 只知道全局限流时也不把具体 5H/7D 窗口猜成已满,整体失败但取得部分窗口时也不显示绿色正常,并只负缓存 30 秒。Codex provider 只有最小推理请求真实成功时才显示绿色;仅 `/v1/models` 鉴权成功、推理端点不兼容、缺 model、超时或网络失败都显示灰色“未验推理”。完整协议、状态机和冒烟步骤见 `docs/CLAUDE-QUOTA-ACQUISITION.md`。
+额度主路径是官方 `GET https://api.anthropic.com/api/oauth/usage`,只读 Claude Code 已有 OAuth access token;请求按 Claude Code 协议携带 OAuth beta、Anthropic version 与本机 `claude-code/<version>` User-Agent,避免普通 UA 的激进 429。解析逐字段优先使用现代 `limits` 的 `session` / `weekly_all` / 全部 `weekly_scoped`,同时兼容旧顶层窗口;percent/reset 都缺失的空对象不算数据。失败时降级到 `ClaudeCodeProbe`。权威快照延迟写入 SQLite `quota_snapshots` 并按 `organizationUuid` 的 SHA-256 指纹隔离;跨窗口更新在单个 SQLite `IMMEDIATE` 事务内重读、合并、写回。OAuth 与 CLI 都视为稀疏观测,缺字段不作删除;同一 reset 代次的已用百分比单调不回退,旧观测也不能把新 reset 代次倒写成旧代次。scoped 以规范化完整 scope 的 SHA-256 作内部身份,同名模型重排不会串窗。只在同账号、同身份、同一未来重置周期内承接并标记 `carriedForward`;账号变化、reset 换代或到期立即清除,承接值显示琥珀“最近读数”而非“已限流”或绿色实时正常。窗口只有 reset、没有百分比时,GUI 保留分段轨道并显示无数值含义的移动未知扫描,不伪造 0%/100%;CLI 只知道全局限流时也不把具体 5H/7D 窗口猜成已满,整体失败但取得部分窗口时也不显示绿色正常,并只负缓存 30 秒。Codex home 统一按“显式参数 → `AI_RESUME_CODEX_HOME` → `CODEX_HOME` → `%USERPROFILE%\.codex`”解析,doctor、models、responses、usage 与通知配置都使用同一路径。开窗/定时 shallow 跑 doctor、带凭据的 `{base_url}/models` 与第三方零 token `/v1/usage`;Sub2API 请求成功、账户未显式失效且余额大于 0 时按 CC Switch 语义直接点绿,没有有效余额证据时保持未核实。用户主动刷新时 deep 才额外向 `{base_url}/responses` 发一次 `max_output_tokens=1` 的最小推理请求。HTTP 探针复现 provider 的 `query_params`、`http_headers` 与 `env_http_headers`,环境头覆盖静态头;余额字段依次兼容 `remaining` / `quota.remaining` / `balance` 并默认 USD,余额为 0、账户失效、鉴权失败、402/429 等明确失败优先。官方 OpenAI/ChatGPT 和 ChatGPT OAuth token 不走该第三方接口,因此这里不是 ChatGPT Plus/Pro 订阅额度。完整协议、状态机和冒烟步骤见 `docs/CLAUDE-QUOTA-ACQUISITION.md`。
 
 ### 2.4 cc-connect 配置激活
 
@@ -141,12 +141,12 @@ Windows 上裸 `daemon restart`、`restart --force` 的退出码和 `daemon stat
 | `csharp/src/AiResume.Worker/Resume/` | 限额后续跑核心 | `ResumeEngine`、`ClaudeResumeRunner` |
 | `csharp/src/AiResume.Worker/Products/` | 产品配置、项目索引和布防周期 | `ProductConfigStore`、`ProjectCatalog`、`ProjectIndex`、`CheckerCycle` |
 | `csharp/src/AiResume.Worker/Supervision/` | 进程登记、Job Object、恢复对账 | `ProcessSupervisor`、`ProcessVerifier`、`Reconciler` |
-| `csharp/src/AiResume.Worker/Probes/` | Claude/Codex/DeepSeek 真实探测 | `ClaudeCodeProbe`、`CodexAuthProbe`、`DeepSeekProbe` |
+| `csharp/src/AiResume.Worker/Probes/` | Claude/Codex/DeepSeek 真实探测 | `ClaudeCodeProbe`、`CodexAuthProbe`、`CodexBalanceProbe`、`DeepSeekProbe` |
 | `csharp/src/AiResume.Worker/Notifications/` | 完成通知注册表和投递 | `NotificationRegistry`、`HookHealth`、`NotificationWorker` |
 | `csharp/src/AiResume.Gui/` | WPF + WebView2 控制面 | `MainWindow`、`ControlPlaneBridge.HandleAsync` |
 | `csharp/src/AiResume.Gui/wwwroot/index.html` | 单页前端、交互和视觉 | `call`、`render*`、`genCutover` |
 | `csharp/src/AiResume.Hook/Program.cs` | agent hook 入口 | 解析来源、内部运行抑制、事件落队列 |
-| `csharp/test/AiResume.Tests/` | 隔离的 xUnit 回归 | 972 项,不触碰真实会话/项目运行 |
+| `csharp/test/AiResume.Tests/` | 隔离的 xUnit 回归 | 1161 项,不触碰真实会话/项目运行 |
 
 ## 4. 测试 / 运行流程
 
@@ -162,7 +162,7 @@ dotnet build csharp\AiResume.sln
 dotnet test csharp\AiResume.sln
 ```
 
-当前完整回归:972 个 xUnit,0 skipped。测试通过临时目录、注入 runner/API、假 PID/时钟和合成 session 隔离生产状态,不发付费 API 请求；通知回归会启动真实 Hook 进程和 Cline wrapper,但不启动 agent。
+当前完整回归:1161 个 xUnit,0 skipped。测试通过临时目录、注入 runner/API、假 PID/时钟和合成 session 隔离生产状态,不发付费 API 请求；通知回归会启动真实 Hook 进程和 Cline wrapper,但不启动 agent。
 
 ### 4.2 部署现役副本
 
@@ -170,7 +170,7 @@ dotnet test csharp\AiResume.sln
 csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe install
 ```
 
-`install` 先在安装目录同级 staging 并校验 Gui/Worker/Hook,写入 payload 清单,备份将覆盖或淘汰的旧运行文件后再替换；上一版清单中已移除的 DLL/脚本会删除并纳入回滚。随后重建入口并按持久化意图原位刷新通知钩子。新 Worker 必须存活,且 Named Pipe pong 的 PID 等于本次启动 PID；失败会恢复旧运行版本,回滚不完整则保留恢复目录。从安装目录执行卸载时会复制清单拥有的临时 Worker,由它在返回成功前把全部 payload 事务性移入私有退役区；失败原路恢复,无信号/坏信号/提前退出时父进程保留恢复目录,成功后的 temp 清理不再触碰安装目录。状态和未知文件保留,未知文件存在时写入仅允许重装的 preserved-root marker。已打开 GUI 不热更新,部署后要关闭重开。
+`install` 先在安装目录同级 staging 并校验 Gui/Worker/Hook,写入 payload 清单,备份将覆盖或淘汰的旧运行文件并冻结逐文件 SHA-256 后再替换；提交只复制快照清单中的文件并逐字节复核,上一版清单中已移除的 DLL/脚本会删除并纳入回滚。随后以不继承调用方重定向管道的方式启动 Worker,重建入口并按持久化意图原位刷新通知钩子。新 Worker 必须存活,且 Named Pipe pong 的 PID 等于本次启动 PID；失败会恢复旧运行版本,回滚不完整则保留恢复目录。从安装目录执行卸载时会复制清单拥有的临时 Worker,由它在返回成功前把全部 payload 事务性移入私有退役区；失败原路恢复,无信号/坏信号/提前退出时父进程保留恢复目录,成功后的 temp 清理不再触碰安装目录。状态和未知文件保留,未知文件存在时写入仅允许重装的 preserved-root marker。已打开 GUI 不热更新,部署后要关闭重开；写入时已运行的 Codex 也必须重启后才会加载新的 `notify`。
 
 ### 4.3 常用 Worker 命令
 
@@ -195,6 +195,7 @@ notify                    管理完成通知源
 - 改续跑:`ResumeEngineTests`、`CheckerCycleTests`、`ClaudeResumeRunnerTests`。
 - 改通知:各 `*NotificationAdapterTests`、`HookHealthTests`、`NotifyIntentTests`、`NotificationHookProcessTests`、`NotificationWorkerTests`;协议和冒烟见 `docs/COMPLETION-NOTIFICATIONS.md`。
 - 改 GUI bridge:`ControlPlaneBridgeArmTests`、`ControlPlaneBridgeProjectsTests`。
+- 改 Codex 可用性/第三方余额:`CodexAuthProbeTests`、`CodexProbeTests`、`CodexBalanceProbeTests`、`ControlPlaneBridgeProviderTests`。
 
 ## 5. 数据格式与命名约定
 
@@ -213,6 +214,7 @@ notify                    管理完成通知源
 - `runs.db`:SQLite schema v5;含 `runs`、`run_events`、`outbox`、`process_registry`、`product_state`、`quota_snapshots`。v5 会丢弃无法证明账号归属的旧 v4 三列额度行,再按账号指纹重新建立基线。
 - `logs\YYYY-MM-DD.jsonl`:按本地日期滚动的结构化日志;每行一个 JSON 对象。
 - `AIRESUME_SHADOW_DIR`:测试/并行运行用状态根覆盖。设置后禁止迁移真实旧目录。
+- `AI_RESUME_ENABLE_WEBVIEW_DEVTOOLS`:仅显式设为 `1` / `true` 时开启 WebView2 DevTools;安装态默认关闭。
 
 ### 5.2 cc-connect 状态
 
@@ -274,6 +276,8 @@ model = "gpt-5.6"
 - **Q:为什么显示“配置已提交,但新代次未验证”?** — A:文件提交和运行代次是两个独立事实。此时配置已落盘,但任务、锁、稳定 PID 或同代日志仍有一项缺证据;界面会同时显示阶段与两个布尔状态,不能把它说成整体成功。
 - **Q:项目在手机上怎么切?** — A:用 `/dir <路径>`、`/dir <序号>`、`/dir -` 或 `/dir reset`;cc-connect 项目身份固定为 `ai-resume`,工作目录才是实际项目。
 - **Q:绿灯依据是什么?** — A:真实最小请求成功,不是“填了 key”或“命令存在”。核对不了时显示未验证,不会回退成可用。
+- **Q:Sub2API 有正余额为什么现在会点绿?** — A:因为当前产品明确采用 CC Switch 的判定:用量请求成功、账户未显式失效且余额大于 0,就是该 provider/account 的绿色可用证据。它不是对每一次未来推理请求的绝对保证;若随后拿到 401/403、余额为 0、账户失效、402/429 等更强失败证据,失败状态优先。
+- **Q:为什么 AI Resume 的 Codex 通知开着却没有消息?** — A:先看 `notify list`、队列和 Worker 日志。若完整合成链路能送达,再比较 ChatGPT/Codex 主进程启动时间与 `~/.codex/config.toml` 写入时间；主进程更早时说明它尚未加载新 `notify`,重启 Codex Desktop 后再验证下一次真实任务。
 - **Q:测试会不会碰真实会话或项目?** — A:不应。测试使用临时状态根、假 PID/runner 和合成 session;禁止 resume 真实会话或对真实仓库启动修改运行。
 
 ## 7. 术语表(中英 / 缩写对照)

@@ -1,5 +1,8 @@
 using System.IO;
 using System.Windows;
+using AiResume.Secrets;
+using AiResume.Worker.Logging;
+using Microsoft.Extensions.Logging;
 using Microsoft.Web.WebView2.Core;
 
 namespace AiResume.Gui;
@@ -15,8 +18,11 @@ public partial class MainWindow : Window
 {
     /// <summary>前端资源的虚拟主机名;用 https 而非 file:// 以获得正常的同源与 fetch 行为。</summary>
     private const string VirtualHost = "controlplane.airesume.local";
+    private const string DevToolsEnvironmentVariable = "AI_RESUME_ENABLE_WEBVIEW_DEVTOOLS";
 
     private readonly ControlPlaneBridge _bridge;
+    private readonly DailyJsonFileLoggerProvider _loggerProvider;
+    private readonly ILogger _logger;
     private readonly CancellationTokenSource _cts = new();
     private readonly bool _screenshotMode;
 
@@ -25,11 +31,27 @@ public partial class MainWindow : Window
         InitializeComponent();
         _screenshotMode = Environment.GetCommandLineArgs().Any(
             arg => string.Equals(arg, "--screenshot", StringComparison.OrdinalIgnoreCase));
+        _loggerProvider = new DailyJsonFileLoggerProvider(AiResume.Worker.ShadowPaths.LogsDirectory, "gui");
+        _logger = _loggerProvider.CreateLogger(typeof(MainWindow).FullName!);
         // 公开截图必须使用合成数据，不能读取或展示真实项目、用户名、凭据和本机路径。
-        _bridge = new ControlPlaneBridge(folderPicker: PickFolderAsync, demoMode: _screenshotMode);
+        _bridge = new ControlPlaneBridge(
+            folderPicker: PickFolderAsync,
+            probeFailureReporter: (probe, exceptionType) => _logger.LogWarning(
+                "gui.provider_probe.failed probe={Probe} exception_type={ExceptionType}",
+                probe,
+                exceptionType),
+            requestFailureReporter: (requestType, exceptionType) => _logger.LogError(
+                "gui.control_plane.request_failed request_type={RequestType} exception_type={ExceptionType}",
+                requestType,
+                exceptionType),
+            demoMode: _screenshotMode);
         Loaded += async (_, _) => await InitializeHostAsync();
         Closing += OnClosing;
-        Closed += (_, _) => _cts.Cancel();
+        Closed += (_, _) =>
+        {
+            _cts.Cancel();
+            _loggerProvider.Dispose();
+        };
     }
 
     private void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
@@ -93,7 +115,7 @@ public partial class MainWindow : Window
             // 控制面是本机工具,不需要这些浏览器能力;关掉以缩小攻击面。
             core.Settings.AreDefaultContextMenusEnabled = false;
             core.Settings.IsStatusBarEnabled = false;
-            core.Settings.AreDevToolsEnabled = true; // 开发期保留;发布前由配置关闭
+            core.Settings.AreDevToolsEnabled = ShouldEnableDevTools();
             core.Settings.IsPasswordAutosaveEnabled = false;
             core.Settings.IsGeneralAutofillEnabled = false;
 
@@ -129,8 +151,26 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            SkeletonText.Text = $"控制面初始化失败:{ex.Message}";
+            _logger.LogError(ex, "gui.webview.initialize_failed");
+            SkeletonText.Text = $"控制面初始化失败:{SecretRedactor.RedactText(ex.Message)}";
         }
+    }
+
+    internal static bool ShouldEnableDevTools(Func<string, string?>? environmentVariable = null)
+    {
+        environmentVariable ??= Environment.GetEnvironmentVariable;
+        string? value;
+        try
+        {
+            value = environmentVariable(DevToolsEnvironmentVariable);
+        }
+        catch (Exception ex) when (ex is ArgumentException or System.Security.SecurityException)
+        {
+            return false;
+        }
+
+        return string.Equals(value, "1", StringComparison.Ordinal) ||
+               bool.TryParse(value, out bool enabled) && enabled;
     }
 
     /// <summary>
@@ -161,7 +201,8 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"截图失败:{ex.Message}");
+            _logger.LogError(ex, "gui.screenshot.capture_failed");
+            Console.Error.WriteLine($"截图失败:{SecretRedactor.RedactText(ex.Message)}");
         }
 
         Application.Current.Shutdown();

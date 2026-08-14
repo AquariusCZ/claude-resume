@@ -1,6 +1,4 @@
 using System.Diagnostics;
-using System.Globalization;
-using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -8,10 +6,8 @@ namespace AiResume.Worker.Probes;
 
 /// <summary>
 /// Codex 可用性探测。分两层:
-/// - Shallow:只跑 <c>codex doctor --json</c>,不发模型请求(不烧额度)。
-///   doctor **不验证授权**,所以 shallow 最好的结论只能是「可达,授权未验证」。
-/// - Deep:先 shallow,shallow 明确失败就直接返回;否则再发一次最小请求
-///   <c>codex exec OK</c> 验证真实可用性。
+/// - Shallow:<c>codex doctor --json</c> + 带凭据 <c>/models</c>,零 token。
+/// - Deep:同一链路再发且只发一次 <c>max_output_tokens=1</c> 的最小 HTTP 推理请求。
 ///
 /// **2026-08-07 修正:route probe 的 401/403 不是认证失败。**
 /// 原实现把 <c>provider_reachability.details</c> 里出现的 401/403 一律判成"认证被拒",
@@ -44,7 +40,8 @@ public sealed record CodexProbeResult(
     CodexReadiness Readiness,
     string Reason,
     string? Summary,
-    bool DeepChecked);
+    bool DeepChecked,
+    string? ProviderIdentity = null);
 
 public sealed class CodexProbe
 {
@@ -58,45 +55,63 @@ public sealed class CodexProbe
     private readonly int _timeoutSeconds;
     private readonly string? _codexHome;
     private readonly HttpMessageHandler? _authHandler;
+    private readonly Func<CancellationToken, Task<CodexProbeResult>>? _doctorProbe;
+    private readonly Func<string, string?> _environmentVariable;
+    private readonly Action<ProcessStartInfo>? _doctorStartObserver;
 
     public CodexProbe(
         string? codexCommand = null,
         int timeoutSeconds = DefaultTimeoutSeconds,
         string? codexHome = null,
-        HttpMessageHandler? authHandler = null)
+        HttpMessageHandler? authHandler = null,
+        Func<CancellationToken, Task<CodexProbeResult>>? doctorProbe = null,
+        Func<string, string?>? environmentVariable = null,
+        Action<ProcessStartInfo>? doctorStartObserver = null)
     {
         _codexCommand = string.IsNullOrWhiteSpace(codexCommand) ? "codex" : codexCommand;
         _timeoutSeconds = timeoutSeconds > 0 ? timeoutSeconds : DefaultTimeoutSeconds;
+        _environmentVariable = environmentVariable ?? Environment.GetEnvironmentVariable;
         // 两个注入点只为测试:codexHome 让测试指向假配置目录,
         // authHandler 让测试不联网就能断言状态码映射。生产一律走默认。
-        _codexHome = codexHome;
+        _codexHome = CodexAuthProbe.ResolveCodexHome(codexHome, _environmentVariable);
         _authHandler = authHandler;
+        _doctorProbe = doctorProbe;
+        _doctorStartObserver = doctorStartObserver;
     }
 
     /// <summary>
-    /// 默认探测:<c>codex doctor --json</c> + **一次带凭据的 /v1/models 请求**。
+    /// 默认探测:<c>codex doctor --json</c> + **一次带凭据的 /models 请求**。
     ///
-    /// 后半段是关键 —— doctor 证明不了授权,而唯一此前能证明的办法 `codex exec`
-    /// 要 10-12 秒、2.3 万 tokens,贵到不能每次开窗都跑,于是面板长期只能显示
-    /// 「已就绪 · 未验证授权」。带凭据打 /v1/models 是 **1.3 秒、0 token** 的真实验证,
-    /// 所以现在**每一次探测都是真的**,绿灯有据可依。
+    /// 后半段是关键 —— doctor 证明不了授权。带凭据打 /models 是零 token 的真实鉴权验证,
+    /// 但仍不证明当前模型能完成推理,所以 shallow 结果保持灰色。
     ///
     /// 授权探测拿不出结论时(读不到配置、网络失败),**不冒充绿灯**,
     /// 退回 doctor 的「可达,授权未验证」。
     /// </summary>
-    public async Task<CodexProbeResult> ProbeShallowAsync(CancellationToken ct = default)
+    public Task<CodexProbeResult> ProbeShallowAsync(CancellationToken ct = default)
     {
+        CodexProviderCredentials provider = CodexAuthProbe.ReadActiveProviderCredentials(
+            _codexHome,
+            _environmentVariable);
+        return ProbeShallowAsync(provider, ct);
+    }
+
+    public async Task<CodexProbeResult> ProbeShallowAsync(
+        CodexProviderCredentials provider,
+        CancellationToken ct = default)
+    {
+        string providerIdentity = CodexAuthProbe.CreateProviderIdentity(provider);
         CodexProbeResult doctor = await ProbeDoctorAsync(ct).ConfigureAwait(false);
         if (doctor.Readiness != CodexReadiness.Ok)
         {
             // doctor 已经给出明确的坏结论(没装/不可达/被限流),没必要再打一次网络。
-            return doctor;
+            return doctor with { ProviderIdentity = providerIdentity };
         }
 
         CodexAuthResult auth = await CodexAuthProbe
-            .ProbeAsync(_codexHome, _authHandler, ct).ConfigureAwait(false);
+            .ProbeModelsAsync(provider, _authHandler, ct).ConfigureAwait(false);
 
-        return FromAuthResult(auth);
+        return FromAuthResult(auth) with { ProviderIdentity = providerIdentity };
     }
 
     public static CodexProbeResult FromAuthResult(CodexAuthResult auth)
@@ -114,20 +129,33 @@ public sealed class CodexProbe
             CodexAuthOutcome.NoInference =>
                 new CodexProbeResult(CodexReadiness.Auth, "no-inference", auth.Detail, true),
             CodexAuthOutcome.Rejected =>
-                new CodexProbeResult(CodexReadiness.Auth, "auth-rejected", auth.Detail, true),
+                new CodexProbeResult(
+                    CodexReadiness.Auth,
+                    auth.UsedCredential ? "auth-rejected" : "credential-required",
+                    auth.Detail,
+                    true),
             CodexAuthOutcome.Limited =>
-                new CodexProbeResult(CodexReadiness.Limited, "http-429", auth.Detail, true),
+                new CodexProbeResult(
+                    CodexReadiness.Limited,
+                    auth.Reason is "http-402" or "http-429" ? auth.Reason : "limited",
+                    auth.Detail,
+                    true),
             CodexAuthOutcome.ServerError =>
                 new CodexProbeResult(CodexReadiness.Unreachable, "server-error", auth.Detail, true),
-            // 读不到配置 / 网络失败:doctor 说可达,但授权没验成 —— 如实说,不给绿灯。
+            // doctor 通过,但 HTTP 探针没拿到结论:只陈述 doctor 证据,不给绿灯。
             _ => new CodexProbeResult(
-                CodexReadiness.Ok, "unverified", "已装好并可达,未验证授权(" + auth.Detail + ")", false),
+                CodexReadiness.Ok, "unverified", "Codex doctor 通过,HTTP 可用性未验证(" + auth.Detail + ")", false),
         };
     }
 
     /// <summary>只跑 codex doctor --json,不发任何模型请求。</summary>
     public async Task<CodexProbeResult> ProbeDoctorAsync(CancellationToken ct = default)
     {
+        if (_doctorProbe is not null)
+        {
+            return await _doctorProbe(ct).ConfigureAwait(false);
+        }
+
         // 起进程 codex doctor --json,捕获 stdout。
         // 必须异步读流:先 WaitForExit 再读会死锁(输出超过管道缓冲)。
         using var process = new Process();
@@ -141,6 +169,8 @@ public sealed class CodexProbe
             RedirectStandardError = true,
         };
         process.StartInfo.Environment[InternalRunEnvName] = "1";
+        process.StartInfo.Environment["CODEX_HOME"] = _codexHome;
+        _doctorStartObserver?.Invoke(process.StartInfo);
 
         try
         {
@@ -172,12 +202,12 @@ public sealed class CodexProbe
             await WaitForExitQuietlyAsync(process).ConfigureAwait(false);
             return new CodexProbeResult(CodexReadiness.Timeout, "timeout", "探测超时", false);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            // 调用方取消:杀进程树,归 Unknown(与契约对齐,不新增 cancelled 枚举)。
+            // 调用方取消:杀进程树后把取消继续传给 GUI/RPC 调用链。
             TryKillTree(process);
             await WaitForExitQuietlyAsync(process).ConfigureAwait(false);
-            return new CodexProbeResult(CodexReadiness.Unknown, "cancelled", "探测被取消", false);
+            throw;
         }
 
         string stdout = await stdoutTask.ConfigureAwait(false);
@@ -212,19 +242,28 @@ public sealed class CodexProbe
             }
 
             // 读关键 check 的 status。
-            if (TryGetCheckStatus(checks, "installation", out string? installStatus) && installStatus == "error")
+            if (TryGetCheckStatus(checks, "installation", out string? installStatus) && IsFailureStatus(installStatus))
             {
                 return new CodexProbeResult(CodexReadiness.NoCli, "install-error", "codex 安装异常", false);
             }
 
+            if (TryGetCheckFailure(checks, "config.load", out string? configFailure))
+            {
+                return new CodexProbeResult(
+                    CodexReadiness.Unknown,
+                    "config-error",
+                    DescribeConfigFailure(configFailure),
+                    false);
+            }
+
             // 这一条才是真的授权信号:doctor 判 error 时确实是凭据有问题。
             // (自定义 provider 不走 OpenAI 登录时,它会判 ok 并注明 "auth is not required"。)
-            if (TryGetCheckStatus(checks, "auth.credentials", out string? authStatus) && authStatus == "error")
+            if (TryGetCheckStatus(checks, "auth.credentials", out string? authStatus) && IsFailureStatus(authStatus))
             {
                 return new CodexProbeResult(CodexReadiness.Auth, "auth", "认证失败", false);
             }
 
-            if (TryGetCheckStatus(checks, "network.provider_reachability", out string? networkStatus) && networkStatus == "error")
+            if (TryGetCheckStatus(checks, "network.provider_reachability", out string? networkStatus) && IsFailureStatus(networkStatus))
             {
                 return new CodexProbeResult(CodexReadiness.Unreachable, "unreachable", "网络不可达", false);
             }
@@ -266,124 +305,29 @@ public sealed class CodexProbe
         }
     }
 
-    /// <summary>先 shallow;shallow 明确失败就直接返回,否则再发一次最小请求。</summary>
-    public async Task<CodexProbeResult> ProbeDeepAsync(CancellationToken ct = default)
+    /// <summary>先 doctor;明确失败就返回,否则执行一次完整 HTTP 鉴权+最小推理链路。</summary>
+    public Task<CodexProbeResult> ProbeDeepAsync(CancellationToken ct = default)
     {
-        // 先 shallow;Readiness != Ok 时直接返回它(不浪费一次真实请求)。
-        CodexProbeResult shallow = await ProbeShallowAsync(ct).ConfigureAwait(false);
-        if (shallow.Readiness != CodexReadiness.Ok)
-        {
-            return shallow;
-        }
-
-        // **必须给它一个一次性空目录当 cwd。**
-        // `codex exec` 起的是一个真 agent,不是一次纯 HTTP 调用 —— 不指定工作目录就继承
-        // 调用方的 cwd。探测是无人值守跑的(开窗、定时),让一个 agent 落在用户的仓库里
-        // 是没有理由承担的风险。空目录里它无事可做,只能回一句话然后退出。
-        string scratch = Path.Combine(Path.GetTempPath(), "airesume-codex-probe-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(scratch);
-
-        try
-        {
-            return await ProbeDeepCoreAsync(scratch, ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            try
-            {
-                Directory.Delete(scratch, recursive: true);
-            }
-            catch (Exception)
-            {
-                // 清不掉就留着:临时目录残留远好过在这里抛掉真正的探测结果。
-            }
-        }
+        CodexProviderCredentials provider = CodexAuthProbe.ReadActiveProviderCredentials(
+            _codexHome,
+            _environmentVariable);
+        return ProbeDeepAsync(provider, ct);
     }
 
-    private async Task<CodexProbeResult> ProbeDeepCoreAsync(string workingDirectory, CancellationToken ct)
+    public async Task<CodexProbeResult> ProbeDeepAsync(
+        CodexProviderCredentials provider,
+        CancellationToken ct = default)
     {
-        // 起 codex exec OK,超时同上。
-        using var process = new Process();
-        process.StartInfo = new ProcessStartInfo
+        string providerIdentity = CodexAuthProbe.CreateProviderIdentity(provider);
+        CodexProbeResult doctor = await ProbeDoctorAsync(ct).ConfigureAwait(false);
+        if (doctor.Readiness != CodexReadiness.Ok)
         {
-            FileName = _codexCommand,
-            // **--skip-git-repo-check 是必需的,不是可选优化。**
-            // 没有它,codex 在非受信目录直接 exit 1 并打印
-            // "Not inside a trusted directory and --skip-git-repo-check was not specified",
-            // 探测于是恒返回「codex 执行异常」——绿灯永远点不亮,而且看着像 Codex 坏了。
-            // 安装目录同样不是 git 仓库,所以这个参数在改用临时目录之前就已经是必需的。
-            Arguments = "exec --skip-git-repo-check OK",
-            WorkingDirectory = workingDirectory,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-        };
-        process.StartInfo.Environment[InternalRunEnvName] = "1";
-
-        try
-        {
-            if (!process.Start())
-            {
-                return new CodexProbeResult(CodexReadiness.NoCli, "no-cli", "未安装 codex 命令", true);
-            }
-        }
-        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or System.IO.FileNotFoundException)
-        {
-            return new CodexProbeResult(CodexReadiness.NoCli, "no-cli", "未安装 codex 命令", true);
+            return doctor with { ProviderIdentity = providerIdentity };
         }
 
-        // 异步读两个流,避免管道缓冲死锁。
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
-        var stderrTask = process.StandardError.ReadToEndAsync(ct);
-
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(TimeSpan.FromSeconds(_timeoutSeconds));
-        try
-        {
-            await process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            TryKillTree(process);
-            await WaitForExitQuietlyAsync(process).ConfigureAwait(false);
-            return new CodexProbeResult(CodexReadiness.Timeout, "timeout", "探测超时", true);
-        }
-        catch (OperationCanceledException)
-        {
-            TryKillTree(process);
-            await WaitForExitQuietlyAsync(process).ConfigureAwait(false);
-            return new CodexProbeResult(CodexReadiness.Unknown, "cancelled", "探测被取消", true);
-        }
-
-        string stdout = await stdoutTask.ConfigureAwait(false);
-        string stderr = await stderrTask.ConfigureAwait(false);
-        string combined = stdout + "\n" + stderr;
-        string low = combined.ToLowerInvariant();
-
-        // 退出码 0 → Ok。
-        if (process.ExitCode == 0)
-        {
-            return new CodexProbeResult(CodexReadiness.Ok, "ok", "已装好并可用", true);
-        }
-
-        // 输出分类(大小写不敏感)。
-        if (Regex.IsMatch(low, @"rate limit|quota|\b429\b|额度"))
-        {
-            return new CodexProbeResult(CodexReadiness.Limited, "limited", "额度受限", true);
-        }
-
-        if (Regex.IsMatch(low, @"\b401\b|unauthorized|invalid api key|authentication"))
-        {
-            return new CodexProbeResult(CodexReadiness.Auth, "auth", "认证失败", true);
-        }
-
-        // 否则 Unknown / exit-N。
-        return new CodexProbeResult(
-            CodexReadiness.Unknown,
-            "exit-" + process.ExitCode.ToString(CultureInfo.InvariantCulture),
-            "codex 执行异常",
-            true);
+        CodexAuthResult auth = await CodexAuthProbe
+            .ProbeAsync(provider, _authHandler, ct).ConfigureAwait(false);
+        return FromAuthResult(auth) with { ProviderIdentity = providerIdentity };
     }
 
     private static bool TryGetCheckStatus(JsonElement checks, string id, out string? status)
@@ -406,6 +350,76 @@ public sealed class CodexProbe
 
         status = statusEl.GetString();
         return status != null;
+    }
+
+    private static bool TryGetCheckFailure(JsonElement checks, string id, out string? failure)
+    {
+        failure = null;
+        if (!TryGetCheckStatus(checks, id, out string? status) ||
+            !IsFailureStatus(status))
+        {
+            return false;
+        }
+
+        if (checks.TryGetProperty(id, out JsonElement check) && check.ValueKind == JsonValueKind.Object)
+        {
+            if (check.TryGetProperty("summary", out JsonElement summary) && summary.ValueKind == JsonValueKind.String)
+            {
+                failure = summary.GetString();
+            }
+
+            if (check.TryGetProperty("notes", out JsonElement notes) && notes.ValueKind == JsonValueKind.Array)
+            {
+                foreach (JsonElement item in notes.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.String)
+                    {
+                        continue;
+                    }
+
+                    string? note = item.GetString();
+                    if (!string.IsNullOrWhiteSpace(note))
+                    {
+                        failure = note;
+                        break;
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsFailureStatus(string? status) =>
+        string.Equals(status, "error", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(status, "fail", StringComparison.OrdinalIgnoreCase);
+
+    private static string DescribeConfigFailure(string? failure)
+    {
+        if (string.IsNullOrWhiteSpace(failure))
+        {
+            return "Codex 配置无法加载";
+        }
+
+        if (Regex.IsMatch(failure, @"\bduplicate\s+(?:key|field)\b", RegexOptions.IgnoreCase) ||
+            failure.Contains("重复", StringComparison.Ordinal))
+        {
+            return "Codex 配置无法加载:存在重复键";
+        }
+
+        if (Regex.IsMatch(failure, @"\bparse|invalid\s+toml|toml.*(?:error|invalid)\b", RegexOptions.IgnoreCase) ||
+            failure.Contains("语法", StringComparison.Ordinal))
+        {
+            return "Codex 配置无法加载:TOML 语法错误";
+        }
+
+        if (Regex.IsMatch(failure, @"permission|access\s+denied|unauthorized", RegexOptions.IgnoreCase) ||
+            failure.Contains("权限", StringComparison.Ordinal))
+        {
+            return "Codex 配置无法加载:无读取权限";
+        }
+
+        return "Codex 配置无法加载:详情请运行 codex doctor --json";
     }
 
     private static bool TryGetCheckDetails(JsonElement checks, string id, out JsonElement details)

@@ -53,6 +53,17 @@ public sealed class InstallTargetSafetyTests
     }
 
     [Fact]
+    public void ValidateInstallTarget_RejectsExtendedPathAliasOfProtectedRoot()
+    {
+        string localAppData = Environment.GetFolderPath(
+            Environment.SpecialFolder.LocalApplicationData);
+        string extendedAlias = @"\\?\" + localAppData;
+
+        Assert.Throws<InvalidOperationException>(() =>
+            InstallCommand.ValidateInstallTarget(extendedAlias));
+    }
+
+    [Fact]
     public void ValidateUninstallTarget_RequiresExactOwnershipMarkerAndManifest()
     {
         string target = TestTemp.NewDir("uninstall-unowned");
@@ -122,6 +133,155 @@ public sealed class InstallTargetSafetyTests
         Assert.True(File.Exists(Path.Combine(target, "current.dll")));
         Assert.False(File.Exists(Path.Combine(target, "obsolete.dll")));
         Assert.True(File.Exists(Path.Combine(target, "personal.txt")));
+    }
+
+    [Fact]
+    public void PayloadManifest_OnlyExcludesRootOwnershipMarker()
+    {
+        string target = TestTemp.NewDir("install-nested-marker");
+        Directory.CreateDirectory(Path.Combine(target, "archive"));
+        File.WriteAllText(Path.Combine(target, ".ai-resume-install-root"), "root marker");
+        File.WriteAllText(Path.Combine(target, "archive", ".ai-resume-install-root"), "payload");
+
+        InstallCommand.WritePayloadManifest(target);
+
+        string[] manifest = File.ReadAllLines(Path.Combine(target, ".ai-resume-install-manifest"));
+        Assert.Contains(
+            Path.Combine("archive", ".ai-resume-install-root"),
+            manifest,
+            StringComparer.OrdinalIgnoreCase);
+        Assert.DoesNotContain(
+            ".ai-resume-install-root",
+            manifest,
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void PayloadHashes_AcceptExactCopyAndRejectChangedOrMissingFiles()
+    {
+        string stage = TestTemp.NewDir("install-hash-stage");
+        string target = TestTemp.NewDir("install-hash-target");
+        Directory.CreateDirectory(Path.Combine(stage, "nested"));
+        Directory.CreateDirectory(Path.Combine(target, "nested"));
+        File.WriteAllText(Path.Combine(stage, "root.dll"), "root-v1");
+        File.WriteAllText(Path.Combine(stage, "nested", "payload.dll"), "nested-v1");
+        File.Copy(Path.Combine(stage, "root.dll"), Path.Combine(target, "root.dll"));
+        File.Copy(
+            Path.Combine(stage, "nested", "payload.dll"),
+            Path.Combine(target, "nested", "payload.dll"));
+
+        IReadOnlyDictionary<string, string> hashes = InstallCommand.CapturePayloadHashes(stage);
+
+        InstallCommand.VerifyPayloadHashes(target, hashes);
+
+        File.WriteAllText(Path.Combine(target, "nested", "payload.dll"), "nested-v2");
+        InvalidDataException changed = Assert.Throws<InvalidDataException>(() =>
+            InstallCommand.VerifyPayloadHashes(target, hashes));
+        Assert.Contains("nested", changed.Message, StringComparison.OrdinalIgnoreCase);
+
+        File.Copy(
+            Path.Combine(stage, "nested", "payload.dll"),
+            Path.Combine(target, "nested", "payload.dll"),
+            overwrite: true);
+        File.Delete(Path.Combine(target, "root.dll"));
+        InvalidDataException missing = Assert.Throws<InvalidDataException>(() =>
+            InstallCommand.VerifyPayloadHashes(target, hashes));
+        Assert.Contains("root.dll", missing.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task InstallOperationLease_SerializesEquivalentTargetPaths()
+    {
+        string target = TestTemp.NewDir("install-operation-lock");
+        using var acquired = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        Task holder = Task.Run(() =>
+        {
+            using IDisposable lease = InstallCommand.AcquireOperationLease(
+                target, TimeSpan.FromSeconds(5));
+            acquired.Set();
+            release.Wait(TimeSpan.FromSeconds(5));
+        });
+
+        Assert.True(acquired.Wait(TimeSpan.FromSeconds(5)));
+        try
+        {
+            await Assert.ThrowsAsync<TimeoutException>(() => Task.Run(() =>
+            {
+                using IDisposable lease = InstallCommand.AcquireOperationLease(
+                    target + Path.DirectorySeparatorChar,
+                    TimeSpan.FromMilliseconds(100));
+            }));
+        }
+        finally
+        {
+            release.Set();
+            await holder;
+        }
+
+        using IDisposable reacquired = InstallCommand.AcquireOperationLease(
+            target, TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task UninstallHelperHandoff_KeepsInstallersBlockedUntilHelperFinishes()
+    {
+        string target = TestTemp.NewDir("install-operation-handoff");
+        var handoffReady = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var helperAcquired = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gateReleased = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var releaseOperation = new ManualResetEventSlim();
+        using var releaseGate = new ManualResetEventSlim();
+        using var releaseHelper = new ManualResetEventSlim();
+        Task handoffOwner = Task.Run(() =>
+        {
+            using InstallCommand.OperationHandoffLease handoff =
+                InstallCommand.AcquireOperationHandoffLease(target, TimeSpan.FromSeconds(5));
+            handoffReady.SetResult(true);
+            releaseOperation.Wait(TimeSpan.FromSeconds(5));
+            handoff.ReleaseOperation();
+            releaseGate.Wait(TimeSpan.FromSeconds(5));
+            handoff.ReleaseGate();
+            gateReleased.SetResult(true);
+        });
+
+        await handoffReady.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Task helper = Task.Run(() =>
+        {
+            using IDisposable lease = InstallCommand.AcquireTransferredOperationLease(
+                target, TimeSpan.FromSeconds(5));
+            helperAcquired.SetResult(true);
+            releaseHelper.Wait(TimeSpan.FromSeconds(5));
+        });
+
+        releaseOperation.Set();
+        await helperAcquired.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            await Assert.ThrowsAsync<TimeoutException>(() => Task.Run(() =>
+            {
+                using IDisposable lease = InstallCommand.AcquireOperationLease(
+                    target, TimeSpan.FromMilliseconds(100));
+            }));
+
+            releaseGate.Set();
+            await gateReleased.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Assert.ThrowsAsync<TimeoutException>(() => Task.Run(() =>
+            {
+                using IDisposable lease = InstallCommand.AcquireOperationLease(
+                    target, TimeSpan.FromMilliseconds(100));
+            }));
+        }
+        finally
+        {
+            releaseHelper.Set();
+            releaseOperation.Set();
+            releaseGate.Set();
+            await Task.WhenAll(helper, handoffOwner);
+        }
+
+        using IDisposable reacquired = InstallCommand.AcquireOperationLease(
+            target, TimeSpan.FromSeconds(1));
     }
 
     [Fact]

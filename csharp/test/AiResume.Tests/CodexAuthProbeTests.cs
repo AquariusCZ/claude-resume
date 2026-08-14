@@ -10,7 +10,7 @@ namespace AiResume.Tests;
 ///
 /// 这个探测存在的理由(2026-08-08 实测):
 /// - `codex exec` 能验证授权,但 10-12 秒、**23,220 tokens**;
-/// - 带凭据 GET /v1/models **1.3 秒、0 token**,且 200/401 完全由凭据决定
+/// - 带凭据 GET /models **1.3 秒、0 token**,且 200/401 完全由凭据决定
 ///   (同一请求带 key → 200 返回模型列表;去掉 key → 401 API_KEY_REQUIRED)。
 /// 于是"每次探测都是真的"才成立。
 /// </summary>
@@ -61,12 +61,29 @@ public sealed class CodexAuthProbeTests : IDisposable
         name = "OpenAI"
         base_url = "https://relay.example.invalid"
         wire_api = "responses"
-        requires_openai_auth = false
+        requires_openai_auth = true
 
         [model_providers.deepseek]
         name = "deepseek"
         base_url = "https://api.deepseek.example/"
         """;
+
+    [Fact]
+    public void CodexHome按显式参数再AiResume环境再Codex环境解析()
+    {
+        static string? Env(string name) => name switch
+        {
+            "AI_RESUME_CODEX_HOME" => @"C:\ai-resume-codex",
+            "CODEX_HOME" => @"C:\codex-home",
+            _ => null,
+        };
+
+        Assert.Equal(@"C:\explicit", CodexAuthProbe.ResolveCodexHome(@"C:\explicit", Env));
+        Assert.Equal(@"C:\ai-resume-codex", CodexAuthProbe.ResolveCodexHome(null, Env));
+        Assert.Equal(
+            @"C:\codex-home",
+            CodexAuthProbe.ResolveCodexHome(null, name => name == "CODEX_HOME" ? @"C:\codex-home" : null));
+    }
 
     [Fact]
     public void 读出活动provider的base_url与凭据()
@@ -90,10 +107,23 @@ public sealed class CodexAuthProbeTests : IDisposable
         Assert.Equal("https://x.example", CodexAuthProbe.ReadActiveProvider(home).BaseUrl);
     }
 
+    [Fact]
+    public void 尾注释与引号式provider表头同样认()
+    {
+        string home = NewCodexHome(
+            """
+            model_provider = "Sub2API" # active provider
+
+            [model_providers."Sub2API"]
+            base_url = "https://x.example/v1" # endpoint
+            """,
+            """{"OPENAI_API_KEY":"k"}""");
+
+        Assert.Equal("https://x.example/v1", CodexAuthProbe.ReadActiveProvider(home).BaseUrl);
+    }
+
     [Theory]
-    [InlineData(null, """{"OPENAI_API_KEY":"k"}""")]              // 没有 config.toml
     [InlineData("model_provider = \"OpenAI\"\n", null)]           // 没有 auth.json
-    [InlineData("model = \"x\"\n", """{"OPENAI_API_KEY":"k"}""")] // 没写 model_provider
     [InlineData("model_provider = \"Nope\"\n[model_providers.Other]\nbase_url = \"https://o\"\n",
                 """{"OPENAI_API_KEY":"k"}""")]                     // 指向不存在的段
     public void 读不全就返回null而不是猜(string? cfg, string? auth)
@@ -121,6 +151,7 @@ public sealed class CodexAuthProbeTests : IDisposable
     [InlineData(HttpStatusCode.NoContent, CodexAuthOutcome.Authorized)]
     [InlineData(HttpStatusCode.Unauthorized, CodexAuthOutcome.Rejected)]
     [InlineData(HttpStatusCode.Forbidden, CodexAuthOutcome.Rejected)]
+    [InlineData(HttpStatusCode.PaymentRequired, CodexAuthOutcome.Limited)]
     [InlineData(HttpStatusCode.TooManyRequests, CodexAuthOutcome.Limited)]
     [InlineData(HttpStatusCode.BadGateway, CodexAuthOutcome.ServerError)]
     [InlineData(HttpStatusCode.ServiceUnavailable, CodexAuthOutcome.ServerError)]
@@ -128,6 +159,58 @@ public sealed class CodexAuthProbeTests : IDisposable
     public void 状态码映射(HttpStatusCode status, CodexAuthOutcome expected)
     {
         Assert.Equal(expected, CodexAuthProbe.Classify(status).Outcome);
+    }
+
+    /// <summary>
+    /// 2026-08-13 用默认 UA 请求本机活动 provider 录到的真实 403 体,域名与 ray_id 换成合成值。
+    /// 换成探针的浏览器 UA 后同一把凭据立刻 200 —— 拦的是客户端,不是凭据。
+    /// </summary>
+    private const string CloudflareBlockBody = """
+        {"title":"Error 1010: Access denied","status":403,
+         "detail":"The site owner has blocked access based on your browser's signature.",
+         "error_code":1010,"error_name":"browser_signature_banned",
+         "error_category":"access_denied","zone":"relay.example.invalid",
+         "cloudflare_error":true,"retryable":false}
+        """;
+
+    [Fact]
+    public void CDN拦截的403判成未核实而不是凭据被拒()
+    {
+        CodexAuthResult models = CodexAuthProbe.Classify(
+            HttpStatusCode.Forbidden, usedCredential: true, body: CloudflareBlockBody);
+        CodexAuthResult inference = CodexAuthProbe.ClassifyInference(
+            HttpStatusCode.Forbidden, usedCredential: true, body: CloudflareBlockBody);
+
+        Assert.Equal(CodexAuthOutcome.NetworkFailed, models.Outcome);
+        Assert.Equal("cdn-blocked", models.Reason);
+        Assert.Equal(CodexAuthOutcome.NetworkFailed, inference.Outcome);
+        Assert.Equal("cdn-blocked", inference.Reason);
+    }
+
+    [Theory]
+    // 401 一律是凭据问题:Cloudflare 的 1xxx 只走 403,不能因为体里有关键字就放过 401。
+    [InlineData(HttpStatusCode.Unauthorized, """{"error_code":1010,"cloudflare_error":true}""")]
+    [InlineData(HttpStatusCode.Forbidden, """{"error":{"message":"invalid api key"}}""")]
+    [InlineData(HttpStatusCode.Forbidden, "")]
+    [InlineData(HttpStatusCode.Forbidden, "cloudflare 只有一个标记不足以判定")]
+    [InlineData(HttpStatusCode.Forbidden, """{"error_code":403,"message":"forbidden"}""")]
+    public void 非CDN拦截的拒绝仍判凭据被拒(HttpStatusCode status, string body)
+    {
+        Assert.Equal(
+            CodexAuthOutcome.Rejected,
+            CodexAuthProbe.Classify(status, usedCredential: true, body: body).Outcome);
+    }
+
+    [Fact]
+    public void 非JSON的CDN拦截页需要两个标记同时出现()
+    {
+        const string page =
+            "<html><body><h1>Error 1010</h1><p>Ray ID: abc</p>" +
+            "<div>Performance &amp; security by Cloudflare</div></body></html>";
+
+        Assert.Equal(
+            CodexAuthOutcome.NetworkFailed,
+            CodexAuthProbe.Classify(HttpStatusCode.Forbidden, body: page).Outcome);
     }
 
     [Fact]
@@ -139,11 +222,94 @@ public sealed class CodexAuthProbeTests : IDisposable
         CodexAuthResult r = await CodexAuthProbe.ProbeAsync(home, handler);
 
         Assert.Equal(CodexAuthOutcome.Authorized, r.Outcome);
-        Assert.Equal("https://relay.example.invalid/v1/models", handler.Uri);
+        Assert.Equal("https://relay.example.invalid/models", handler.Uri);
         Assert.Equal("Bearer sk-test", handler.Authorization);
         // Cloudflare 会按 UA 拦默认 HTTP 客户端(实测 403 error code: 1010),
         // 那会被读成"认证失败"——正是这个探测要避免的错。UA 必须带。
         Assert.Contains("Mozilla/5.0", handler.UserAgent);
+    }
+
+    [Fact]
+    public void 没有配置文件时按Codex默认内置OpenAi解析()
+    {
+        string home = NewCodexHome(null, """{"OPENAI_API_KEY":"k"}""");
+
+        CodexProviderCredentials provider = CodexAuthProbe.ReadActiveProviderCredentials(home);
+
+        Assert.True(provider.IsBuiltInOpenAi);
+        Assert.Equal("openai", provider.ProviderId);
+        Assert.Equal("https://api.openai.com/v1", provider.BaseUrl);
+    }
+
+    [Fact]
+    public async Task baseUrl已含v1时不重复拼接()
+    {
+        string home = NewCodexHome(
+            RealisticConfig.Replace("https://relay.example.invalid", "https://relay.example.invalid/v1"),
+            """{"OPENAI_API_KEY":"sk-test"}""");
+        var handler = new CapturingHandler(HttpStatusCode.OK, HttpStatusCode.OK);
+
+        CodexAuthResult r = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        Assert.Equal(CodexAuthOutcome.Authorized, r.Outcome);
+        Assert.Equal(
+            new[] { "https://relay.example.invalid/v1/models", "https://relay.example.invalid/v1/responses" },
+            handler.Uris);
+    }
+
+    [Fact]
+    public async Task ChatGPTBackend路径不插入v1()
+    {
+        string home = NewCodexHome(
+            RealisticConfig.Replace(
+                "https://relay.example.invalid",
+                "https://chatgpt.com/backend-api/codex"),
+            """{"auth_mode":"chatgpt","tokens":{"access_token":"chatgpt-access","account_id":"acct-1"}}""");
+        var handler = new CapturingHandler(HttpStatusCode.OK, HttpStatusCode.OK);
+
+        CodexAuthResult result = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        Assert.Equal(CodexAuthOutcome.Authorized, result.Outcome);
+        Assert.Equal(
+            new[]
+            {
+                "https://chatgpt.com/backend-api/codex/models",
+                "https://chatgpt.com/backend-api/codex/responses",
+            },
+            handler.Uris);
+    }
+
+    [Fact]
+    public async Task 内置OpenAi无需显式provider表即可按AuthMode解析端点()
+    {
+        string home = NewCodexHome(
+            "model = \"gpt-5.5\"\n",
+            """{"auth_mode":"chatgpt","tokens":{"access_token":"chatgpt-access","account_id":"acct-1"}}""");
+        var handler = new CapturingHandler(HttpStatusCode.OK, HttpStatusCode.OK);
+
+        CodexAuthResult result = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        Assert.Equal(CodexAuthOutcome.Authorized, result.Outcome);
+        Assert.Equal(
+            new[]
+            {
+                "https://chatgpt.com/backend-api/codex/models",
+                "https://chatgpt.com/backend-api/codex/responses",
+            },
+            handler.Uris);
+    }
+
+    [Fact]
+    public async Task baseUrl格式无效时返回未配置而不是抛到GUI()
+    {
+        string home = NewCodexHome(
+            "model_provider = \"X\"\n[model_providers.X]\nbase_url = \"not a url\"\n",
+            """{"OPENAI_API_KEY":"k"}""");
+
+        CodexAuthResult r = await CodexAuthProbe.ProbeAsync(home);
+
+        Assert.Equal(CodexAuthOutcome.NotConfigured, r.Outcome);
+        Assert.Contains("格式无效", r.Detail);
     }
 
     [Fact]
@@ -156,20 +322,296 @@ public sealed class CodexAuthProbeTests : IDisposable
 
         Assert.Equal(CodexAuthOutcome.Authorized, r.Outcome);
         Assert.Equal(
-            new[] { "https://relay.example.invalid/v1/models", "https://relay.example.invalid/v1/chat/completions" },
+            new[] { "https://relay.example.invalid/models", "https://relay.example.invalid/responses" },
             handler.Uris);
         Assert.Equal(new[] { "GET", "POST" }, handler.Methods);
         // 用**用户配置里那个模型**,而不是随便挑一个能跑的。
         Assert.Contains("gpt-5.6-sol", handler.Bodies[1]);
         // 每次探测都要真发,所以必须便宜到可以忽略:1 个 token。
-        Assert.Contains("\"max_tokens\":1", handler.Bodies[1]);
+        Assert.Contains("\"max_output_tokens\":1", handler.Bodies[1]);
+        Assert.Contains("\"input\":\"1\"", handler.Bodies[1]);
         Assert.Contains("推理", r.Detail);
+    }
+
+    [Fact]
+    public async Task Provider查询参数和自定义请求头复现到Models与Responses()
+    {
+        string home = NewCodexHome(
+            """
+            model_provider = "relay"
+            model = "gpt-test"
+
+            [model_providers.relay]
+            base_url = "https://relay.example.invalid/v1"
+            wire_api = "responses"
+            requires_openai_auth = true
+            query_params = { api-version = "2026-01-01" }
+            http_headers = { X-Static = "static", Authorization = "Bearer must-be-overridden" }
+            env_http_headers = { X-Env = "RELAY_HEADER", X-Static = "RELAY_OVERRIDE" }
+            """,
+            """{"auth_mode":"apikey","OPENAI_API_KEY":"sk-real-probe-key"}""");
+        var handler = new CapturingHandler(HttpStatusCode.OK, HttpStatusCode.OK);
+
+        CodexAuthResult result = await CodexAuthProbe.ProbeAsync(
+            home,
+            handler,
+            name => name switch
+            {
+                "RELAY_HEADER" => "from-environment",
+                "RELAY_OVERRIDE" => "environment-wins",
+                _ => null,
+            });
+
+        Assert.Equal(CodexAuthOutcome.Authorized, result.Outcome);
+        Assert.Equal(
+            new[]
+            {
+                "https://relay.example.invalid/v1/models?api-version=2026-01-01",
+                "https://relay.example.invalid/v1/responses?api-version=2026-01-01",
+            },
+            handler.Uris);
+        Assert.Equal("Bearer sk-real-probe-key", handler.Authorization);
+        Assert.Equal("environment-wins", handler.Header("X-Static"));
+        Assert.Equal("from-environment", handler.Header("X-Env"));
+    }
+
+    [Fact]
+    public void Provider查询参数的键和值分别按Uri规则编码()
+    {
+        var query = new Dictionary<string, string>
+        {
+            ["tenant key&"] = "a=b + 100% 中文",
+        };
+
+        string url = CodexAuthProbe.BuildApiUrl(
+            "https://relay.example.invalid/v1",
+            "models",
+            query);
+
+        Assert.Equal(
+            "https://relay.example.invalid/v1/models?tenant%20key%26=a%3Db%20%2B%20100%25%20%E4%B8%AD%E6%96%87",
+            url);
+    }
+
+    [Fact]
+    public async Task 无OpenAiAuth的Provider可用自定义Authorization且拒绝时不说匿名端点()
+    {
+        string home = NewCodexHome(
+            """
+            model_provider = "relay"
+            model = "gpt-test"
+
+            [model_providers.relay]
+            base_url = "https://relay.example.invalid"
+            requires_openai_auth = false
+            http_headers = { Authorization = "Bearer relay-header-token" }
+            """,
+            authJson: null);
+        var handler = new CapturingHandler(HttpStatusCode.Unauthorized);
+
+        CodexAuthResult result = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        Assert.Equal(CodexAuthOutcome.Rejected, result.Outcome);
+        Assert.True(result.UsedCredential);
+        Assert.Contains("凭据被拒", result.Detail, StringComparison.Ordinal);
+        Assert.Equal("Bearer relay-header-token", handler.Authorization);
+    }
+
+    [Fact]
+    public void envKey优先于authJson且不回退到错误凭据()
+    {
+        string home = NewCodexHome(
+            RealisticConfig.Replace(
+                "requires_openai_auth = true",
+                "requires_openai_auth = false\nenv_key = \"CORP_TOKEN\""),
+            """{"auth_mode":"apikey","OPENAI_API_KEY":"sk-auth-file"}""");
+
+        CodexProviderCredentials credentials = CodexAuthProbe.ReadActiveProviderCredentials(
+            home,
+            name => name == "CORP_TOKEN" ? "sk-from-env" : null);
+
+        Assert.Equal("sk-from-env", credentials.BearerToken);
+        Assert.Equal("env_key", credentials.CredentialSource);
+    }
+
+    [Fact]
+    public void experimentalBearer优先于authJson()
+    {
+        string home = NewCodexHome(
+            RealisticConfig.Replace(
+                "requires_openai_auth = true",
+                "requires_openai_auth = false\nexperimental_bearer_token = \"static-provider-token\""),
+            """{"auth_mode":"apikey","OPENAI_API_KEY":"sk-auth-file"}""");
+
+        CodexProviderCredentials credentials = CodexAuthProbe.ReadActiveProviderCredentials(home);
+
+        Assert.Equal("static-provider-token", credentials.BearerToken);
+        Assert.Equal("experimental_bearer_token", credentials.CredentialSource);
+    }
+
+    [Theory]
+    [InlineData("apikey", "sk-api", null, "sk-api", "auth.json:apikey")]
+    [InlineData("chatgpt", "sk-api", "chatgpt-access", "chatgpt-access", "auth.json:chatgpt")]
+    [InlineData(null, "sk-api", "chatgpt-access", "sk-api", "auth.json:apikey")]
+    [InlineData(null, null, "chatgpt-access", "chatgpt-access", "auth.json:chatgpt")]
+    public void authMode按Codex上游规则选择凭据(
+        string? authMode,
+        string? apiKey,
+        string? accessToken,
+        string expectedToken,
+        string expectedSource)
+    {
+        string authJson = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            auth_mode = authMode,
+            OPENAI_API_KEY = apiKey,
+            tokens = accessToken is null ? null : new { access_token = accessToken, account_id = "acct-1" },
+        });
+        string home = NewCodexHome(RealisticConfig, authJson);
+
+        CodexProviderCredentials credentials = CodexAuthProbe.ReadActiveProviderCredentials(home);
+
+        Assert.Equal(expectedToken, credentials.BearerToken);
+        Assert.Equal(expectedSource, credentials.CredentialSource);
+        Assert.Equal(expectedSource == "auth.json:chatgpt" ? "acct-1" : null, credentials.AccountId);
+    }
+
+    [Fact]
+    public async Task ChatGPT凭据携带账户头且不泄露到账户摘要()
+    {
+        string home = NewCodexHome(
+            RealisticConfig,
+            """{"auth_mode":"chatgpt","tokens":{"access_token":"chatgpt-access","account_id":"acct-123"}}""");
+        var handler = new CapturingHandler(HttpStatusCode.OK, HttpStatusCode.OK);
+
+        CodexAuthResult result = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        Assert.Equal(CodexAuthOutcome.Authorized, result.Outcome);
+        Assert.Equal("acct-123", handler.AccountId);
+        Assert.DoesNotContain("chatgpt-access", result.Detail, StringComparison.Ordinal);
+        Assert.DoesNotContain("acct-123", result.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task 未启用OpenAi认证的自定义Provider不读取AuthJson也不发送授权头()
+    {
+        string home = NewCodexHome(
+            RealisticConfig.Replace("requires_openai_auth = true", "requires_openai_auth = false"),
+            """{"auth_mode":"chatgpt","tokens":{"access_token":"must-not-leak","account_id":"acct-123"}}""");
+        var handler = new CapturingHandler(HttpStatusCode.OK, HttpStatusCode.OK);
+
+        CodexProviderCredentials credentials = CodexAuthProbe.ReadActiveProviderCredentials(home);
+        CodexAuthResult result = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        Assert.Null(credentials.BearerToken);
+        Assert.Equal("none", credentials.CredentialSource);
+        Assert.Equal(CodexAuthOutcome.Authorized, result.Outcome);
+        Assert.False(result.UsedCredential);
+        Assert.Null(handler.Authorization);
+        Assert.Null(handler.AccountId);
+        Assert.DoesNotContain("must-not-leak", string.Join("\n", handler.Bodies), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task 无认证Provider遇到401说明端点要求凭据而不是凭据被拒()
+    {
+        string home = NewCodexHome(
+            RealisticConfig.Replace("requires_openai_auth = true", "requires_openai_auth = false"),
+            """{"OPENAI_API_KEY":"must-not-leak"}""");
+        var handler = new CapturingHandler(HttpStatusCode.Unauthorized);
+
+        CodexAuthResult result = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        Assert.Equal(CodexAuthOutcome.Rejected, result.Outcome);
+        Assert.False(result.UsedCredential);
+        Assert.Contains("要求凭据", result.Detail, StringComparison.Ordinal);
+        Assert.Null(handler.Authorization);
+    }
+
+    [Theory]
+    [InlineData("auth", "provider 使用命令式 auth")]
+    [InlineData("aws", "AWS SigV4")]
+    public void 需要上游状态机的provider认证不自行执行(string kind, string expectedProblem)
+    {
+        string providerBlock = kind == "auth"
+            ? "[model_providers.OpenAI.auth]\ncommand = \"definitely-not-a-real-command\""
+            : "[model_providers.OpenAI.aws]\nprofile = \"default\"";
+        string home = NewCodexHome(
+            RealisticConfig + "\n" + providerBlock + "\n",
+            """{"auth_mode":"apikey","OPENAI_API_KEY":"sk-auth-file"}""");
+
+        CodexProviderCredentials credentials = CodexAuthProbe.ReadActiveProviderCredentials(home);
+
+        Assert.Null(credentials.BearerToken);
+        Assert.Contains(expectedProblem, credentials.Problem);
+    }
+
+    [Fact]
+    public void profile覆盖活动provider与模型()
+    {
+        string home = NewCodexHome(
+            """
+            profile = "work"
+            model_provider = "A"
+            model = "root-model"
+
+            [profiles.work]
+            model_provider = "B"
+            model = "profile-model"
+
+            [model_providers.A]
+            base_url = "https://a.example"
+
+            [model_providers.B]
+            base_url = "https://b.example"
+            wire_api = "responses"
+            """,
+            """{"OPENAI_API_KEY":"k"}""");
+
+        CodexProviderCredentials credentials = CodexAuthProbe.ReadActiveProviderCredentials(home);
+
+        Assert.Equal("https://b.example", credentials.BaseUrl);
+        Assert.Equal("profile-model", credentials.Model);
+    }
+
+    [Theory]
+    [InlineData("http://relay.example")]
+    [InlineData("https://user:pass@relay.example")]
+    [InlineData("https://relay.example?token=x")]
+    [InlineData("https://relay.example#fragment")]
+    [InlineData("file:///C:/temp")]
+    public async Task 不安全baseUrl失败关闭且不发请求(string baseUrl)
+    {
+        string home = NewCodexHome(
+            RealisticConfig.Replace("https://relay.example.invalid", baseUrl),
+            """{"OPENAI_API_KEY":"k"}""");
+        var handler = new CapturingHandler(HttpStatusCode.OK);
+
+        CodexAuthResult result = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        Assert.Equal(CodexAuthOutcome.NotConfigured, result.Outcome);
+        Assert.Empty(handler.Uris);
+    }
+
+    [Fact]
+    public async Task 非Responses协议只验models不猜请求形状()
+    {
+        string home = NewCodexHome(
+            RealisticConfig.Replace("wire_api = \"responses\"", "wire_api = \"legacy-chat\""),
+            """{"OPENAI_API_KEY":"k"}""");
+        var handler = new CapturingHandler(HttpStatusCode.OK);
+
+        CodexAuthResult result = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        Assert.Equal(CodexAuthOutcome.InferenceUnverified, result.Outcome);
+        Assert.Single(handler.Uris);
+        Assert.Contains("wire_api", result.Detail);
     }
 
     [Fact]
     public async Task 能列模型但不允许推理不得判成可用()
     {
-        // 审计 A6 的原始注入条件:/v1/models 返 200,推理路由返 403。
+        // 审计 A6 的原始注入条件:{base_url}/models 返 200,推理路由返 403。
         // 原来这种组合界面绿着写"凭据已验证",而任务一跑就失败。
         string home = NewCodexHome(RealisticConfig, """{"OPENAI_API_KEY":"sk-test"}""");
         var handler = new CapturingHandler(HttpStatusCode.OK, HttpStatusCode.Forbidden);
@@ -213,15 +655,136 @@ public sealed class CodexAuthProbeTests : IDisposable
     [InlineData(HttpStatusCode.OK, CodexAuthOutcome.Authorized)]
     [InlineData(HttpStatusCode.Unauthorized, CodexAuthOutcome.NoInference)]
     [InlineData(HttpStatusCode.Forbidden, CodexAuthOutcome.NoInference)]
+    [InlineData(HttpStatusCode.PaymentRequired, CodexAuthOutcome.Limited)]
     [InlineData(HttpStatusCode.TooManyRequests, CodexAuthOutcome.Limited)]
     [InlineData(HttpStatusCode.InternalServerError, CodexAuthOutcome.ServerError)]
     // 端点形状不支持 ≠ 没有推理权限。sub2api 各家路由不一,
-    // 把"这家不认识 chat/completions"标成红,是把好配置误判成坏的。
+    // 把"这家不认识 responses"标成红,是把好配置误判成坏的。
     [InlineData(HttpStatusCode.NotFound, CodexAuthOutcome.InferenceUnverified)]
     [InlineData(HttpStatusCode.BadRequest, CodexAuthOutcome.InferenceUnverified)]
     public void 推理状态码映射(HttpStatusCode status, CodexAuthOutcome expected)
     {
         Assert.Equal(expected, CodexAuthProbe.ClassifyInference(status).Outcome);
+    }
+
+    [Theory]
+    [InlineData("""{"id":"resp_1","object":"response","status":"completed","output":[]}""")]
+    [InlineData("""{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}""")]
+    [InlineData("""{"id":"resp_1","object":"response","output":[]}""")]
+    public void Responses有效终态才能作为推理成功证据(string body)
+    {
+        CodexAuthResult result = CodexAuthProbe.ClassifyInferenceResponse(HttpStatusCode.OK, body);
+
+        Assert.Equal(CodexAuthOutcome.Authorized, result.Outcome);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("<html>ok</html>")]
+    [InlineData("{ broken")]
+    [InlineData("{}")]
+    [InlineData("""{"status":"in_progress","output":[]}""")]
+    public void 空响应非Json和非终态不能因Http200点绿(string body)
+    {
+        CodexAuthResult result = CodexAuthProbe.ClassifyInferenceResponse(HttpStatusCode.OK, body);
+
+        Assert.NotEqual(CodexAuthOutcome.Authorized, result.Outcome);
+    }
+
+    [Theory]
+    // 非终态:请求被收下了,但还没跑完 —— 证明不了"这把 key 能干活"。
+    [InlineData("""{"id":"resp_1","object":"response","status":"queued","output":[]}""")]
+    [InlineData("""{"id":"resp_1","object":"response","status":"in_progress","output":[]}""")]
+    // 未知/非字符串 status:读不懂就不许点绿,更不许因为"看着像 envelope"而走兼容分支。
+    [InlineData("""{"id":"resp_1","object":"response","status":"weird_new_state","output":[]}""")]
+    [InlineData("""{"id":"resp_1","object":"response","status":null,"output":[]}""")]
+    [InlineData("""{"id":"resp_1","object":"response","status":7,"output":[]}""")]
+    // completed 但没有 output:没有产出就没有"跑得动"的证据。
+    [InlineData("""{"id":"resp_1","object":"response","status":"completed"}""")]
+    // incomplete 的原因不是长度截断,或截断了却没有 output —— 都不算成功。
+    [InlineData("""{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}""")]
+    [InlineData("""{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}""")]
+    // 既没有 object=response 也没有 id 的裸对象,不构成 envelope。
+    [InlineData("""{"object":"chat.completion","output":[]}""")]
+    [InlineData("""{"output":[]}""")]
+    public void 非终态与读不懂的终态一律不点绿(string body)
+    {
+        CodexAuthResult result = CodexAuthProbe.ClassifyInferenceResponse(HttpStatusCode.OK, body);
+
+        Assert.Equal(CodexAuthOutcome.InferenceUnverified, result.Outcome);
+    }
+
+    [Fact]
+    public void HTTP202只证明请求被收下不证明推理完成()
+    {
+        // 202 + 一份看着完整的 envelope 是最容易骗过判定的组合:
+        // 缺 status 的兼容分支必须锁死在 200,否则"已接受"会被读成"已完成"。
+        const string envelope = """{"id":"resp_1","object":"response","output":[]}""";
+
+        Assert.Equal(
+            CodexAuthOutcome.Authorized,
+            CodexAuthProbe.ClassifyInferenceResponse(HttpStatusCode.OK, envelope).Outcome);
+        Assert.Equal(
+            CodexAuthOutcome.InferenceUnverified,
+            CodexAuthProbe.ClassifyInferenceResponse(HttpStatusCode.Accepted, envelope).Outcome);
+    }
+
+    [Fact]
+    public void error为null不算错误也不因此点绿()
+    {
+        // null 是"没有错误",不是"有个错误对象"。误判成错误会把好 provider 标红。
+        CodexAuthResult completed = CodexAuthProbe.ClassifyInferenceResponse(
+            HttpStatusCode.OK,
+            """{"id":"resp_1","object":"response","status":"completed","error":null,"output":[]}""");
+        CodexAuthResult queued = CodexAuthProbe.ClassifyInferenceResponse(
+            HttpStatusCode.OK,
+            """{"id":"resp_1","object":"response","status":"queued","error":null,"output":[]}""");
+
+        Assert.Equal(CodexAuthOutcome.Authorized, completed.Outcome);
+        Assert.Equal(CodexAuthOutcome.InferenceUnverified, queued.Outcome);
+    }
+
+    [Fact]
+    public void output必须是数组而不是随便什么真值()
+    {
+        foreach (string body in new[]
+                 {
+                     """{"id":"resp_1","object":"response","status":"completed","output":"done"}""",
+                     """{"id":"resp_1","object":"response","status":"completed","output":{}}""",
+                     """{"id":"resp_1","object":"response","output":"done"}""",
+                 })
+        {
+            Assert.Equal(
+                CodexAuthOutcome.InferenceUnverified,
+                CodexAuthProbe.ClassifyInferenceResponse(HttpStatusCode.OK, body).Outcome);
+        }
+    }
+
+    [Theory]
+    [InlineData("""{"status":"failed","error":{"message":"backend failed"},"output":[]}""")]
+    [InlineData("""{"status":"cancelled","output":[]}""")]
+    [InlineData("""{"error":{"type":"rate_limit_error"}}""")]
+    public void Http200内的语义失败不能点绿(string body)
+    {
+        CodexAuthResult result = CodexAuthProbe.ClassifyInferenceResponse(HttpStatusCode.OK, body);
+
+        Assert.Equal(CodexAuthOutcome.NoInference, result.Outcome);
+    }
+
+    [Fact]
+    public async Task 深探针实际读取Responses响应体而不是只看Http状态码()
+    {
+        string home = NewCodexHome(RealisticConfig, """{"OPENAI_API_KEY":"sk-test"}""");
+        var handler = new SequenceHandler(
+            _ => new HttpResponseMessage(HttpStatusCode.OK),
+            _ => new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("""{"status":"failed","error":{"message":"hidden"},"output":[]}"""),
+            });
+
+        CodexAuthResult result = await CodexAuthProbe.ProbeAsync(home, handler);
+
+        Assert.Equal(CodexAuthOutcome.NoInference, result.Outcome);
     }
 
     [Fact]
@@ -284,7 +847,7 @@ public sealed class CodexAuthProbeTests : IDisposable
         private readonly HttpStatusCode? _second;
         private int _count;
 
-        /// <param name="first">/v1/models 的状态码。</param>
+        /// <param name="first">{base_url}/models 的状态码。</param>
         /// <param name="second">最小推理请求的状态码;null 表示与 first 相同。</param>
         public CapturingHandler(HttpStatusCode first, HttpStatusCode? second = null)
         {
@@ -304,6 +867,12 @@ public sealed class CodexAuthProbeTests : IDisposable
 
         public string? UserAgent { get; private set; }
 
+        public string? AccountId { get; private set; }
+
+        private Dictionary<string, string> LastHeaders { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public string? Header(string name) => LastHeaders.TryGetValue(name, out string? value) ? value : null;
+
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             Uris.Add(request.RequestUri?.ToString() ?? string.Empty);
@@ -315,9 +884,23 @@ public sealed class CodexAuthProbeTests : IDisposable
                 ? string.Join(",", a) : null;
             UserAgent = request.Headers.TryGetValues("User-Agent", out IEnumerable<string>? u)
                 ? string.Join(" ", u) : null;
+            AccountId = request.Headers.TryGetValues("ChatGPT-Account-ID", out IEnumerable<string>? account)
+                ? string.Join(",", account) : null;
+            LastHeaders.Clear();
+            foreach ((string name, IEnumerable<string> values) in request.Headers)
+            {
+                LastHeaders[name] = string.Join(",", values);
+            }
 
             HttpStatusCode status = _count++ == 0 ? _first : (_second ?? _first);
-            return Task.FromResult(new HttpResponseMessage(status));
+            var response = new HttpResponseMessage(status);
+            if (request.Method == HttpMethod.Post && response.IsSuccessStatusCode)
+            {
+                response.Content = new StringContent(
+                    """{"id":"resp_test","object":"response","status":"completed","output":[]}""");
+            }
+
+            return Task.FromResult(response);
         }
     }
 

@@ -1,7 +1,10 @@
 using AiResume.Worker.Notifications;
 using AiResume.Worker.Products;
 using AiResume.Ipc;
+using Microsoft.Win32.SafeHandles;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace AiResume.Worker.Migration;
@@ -30,13 +33,25 @@ public static class InstallCommand
     private const string PreservedRootMarkerName = ".ai-resume-preserved-root";
     private const string PreservedRootMarkerContent = "AI Resume v2 preserved root\n";
     private const string UninstallHelperPrefix = ".airesume-uninstall-";
+    private const int InstallLockTimeoutSeconds = 120;
+    private const int InstallHandoffTimeoutSeconds = 15;
+    private const uint FileReadAttributes = 0x0080;
+    private const uint FileShareRead = 0x00000001;
+    private const uint FileShareWrite = 0x00000002;
+    private const uint FileShareDelete = 0x00000004;
+    private const uint OpenExisting = 3;
+    private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint VolumeNameNt = 0x00000002;
 
     /// <summary>安装目标。与旧系统同层级,便于用户按同一心智找它。</summary>
     public static string DefaultTarget => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AI Resume");
 
     /// <summary>需要装进目标目录的项目(输出目录里的全部文件合并到同一层)。</summary>
-    private static readonly string[] Projects = ["AiResume.Gui", "AiResume.Worker", "AiResume.Hook"];
+    // Launcher 是开机自启的无窗口垫片(见 WorkerAutostart),必须随产物一起装进去,
+    // 否则自启会退化成直接拉起控制台程序、每次登录弹黑框。
+    private static readonly string[] Projects =
+        ["AiResume.Gui", "AiResume.Worker", "AiResume.Hook", "AiResume.Launcher"];
 
     public static int Run(string[] args)
     {
@@ -60,6 +75,7 @@ public static class InstallCommand
 
     private static int Install(string[] args, string target)
     {
+        using IDisposable operationLease = AcquireOperationLease(target);
         IReadOnlyList<string> sources = ResolveSources(ReadOption(args, "--from"));
         if (sources.Count == 0)
         {
@@ -96,13 +112,15 @@ public static class InstallCommand
             Directory.CreateDirectory(backup);
             obsoletePayload = FindObsoletePayload(fullTarget, stage);
             BackupPayload(stage, fullTarget, backup, obsoletePayload);
+            IReadOnlyDictionary<string, string> stagedHashes = CapturePayloadHashes(stage);
 
             // 源文件读取、staging 和旧版备份都完成后才停服务。
             // 这样磁盘/权限/构建产物错误不会先制造通知消费者停机。
             StopRunningIn(fullTarget);
             Directory.CreateDirectory(fullTarget);
             runtimeTouched = true;
-            CopyTree(stage, fullTarget, rejectReparse: true);
+            CopyTree(stage, fullTarget, rejectReparse: true, stagedHashes.Keys);
+            VerifyPayloadHashes(fullTarget, stagedHashes);
             DeleteObsoletePayload(fullTarget, obsoletePayload);
 
             Console.WriteLine($"已安装 {files} 个文件到 {fullTarget}");
@@ -188,6 +206,232 @@ public static class InstallCommand
         }
     }
 
+    /// <summary>按物理规范目标目录串行化完整安装/卸载事务。</summary>
+    public static IDisposable AcquireOperationLease(string target, TimeSpan? timeout = null)
+    {
+        OperationLockNames names = GetOperationLockNames(target);
+        TimeSpan wait = NormalizeOperationLockTimeout(timeout);
+        using MutexLease gate = AcquireMutex(
+            names.Gate,
+            wait,
+            "等待同一安装目录的事务门闩超时，未修改运行文件。");
+        return AcquireMutex(
+            names.Operation,
+            wait,
+            "等待同一安装目录的既有安装或卸载事务超时，未修改运行文件。");
+    }
+
+    /// <summary>父卸载进程持有门闩和事务锁，直到临时 Worker 已准备好接管。</summary>
+    public static OperationHandoffLease AcquireOperationHandoffLease(
+        string target,
+        TimeSpan? timeout = null)
+    {
+        OperationLockNames names = GetOperationLockNames(target);
+        TimeSpan wait = NormalizeOperationLockTimeout(timeout);
+        MutexLease gate = AcquireMutex(
+            names.Gate,
+            wait,
+            "等待同一安装目录的事务门闩超时，未启动卸载。");
+        try
+        {
+            MutexLease operation = AcquireMutex(
+                names.Operation,
+                wait,
+                "等待同一安装目录的既有安装或卸载事务超时，未启动卸载。");
+            return new OperationHandoffLease(gate, operation);
+        }
+        catch
+        {
+            gate.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>卸载 helper 在父进程仍持有门闩时直接接管事务锁。</summary>
+    public static IDisposable AcquireTransferredOperationLease(
+        string target,
+        TimeSpan? timeout = null)
+    {
+        OperationLockNames names = GetOperationLockNames(target);
+        return AcquireMutex(
+            names.Operation,
+            NormalizeOperationLockTimeout(timeout),
+            "等待父进程移交安装目录事务锁超时，未执行卸载。");
+    }
+
+    private static TimeSpan NormalizeOperationLockTimeout(TimeSpan? timeout)
+    {
+        TimeSpan result = timeout ?? TimeSpan.FromSeconds(InstallLockTimeoutSeconds);
+        if (result <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        }
+
+        return result;
+    }
+
+    private static MutexLease AcquireMutex(string name, TimeSpan timeout, string timeoutMessage)
+    {
+        var mutex = new Mutex(initiallyOwned: false, name);
+        bool acquired;
+        try
+        {
+            acquired = mutex.WaitOne(timeout);
+        }
+        catch (AbandonedMutexException)
+        {
+            acquired = true;
+        }
+
+        if (!acquired)
+        {
+            mutex.Dispose();
+            throw new TimeoutException(timeoutMessage);
+        }
+
+        return new MutexLease(mutex);
+    }
+
+    private static OperationLockNames GetOperationLockNames(string target)
+    {
+        string canonicalTarget = GetCanonicalOperationTarget(target);
+        string targetHash = Convert.ToHexString(
+            SHA256.HashData(Encoding.UTF8.GetBytes(canonicalTarget)));
+        return new OperationLockNames(
+            @"Global\AIResume.InstallGate." + targetHash,
+            @"Global\AIResume.Install." + targetHash);
+    }
+
+    private static string GetCanonicalOperationTarget(string target)
+    {
+        string full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(target));
+        string existing = full;
+        var missingSegments = new Stack<string>();
+        while (!Directory.Exists(existing))
+        {
+            string segment = Path.GetFileName(existing);
+            DirectoryInfo? parent = Directory.GetParent(existing);
+            if (segment.Length == 0 || parent is null)
+            {
+                throw new DirectoryNotFoundException($"无法确定安装锁的现有父目录:{full}");
+            }
+
+            missingSegments.Push(segment);
+            existing = parent.FullName;
+        }
+
+        string canonical = GetFinalDirectoryPath(existing).TrimEnd('\\');
+        while (missingSegments.TryPop(out string? segment))
+        {
+            canonical += "\\" + segment;
+        }
+
+        return canonical.ToUpperInvariant();
+    }
+
+    private static string GetFinalDirectoryPath(string path)
+    {
+        using SafeFileHandle handle = CreateFileW(
+            path,
+            FileReadAttributes,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            throw new IOException(
+                $"无法打开安装目录以建立唯一事务锁:{path}",
+                Marshal.GetExceptionForHR(Marshal.GetHRForLastWin32Error()));
+        }
+
+        var buffer = new StringBuilder(512);
+        uint length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, VolumeNameNt);
+        if (length >= buffer.Capacity)
+        {
+            buffer.EnsureCapacity(checked((int)length + 1));
+            length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, VolumeNameNt);
+        }
+
+        if (length == 0 || length >= buffer.Capacity)
+        {
+            throw new IOException(
+                $"无法规范化安装目录事务锁路径:{path}",
+                Marshal.GetExceptionForHR(Marshal.GetHRForLastWin32Error()));
+        }
+
+        return buffer.ToString();
+    }
+
+    public sealed class OperationHandoffLease : IDisposable
+    {
+        private MutexLease? _gate;
+        private MutexLease? _operation;
+
+        internal OperationHandoffLease(MutexLease gate, MutexLease operation)
+        {
+            _gate = gate;
+            _operation = operation;
+        }
+
+        public void ReleaseOperation() =>
+            Interlocked.Exchange(ref _operation, null)?.Dispose();
+
+        public void ReleaseGate() =>
+            Interlocked.Exchange(ref _gate, null)?.Dispose();
+
+        public void Dispose()
+        {
+            ReleaseOperation();
+            ReleaseGate();
+        }
+    }
+
+    internal sealed class MutexLease : IDisposable
+    {
+        private Mutex? _mutex;
+
+        public MutexLease(Mutex mutex) => _mutex = mutex;
+
+        public void Dispose()
+        {
+            Mutex? mutex = Interlocked.Exchange(ref _mutex, null);
+            if (mutex is null)
+            {
+                return;
+            }
+
+            try
+            {
+                mutex.ReleaseMutex();
+            }
+            finally
+            {
+                mutex.Dispose();
+            }
+        }
+    }
+
+    private sealed record OperationLockNames(string Gate, string Operation);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandleW(
+        SafeFileHandle file,
+        StringBuilder filePath,
+        uint filePathLength,
+        uint flags);
+
     /// <summary>
     /// 新运行时的提交屏障:Worker 未通过进程身份绑定的 Named Pipe 核验前,
     /// 不允许修改桌面/启动项快捷方式或任何用户级通知 Hook。
@@ -233,8 +477,9 @@ public static class InstallCommand
         var psi = new ProcessStartInfo(workerExe)
         {
             WorkingDirectory = workingDirectory,
-            UseShellExecute = false,
-            CreateNoWindow = true,
+            // install 常由 GUI、测试或 shell 通过重定向管道调用。直接 CreateProcess
+            // 会让常驻 Worker 继承这些句柄,调用方即使看到 install 退出也等不到 EOF。
+            UseShellExecute = true,
             WindowStyle = ProcessWindowStyle.Hidden,
         };
 
@@ -325,19 +570,22 @@ public static class InstallCommand
 
     private static int Uninstall(string target)
     {
-        target = ValidateUninstallTarget(target);
         string? currentExecutable = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName;
-        string installedWorker = Path.GetFullPath(Path.Combine(target, "AiResume.Worker.exe"));
+        string installedWorker = Path.GetFullPath(Path.Combine(Path.GetFullPath(target), "AiResume.Worker.exe"));
         if (currentExecutable is not null && string.Equals(
                 Path.GetFullPath(currentExecutable), installedWorker, StringComparison.OrdinalIgnoreCase))
         {
-            return LaunchUninstallHelperAndWait(target);
+            using OperationHandoffLease handoff = AcquireOperationHandoffLease(target);
+            target = ValidateUninstallTarget(target);
+            return LaunchUninstallHelperAndWait(target, handoff);
         }
 
+        using IDisposable operationLease = AcquireOperationLease(target);
+        target = ValidateUninstallTarget(target);
         return UninstallCore(target, protectedProcessId: null, deferPayloadDeletion: false);
     }
 
-    private static int LaunchUninstallHelperAndWait(string target)
+    private static int LaunchUninstallHelperAndWait(string target, OperationHandoffLease handoff)
     {
         string helperRoot = Path.Combine(
             Path.GetTempPath(), UninstallHelperPrefix + Guid.NewGuid().ToString("N"));
@@ -345,6 +593,12 @@ public static class InstallCommand
         StageUninstallHelper(target, helperRoot);
         string signalPath = Path.Combine(helperRoot, "uninstall-result.txt");
         string helperExe = Path.Combine(helperRoot, "AiResume.Worker.exe");
+        string handoffEventName = @"Global\AIResume.InstallHandoff." + Guid.NewGuid().ToString("N");
+        using var handoffAcquired = new EventWaitHandle(
+            initialState: false,
+            EventResetMode.ManualReset,
+            handoffEventName,
+            out _);
         var psi = new ProcessStartInfo(helperExe)
         {
             UseShellExecute = false,
@@ -358,6 +612,7 @@ public static class InstallCommand
             "--parent-pid", Environment.ProcessId.ToString(),
             "--signal", signalPath,
             "--helper-root", helperRoot,
+            "--operation-handoff", handoffEventName,
         })
         {
             psi.ArgumentList.Add(argument);
@@ -365,7 +620,37 @@ public static class InstallCommand
 
         using Process helper = Process.Start(psi)
             ?? throw new InvalidOperationException("无法启动临时卸载 Worker");
+        handoff.ReleaseOperation();
+        WaitForHelperOperationHandoff(helper, handoffAcquired, signalPath, helperRoot);
+        handoff.ReleaseGate();
         return WaitForUninstallHelperResult(helper, signalPath, helperRoot, TimeSpan.FromSeconds(60));
+    }
+
+    private static void WaitForHelperOperationHandoff(
+        Process helper,
+        EventWaitHandle handoffAcquired,
+        string signalPath,
+        string helperRoot)
+    {
+        DateTime deadline = DateTime.UtcNow.AddSeconds(InstallHandoffTimeoutSeconds);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (handoffAcquired.WaitOne(TimeSpan.FromMilliseconds(100)))
+            {
+                return;
+            }
+
+            if (helper.HasExited || File.Exists(signalPath))
+            {
+                throw new InvalidOperationException(
+                    $"临时卸载 Worker 未接管安装目录事务锁；恢复材料保留在 {helperRoot}");
+            }
+        }
+
+        StopUninstallHelperBeforeReturn(helper, helperRoot);
+        throw new TimeoutException(
+            $"临时卸载 Worker 未在 {InstallHandoffTimeoutSeconds} 秒内接管安装目录事务锁；" +
+            $"恢复材料保留在 {helperRoot}");
     }
 
     /// <summary>
@@ -470,9 +755,9 @@ public static class InstallCommand
         int result = 1;
         string detail = "临时卸载未完成";
         bool preserveHelperRoot = false;
+        IDisposable? operationLease = null;
         try
         {
-            target = ValidateUninstallTarget(target);
             if (!int.TryParse(ReadOption(args, "--parent-pid"), out int parsedParent) || parsedParent <= 0)
             {
                 throw new InvalidDataException("临时卸载缺少有效 parent pid");
@@ -482,11 +767,20 @@ public static class InstallCommand
                 ?? throw new InvalidDataException("临时卸载缺少结果路径");
             string requestedRoot = ReadOption(args, "--helper-root")
                 ?? throw new InvalidDataException("临时卸载缺少 helper root");
+            string handoffEventName = ReadOption(args, "--operation-handoff")
+                ?? throw new InvalidDataException("临时卸载缺少事务锁交接事件");
             if (!string.Equals(ValidateHelperRoot(requestedRoot), helperRoot, StringComparison.OrdinalIgnoreCase) ||
                 !string.Equals(Path.GetFullPath(requestedSignal), signalPath, StringComparison.OrdinalIgnoreCase))
             {
                 throw new InvalidDataException("临时卸载参数与实际 helper 路径不一致");
             }
+
+            using EventWaitHandle handoffAcquired = EventWaitHandle.OpenExisting(handoffEventName);
+            operationLease = AcquireTransferredOperationLease(
+                target,
+                TimeSpan.FromSeconds(InstallHandoffTimeoutSeconds));
+            handoffAcquired.Set();
+            target = ValidateUninstallTarget(target);
 
             result = UninstallCore(target, parsedParent, deferPayloadDeletion: true);
             if (result == 0)
@@ -521,6 +815,8 @@ public static class InstallCommand
                 Console.Error.WriteLine($"临时卸载结果写入失败:{ex.Message};恢复材料:{helperRoot}");
                 preserveHelperRoot = true;
             }
+
+            operationLease?.Dispose();
 
             if (!preserveHelperRoot)
             {
@@ -821,9 +1117,10 @@ public static class InstallCommand
     {
         Directory.CreateDirectory(target);
         string manifestPath = Path.Combine(target, PayloadManifestName);
+        string ownershipMarkerPath = Path.Combine(target, OwnershipMarkerName);
         string[] relativeFiles = Directory.EnumerateFiles(target, "*", SearchOption.AllDirectories)
             .Where(path => !string.Equals(path, manifestPath, StringComparison.OrdinalIgnoreCase) &&
-                           !string.Equals(Path.GetFileName(path), OwnershipMarkerName, StringComparison.Ordinal))
+                           !string.Equals(path, ownershipMarkerPath, StringComparison.OrdinalIgnoreCase))
             .Select(path => NormalizeRelativePath(Path.GetRelativePath(target, path)))
             .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -948,10 +1245,12 @@ public static class InstallCommand
             Environment.GetFolderPath(Environment.SpecialFolder.Windows),
             Environment.GetFolderPath(Environment.SpecialFolder.System),
         ];
+        string canonicalFull = GetCanonicalOperationTarget(full);
         if (protectedRoots
             .Where(p => !string.IsNullOrWhiteSpace(p))
-            .Select(p => Path.TrimEndingDirectorySeparator(Path.GetFullPath(p)))
-            .Any(p => string.Equals(full, p, StringComparison.OrdinalIgnoreCase)))
+            .Select(p => GetCanonicalOperationTarget(
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(p))))
+            .Any(p => string.Equals(canonicalFull, p, StringComparison.Ordinal)))
         {
             throw new InvalidOperationException($"拒绝把系统或用户根目录作为安装目标:{full}");
         }
@@ -1040,6 +1339,10 @@ public static class InstallCommand
         if (targets.Count == 0)
         {
             Console.WriteLine("没有需要启用的通知源(此前也没开过)。");
+        }
+        else if (done.Contains(NotificationProviderKind.Codex))
+        {
+            Console.WriteLine("Codex 通知配置已写入;若客户端此前已在运行,需重启 Codex 后加载。");
         }
 
         // 意图代表用户想要的目标,不是本轮偶然成功的子集。失败项必须保留,
@@ -1249,12 +1552,21 @@ public static class InstallCommand
         return resolved;
     }
 
-    private static int CopyTree(string sourceDir, string targetDir, bool rejectReparse = false)
+    private static int CopyTree(
+        string sourceDir,
+        string targetDir,
+        bool rejectReparse = false,
+        IEnumerable<string>? relativeFiles = null)
     {
         int count = 0;
-        foreach (string file in Directory.EnumerateFiles(sourceDir, "*", SearchOption.AllDirectories))
+        IEnumerable<(string File, string Relative)> files = relativeFiles is null
+            ? Directory.EnumerateFiles(sourceDir, "*", SearchOption.AllDirectories)
+                .Select(file => (file, NormalizeRelativePath(Path.GetRelativePath(sourceDir, file))))
+            : relativeFiles.Select(relative =>
+                (ResolvePayloadPath(sourceDir, relative), NormalizeRelativePath(relative)));
+
+        foreach ((string file, string rel) in files)
         {
-            string rel = Path.GetRelativePath(sourceDir, file);
             string dest = rejectReparse
                 ? ResolvePayloadPath(targetDir, rel)
                 : Path.Combine(targetDir, rel);
@@ -1269,6 +1581,42 @@ public static class InstallCommand
         }
 
         return count;
+    }
+
+    /// <summary>冻结 staging 的逐文件摘要,供停服务后的提交阶段核对精确字节。</summary>
+    public static IReadOnlyDictionary<string, string> CapturePayloadHashes(string root)
+    {
+        var hashes = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+        {
+            string relative = NormalizeRelativePath(Path.GetRelativePath(root, file));
+            using FileStream stream = new(file, FileMode.Open, FileAccess.Read, FileShare.Read);
+            hashes.Add(relative, Convert.ToHexString(SHA256.HashData(stream)));
+        }
+
+        return hashes;
+    }
+
+    /// <summary>确认目标中的每个提交文件仍与 staging 快照逐字节一致。</summary>
+    public static void VerifyPayloadHashes(
+        string root,
+        IReadOnlyDictionary<string, string> expectedHashes)
+    {
+        foreach ((string relative, string expectedHash) in expectedHashes)
+        {
+            string file = ResolvePayloadPath(root, relative);
+            if (!File.Exists(file))
+            {
+                throw new InvalidDataException($"安装提交缺少 payload 文件:{relative}");
+            }
+
+            using FileStream stream = new(file, FileMode.Open, FileAccess.Read, FileShare.Read);
+            string actualHash = Convert.ToHexString(SHA256.HashData(stream));
+            if (!actualHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException($"安装提交 payload 校验失败:{relative}");
+            }
+        }
     }
 
     private static void ValidateStagedRuntime(string stage)

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- **WinExe 是这个项目存在的全部理由。** 它只做一件事:用 CreateNoWindow 启动
+         续跑引擎。Worker 自己必须留在控制台程序形态(install / notify / feishu-check
+         都要 stdout),而控制台程序被 Explorer 从 Startup 的 .lnk 拉起时必然带一个
+         控制台窗口 —— .lnk 只有 Normal/Minimized/Maximized,没有 Hidden 档。 -->
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>AiResume.Launcher</RootNamespace>
+    <ApplicationIcon>..\AiResume.Worker\icon.ico</ApplicationIcon>
+  </PropertyGroup>
+</Project>
