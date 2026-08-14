@@ -72,15 +72,35 @@ $launcher = Join-Path $InstallDir 'AiResume.Launcher.exe'
 $icon     = Join-Path $InstallDir 'icon.ico'
 
 if ($Revert) {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    Write-Host "已删除计划任务:$TaskName"
-    # 撤销后必须把快捷方式加回来,否则开机就没有任何东西会拉起续跑引擎。
-    if (-not (Test-Path $launcher)) {
-        Write-Error "找不到 $launcher,无法恢复开机自启。请先运行 AiResume.Worker.exe install。"
+    # 顺序是有讲究的:**先确认能建回替代入口,再删任务**。
+    # 反过来的话,垫片缺失(install 对未构建的 Launcher 是静默跳过的,属合法状态)
+    # 会让脚本在删完任务之后才 exit 1 —— 任务没了、快捷方式没建,
+    # 登录后一个拉起续跑引擎的东西都没有,而且脚本自己不回滚。
+    $revertTarget = if (Test-Path $launcher) { $launcher } else { $worker }
+    if (-not (Test-Path $revertTarget)) {
+        Write-Error "找不到 $revertTarget,无法恢复开机自启;计划任务保持原样未改动。请先运行 AiResume.Worker.exe install。"
         exit 1
     }
-    New-StartupShortcut -Target $launcher -WorkDir $InstallDir -IconPath $icon
-    Write-Host "已恢复开机快捷方式(经启动器,仍然无窗口):$StartupLink"
+    if ($revertTarget -eq $worker) {
+        Write-Warning "找不到 $launcher,开机自启将直接启动控制台程序,登录时会短暂弹出控制台窗口。"
+    }
+
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+    # **删了不等于删掉了。** -ErrorAction SilentlyContinue 会把 ACL/策略/并发导致的
+    # 失败整个吞掉;不核验就建快捷方式,等于亲手制造"任务 + 快捷方式并存"的双启动。
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Write-Error "计划任务仍然存在,已放弃创建开机快捷方式(避免与任务并存造成双启动)。请手动删除 `"$TaskName`" 后重试。"
+        exit 2
+    }
+    Write-Host "已删除计划任务并核验不存在:$TaskName"
+
+    New-StartupShortcut -Target $revertTarget -WorkDir $InstallDir -IconPath $icon
+    if (-not (Test-Path $StartupLink)) {
+        Write-Error "开机快捷方式创建失败,当前既无计划任务也无快捷方式,开机不会启动续跑引擎:$StartupLink"
+        exit 3
+    }
+    Write-Host "已恢复开机快捷方式:$StartupLink"
     exit 0
 }
 

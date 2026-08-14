@@ -1217,7 +1217,10 @@ public sealed class ControlPlaneBridge
             return "配置已切换";
         }
 
-        if (codex.Readiness is CodexReadiness.Auth or CodexReadiness.NoCli or CodexReadiness.Limited)
+        // Unreachable 也在此列:可用性探测挂了的时候,这一行该说的是"服务端异常",
+        // 而不是把余额数字端出来 —— 那会让琥珀灯看起来像一切正常。
+        if (codex.Readiness is CodexReadiness.Auth or CodexReadiness.NoCli or CodexReadiness.Limited
+            or CodexReadiness.Unreachable)
         {
             return ShortLabel(codex.Reason, codex.Summary);
         }
@@ -1337,7 +1340,11 @@ public sealed class ControlPlaneBridge
                 return balance.Reason == "http-429" ? "wait" : "bad";
             }
 
-            if (balance.Readiness is ProviderReadiness.Auth or ProviderReadiness.Unreachable)
+            // 只有"凭据被这个路由拒了"是需要动手修的。**网络不可达/超时不是。**
+            // 原来把 Unreachable 也归红,会出现"本轮最小推理刚跑通、只因余额路由
+            // 一次 DNS 失败就红着说凭据坏了",而同模块的 IsTransient 明明把它当
+            // 瞬时失败 —— 两处语义必须一致。
+            if (balance.Readiness == ProviderReadiness.Auth)
             {
                 return "bad";
             }
@@ -1348,6 +1355,14 @@ public sealed class ControlPlaneBridge
             return "ok";
         }
 
+        // 可用性探测本身失败时,正余额只能证明"计费系统还认识这把 key",
+        // 证明不了"现在跑得动活儿" —— 最多琥珀,绝不点绿。
+        // 否则会出现绿灯配 detail「服务端异常(HTTP 502)」这种自我证伪的一行。
+        if (result.Readiness == CodexReadiness.Unreachable)
+        {
+            return balance is { Readiness: ProviderReadiness.Ok, Remaining: > 0 } ? "wait" : "bad";
+        }
+
         // 与 CC Switch 的 Sub2API usage_script 语义保持一致：余额请求成功、
         // 账户未显式失效且 remaining > 0，就是当前凭据可用的真实零 token 证据。
         if (balance is { Readiness: ProviderReadiness.Ok, Remaining: > 0 })
@@ -1355,16 +1370,14 @@ public sealed class ControlPlaneBridge
             return "ok";
         }
 
-        // 限流与 CDN 拦截是"这次没问出来",既不是故障也不是没验过 —— 归琥珀(在等)。
-        // 放在 deep 绿之后:本轮最小推理真成功了,余额路由被限流不该把它压成琥珀。
-        if (balance is not null && balance.Reason is "http-429" or "cdn-blocked")
+        // 限流、CDN 拦截、网络不可达与超时都是"这次没问出来",既不是故障也不是没验过
+        // —— 归琥珀(在等)。放在 deep 绿之后:本轮最小推理真成功了,余额路由这一次
+        // 没问出来不该把它压成琥珀。
+        if (balance is not null &&
+            (balance.Reason is "http-429" or "cdn-blocked" ||
+             balance.Readiness is ProviderReadiness.Unreachable or ProviderReadiness.Timeout))
         {
             return "wait";
-        }
-
-        if (result.Readiness == CodexReadiness.Unreachable)
-        {
-            return "bad";
         }
 
         return "idle";

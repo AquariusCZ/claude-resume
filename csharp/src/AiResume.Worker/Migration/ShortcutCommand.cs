@@ -92,10 +92,15 @@ public static class ShortcutCommand
                 Console.Error.WriteLine($"警告:找不到图标 {icon},快捷方式将使用默认图标。");
             }
 
+            // 计划任务是否**真的在管**自启:不光要文件在,还要没被禁用、且 action 指向
+            // 本次安装目录的 Worker。只看存在性会让"卸载重装 / 换 --target"之后
+            // 留下的失效任务永久压掉唯一的自启入口,而 install 照样返回 0。
+            bool managedByTask = WorkerAutostart.IsScheduledTaskManagingAutostart(workerExe);
+
             // 开机自启指向 WinExe 垫片(无窗口拉起 Worker);垫片缺席时直指 Worker,
             // 会弹控制台窗口 —— 但没有自启才是真故障,不能因此不装。
             WorkerAutostart.AutostartTarget autostart = WorkerAutostart.Resolve(workerExe);
-            if (!autostart.Hidden && !WorkerAutostart.IsScheduledTaskRegistered())
+            if (!autostart.Hidden && !managedByTask)
             {
                 Console.Error.WriteLine(
                     $"警告:找不到 {WorkerAutostart.LauncherFileName},开机自启将直接启动控制台程序 —— " +
@@ -118,7 +123,6 @@ public static class ShortcutCommand
                     "AI Resume 控制面:额度、续跑队列与完成通知"),
             };
             // 已升级成计划任务时不能再建快捷方式:两条链路都在,登录时会各拉起一个 Worker。
-            bool managedByTask = WorkerAutostart.IsScheduledTaskRegistered();
             if (!managedByTask)
             {
                 shortcuts.Add(new ShortcutSpec(
@@ -157,6 +161,10 @@ public static class ShortcutCommand
             Console.WriteLine($"已创建:{Path.Combine(DesktopDir, DesktopLinkName)}(覆盖旧入口)");
             if (managedByTask)
             {
+                // **只"不创建"不够。** 上一次安装留下的那个 .lnk 还在,它与计划任务并存,
+                // 登录时会各拉起一个 Worker —— 此前这里却打印"已避免双启动"。
+                WorkerAutostart.RemoveStartupShortcut(
+                    StartupDir, Console.WriteLine, Console.Error.WriteLine);
                 Console.WriteLine("开机自启已由计划任务接管,未创建开机快捷方式(避免双启动)。");
             }
             else

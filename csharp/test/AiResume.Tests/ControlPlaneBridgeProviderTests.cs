@@ -33,9 +33,38 @@ public sealed class ControlPlaneBridgeProviderTests : IDisposable
         Assert.Equal("bad", ControlPlaneBridge.CodexProviderState(
             new CodexProbeResult(CodexReadiness.Auth, "auth-rejected", "凭据被拒", true),
             new CodexBalanceResult(ProviderReadiness.Ok, "ok", "余额 8 USD", 8m, "USD")));
-        Assert.Equal("ok", ControlPlaneBridge.CodexProviderState(
+        // 可用性探测挂了时,正余额只能证明"计费系统还认识这把 key",证明不了
+        // "现在跑得动活儿"。此前这里给绿,结果是绿灯配 detail「服务端异常(HTTP 502)」
+        // —— 同一行里自己把自己证伪。改为琥珀:在等,不是可用,也不是需要动手修。
+        Assert.Equal("wait", ControlPlaneBridge.CodexProviderState(
             new CodexProbeResult(CodexReadiness.Unreachable, "server-error", "models 暂时不可达", false),
             new CodexBalanceResult(ProviderReadiness.Ok, "ok", "余额 8 USD", 8m, "USD")));
+        // 没有余额证据时仍然是红:那是真的什么都问不出来。
+        Assert.Equal("bad", ControlPlaneBridge.CodexProviderState(
+            new CodexProbeResult(CodexReadiness.Unreachable, "server-error", "models 暂时不可达", false)));
+    }
+
+    [Fact]
+    public void 余额路由网络失败不得压过本轮deep成功()
+    {
+        var deepOk = new CodexProbeResult(CodexReadiness.Ok, "authorized", "可用 · 凭据与推理已验证", true);
+        var shallow = new CodexProbeResult(CodexReadiness.Ok, "inference-unverified", "未验推理", false);
+        var unreachable = new CodexBalanceResult(
+            ProviderReadiness.Unreachable, "unreachable", "余额接口网络不可达", null, null);
+        var timedOut = new CodexBalanceResult(
+            ProviderReadiness.Timeout, "timeout", "余额探测超时", null, null);
+
+        // 本轮最小推理刚用同一把凭据跑通,却因为余额路由一次 DNS 失败就红着说凭据坏了
+        // —— 而同模块的 IsTransient 明明把它当瞬时失败。两处语义必须一致。
+        Assert.Equal("ok", ControlPlaneBridge.CodexProviderState(deepOk, unreachable));
+        Assert.Equal("ok", ControlPlaneBridge.CodexProviderState(deepOk, timedOut));
+        Assert.Equal("wait", ControlPlaneBridge.CodexProviderState(shallow, unreachable));
+        Assert.Equal("wait", ControlPlaneBridge.CodexProviderState(shallow, timedOut));
+
+        // 凭据被这个路由拒了仍然是红:那是真的需要动手。
+        Assert.Equal("bad", ControlPlaneBridge.CodexProviderState(
+            deepOk,
+            new CodexBalanceResult(ProviderReadiness.Auth, "http-401", "余额接口拒绝凭据", null, null)));
     }
 
     [Fact]

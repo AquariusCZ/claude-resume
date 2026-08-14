@@ -1803,9 +1803,72 @@ public static class InstallCommand
         return false;
     }
 
+    /// <summary>
+    /// 等到文件不再被别的进程独占为止。超时不抛异常 —— 让后续复制阶段以真实的
+    /// 文件锁错误失败,那里有完整的备份与回滚,比在这里提前中断更安全。
+    /// </summary>
+    internal static bool WaitForFileUnlocked(
+        string path,
+        TimeSpan timeout,
+        Func<string, bool>? isUnlocked = null,
+        Action<int>? sleep = null)
+    {
+        isUnlocked ??= DefaultIsUnlocked;
+        sleep ??= Thread.Sleep;
+
+        int attempts = Math.Max(1, (int)(timeout.TotalMilliseconds / 250));
+        for (int i = 0; i < attempts; i++)
+        {
+            if (isUnlocked(path))
+            {
+                return true;
+            }
+
+            sleep(250);
+        }
+
+        return isUnlocked(path);
+    }
+
+    private static bool DefaultIsUnlocked(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return true;
+        }
+
+        try
+        {
+            using FileStream stream = File.Open(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // 权限问题不是"还锁着",继续等也没用。
+            return true;
+        }
+    }
+
     /// <summary>只终止**从目标目录运行**的实例;用户在仓库里跑的开发实例不受影响。</summary>
     private static void StopRunningIn(string target, int? protectedProcessId = null)
     {
+        // 先结束计划任务的运行实例。它用 S4U 跑在会话 0,而 install 是会话 1 的非提权
+        // 进程,读不到那个进程的 MainModule —— 下面"只杀本目录进程"的保守判据会直接
+        // 跳过它,于是 DLL 一直锁着,安装失败并进入不完整回滚(2026-08-14 实测)。
+        string taskWorker = Path.Combine(Path.GetFullPath(target), "AiResume.Worker.exe");
+        if (WorkerAutostart.IsScheduledTaskManagingAutostart(taskWorker) &&
+            WorkerAutostart.StopScheduledTaskInstance(log: Console.WriteLine))
+        {
+            // **/End 是异步的。** 它只是给任务发停止信号,进程还要一会儿才退。
+            // 不等就继续复制,文件仍然锁着 —— 表现和完全没停一模一样(实测)。
+            // 直接以"能不能独占打开 Worker.exe"为判据:这正是复制阶段需要的那个条件。
+            WaitForFileUnlocked(taskWorker, TimeSpan.FromSeconds(20));
+        }
+
         string normalized = Path.GetFullPath(target).TrimEnd('\\');
         foreach (string name in new[] { "AiResume.Gui", "AiResume.Worker" })
         {
