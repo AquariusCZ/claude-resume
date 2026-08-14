@@ -28,7 +28,15 @@ public static class Program
         string? ExplicitEventId,
         string? Timestamp,
         string? LastAssistantMessage,
-        bool Smoke);
+        bool Smoke,
+        string Kind = CompletionKind,
+        string? NotificationType = null);
+
+    /// <summary>任务跑完。原有行为,文案是「✅ 已完成」。</summary>
+    public const string CompletionKind = "completion";
+
+    /// <summary>AI 停下来等人:需要输入或弹出了确认框。卡住的这一刻才是要把人拉回来的时刻。</summary>
+    public const string DecisionKind = "decision";
 
     /// <summary>内部任务、递归 Stop、空负载或非法 JSON 一律不入队。</summary>
     public static bool ShouldSuppress(string? payloadJson, IDictionary<string, string?> env)
@@ -79,6 +87,25 @@ public static class Program
         return IsJsonObject(stdinJson) ? stdinJson : null;
     }
 
+    /// <summary>
+    /// 从 <c>--kind=decision</c> 取事件种类。**由命令行而不是 payload 决定** ——
+    /// settings.json 里每个 matcher 分组配一条自己的命令,种类因此在配置期就确定了,
+    /// 不用赌上游 payload 里那个字段叫什么名字。认不出来一律按完成处理。
+    /// </summary>
+    public static string ReadKind(IReadOnlyList<string> args)
+    {
+        foreach (string arg in args)
+        {
+            if (arg.StartsWith("--kind=", StringComparison.Ordinal) &&
+                string.Equals(arg["--kind=".Length..], DecisionKind, StringComparison.Ordinal))
+            {
+                return DecisionKind;
+            }
+        }
+
+        return CompletionKind;
+    }
+
     /// <summary>保留既有测试/调用方使用的稳定 ID 入口。</summary>
     public static string ComputeEventId(string source, string? sessionId, string? cwd, string? transcriptPath)
         => ComputeEventId(source, sessionId, null, null, cwd, transcriptPath, null, null, null);
@@ -99,7 +126,8 @@ public static class Program
         string? payloadJson,
         IDictionary<string, string?> env,
         out string eventId,
-        out string reason)
+        out string reason,
+        string kind = CompletionKind)
     {
         eventId = string.Empty;
         reason = "suppressed";
@@ -111,7 +139,8 @@ public static class Program
         }
 
         using JsonDocument doc = JsonDocument.Parse(payloadJson!);
-        if (!TryNormalize(normalizedSource, doc.RootElement, env, out NormalizedEvent? item, out reason) || item is null)
+        if (!TryNormalize(normalizedSource, doc.RootElement, env, kind, out NormalizedEvent? item, out reason) ||
+            item is null)
         {
             return false;
         }
@@ -124,7 +153,8 @@ public static class Program
 
         eventId = ComputeEventId(
             item.Source, item.SessionId, item.TurnId, item.TaskId, item.Cwd,
-            item.TranscriptPath, item.ExplicitEventId, item.Timestamp, item.LastAssistantMessage);
+            item.TranscriptPath, item.ExplicitEventId, item.Timestamp, item.LastAssistantMessage,
+            item.Kind);
         string targetPath = Path.Combine(eventsDirectory, eventId + ".json");
         if (File.Exists(targetPath))
         {
@@ -143,6 +173,8 @@ public static class Program
             ["cwd"] = item.Cwd,
             ["transcriptPath"] = item.TranscriptPath,
             ["smoke"] = item.Smoke,
+            ["kind"] = item.Kind,
+            ["notificationType"] = item.NotificationType,
             ["atUtc"] = DateTimeOffset.UtcNow.ToString("o", CultureInfo.InvariantCulture),
         };
 
@@ -198,6 +230,7 @@ public static class Program
         {
             string source = NormalizeSource(args.Length > 0 ? args[0] : string.Empty);
             string[] sourceArgs = args.Skip(1).ToArray();
+            string kind = ReadKind(sourceArgs);
             // Codex 官方把 JSON 作为最后一个 argv。若先无条件 ReadToEnd(stdin),
             // 宿主继承了未关闭的控制台输入时会永久等待 EOF,完成通知进程也就不退出。
             // 只有 argv 没有可用 JSON 时才做兼容性 stdin 回退。
@@ -209,7 +242,7 @@ public static class Program
             Dictionary<string, string?> env = SnapshotEnvironment();
 
             string eventsDirectory = Path.Combine(AiResume.Worker.ShadowPaths.Root, "completion-events");
-            TryWriteEvent(eventsDirectory, source, payload, env, out _, out _);
+            TryWriteEvent(eventsDirectory, source, payload, env, out _, out _, kind);
 
             if (string.Equals(source, "codex", StringComparison.Ordinal))
             {
@@ -313,6 +346,7 @@ public static class Program
         string source,
         JsonElement root,
         IDictionary<string, string?> env,
+        string kind,
         out NormalizedEvent? item,
         out string reason)
     {
@@ -330,6 +364,17 @@ public static class Program
             if (!string.Equals(eventName, "agent-turn-complete", StringComparison.Ordinal))
             {
                 reason = "codex_event_not_complete";
+                return false;
+            }
+        }
+        else if (source == "claudecode" && kind == DecisionKind)
+        {
+            // 决策类只认 Notification。种类由 settings.json 的 matcher 选定并经命令行传入,
+            // 所以这里不依赖 payload 里是否真有 notification_type —— 那个字段官方文档
+            // 只给了"与其它事件一致"的推断,没有逐字写明,不能拿它当准入条件。
+            if (!string.Equals(eventName, "Notification", StringComparison.Ordinal))
+            {
+                reason = "notification_event_mismatch";
                 return false;
             }
         }
@@ -409,7 +454,9 @@ public static class Program
             GetFirstString(root, "event_id", "eventId"),
             GetFirstString(root, "timestamp", "created_at", "createdAt"),
             GetFirstString(root, "last_assistant_message", "lastAssistantMessage"),
-            smoke);
+            smoke,
+            kind,
+            GetFirstString(root, "notification_type", "notificationType"));
         reason = "normalized";
         return true;
     }
@@ -709,7 +756,8 @@ public static class Program
         string? transcriptPath,
         string? explicitEventId,
         string? timestamp,
-        string? lastAssistantMessage)
+        string? lastAssistantMessage,
+        string kind = CompletionKind)
     {
         string transcriptTime = string.Empty;
         if (!string.IsNullOrWhiteSpace(transcriptPath) && File.Exists(transcriptPath))
@@ -724,7 +772,7 @@ public static class Program
         }
 
         string raw = string.Join("|", source, sessionId, turnId, taskId, cwd, transcriptTime,
-            explicitEventId, timestamp, lastAssistantMessage);
+            explicitEventId, timestamp, lastAssistantMessage, kind);
         byte[] hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(raw));
         return Convert.ToHexString(hashBytes.AsSpan(0, 8)).ToLowerInvariant();
     }

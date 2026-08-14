@@ -138,6 +138,8 @@ public sealed class CompletionNotifier
             string? source;
             DateTimeOffset? atUtc;
             bool smoke;
+            string? kind;
+            string? notificationType;
             try
             {
                 using var doc = JsonDocument.Parse(text);
@@ -153,6 +155,8 @@ public sealed class CompletionNotifier
                 atUtc = ParseUtc(atStr);
                 smoke = root.TryGetProperty("smoke", out JsonElement smokeElement) &&
                         smokeElement.ValueKind == JsonValueKind.True;
+                kind = ReadOptionalString(root, "kind");
+                notificationType = ReadOptionalString(root, "notificationType");
             }
             catch (Exception ex) when (ex is JsonException or InvalidDataException)
             {
@@ -207,7 +211,7 @@ public sealed class CompletionNotifier
             }
 
             // 5. 投递。(变量名不能再叫 text —— 上面读文件时已占用。)
-            string message = BuildText(cwd, source, atUtc, nowUtc, smoke);
+            string message = BuildText(cwd, source, atUtc, nowUtc, smoke, kind, notificationType);
             try
             {
                 bool ok = await _send(receiverOpenId, message, eventId, ct);
@@ -276,13 +280,21 @@ public sealed class CompletionNotifier
         return value.GetString();
     }
 
-    /// <summary>构造通知文本:✅ &lt;项目名&gt; 已完成 / &lt;source&gt; · &lt;本地时间 HH:mm&gt;。</summary>
+    /// <summary>
+    /// 构造通知文本:✅ &lt;项目名&gt; 已完成 / &lt;source&gt; · &lt;本地时间 HH:mm&gt;。
+    ///
+    /// 决策类换成 ⏳ 打头并写明**在等什么**:完成通知说的是"结束了",
+    /// 而决策通知说的是"停在这儿等你" —— 两者的紧迫程度完全不同,
+    /// 用同一个 ✅ 会让人以为可以晚点再看。
+    /// </summary>
     private static string BuildText(
         string cwd,
         string? source,
         DateTimeOffset? atUtc,
         DateTimeOffset nowUtc,
-        bool smoke)
+        bool smoke,
+        string? kind = null,
+        string? notificationType = null)
     {
         string projectName = Path.GetFileName(cwd.TrimEnd('\\', '/'));
         if (string.IsNullOrEmpty(projectName))
@@ -293,9 +305,27 @@ public sealed class CompletionNotifier
         DateTimeOffset localTime = atUtc?.ToLocalTime() ?? nowUtc.ToLocalTime();
         string sourceText = SourceDisplayName(source);
 
-        string heading = smoke ? $"🧪 {projectName} 通知冒烟通过" : $"✅ {projectName} 已完成";
+        string heading = smoke
+            ? $"🧪 {projectName} 通知冒烟通过"
+            : string.Equals(kind, "decision", StringComparison.Ordinal)
+                ? $"⏳ {projectName} {DecisionLabel(notificationType)}"
+                : $"✅ {projectName} 已完成";
         return $"{heading}\n{sourceText} · {localTime:HH:mm}";
     }
+
+    /// <summary>
+    /// 事件类型 → 一句人话。上游的 notification_type 只在 payload 里出现时才有值;
+    /// 认不出来就说「等你决定」,绝不编一个更具体的说法。
+    /// </summary>
+    private static string DecisionLabel(string? notificationType)
+        => notificationType?.Trim().ToLowerInvariant() switch
+        {
+            "agent_needs_input" => "等你输入",
+            "elicitation_dialog" or "elicitation_url_dialog" => "等你确认",
+            "permission_prompt" => "等你授权",
+            "idle_prompt" => "在等你回来",
+            _ => "等你决定",
+        };
 
     private static string SourceDisplayName(string? source)
         => source?.Trim().ToLowerInvariant() switch

@@ -112,7 +112,7 @@ public sealed class GuiMotionContractTests
         }
 
         // 常驻 will-change 只允许留在"一直在动"的元素上;偶发过渡挂着它等于永久多一个合成层。
-        Assert.Equal(1, System.Text.RegularExpressions.Regex.Matches(html, "will-change").Count);
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(html, "will-change"));
         Assert.Contains("animation:quota-unknown 2.4s linear infinite;will-change:transform", html,
             StringComparison.Ordinal);
         Assert.DoesNotContain(".bank .k.on{background:var(--sunk);color:var(--ink);transform", html,
