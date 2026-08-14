@@ -751,12 +751,23 @@ public static partial class CodexAuthProbe
                 return true;
             }
 
+            if (root.TryGetProperty("error_name", out JsonElement name) &&
+                name.ValueKind == JsonValueKind.String &&
+                string.Equals(name.GetString(), "browser_signature_banned", StringComparison.Ordinal))
+            {
+                blocked = true;
+                return true;
+            }
+
             // Cloudflare 的 1xxx 全族都是"边缘把客户端挡了"(1010 UA 封禁、1015 限速、
-            // 1020 防火墙规则),没有一个是在说这把凭据不对。
+            // 1020 防火墙规则)。但**光凭这个区间不够**:第三方 relay 完全可能用
+            // error_code:1003 表达"这把 key 无效",单看数字会把真正的凭据被拒读成
+            // CDN 拦截,红色就此消失。必须同时有 Cloudflare 自己的标记。
             if (root.TryGetProperty("error_code", out JsonElement code) &&
                 code.ValueKind == JsonValueKind.Number &&
                 code.TryGetInt32(out int value) &&
-                value is >= 1000 and <= 1999)
+                value is >= 1000 and <= 1999 &&
+                body.Contains("cloudflare", StringComparison.OrdinalIgnoreCase))
             {
                 blocked = true;
                 return true;
@@ -1063,7 +1074,7 @@ public static partial class CodexAuthProbe
             // 只有 403 才值得读一眼 body:要把 CDN 边缘拦截和"凭据被拒"分开。
             // 其余状态维持原来的只读响应头,不把模型列表拉进内存。
             string? blockBody = response.StatusCode == HttpStatusCode.Forbidden
-                ? await ReadLimitedBodyAsync(response.Content, MaxBlockBodyBytes, ct).ConfigureAwait(false)
+                ? await ReadPrefixAsync(response.Content, MaxBlockBodyBytes, ct).ConfigureAwait(false)
                 : null;
             CodexAuthResult models = Classify(response.StatusCode, usedCredential, blockBody);
 
@@ -1161,7 +1172,7 @@ public static partial class CodexAuthProbe
             if (!response.IsSuccessStatusCode)
             {
                 string? blockBody = response.StatusCode == HttpStatusCode.Forbidden
-                    ? await ReadLimitedBodyAsync(response.Content, MaxBlockBodyBytes, requestToken)
+                    ? await ReadPrefixAsync(response.Content, MaxBlockBodyBytes, requestToken)
                         .ConfigureAwait(false)
                     : null;
                 return ClassifyInference(response.StatusCode, usedCredential, blockBody);
@@ -1292,6 +1303,38 @@ public static partial class CodexAuthProbe
             CodexAuthOutcome.InferenceUnverified,
             usedCredential ? "凭据已验证 · " + detail : "端点可访问 · " + detail,
             UsedCredential: usedCredential);
+
+    /// <summary>
+    /// 读响应体的**前缀**,超限就截断而不是整体丢弃。
+    ///
+    /// 专供 CDN 拦截判定使用:Cloudflare 带内联挑战脚本的拦截页动辄几十 KB,
+    /// 用 <see cref="ReadLimitedBodyAsync"/> 会因超限返回 null,
+    /// <see cref="LooksLikeCdnBlock"/> 拿到 null 恒为 false,于是判回"凭据被拒" ——
+    /// 正好是这套识别本来要避免的那个错误结论。判定只看开头的几个标记,前缀足够。
+    /// </summary>
+    internal static async Task<string> ReadPrefixAsync(
+        HttpContent content,
+        int maxBytes,
+        CancellationToken ct)
+    {
+        await using Stream stream = await content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        using var buffer = new MemoryStream();
+        byte[] chunk = new byte[8192];
+        while (buffer.Length < maxBytes)
+        {
+            int read = await stream
+                .ReadAsync(chunk.AsMemory(0, (int)Math.Min(chunk.Length, maxBytes - buffer.Length)), ct)
+                .ConfigureAwait(false);
+            if (read == 0)
+            {
+                break;
+            }
+
+            buffer.Write(chunk, 0, read);
+        }
+
+        return Encoding.UTF8.GetString(buffer.GetBuffer(), 0, checked((int)buffer.Length));
+    }
 
     private static async Task<string?> ReadLimitedBodyAsync(
         HttpContent content,

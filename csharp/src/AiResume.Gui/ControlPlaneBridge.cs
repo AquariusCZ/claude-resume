@@ -1222,6 +1222,15 @@ public sealed class ControlPlaneBridge
             return ShortLabel(codex.Reason, codex.Summary);
         }
 
+        // 本轮最小推理真成功时,灯是绿的。此时余额路由"这次没问出来"(限流/CDN 拦截)
+        // 不能当成这一行的结论 —— 绿灯配「余额限流」是颜色和文字各说各话,
+        // 与"红色状态却显示限流"是同一类缺陷。402 不在此列:那是真的余额不足。
+        if (codex.Readiness == CodexReadiness.Ok && codex.DeepChecked &&
+            balance.Reason is "http-429" or "cdn-blocked")
+        {
+            return ShortLabel(codex.Reason, codex.Summary);
+        }
+
         if (balance.Reason == "invalid")
         {
             return "账户不可用";

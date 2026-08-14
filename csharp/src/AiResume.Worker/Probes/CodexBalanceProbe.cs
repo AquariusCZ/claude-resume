@@ -178,7 +178,8 @@ public sealed class CodexBalanceProbe
                 // 不分开就会红着说"余额接口拒绝凭据",而换个 UA 同一把凭据就能 200。
                 if (resp.StatusCode == HttpStatusCode.Forbidden &&
                     CodexAuthProbe.LooksLikeCdnBlock(
-                        await ReadBodyAsync(resp.Content, requestToken).ConfigureAwait(false)))
+                        await CodexAuthProbe.ReadPrefixAsync(resp.Content, MaxResponseBytes, requestToken)
+                            .ConfigureAwait(false)))
                 {
                     return new CodexBalanceResult(
                         ProviderReadiness.Unknown,

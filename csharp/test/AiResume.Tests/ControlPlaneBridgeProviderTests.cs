@@ -70,6 +70,27 @@ public sealed class ControlPlaneBridgeProviderTests : IDisposable
         Assert.Equal("ok", ControlPlaneBridge.CodexProviderState(deepOk, throttled));
         Assert.Equal("ok", ControlPlaneBridge.CodexProviderState(deepOk, blocked));
         Assert.Equal("CDN 拦截", InvokeProviderText(shallow, blocked));
+
+        // 灯绿了,文案就不能再说"这次没问出来":颜色和文字必须来自同一个结论。
+        Assert.Equal("已验证", InvokeProviderText(deepOk, throttled));
+        Assert.Equal("已验证", InvokeProviderText(deepOk, blocked));
+    }
+
+    [Fact]
+    public void CDN判定必须同时有Cloudflare标记否则不得吃掉凭据被拒()
+    {
+        // 第三方 relay 完全可能用 error_code:1003 表达"这把 key 无效";
+        // 只按 1xxx 数字区间判 CDN 拦截,会让红色「凭据被拒」变成灰色「未验证」。
+        Assert.Equal(
+            CodexAuthOutcome.Rejected,
+            CodexAuthProbe.Classify(
+                System.Net.HttpStatusCode.Forbidden,
+                body: """{"error_code":1003,"message":"invalid api key"}""").Outcome);
+        Assert.Equal(
+            CodexAuthOutcome.NetworkFailed,
+            CodexAuthProbe.Classify(
+                System.Net.HttpStatusCode.Forbidden,
+                body: """{"error_code":1003,"message":"blocked by cloudflare"}""").Outcome);
     }
 
     private static string InvokeProviderText(CodexProbeResult codex, CodexBalanceResult balance) =>
