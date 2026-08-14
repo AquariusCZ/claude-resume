@@ -281,7 +281,7 @@ Two consequences of S4U are load-bearing. First, the task's Worker runs in sessi
 
 DPAPI under S4U was verified on 2026-08-14 rather than assumed: a completion event delivered by the session-0 Worker requires decrypting the `CurrentUser`-scoped Feishu credential, and it reported `outcome=Sent` with no `CryptographicException`.
 
-The C# suite currently contains 1174 xUnit tests. It uses isolated temporary state, synthetic sessions and injected process/API runners. It does not start an AI modify run against a real project or send a paid API request.
+The C# suite currently contains 1183 xUnit tests. It uses isolated temporary state, synthetic sessions and injected process/API runners. It does not start an AI modify run against a real project or send a paid API request.
 
 Relevant focused suites include:
 

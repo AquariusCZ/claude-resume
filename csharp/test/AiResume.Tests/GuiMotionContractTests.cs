@@ -21,7 +21,8 @@ public sealed class GuiMotionContractTests
         Assert.DoesNotContain(".refresh-spinner::after", html, StringComparison.Ordinal);
         Assert.Contains("btn.setAttribute('aria-busy', 'true');", html, StringComparison.Ordinal);
         Assert.Contains("btn.disabled = true;", html, StringComparison.Ordinal);
-        Assert.Contains("$('refreshLabel').textContent = '刷新中';", html, StringComparison.Ordinal);
+        // 载入态一律以省略号结尾,与面板其它处的「探测中…」「正在加载…」「正在刷新…」一致。
+        Assert.Contains("$('refreshLabel').textContent = '刷新中…';", html, StringComparison.Ordinal);
 
         Assert.Contains("@media (prefers-reduced-motion:reduce)", html, StringComparison.Ordinal);
         Assert.Contains(".refresh.busy .refresh-spinner,.btn.busy::after", html, StringComparison.Ordinal);
@@ -90,7 +91,29 @@ public sealed class GuiMotionContractTests
         Assert.DoesNotContain("background-position:130%", html, StringComparison.Ordinal);
         Assert.DoesNotContain("transition:width", html, StringComparison.Ordinal);
         Assert.DoesNotContain("transition:left", html, StringComparison.Ordinal);
-        Assert.Contains("transition:background .12s,color .12s,box-shadow .12s", html,
+        // 缓动必须显式写出来。漏写会回落到 CSS 默认的 ease,和面板其它动效手感不一致 ——
+        // 钉住"每一条过渡的每个时长后面都跟着缓动",比钉某一条具体声明更能挡住回归。
+        foreach (System.Text.RegularExpressions.Match declaration in
+                 System.Text.RegularExpressions.Regex.Matches(html, @"transition:([^;}]+)"))
+        {
+            string body = declaration.Groups[1].Value;
+            if (body.Contains("none", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            foreach (string segment in body.Split(','))
+            {
+                Assert.True(
+                    System.Text.RegularExpressions.Regex.IsMatch(
+                        segment, @"[0-9.]+s\s*(var\(--ease|cubic-bezier|linear|ease|steps)"),
+                    $"过渡缺少显式缓动:{segment.Trim()}");
+            }
+        }
+
+        // 常驻 will-change 只允许留在"一直在动"的元素上;偶发过渡挂着它等于永久多一个合成层。
+        Assert.Equal(1, System.Text.RegularExpressions.Regex.Matches(html, "will-change").Count);
+        Assert.Contains("animation:quota-unknown 2.4s linear infinite;will-change:transform", html,
             StringComparison.Ordinal);
         Assert.DoesNotContain(".bank .k.on{background:var(--sunk);color:var(--ink);transform", html,
             StringComparison.Ordinal);

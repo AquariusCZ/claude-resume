@@ -334,6 +334,137 @@ public sealed class CodexAuthProbeTests : IDisposable
     }
 
     [Fact]
+    public async Task 查询参数按RFC3986逐个转义而不是拼裸字符串()
+    {
+        // 之前只有一个 api-version=2026-01-01 这种纯 ASCII 用例过了 ——
+        // 而真正会出事的是 & = 空格 + / 和非 ASCII:拼裸串会让一个参数把后面的
+        // 参数"注入"掉,provider 收到的是另一组条件,而我们以为问的是这一组。
+        string home = NewCodexHome(
+            """
+            model_provider = "relay"
+            model = "gpt-test"
+
+            [model_providers.relay]
+            base_url = "https://relay.example.invalid/v1"
+            wire_api = "responses"
+            requires_openai_auth = true
+            query_params = { "a&b=c" = "x y+z/w", tenant = "研发&测试", empty = "" }
+            """,
+            """{"auth_mode":"apikey","OPENAI_API_KEY":"sk-real-probe-key"}""");
+        var handler = new CapturingHandler(HttpStatusCode.OK, HttpStatusCode.OK);
+
+        CodexAuthResult result = await CodexAuthProbe.ProbeAsync(home, handler, _ => null);
+
+        Assert.Equal(CodexAuthOutcome.Authorized, result.Outcome);
+        string uri = handler.Uris[0];
+        // 键里的 & 和 = 必须被转义,否则它会被读成"新参数"和"赋值"。
+        Assert.Contains("a%26b%3Dc=x%20y%2Bz%2Fw", uri, StringComparison.Ordinal);
+        // 非 ASCII 走 UTF-8 百分号编码,不是原样塞进 URL。
+        Assert.Contains("tenant=%E7%A0%94%E5%8F%91%26%E6%B5%8B%E8%AF%95", uri, StringComparison.Ordinal);
+        // 空值保留为 key=,不能整条丢掉:有些 relay 用空值表达"该开关存在"。
+        Assert.Contains("empty=", uri, StringComparison.Ordinal);
+        Assert.DoesNotContain("研发", uri, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    // 上游 Codex 的 query_params / http_headers 都是 HashMap<String, String>,
+    // 非字符串值在 Codex 自己那里就反序列化失败。我们跟着失败关闭,而不是
+    // 悄悄丢掉那个参数 —— 丢掉会让请求带着一组不完整的条件发出去。
+    [InlineData("""query_params = { version = 2 }""")]
+    [InlineData("""query_params = { flag = true }""")]
+    [InlineData("""http_headers = { X-Count = 3 }""")]
+    [InlineData("""env_http_headers = { X-Env = 7 }""")]
+    [InlineData("""query_params = "not-a-table" """)]
+    public void 非字符串的映射值让整份provider配置失败关闭(string line)
+    {
+        string home = NewCodexHome(
+            $"""
+            model_provider = "relay"
+            model = "gpt-test"
+
+            [model_providers.relay]
+            base_url = "https://relay.example.invalid/v1"
+            requires_openai_auth = true
+            {line}
+            """,
+            """{"auth_mode":"apikey","OPENAI_API_KEY":"sk-real-probe-key"}""");
+
+        CodexProviderCredentials provider = CodexAuthProbe.ReadActiveProviderCredentials(home);
+
+        Assert.Null(provider.BaseUrl);
+        Assert.False(string.IsNullOrWhiteSpace(provider.Problem));
+    }
+
+    [Fact]
+    public void 请求头拒绝换行与非法名字符以挡住头注入()
+    {
+        string home = NewCodexHome(
+            """
+            model_provider = "relay"
+            model = "gpt-test"
+
+            [model_providers.relay]
+            base_url = "https://relay.example.invalid/v1"
+            requires_openai_auth = true
+            http_headers = { "X-Good" = "fine", "X-Bad" = "a\nX-Injected: 1", "Bad Name" = "v" }
+            """,
+            """{"auth_mode":"apikey","OPENAI_API_KEY":"sk-real-probe-key"}""");
+
+        CodexProviderCredentials provider = CodexAuthProbe.ReadActiveProviderCredentials(home);
+
+        Assert.True(provider.RequestHeaders.ContainsKey("X-Good"));
+        Assert.False(provider.RequestHeaders.ContainsKey("X-Bad"));
+        Assert.False(provider.RequestHeaders.ContainsKey("Bad Name"));
+    }
+
+    [Fact]
+    public void 环境变量未设置时整条头省略而不是发一个空头()
+    {
+        // 发空头会被 relay 读成"提供了但是空的",最典型的后果是把
+        // 401 的原因从"没带凭据"变成"凭据无效",诊断方向直接跑偏。
+        string home = NewCodexHome(
+            """
+            model_provider = "relay"
+            model = "gpt-test"
+
+            [model_providers.relay]
+            base_url = "https://relay.example.invalid/v1"
+            requires_openai_auth = true
+            env_http_headers = { X-Missing = "NOT_SET_ANYWHERE", X-Blank = "SET_BUT_BLANK" }
+            """,
+            """{"auth_mode":"apikey","OPENAI_API_KEY":"sk-real-probe-key"}""");
+
+        CodexProviderCredentials provider = CodexAuthProbe.ReadActiveProviderCredentials(
+            home,
+            name => name == "SET_BUT_BLANK" ? "   " : null);
+
+        Assert.False(provider.RequestHeaders.ContainsKey("X-Missing"));
+        Assert.False(provider.RequestHeaders.ContainsKey("X-Blank"));
+    }
+
+    [Fact]
+    public void 能力字段缺省时取上游默认而不是留空()
+    {
+        // wire_api 缺省 -> responses;requires_openai_auth 缺省 -> false
+        // (于是不把 auth.json 的 OpenAI 登录发给第三方 base_url)。
+        string home = NewCodexHome(
+            """
+            model_provider = "relay"
+            model = "gpt-test"
+
+            [model_providers.relay]
+            base_url = "https://relay.example.invalid/v1"
+            """,
+            """{"auth_mode":"apikey","OPENAI_API_KEY":"sk-real-probe-key"}""");
+
+        CodexProviderCredentials provider = CodexAuthProbe.ReadActiveProviderCredentials(home);
+
+        Assert.Equal("responses", provider.WireApi);
+        Assert.False(provider.RequiresOpenAiAuth);
+        Assert.True(string.IsNullOrWhiteSpace(provider.BearerToken));
+    }
+
+    [Fact]
     public async Task Provider查询参数和自定义请求头复现到Models与Responses()
     {
         string home = NewCodexHome(
@@ -875,7 +1006,9 @@ public sealed class CodexAuthProbeTests : IDisposable
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
-            Uris.Add(request.RequestUri?.ToString() ?? string.Empty);
+            // **必须记 AbsoluteUri 而不是 ToString()。** Uri.ToString() 会把百分号编码
+            // 反解成"给人看"的形式,拿它断言等于放过所有转义缺陷;上线走的是 AbsoluteUri。
+            Uris.Add(request.RequestUri?.AbsoluteUri ?? string.Empty);
             Methods.Add(request.Method.Method);
             Bodies.Add(request.Content is null
                 ? string.Empty
