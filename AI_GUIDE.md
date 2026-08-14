@@ -146,7 +146,7 @@ Windows 上裸 `daemon restart`、`restart --force` 的退出码和 `daemon stat
 | `csharp/src/AiResume.Gui/` | WPF + WebView2 控制面 | `MainWindow`、`ControlPlaneBridge.HandleAsync` |
 | `csharp/src/AiResume.Gui/wwwroot/index.html` | 单页前端、交互和视觉 | `call`、`render*`、`genCutover` |
 | `csharp/src/AiResume.Hook/Program.cs` | agent hook 入口 | 解析来源、内部运行抑制、事件落队列 |
-| `csharp/test/AiResume.Tests/` | 隔离的 xUnit 回归 | 1161 项,不触碰真实会话/项目运行 |
+| `csharp/test/AiResume.Tests/` | 隔离的 xUnit 回归 | 1174 项,不触碰真实会话/项目运行 |
 
 ## 4. 测试 / 运行流程
 
@@ -162,7 +162,7 @@ dotnet build csharp\AiResume.sln
 dotnet test csharp\AiResume.sln
 ```
 
-当前完整回归:1161 个 xUnit,0 skipped。测试通过临时目录、注入 runner/API、假 PID/时钟和合成 session 隔离生产状态,不发付费 API 请求；通知回归会启动真实 Hook 进程和 Cline wrapper,但不启动 agent。
+当前完整回归:1174 个 xUnit,0 skipped。测试通过临时目录、注入 runner/API、假 PID/时钟和合成 session 隔离生产状态,不发付费 API 请求；通知回归会启动真实 Hook 进程和 Cline wrapper,但不启动 agent。
 
 ### 4.2 部署现役副本
 
