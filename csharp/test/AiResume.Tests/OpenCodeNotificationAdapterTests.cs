@@ -97,7 +97,8 @@ public class OpenCodeNotificationAdapterTests : IDisposable
         Assert.Contains("client.session.get", content);
         Assert.Contains("session.parentID", content);
         Assert.Contains("if (!session || session.parentID) return;", content);
-        Assert.Contains("Bun.spawn([cmd, \"opencode\"]", content);
+        Assert.Contains("Bun.spawn([cmd, ...args]", content);
+        Assert.Contains("await run(payload, [\"opencode\"]);", content);
         Assert.Contains("new TextEncoder().encode(payload)", content);
         Assert.DoesNotContain("Bun.$`", content);
 
@@ -403,5 +404,43 @@ public class OpenCodeNotificationAdapterTests : IDisposable
             // 恢复目录属性以便清理
             File.SetAttributes(_pluginsDirectory, originalAttributes);
         }
+    }
+
+    [Fact]
+    public void 插件同时监听完成与授权两类事件()
+    {
+        string source = OpenCodeNotificationAdapter.BuildPluginSource(@"C:\Tools\AiResume.Hook.exe");
+
+        Assert.Contains("event.type === \"permission.asked\"", source, StringComparison.Ordinal);
+        Assert.Contains("event.type !== \"session.idle\"", source, StringComparison.Ordinal);
+        // 决策那条必须带 --kind=decision,否则会被当成"又跑完了一次"。
+        Assert.Contains("[\"opencode\", \"--kind=decision\"]", source, StringComparison.Ordinal);
+        Assert.Contains("await run(payload, [\"opencode\"]);", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void 授权事件不做顶层session过滤()
+    {
+        string source = OpenCodeNotificationAdapter.BuildPluginSource(@"C:\Tools\AiResume.Hook.exe");
+
+        int ask = source.IndexOf("event.type === \"permission.asked\"", StringComparison.Ordinal);
+        int idle = source.IndexOf("event.type !== \"session.idle\"", StringComparison.Ordinal);
+        string askBranch = source[ask..idle];
+
+        // 子 agent 的授权请求同样会卡住整个会话,按 parentID 过滤等于漏掉真正需要人的那一刻。
+        Assert.DoesNotContain("parentID", askBranch, StringComparison.Ordinal);
+        Assert.DoesNotContain("client.session.get", askBranch, StringComparison.Ordinal);
+        // 完成那条仍然要过滤,否则 Task 子 session 每次 idle 都会报一次"已完成"。
+        Assert.Contains("session.parentID", source[idle..], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void 授权事件的id字段取不到时退回时间戳()
+    {
+        string source = OpenCodeNotificationAdapter.BuildPluginSource(@"C:\Tools\AiResume.Hook.exe");
+
+        // 授权项的 id 字段名没查证过,不能赌它一定存在。
+        Assert.Contains("event.properties?.id || event.properties?.permissionID || askedAt", source,
+            StringComparison.Ordinal);
     }
 }

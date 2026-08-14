@@ -390,6 +390,17 @@ public static class Program
             reason = "cline_event_mismatch";
             return false;
         }
+        else if (source == "opencode" && kind == DecisionKind)
+        {
+            // OpenCode 的等待信号是 permission.asked(官方文档:opencode 向用户请求授权时触发)。
+            // 与 Claude Code 不同,这里**不做顶层 session 过滤** —— 子 agent 的授权请求
+            // 同样会把整个会话卡住,过滤掉等于漏掉真正需要你的那一刻。
+            if (!string.Equals(eventName, "permission.asked", StringComparison.Ordinal))
+            {
+                reason = "opencode_decision_event_mismatch";
+                return false;
+            }
+        }
         else if (source == "opencode" &&
                  !string.Equals(eventName, "session.idle", StringComparison.Ordinal))
         {

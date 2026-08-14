@@ -188,12 +188,42 @@ public sealed class OpenCodeNotificationAdapter : INotificationAdapter
         var sb = new StringBuilder();
         sb.AppendLine(ManagedMarker);
         sb.AppendLine("// 由 AI Resume 自动生成,请勿手动修改");
-        sb.AppendLine("// 监听 session.idle 事件,在 agent 完成响应时触发通知");
+        sb.AppendLine("// 监听两类事件:session.idle(任务跑完)与 permission.asked(停下来等你授权)");
         sb.AppendLine();
         sb.AppendLine("export const AiResumeNotify = async ({ client, project, directory, worktree }) => {");
         sb.AppendLine("  return {");
         sb.AppendLine("    event: async ({ event }) => {");
         sb.AppendLine("      try {");
+        sb.AppendLine("        const cmd = " + QuoteForTs(hookCommand) + ";");
+        sb.AppendLine("        const run = async (payload, args) => {");
+        sb.AppendLine("          // Bun.spawn 用 argv 数组,路径含空格时不会被 shell 再拆分;JSON 经 stdin 传给统一 Hook。");
+        sb.AppendLine("          const child = Bun.spawn([cmd, ...args], {");
+        sb.AppendLine("            stdin: new TextEncoder().encode(payload),");
+        sb.AppendLine("            stdout: \"ignore\",");
+        sb.AppendLine("            stderr: \"ignore\"");
+        sb.AppendLine("          });");
+        sb.AppendLine("          await child.exited;");
+        sb.AppendLine("        };");
+        sb.AppendLine();
+        sb.AppendLine("        // permission.asked:AI 停在这儿等你授权。**不做顶层 session 过滤** ——");
+        sb.AppendLine("        // 子 agent 的授权请求同样会卡住整个会话,过滤掉等于漏掉真正需要你的那一刻。");
+        sb.AppendLine("        if (event.type === \"permission.asked\") {");
+        sb.AppendLine("          const askDir = directory || worktree || project?.directory || process.cwd();");
+        sb.AppendLine("          const askSession = event.properties?.sessionID || \"\";");
+        sb.AppendLine("          const askedAt = new Date().toISOString();");
+        sb.AppendLine("          // 授权项 id 字段名未经查证,取不到就退回时间戳,不赌一个没验过的字段。");
+        sb.AppendLine("          const askId = event.properties?.id || event.properties?.permissionID || askedAt;");
+        sb.AppendLine("          await run(JSON.stringify({");
+        sb.AppendLine("            hook_event_name: \"permission.asked\",");
+        sb.AppendLine("            notification_type: \"permission_prompt\",");
+        sb.AppendLine("            session_id: askSession,");
+        sb.AppendLine("            cwd: askDir,");
+        sb.AppendLine("            event_id: `permission.asked:${askSession}:${askId}`,");
+        sb.AppendLine("            timestamp: askedAt");
+        sb.AppendLine("          }), [\"opencode\", \"--kind=decision\"]);");
+        sb.AppendLine("          return;");
+        sb.AppendLine("        }");
+        sb.AppendLine();
         sb.AppendLine("        // 仅在 session.idle 事件时触发");
         sb.AppendLine("        if (event.type !== \"session.idle\") {");
         sb.AppendLine("          return;");
@@ -228,14 +258,7 @@ public sealed class OpenCodeNotificationAdapter : INotificationAdapter
         sb.AppendLine("          timestamp");
         sb.AppendLine("        });");
         sb.AppendLine();
-        sb.AppendLine("        // Bun.spawn 使用 argv 数组,路径含空格时不会被 shell 再拆分;JSON 经 stdin 传给统一 Hook。");
-        sb.AppendLine("        const cmd = " + QuoteForTs(hookCommand) + ";");
-        sb.AppendLine("        const child = Bun.spawn([cmd, \"opencode\"], {");
-        sb.AppendLine("          stdin: new TextEncoder().encode(payload),");
-        sb.AppendLine("          stdout: \"ignore\",");
-        sb.AppendLine("          stderr: \"ignore\"");
-        sb.AppendLine("        });");
-        sb.AppendLine("        await child.exited;");
+        sb.AppendLine("        await run(payload, [\"opencode\"]);");
         sb.AppendLine("      } catch (err) {");
         sb.AppendLine("        // 吞掉所有异常,不影响 OpenCode 主流程");
         sb.AppendLine("        console.error(\"[airesume-notify] 通知执行失败:\", err);");
@@ -329,7 +352,11 @@ public sealed class OpenCodeNotificationAdapter : INotificationAdapter
         return current
             ? source.Contains("hook_event_name: \"session.idle\"", StringComparison.Ordinal) &&
               source.Contains("new TextEncoder().encode(payload)", StringComparison.Ordinal) &&
-              source.Contains("Bun.spawn([cmd, \"opencode\"]", StringComparison.Ordinal)
+              // 认出**我方任意一代**的投递形状。所有权判据绝不能绑在最新特性上
+              // (比如 permission.asked):那样每加一个功能,上一代文件就变成"别人的",
+              // 就地升级的路径随之断掉,用户会被备份+覆盖而不是平滑刷新。
+              (source.Contains("Bun.spawn([cmd, ...args]", StringComparison.Ordinal) ||
+               source.Contains("Bun.spawn([cmd, \"opencode\"]", StringComparison.Ordinal))
             : source.Contains("export const AiResumeNotify = async ({ project, directory })", StringComparison.Ordinal) &&
               source.Contains("await Bun.$`${cmd} ${targetDir}`.quiet();", StringComparison.Ordinal);
     }
