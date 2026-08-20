@@ -24,6 +24,30 @@
 - **`/provider`** 换的是**整套 API 接入**。DeepSeek 是独立端点 + 独立 key，
   属于这一层，所以**不会出现在 `/model` 的下拉里**。
 
+### 菜单里的模型名为什么不带版本号
+
+`sonnet` / `opus` / `haiku` 是 Claude Code 的**滚动别名**：始终指向订阅下
+当前一代模型，Anthropic 升级后别名自动跟着走。这套菜单文案是 cc-connect
+内置的（订阅模式下没有配置项能覆盖，v1.4.1 与上游最新 v1.5.0-beta 均如此），
+Claude Code 官方界面同样只把版本号放在动态描述里——把「Opus 5」写死进菜单，
+下次升级就变成错误标注，所以不带数字是设计而不是 bug。
+
+当前对照（本机 Claude Code 2.1.232 的模型菜单文案，2026-08-14 提取）：
+
+| 菜单名 | 实际指向 |
+|---|---|
+| `sonnet` | Sonnet 5 |
+| `opus` | Opus 5 |
+| `opus[1m]` | Opus 5（1M 上下文） |
+| `haiku` | Haiku 4.5 |
+
+- CLI 还支持 `sonnet[1m]`（Sonnet 5 + 1M 上下文），v1.4.1 的下拉里没列，
+  但直接发 `/model sonnet[1m]` 就能设置（`/model <名字>` 不校验白名单，
+  原样透传给 Claude Code）。
+- 回复页脚显示的模型名也是别名，不是解析后的实际版本。
+- 这份对照会随 Claude Code 升级漂移；升级后以终端里 `claude` 的
+  `/model` 菜单描述为准。
+
 ```
 /provider list             看有哪些服务商
 /provider switch deepseek  切到 DeepSeek
@@ -64,6 +88,74 @@ cc-connect 这边只有**一个项目**，靠切工作目录来访问不同代�
 /history [n]    看最近 n 条
 /stop           停止当前执行
 ```
+
+### `/list` 和本地「对不上」？其实是同一份数据
+
+`/list` 直接读的就是本机 Claude Code 的会话文件
+（`~/.claude/projects/<工作目录转义>/*.jsonl`，2026-08-14 实测逐条对上），
+IDE / 终端 / 飞书对同一目录产生的会话都在里面，没有两套会话。
+看起来对不上，是三个显示差异：
+
+- **只列当前 `work_dir` 的会话**。`/dir` 切目录后列表跟着换，
+  别的目录里的本地会话不会出现。
+- **标题体系不同**（cc-connect v1.4.1）：本地 IDE 显示的是 AI 生成的标题
+  （jsonl 里的 `ai-title` 行），而 v1.4.1 取的是**最后一条纯文本用户消息**
+  截 40 字——所以飞书里的"标题"其实是你最后说的那句话。消息带图片或
+  IDE 附加上下文时内容是数组、提不出文本，整个会话没有一条纯文本用户
+  消息就显示「（空）」（IDE 里每条都贴图的会话就是这样）。
+  上游 main / v1.5.0-beta 已改为优先读自定义标题和 `ai-title`，
+  并且用户消息改取第一条；升级后标题即与本地一致。
+- **「N 条消息」数的是 jsonl 里 user+assistant 行数**，工具调用的往返
+  也各算一行，一轮长任务就能贡献上百条，不等于"你说了 N 句"。
+
+## 在飞书里开发：实用工作流（2026-08-14 按 v1.4.1 源码盘点）
+
+真正把它当远程 Claude Code 用，靠这套顺序：
+
+1. **`/dir` 确认/切换目录**——决定 AI 在哪个代码库干活。
+2. **`/mode` 调权限档**——config 默认 `default`（每个工具都弹卡片等批准，
+   远程开发基本没法推进）。单人 owner 机器建议 `/mode acceptEdits`
+   （文件编辑自动过、其余仍确认）；完全信任的任务用 `/mode yolo`
+   （= `bypassPermissions`，全自动，和你 IDE 里的模式一样，风险自担）。
+3. **直接把需求当消息发**，像在 IDE 里一样描述任务；中途 `/stop` 叫停。
+4. **图片双向可用**：你可以直接发截图给它（报错截图、设计稿）；
+   它生成的截图/文件也会自动发回聊天（attachment send-back，默认开，
+   Claude Code 经注入的系统提示自动学会 `cc-connect send --image/--file`）。
+5. **`/history [n]` / `/search <词>`** 回看和检索当前会话。
+6. **闲置 30 分钟会自动开新会话**（`reset_on_idle_mins` 默认 30，防旧上下文
+   漂移；这就是 `/list` 里会话越攒越多的主因）。回来续上旧任务用
+   `/list` + `/switch`；想永远续旧会话，在 `[[projects]]` 里设
+   `reset_on_idle_mins = 0`。
+
+## 已就绪但一直没用的功能
+
+- **Web 管理面板**：本机 `[management]` 已启用——浏览器开
+  `http://localhost:9820`，用 config.toml 里的 token 登录。项目/会话管理、
+  cron 编辑器、全局设置、网页聊天界面都在里面（Beta）。
+- **`/cron` 定时任务**：`/cron add 0 9 * * * 总结昨天的 git log`，
+  让它每天定点干活并把结果发到飞书。
+- **`/reasoning`**：切推理强度（low/medium/high/max）。
+- **`/usage` / `/status` / `/doctor`**：用量、状态、自检。
+- **`/shell`**：直接在工作目录跑 shell 命令（admin 特权，已锁 owner）——
+  远程看 `git status`、跑测试很顺手，但它就是真的 shell，慎用。
+- **`/compress`**：会话太长时压缩上下文。
+- **微信端**：config 里已接 ilinkai 个人微信，同一套命令在微信里也能用。
+
+## 多项目的两条路
+
+- **现状（简单够用）**：单项目 + `/dir` 切目录（多 `[[projects]]` 绑同一
+  飞书应用会重复消费，见上文「为什么只有一个项目」）。
+- **上游正解（要改配置，先和 AI Resume 的配置生成流程对齐再动）**：
+  项目设 `mode = "multi-workspace"` + `base_dir`，**按群名自动绑定**
+  `base_dir/<群名>/`，每个群独立会话与状态；`/workspace bind|init|list|unbind`
+  管理。适合固定几个项目各建一个群、互不串上下文。
+
+## 别在聊天里碰的
+
+- **`/upgrade`**：会自更新 cc-connect 二进制。本机版本锁定 v1.4.1
+  （AI Resume 的「生成并重启」契约校验此版本），升级必须走正式评估，
+  不要在聊天里顺手点。
+- `run_as_user` 系隔离是 Linux/macOS 专属，Windows 用不上。
 
 ## 显示模式
 
