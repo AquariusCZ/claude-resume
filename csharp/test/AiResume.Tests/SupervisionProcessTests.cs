@@ -10,7 +10,7 @@ namespace AiResume.Tests;
 
 /// <summary>
 /// S2-D ProcessSupervisor 真进程测试(安全关键,工作单 §S2-D):
-/// 先登记后 spawn、树杀 0 残留、mismatched 拒绝终止、gone 运行期 fail-closed、
+/// 先登记后 spawn、树杀 0 残留、mismatched 拒绝终止、完整 Job 终态核验、
 /// RecoverAsync 清理、首次登记失败 internal 拒绝。
 /// 命令使用工作单指定的无害长命令(cmd + ping 回环),测试自身 finally 兜底清理全部残留进程。
 /// </summary>
@@ -181,27 +181,38 @@ public sealed class SupervisionProcessTests : IDisposable
     [Fact]
     public async Task Cancel_mismatched_registration_is_removed_without_killing_process()
     {
-        using var supervisor = new ProcessSupervisor(_dbPath);
         RunId runId = RunId.New();
-        ProcessStartResult result = await supervisor.StartAsync(NewRequest(runId, LongPing), CancellationToken.None);
-        Assert.True(result.Started);
-        Track(result.ChildPid!.Value);
+        using var process = Process.Start(new ProcessStartInfo("cmd.exe", LongPing)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        }) ?? throw new InvalidOperationException("测试进程启动失败。 ");
+        Track(process.Id);
+        ProcessProbeResult actual = _probe.Probe(process.Id);
+        Assert.Equal(ProcessLiveness.Alive, actual.Liveness);
 
-        // 伪造登记:启动时间改为 10 分钟前(特征明确不符)。
+        // 伪造一个不属于当前 supervisor 的登记，且启动时间明确不符。
         using (var connection = StorageDatabase.Open(_dbPath))
         {
-            StorageDatabase.Execute(connection,
-                "UPDATE process_registry SET started_at = $started_at WHERE run_id = $run_id;", null,
-                ("$started_at", DateTimeOffset.UtcNow.AddMinutes(-10).ToString("o")),
-                ("$run_id", runId.ToString()));
+            StorageDatabase.Execute(connection, """
+                INSERT INTO process_registry (run_id, parent_pid, child_pid, job_id, started_at, command_signature, updated_at)
+                VALUES ($run_id, $parent, $child, 'job-external', $started_at, $signature, $updated_at);
+                """, null,
+                ("$run_id", runId.ToString()),
+                ("$parent", Environment.ProcessId),
+                ("$child", process.Id),
+                ("$started_at", (actual.StartedAt ?? DateTimeOffset.UtcNow).AddMinutes(-10).ToString("o")),
+                ("$signature", ProcessSignature.Compute(actual.ExePath ?? "cmd.exe")),
+                ("$updated_at", DateTimeOffset.UtcNow.ToString("o")));
         }
 
+        using var supervisor = new ProcessSupervisor(_dbPath);
         ProcessStopResult cancel = await supervisor.CancelAsync(runId, CancellationToken.None);
         Assert.False(cancel.TerminateRequested, "mismatched 禁止终止。");
         Assert.False(cancel.ChildPending);
 
         // 进程必须仍然存活(未被误杀);登记已删(只删登记)。
-        ProcessProbeResult alive = _probe.Probe(result.ChildPid!.Value);
+        ProcessProbeResult alive = _probe.Probe(process.Id);
         Assert.Equal(ProcessLiveness.Alive, alive.Liveness);
         using (var connection = StorageDatabase.Open(_dbPath))
         using (var cmd = connection.CreateCommand())
@@ -210,6 +221,31 @@ public sealed class SupervisionProcessTests : IDisposable
             cmd.Parameters.AddWithValue("$run_id", runId.ToString());
             Assert.Equal(0L, (long)cmd.ExecuteScalar()!);
         }
+    }
+
+    [Fact]
+    public async Task Cancel_owned_job_uses_exact_in_memory_ownership_when_registry_is_tampered()
+    {
+        using var supervisor = new ProcessSupervisor(_dbPath);
+        RunId runId = RunId.New();
+        ProcessStartResult result = await supervisor.StartAsync(NewRequest(runId, LongPing), CancellationToken.None);
+        Assert.True(result.Started);
+        Track(result.ChildPid!.Value);
+
+        using (var connection = StorageDatabase.Open(_dbPath))
+        {
+            StorageDatabase.Execute(connection,
+                "UPDATE process_registry SET started_at = $started_at WHERE run_id = $run_id;",
+                null,
+                ("$started_at", DateTimeOffset.UtcNow.AddMinutes(-10).ToString("o")),
+                ("$run_id", runId.ToString()));
+        }
+
+        ProcessStopResult cancel = await supervisor.CancelAsync(runId, CancellationToken.None);
+        Assert.True(cancel.TerminateRequested);
+        Assert.False(cancel.ChildPending);
+        await WaitGoneAsync(result.ChildPid.Value);
+        Assert.Null(GetRegistryRow(runId));
     }
 
     [Fact]
@@ -242,7 +278,7 @@ public sealed class SupervisionProcessTests : IDisposable
     }
 
     [Fact]
-    public async Task Status_reports_liveness_and_gone_after_exit()
+    public async Task Status_reports_liveness_and_cleans_owned_job_after_exit()
     {
         using var supervisor = new ProcessSupervisor(_dbPath);
         RunId runId = RunId.New();
@@ -264,8 +300,129 @@ public sealed class SupervisionProcessTests : IDisposable
         ProcessStatus gone = await supervisor.StatusAsync(runId, CancellationToken.None);
         Assert.Equal(ProcessLiveness.Gone, gone.Liveness);
         Assert.False(gone.ChildPending);
-        // 运行期登记保留(fail-closed)。
-        Assert.NotNull(GetRegistryRow(runId));
+        // 本进程仍持有精确 Job 且 ActiveProcesses=0，正常终态应释放句柄并清登记。
+        Assert.Null(GetRegistryRow(runId));
+    }
+
+    [Fact]
+    public async Task Status_wrapper_gone_but_job_descendant_active_remains_pending()
+    {
+        using var supervisor = new ProcessSupervisor(_dbPath);
+        RunId runId = RunId.New();
+        ProcessStartResult result = await supervisor.StartAsync(
+            NewRequest(runId, "/c start /b ping -n 30 127.0.0.1 > NUL & exit /b 0"),
+            CancellationToken.None);
+        Assert.True(result.Started);
+        Track(result.ChildPid!.Value);
+
+        int grandchildPid = FindGrandchildPid(result.ChildPid.Value);
+        Assert.True(grandchildPid > 0, "必须先观察到后台后代进程。 ");
+        Track(grandchildPid);
+        await WaitGoneAsync(result.ChildPid.Value);
+
+        ProcessStatus status = await supervisor.StatusAsync(runId, CancellationToken.None);
+        Assert.Equal(ProcessLiveness.Alive, status.Liveness);
+        Assert.True(status.ChildPending);
+        Assert.Null(status.MonitorError);
+
+        ProcessStopResult cancel = await supervisor.CancelAsync(runId, CancellationToken.None);
+        Assert.True(cancel.TerminateRequested);
+        Assert.False(cancel.ChildPending);
+        await WaitGoneAsync(grandchildPid);
+        Assert.Null(GetRegistryRow(runId));
+    }
+
+    [Fact]
+    public async Task Missing_registry_still_uses_owned_job_for_status_and_cancel()
+    {
+        using var supervisor = new ProcessSupervisor(_dbPath);
+        RunId runId = RunId.New();
+        ProcessStartResult result = await supervisor.StartAsync(NewRequest(runId, LongPing), CancellationToken.None);
+        Assert.True(result.Started);
+        Track(result.ChildPid!.Value);
+
+        using (var connection = StorageDatabase.Open(_dbPath))
+        {
+            StorageDatabase.Execute(connection,
+                "DELETE FROM process_registry WHERE run_id = $run_id;",
+                null,
+                ("$run_id", runId.ToString()));
+        }
+
+        ProcessStatus status = await supervisor.StatusAsync(runId, CancellationToken.None);
+        Assert.Equal(ProcessLiveness.Alive, status.Liveness);
+        Assert.True(status.ChildPending);
+        Assert.Null(status.MonitorError);
+
+        ProcessStopResult cancel = await supervisor.CancelAsync(runId, CancellationToken.None);
+        Assert.True(cancel.TerminateRequested);
+        Assert.False(cancel.ChildPending);
+        await WaitGoneAsync(result.ChildPid.Value);
+    }
+
+    [Fact]
+    public async Task Incomplete_registry_still_uses_owned_job_for_cancel()
+    {
+        using var supervisor = new ProcessSupervisor(_dbPath);
+        RunId runId = RunId.New();
+        ProcessStartResult result = await supervisor.StartAsync(NewRequest(runId, LongPing), CancellationToken.None);
+        Assert.True(result.Started);
+        Track(result.ChildPid!.Value);
+
+        using (var connection = StorageDatabase.Open(_dbPath))
+        {
+            StorageDatabase.Execute(connection,
+                "UPDATE process_registry SET child_pid = NULL WHERE run_id = $run_id;",
+                null,
+                ("$run_id", runId.ToString()));
+        }
+
+        ProcessStopResult cancel = await supervisor.CancelAsync(runId, CancellationToken.None);
+        Assert.True(cancel.TerminateRequested);
+        Assert.False(cancel.ChildPending);
+        await WaitGoneAsync(result.ChildPid.Value);
+        Assert.Null(GetRegistryRow(runId));
+    }
+
+    [Fact]
+    public async Task Registry_read_failure_does_not_block_owned_job_status_or_cancel()
+    {
+        var registry = new SwitchableProcessRegistry(_dbPath);
+        using var supervisor = new ProcessSupervisor(_dbPath, registry: registry);
+        RunId runId = RunId.New();
+        ProcessStartResult result = await supervisor.StartAsync(NewRequest(runId, LongPing), CancellationToken.None);
+        Assert.True(result.Started);
+        Track(result.ChildPid!.Value);
+
+        registry.ThrowOnRead = true;
+        ProcessStatus status = await supervisor.StatusAsync(runId, CancellationToken.None);
+        Assert.Equal(ProcessLiveness.Alive, status.Liveness);
+        Assert.True(status.ChildPending);
+        Assert.Null(status.MonitorError);
+
+        ProcessStopResult cancel = await supervisor.CancelAsync(runId, CancellationToken.None);
+        Assert.True(cancel.TerminateRequested);
+        Assert.False(cancel.ChildPending);
+        await WaitGoneAsync(result.ChildPid.Value);
+    }
+
+    [Fact]
+    public async Task Unverifiable_registry_probe_still_uses_owned_job_for_cancel()
+    {
+        var probe = new SwitchableProcessProbe();
+        using var supervisor = new ProcessSupervisor(_dbPath, probe);
+        RunId runId = RunId.New();
+        ProcessStartResult result = await supervisor.StartAsync(NewRequest(runId, LongPing), CancellationToken.None);
+        Assert.True(result.Started);
+        Track(result.ChildPid!.Value);
+
+        probe.ReturnUnknown = true;
+        ProcessStopResult cancel = await supervisor.CancelAsync(runId, CancellationToken.None);
+
+        Assert.True(cancel.TerminateRequested);
+        Assert.False(cancel.ChildPending);
+        await WaitGoneAsync(result.ChildPid.Value);
+        Assert.Null(GetRegistryRow(runId));
     }
 
     [Fact]
@@ -337,5 +494,46 @@ public sealed class SupervisionProcessTests : IDisposable
     {
         var registry = new SqliteProcessRegistry(_dbPath);
         return registry.Get(runId);
+    }
+
+    private sealed class SwitchableProcessProbe : IProcessProbe
+    {
+        private readonly NativeProcessProbe _inner = new();
+
+        public bool ReturnUnknown { get; set; }
+
+        public ProcessProbeResult Probe(int pid) => ReturnUnknown
+            ? new ProcessProbeResult(ProcessLiveness.Unknown, null, null)
+            : _inner.Probe(pid);
+
+        public IReadOnlyList<ProcessSnapshotEntry> EnumerateAll() => _inner.EnumerateAll();
+    }
+
+    private sealed class SwitchableProcessRegistry : IProcessRegistry
+    {
+        private readonly SqliteProcessRegistry _inner;
+
+        public SwitchableProcessRegistry(string databasePath)
+        {
+            _inner = new SqliteProcessRegistry(databasePath);
+        }
+
+        public bool ThrowOnRead { get; set; }
+
+        public void InsertPlaceholder(RunId runId, int parentPid, string jobId, string commandSignature) =>
+            _inner.InsertPlaceholder(runId, parentPid, jobId, commandSignature);
+
+        public void Complete(RunId runId, int childPid, DateTimeOffset startedAt, string commandSignature) =>
+            _inner.Complete(runId, childPid, startedAt, commandSignature);
+
+        public ProcessRegistryEntry? Get(RunId runId) => ThrowOnRead
+            ? throw new InvalidDataException("registry read failed")
+            : _inner.Get(runId);
+
+        public void Delete(RunId runId) => _inner.Delete(runId);
+
+        public IReadOnlyList<ProcessRegistryEntry> EnumerateAll() => ThrowOnRead
+            ? throw new InvalidDataException("registry read failed")
+            : _inner.EnumerateAll();
     }
 }

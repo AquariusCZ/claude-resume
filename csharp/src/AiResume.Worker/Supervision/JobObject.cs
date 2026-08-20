@@ -16,6 +16,7 @@ namespace AiResume.Worker.Supervision;
 public sealed class JobObject : IDisposable
 {
     private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
+    private const int JobObjectBasicAccountingInformation = 1;
     private const int JobObjectExtendedLimitInformation = 9;
 
     private IntPtr _handle;
@@ -71,6 +72,53 @@ public sealed class JobObject : IDisposable
         }
     }
 
+    /// <summary>返回 Job 内仍存活的全部进程数，包含已脱离外层 cmd 的后代。</summary>
+    public int GetActiveProcessCount()
+    {
+        IntPtr handle = Volatile.Read(ref _handle);
+        if (handle == IntPtr.Zero)
+        {
+            throw new ObjectDisposedException(nameof(JobObject));
+        }
+
+        int size = Marshal.SizeOf<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>();
+        IntPtr ptr = Marshal.AllocHGlobal(size);
+        try
+        {
+            if (!QueryInformationJobObject(
+                    handle,
+                    JobObjectBasicAccountingInformation,
+                    ptr,
+                    (uint)size,
+                    out _))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "QueryInformationJobObject 失败。");
+            }
+
+            var info = Marshal.PtrToStructure<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>(ptr);
+            return checked((int)info.ActiveProcesses);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(ptr);
+        }
+    }
+
+    /// <summary>请求内核终止 Job 内整棵进程树；句柄继续保留，供调用方确认 ActiveProcesses 归零。</summary>
+    public void TerminateAll(uint exitCode = 1)
+    {
+        IntPtr handle = Volatile.Read(ref _handle);
+        if (handle == IntPtr.Zero)
+        {
+            throw new ObjectDisposedException(nameof(JobObject));
+        }
+
+        if (!TerminateJobObject(handle, exitCode))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "TerminateJobObject 失败。");
+        }
+    }
+
     /// <summary>
     /// 关闭 Job 句柄 → kill-on-close 终止整棵进程树(终止的优先手段)。
     /// 幂等:重复调用无副作用;关闭后 Dispose 不再重复关闭。
@@ -110,6 +158,19 @@ public sealed class JobObject : IDisposable
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+    {
+        public long TotalUserTime;
+        public long TotalKernelTime;
+        public long ThisPeriodTotalUserTime;
+        public long ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount;
+        public uint TotalProcesses;
+        public uint ActiveProcesses;
+        public uint TotalTerminatedProcesses;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct IO_COUNTERS
     {
         public ulong ReadOperationCount;
@@ -140,6 +201,13 @@ public sealed class JobObject : IDisposable
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool QueryInformationJobObject(IntPtr hJob, int jobObjectInfoClass,
+        IntPtr lpJobObjectInfo, uint cbJobObjectInfoLength, out uint lpReturnLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);

@@ -8,7 +8,7 @@ namespace AiResume.Storage;
 /// </summary>
 public static class StorageDatabase
 {
-    public const int CurrentSchemaVersion = 5;
+    public const int CurrentSchemaVersion = 6;
 
     public static SqliteConnection Open(string databasePath)
     {
@@ -76,6 +76,13 @@ public static class StorageDatabase
         {
             ApplyV5(connection, tx);
             Execute(connection, "INSERT INTO schema_version(version, applied_at) VALUES (5, $now);", tx,
+                ("$now", DateTimeOffset.UtcNow.ToString("o")));
+        }
+
+        if (applied < 6)
+        {
+            ApplyV6(connection, tx);
+            Execute(connection, "INSERT INTO schema_version(version, applied_at) VALUES (6, $now);", tx,
                 ("$now", DateTimeOffset.UtcNow.ToString("o")));
         }
 
@@ -204,6 +211,23 @@ public static class StorageDatabase
                 PRIMARY KEY (provider, credential_fingerprint)
             );
             """, tx);
+    }
+
+    /// <summary>
+    /// v6:为单行 product_state 预置合法默认行。此后安全敏感读取可以把“无行”视为故障,
+    /// 避免运行期整行丢失时把 ActiveRunId/PendingCancellationRunId 静默降级为空。
+    /// </summary>
+    private static void ApplyV6(SqliteConnection connection, SqliteTransaction tx)
+    {
+        Execute(connection, """
+            CREATE TABLE IF NOT EXISTS product_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                state_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT OR IGNORE INTO product_state(id, state_json, updated_at)
+            VALUES (1, '{}', $now);
+            """, tx, ("$now", DateTimeOffset.UtcNow.ToString("o")));
     }
 
     public static void Execute(SqliteConnection connection, string sql, SqliteTransaction? tx = null,

@@ -296,10 +296,10 @@ public sealed class FaultInjectionTests : IDisposable
     // ================================================================
 
     [Fact]
-    public void ProductState_corrupted_or_empty_json_yields_idle_default()
+    public void ProductState容错读取回默认_严格读取拒绝损坏或空状态()
     {
-        // 损坏/空 state_json → 默认状态(phase=idle)。idle 是安全侧:
-        // 不布防、不续跑;cycleId 为空使任何旧周期自然失效。
+        // Load 只供 GUI/诊断容错展示;Worker 的 RunId 安全门禁必须走 LoadStrict,
+        // 否则损坏状态会被误当成空状态并允许新的续跑。
         string dir = NewDir();
         string dbPath = Path.Combine(dir, "runs.db");
         StorageDatabase.Migrate(dbPath);
@@ -307,13 +307,22 @@ public sealed class FaultInjectionTests : IDisposable
         using (var connection = StorageDatabase.Open(dbPath))
         {
             StorageDatabase.Execute(connection,
-                "INSERT INTO product_state(id, state_json, updated_at) VALUES (1, $json, $now);",
+                "UPDATE product_state SET state_json = $json, updated_at = $now WHERE id = 1;",
                 null, ("$json", """{"phase":"resuming","cycleId":"""), ("$now", DateTimeOffset.UtcNow.ToString("o")));
         }
 
-        CheckerState state = new ProductStateStore(dbPath).Load();
+        var store = new ProductStateStore(dbPath);
+        CheckerState state = store.Load();
         Assert.Equal(CheckerState.PhaseIdle, state.Phase);
         Assert.Equal(string.Empty, state.CycleId);
+        Assert.ThrowsAny<Exception>(() => store.LoadStrict());
+        Assert.ThrowsAny<Exception>(() => store.Update(s => s.Phase = CheckerState.PhaseWaiting));
+        using (var connection = StorageDatabase.Open(dbPath))
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT state_json FROM product_state WHERE id = 1;";
+            Assert.Equal("""{"phase":"resuming","cycleId":""", command.ExecuteScalar() as string);
+        }
 
         // 空字符串形态。
         using (var connection = StorageDatabase.Open(dbPath))
@@ -322,8 +331,54 @@ public sealed class FaultInjectionTests : IDisposable
                 "UPDATE product_state SET state_json = '' WHERE id = 1;");
         }
 
-        CheckerState emptyState = new ProductStateStore(dbPath).Load();
+        CheckerState emptyState = store.Load();
         Assert.Equal(CheckerState.PhaseIdle, emptyState.Phase);
+        Assert.Throws<InvalidDataException>(() => store.LoadStrict());
+        Assert.Throws<InvalidDataException>(() => store.Update(s => s.Phase = CheckerState.PhaseWaiting));
+    }
+
+    [Fact]
+    public void ProductState_v6预置默认行_运行期整行丢失时严格读取失败()
+    {
+        string dir = NewDir();
+        string dbPath = Path.Combine(dir, "runs.db");
+        StorageDatabase.Migrate(dbPath);
+        var store = new ProductStateStore(dbPath);
+
+        Assert.Equal(CheckerState.PhaseIdle, store.LoadStrict().Phase);
+
+        using (var connection = StorageDatabase.Open(dbPath))
+        {
+            StorageDatabase.Execute(connection, "DELETE FROM product_state WHERE id = 1;");
+        }
+
+        Assert.Equal(CheckerState.PhaseIdle, store.Load().Phase);
+        Assert.Throws<InvalidDataException>(() => store.LoadStrict());
+        Assert.Throws<InvalidDataException>(() => store.Update(_ => { }));
+    }
+
+    [Theory]
+    [InlineData("{\"activeRunId\":null}")]
+    [InlineData("{\"activeRunId\":\"12345678-1234-1234-1234-1234567890ab\",\"activeProjectPath\":\"\"}")]
+    [InlineData("{\"pendingCancellationRunId\":\"not-a-guid\",\"pendingCancellationProjectPath\":\"C:\\\\proj\",\"pendingCancellationCycleId\":\"cycle-1\"}")]
+    [InlineData("{\"activeRunId\":\"12345678-1234-1234-1234-1234567890ab\",\"activeProjectPath\":\"C:\\\\proj\",\"pendingCancellationRunId\":\"12345678-1234-1234-1234-1234567890ac\",\"pendingCancellationProjectPath\":\"C:\\\\proj\",\"pendingCancellationCycleId\":\"cycle-1\"}")]
+    [InlineData("{\"phase\":\"future-unknown-phase\"}")]
+    public void ProductState严格读取拒绝语义损坏(string json)
+    {
+        string dir = NewDir();
+        string dbPath = Path.Combine(dir, "runs.db");
+        StorageDatabase.Migrate(dbPath);
+        using (var connection = StorageDatabase.Open(dbPath))
+        {
+            StorageDatabase.Execute(connection,
+                "UPDATE product_state SET state_json = $json WHERE id = 1;",
+                null,
+                ("$json", json));
+        }
+
+        var store = new ProductStateStore(dbPath);
+        Assert.Throws<InvalidDataException>(() => store.LoadStrict());
+        Assert.Equal(CheckerState.PhaseIdle, store.Load().Phase);
     }
 
     // ================================================================

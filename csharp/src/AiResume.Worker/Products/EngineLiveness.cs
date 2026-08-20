@@ -1,4 +1,5 @@
 using AiResume.Core;
+using AiResume.Worker.Supervision;
 
 namespace AiResume.Worker.Products;
 
@@ -16,6 +17,21 @@ public enum EngineVerdict
 
     /// <summary>布防中,而引擎进程根本不在。**配置说在盯,实际没人盯。**</summary>
     NotRunning,
+
+    /// <summary>状态声称项目在续跑,但精确 RunId 对应的进程已不存在或不匹配。</summary>
+    RunMissing,
+
+    /// <summary>状态声称项目在续跑,但精确 RunId 的进程身份暂时无法核验。</summary>
+    RunUnverified,
+
+    /// <summary>非当前周期仍留有精确 RunId,且核验表明对应进程仍在运行。</summary>
+    RunActive,
+
+    /// <summary>布防周期状态无法从持久化层可靠读取,当前结论未知。</summary>
+    StateUnverified,
+
+    /// <summary>已请求终止精确进程,但核验表明它仍然存活。</summary>
+    CancelPending,
 }
 
 /// <summary>
@@ -39,12 +55,14 @@ public static class EngineLiveness
     /// <param name="lastProbeUtc">最近一次额度探测时间;从未探过为 null。</param>
     /// <param name="nowUtc">当前时刻。</param>
     /// <param name="probeIntervalMinutes">配置的探测间隔,用来推算"多久算太久"。</param>
+    /// <param name="workInProgress">是否正在执行续跑。续跑期间本来就不会再次探额度。</param>
     public static EngineVerdict Evaluate(
         bool armed,
         bool engineRunning,
         DateTimeOffset? lastProbeUtc,
         DateTimeOffset nowUtc,
-        int probeIntervalMinutes)
+        int probeIntervalMinutes,
+        bool workInProgress = false)
     {
         if (!armed)
         {
@@ -54,6 +72,13 @@ public static class EngineLiveness
         if (!engineRunning)
         {
             return EngineVerdict.NotRunning;
+        }
+
+        // 续跑任务可以执行很久,而且 RunContract 明确不以静默时长判失败。
+        // 此时 LastProbeUtc 停在触发续跑的那一拍是正常现象,不能据此报"引擎无响应"。
+        if (workInProgress)
+        {
+            return EngineVerdict.Alive;
         }
 
         // 从未探过**不算卡住**:刚布防、引擎还没走到下一拍是正常的,
@@ -112,16 +137,74 @@ public static class EngineLiveness
         EngineVerdict.Alive => "引擎在跑",
         EngineVerdict.Stalled => "引擎进程在,但久未探测额度",
         EngineVerdict.NotRunning => "已布防,但续跑引擎没在运行",
+        EngineVerdict.RunMissing => "续跑状态仍在,但对应进程已不存在",
+        EngineVerdict.RunUnverified => "续跑进程状态暂时无法核验",
+        EngineVerdict.RunActive => "已登记的续跑进程仍在运行",
+        EngineVerdict.StateUnverified => "布防状态暂时无法核实",
+        EngineVerdict.CancelPending => "已请求终止续跑进程,但它仍在运行",
         _ => verdict.ToString(),
     };
 
     /// <summary>从状态与配置一步到位地判定(GUI 用)。进程探测不出来时按"在跑"处理,不误报。</summary>
     public static EngineVerdict Evaluate(
-        ProductConfig config, CheckerState state, DateTimeOffset nowUtc)
-        => Evaluate(
+        ProductConfig config, CheckerState state, DateTimeOffset nowUtc, bool workInProgress = false)
+    {
+        bool currentCycle = config.Armed &&
+            !string.IsNullOrEmpty(config.ArmCycleId) &&
+            string.Equals(config.ArmCycleId, state.CycleId, StringComparison.Ordinal);
+
+        return Evaluate(
             config.Armed,
             TryDetectEngineProcess() ?? true,
-            state.LastProbeUtc,
+            currentCycle ? state.LastProbeUtc : null,
             nowUtc,
-            config.ProbeIntervalMinutes);
+            config.ProbeIntervalMinutes,
+            currentCycle && workInProgress);
+    }
+
+    /// <summary>
+    /// 只把登记身份匹配且仍存活的 AI Resume 外层进程当作活动执行证据。
+    /// GUI 不持有 Worker 的 Job Object；登记仍在但外层 PID 消失或复用时，无法据此证明
+    /// Job 内后代已经结束，必须返回 null。只有登记本身不存在才返回 false。
+    /// </summary>
+    public static bool? TryDetectActiveOwnedProcess(string databasePath, string runId)
+    {
+        try
+        {
+            var registry = new SqliteProcessRegistry(databasePath);
+            var probe = new NativeProcessProbe();
+            return TryDetectActiveOwnedProcess(RunId.FromString(runId), registry, probe);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>可注入版本:只核验指定 RunId,其它登记进程绝不构成当前续跑证据。</summary>
+    public static bool? TryDetectActiveOwnedProcess(
+        RunId runId,
+        IProcessRegistry registry,
+        IProcessProbe probe)
+    {
+        ArgumentNullException.ThrowIfNull(registry);
+        ArgumentNullException.ThrowIfNull(probe);
+
+        ProcessRegistryEntry? entry = registry.Get(runId);
+        if (entry is null)
+        {
+            return false;
+        }
+
+        if (entry.ChildPid is null)
+        {
+            return null;
+        }
+
+        return ProcessVerifier.Verify(entry, probe.Probe(entry.ChildPid.Value)) switch
+        {
+            ProcessVerdict.Matched => true,
+            _ => null,
+        };
+    }
 }

@@ -109,17 +109,26 @@ if (args.Length > 0 && string.Equals(args[0], "notify", StringComparison.Ordinal
 
 HostApplicationBuilder builder = Host.CreateApplicationBuilder(args);
 
+// 恢复对账是所有后台服务的硬门禁。显式锁定串行启动，避免宿主配置把
+// ServicesStartConcurrently 打开后让 IPC、观察或续跑引擎抢在 RecoverAsync 前运行。
+builder.Services.Configure<HostOptions>(options => options.ServicesStartConcurrently = false);
+
 // 状态目录与数据库迁移。EnsureRoot 会顺带把旧 ClaudeResumeShadow 的内容
 // 搬到 %LOCALAPPDATA%\AI Resume\state(已存在同名项则跳过,绝不覆盖)。
 ShadowPaths.EnsureRoot();
 StorageDatabase.Migrate(ShadowPaths.RunDatabasePath);
 
 builder.Services.AddSingleton(new RunStore(ShadowPaths.RunDatabasePath));
-builder.Services.AddSingleton<IProcessSupervisor>(new ProcessSupervisor(ShadowPaths.RunDatabasePath));
+builder.Services.AddSingleton(new ProcessSupervisor(ShadowPaths.RunDatabasePath));
+builder.Services.AddSingleton<IProcessSupervisor>(sp => sp.GetRequiredService<ProcessSupervisor>());
 builder.Services.AddSingleton<IProviderAdapter, FakeProviderAdapter>();
 builder.Services.AddSingleton<TaskOrchestrator>();
 builder.Services.AddSingleton<ITaskOrchestrator>(sp => sp.GetRequiredService<TaskOrchestrator>());
 builder.Services.AddSingleton<IHealthProbe, FakeHealthProbe>();
+
+// 任何消费续跑/编排状态的后台服务启动前，先核验上次宿主留下的 process_registry。
+// Gone/Mismatched 登记由既有 RecoverAsync 清理；Matched/Unverifiable 继续 fail-closed 保留。
+builder.Services.AddHostedService<ProcessRecoveryBootstrap>();
 
 // Named Pipe 服务端(S2-G):GUI 经 ping 探测 Worker;list-runs 返回活动 run 快照。
 builder.Services.AddSingleton<ITransport>(sp =>
@@ -199,6 +208,35 @@ internal sealed class TransportBootstrap : IHostedService
     public Task StartAsync(CancellationToken cancellationToken) => _transport.StartAsync(cancellationToken);
 
     public Task StopAsync(CancellationToken cancellationToken) => _transport.CancelAsync(cancellationToken);
+}
+
+/// <summary>宿主启动门禁：先完成进程登记恢复，再开放 IPC、观察与续跑服务。</summary>
+internal sealed class ProcessRecoveryBootstrap : IHostedService
+{
+    private readonly ProcessSupervisor _supervisor;
+    private readonly ILogger<ProcessRecoveryBootstrap> _logger;
+
+    public ProcessRecoveryBootstrap(
+        ProcessSupervisor supervisor,
+        ILogger<ProcessRecoveryBootstrap> logger)
+    {
+        _supervisor = supervisor;
+        _logger = logger;
+    }
+
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        RecoveryReport report = await _supervisor.RecoverAsync(cancellationToken).ConfigureAwait(false);
+        int removed = report.Items.Count(item => item.Action == RecoveryAction.RemoveRegistry);
+        int blocked = report.Items.Count(item => item.Action == RecoveryAction.KeepFailClosed);
+        _logger.LogInformation(
+            "process.recovery.completed total={Total} removed={Removed} failClosed={FailClosed}",
+            report.Items.Count,
+            removed,
+            blocked);
+    }
+
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 }
 
 /// <summary>

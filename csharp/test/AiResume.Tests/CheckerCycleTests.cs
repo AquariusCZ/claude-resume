@@ -149,6 +149,8 @@ public sealed class CheckerCycleTests : IDisposable
         state.SawLimited = true;
         state.LimitedRefires = 3;
         state.ProjectStatus = new Dictionary<string, string> { ["C:\\Repo\\A"] = "success" };
+        state.ActiveRunId = RunId.New().ToString();
+        state.ActiveProjectPath = "C:\\Repo\\A";
 
         Assert.True(cycle.Initialize(config, state));
 
@@ -158,6 +160,8 @@ public sealed class CheckerCycleTests : IDisposable
         Assert.Equal(0, state.LimitedRefires);
         Assert.NotNull(state.ProjectStatus);
         Assert.Empty(state.ProjectStatus);
+        Assert.Equal(string.Empty, state.ActiveRunId);
+        Assert.Equal(string.Empty, state.ActiveProjectPath);
 
         // 幂等:已对齐 → true 不重置。
         Assert.True(cycle.Initialize(config, state));
@@ -308,6 +312,78 @@ public sealed class CheckerCycleTests : IDisposable
     }
 
     [Fact]
+    public void Running项目与精确RunId在spawn前一次持久化且终态会清理()
+    {
+        var cycle = NewCycle();
+        var config = Config();
+        var state = CheckerState.CreateDefault();
+        state.CycleId = "cycle-1";
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseResuming;
+        RunId runId = RunId.New();
+
+        Assert.True(cycle.PrepareActiveRun(config, state, "C:\\Repo\\A", runId));
+        Assert.Equal("running", state.ProjectStatus!["C:\\Repo\\A"]);
+        Assert.Equal("C:\\Repo\\A", state.ActiveProjectPath);
+        Assert.Equal(runId.ToString(), state.ActiveRunId);
+        CheckerState persisted = new ProductStateStore(_dbPath).Load();
+        Assert.Equal(runId.ToString(), persisted.ActiveRunId);
+        Assert.Equal("C:\\Repo\\A", persisted.ActiveProjectPath);
+
+        Assert.Equal(
+            ProjectOutcome.Continue,
+            cycle.ApplyProjectResult(config, state, "C:\\Repo\\A", "success"));
+        Assert.Equal(string.Empty, state.ActiveRunId);
+        Assert.Equal(string.Empty, state.ActiveProjectPath);
+    }
+
+    [Fact]
+    public void 终止待确认时保留精确RunId供后续核验()
+    {
+        var cycle = NewCycle();
+        var config = Config();
+        var state = CheckerState.CreateDefault();
+        state.CycleId = "cycle-1";
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseResuming;
+        RunId runId = RunId.New();
+
+        Assert.True(cycle.PrepareActiveRun(config, state, "C:\\Repo\\A", runId));
+        Assert.Equal(
+            ProjectOutcome.Blocked,
+            cycle.ApplyProjectResult(config, state, "C:\\Repo\\A", "cancel-pending"));
+
+        Assert.Equal("cancel-pending", state.ProjectStatus!["C:\\Repo\\A"]);
+        Assert.Equal(CheckerState.PhaseBlocked, state.Phase);
+        Assert.True(state.ReplayBlocked);
+        Assert.Equal(runId.ToString(), state.ActiveRunId);
+        Assert.Equal("C:\\Repo\\A", state.ActiveProjectPath);
+    }
+
+    [Fact]
+    public void 安全中止本轮时清理活动Run并回到waiting()
+    {
+        var cycle = NewCycle();
+        var config = Config();
+        var state = CheckerState.CreateDefault();
+        state.CycleId = "cycle-1";
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseResuming;
+        RunId runId = RunId.New();
+
+        Assert.True(cycle.PrepareActiveRun(config, state, "C:\\Repo\\A", runId));
+
+        Assert.Equal(
+            ProjectOutcome.Blocked,
+            cycle.ApplyProjectResult(config, state, "C:\\Repo\\A", "monitor-error", stopRound: true));
+        Assert.Equal(CheckerState.PhaseBlocked, state.Phase);
+        Assert.True(state.ReplayBlocked);
+        Assert.Equal("monitor-error", state.ProjectStatus!["C:\\Repo\\A"]);
+        Assert.Equal(string.Empty, state.ActiveRunId);
+        Assert.Equal(string.Empty, state.ActiveProjectPath);
+    }
+
+    [Fact]
     public void ApplyProjectResult_returns_to_waiting_before_refire_cap()
     {
         var cycle = NewCycle();
@@ -340,10 +416,11 @@ public sealed class CheckerCycleTests : IDisposable
 
         ProjectOutcome outcome = cycle.ApplyProjectResult(config, state, "C:\\Repo\\A", "limited");
 
-        Assert.Equal(ProjectOutcome.MarkedError, outcome);
+        Assert.Equal(ProjectOutcome.Blocked, outcome);
         Assert.Equal(6, state.LimitedRefires);
         Assert.Equal("error", state.ProjectStatus!["C:\\Repo\\A"]);
-        Assert.Equal(CheckerState.PhaseResuming, state.Phase);
+        Assert.Equal(CheckerState.PhaseBlocked, state.Phase);
+        Assert.True(state.ReplayBlocked);
     }
 
     [Fact]
@@ -405,6 +482,74 @@ public sealed class CheckerCycleTests : IDisposable
         Assert.NotEqual(CheckerState.PhaseDone, state.Phase); // 失效不写收尾。
     }
 
+    [Fact]
+    public void 失败状态会阻断ready与limited且保留项目结果()
+    {
+        var cycle = NewCycle();
+        var config = Config();
+        var state = CheckerState.CreateDefault();
+        state.CycleId = "cycle-1";
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseWaiting;
+        state.ProjectStatus = new Dictionary<string, string>
+        {
+            ["C:\\Repo\\A"] = "monitor-error",
+        };
+
+        Assert.Equal(ProbeDecision.KeepWatching, cycle.OnReady(config, state, Probe("ready")));
+        Assert.True(state.ReplayBlocked);
+        Assert.Equal(CheckerState.PhaseBlocked, state.Phase);
+        Assert.Equal("monitor-error", state.ProjectStatus["C:\\Repo\\A"]);
+
+        Assert.True(cycle.OnLimited(config, state, Probe("limited")));
+        Assert.Equal(CheckerState.PhaseBlocked, state.Phase);
+        Assert.Equal("monitor-error", state.ProjectStatus["C:\\Repo\\A"]);
+    }
+
+    [Fact]
+    public void 升级前失败状态会锁存且新周期初始化后才解除()
+    {
+        var cycle = NewCycle();
+        var config = Config();
+        var state = CheckerState.CreateDefault();
+        state.CycleId = "cycle-1";
+        state.Phase = CheckerState.PhaseWaiting;
+        state.ProjectStatus = new Dictionary<string, string>
+        {
+            ["C:\\Repo\\A"] = "exit-null",
+        };
+
+        Assert.True(cycle.LatchReplayBlock(config, state));
+        Assert.True(state.ReplayBlocked);
+        Assert.Equal(CheckerState.PhaseBlocked, state.Phase);
+        Assert.False(cycle.ShouldProbe(config, state));
+
+        config.ArmCycleId = "cycle-2";
+        Assert.True(cycle.Initialize(config, state));
+        Assert.False(state.ReplayBlocked);
+        Assert.Equal(CheckerState.PhaseWaiting, state.Phase);
+        Assert.Empty(state.ProjectStatus!);
+    }
+
+    [Fact]
+    public void Complete遇到阻断状态时保持当前周期可见()
+    {
+        var cycle = NewCycle();
+        var config = Config();
+        var state = CheckerState.CreateDefault();
+        state.CycleId = "cycle-1";
+        state.ReplayBlocked = true;
+        state.ProjectStatus = new Dictionary<string, string>
+        {
+            ["C:\\Repo\\A"] = "stopped",
+        };
+
+        Assert.Equal(CycleCompletionKind.Blocked, cycle.Complete(config, state));
+        Assert.Equal(CheckerState.PhaseBlocked, state.Phase);
+        Assert.True(state.ReplayBlocked);
+        Assert.Equal("stopped", state.ProjectStatus["C:\\Repo\\A"]);
+    }
+
     // ---- 持久化 round-trip ----
 
     [Fact]
@@ -450,5 +595,29 @@ public sealed class CheckerCycleTests : IDisposable
             Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             Directory.Delete(dir, recursive: true);
         }
+    }
+
+    [Fact]
+    public void Store_Update在事务内合并待终止字段且保留周期状态()
+    {
+        var store = new ProductStateStore(_dbPath);
+        var state = CheckerState.CreateDefault();
+        state.CycleId = "cycle-1";
+        state.Phase = CheckerState.PhaseResuming;
+        state.ProjectStatus = new Dictionary<string, string> { ["C:\\Repo\\A"] = "running" };
+        store.Save(state);
+
+        store.Update(latest =>
+        {
+            latest.PendingCancellationRunId = "12345678-1234-1234-1234-1234567890ab";
+            latest.PendingCancellationProjectPath = "C:\\Repo\\A";
+            latest.PendingCancellationCycleId = "cycle-1";
+        });
+
+        CheckerState saved = store.Load();
+        Assert.Equal("cycle-1", saved.CycleId);
+        Assert.Equal(CheckerState.PhaseResuming, saved.Phase);
+        Assert.Equal("running", saved.ProjectStatus!["C:\\Repo\\A"]);
+        Assert.Equal("12345678-1234-1234-1234-1234567890ab", saved.PendingCancellationRunId);
     }
 }

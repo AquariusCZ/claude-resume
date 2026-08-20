@@ -1,5 +1,5 @@
 using System.Text;
-using System.Text.RegularExpressions;
+using System.Text.Json;
 using AiResume.Core;
 using AiResume.Core.Abstractions;
 using AiResume.Core.Contracts;
@@ -9,8 +9,8 @@ namespace AiResume.Worker.Resume;
 
 /// <summary>
 /// 续跑运行结果。Status 取值与现役 <c>Invoke-ClaudeResume</c> 一致:
-/// success / limited / stopped / no-claude / prompt-multiline / launch-error /
-/// registry-error / monitor-error / exit-&lt;N&gt; / exit-null。
+/// success / limited / limited-side-effects / stopped / cancel-pending / no-claude /
+/// prompt-multiline / launch-error / registry-error / monitor-error / exit-&lt;N&gt; / exit-null。
 /// </summary>
 public sealed record ResumeRunResult
 {
@@ -32,12 +32,26 @@ public sealed record ResumeRunResult
     public bool ResultOk { get; init; }
 
     public long OutputBytes { get; init; }
+
+    /// <summary>进程成功登记后的精确标识;spawn 前门禁或启动失败时为空。</summary>
+    public RunId? RunId { get; init; }
+
+    /// <summary>当前项目结束后必须终止本轮,避免未确认退出的进程与下一项目并发。</summary>
+    public bool StopRound { get; init; }
+
+    /// <summary>本次运行已经出现写入、命令或未知工具活动;一旦为 true 就禁止自动重放。</summary>
+    public bool SideEffectsStarted { get; init; }
 }
 
 /// <summary>续跑运行器最小接口(供 ResumeEngine 依赖注入与测试替身)。</summary>
 public interface IClaudeResumeRunner
 {
-    Task<ResumeRunResult> RunAsync(ProjectRef project, ProductConfig config, CancellationToken cancellationToken);
+    Task<ResumeRunResult> RunAsync(
+        ProjectRef project,
+        ProductConfig config,
+        CancellationToken cancellationToken,
+        Func<RunId, bool>? beforeStart = null,
+        Func<RunId, bool?>? shouldContinue = null);
 }
 
 /// <summary>
@@ -51,35 +65,60 @@ public interface IClaudeResumeRunner
 /// </summary>
 public sealed class ClaudeResumeRunner : IClaudeResumeRunner
 {
-    private const int PollIntervalMs = 500;
     private const int RescanDelayMs = 300;
 
     /// <summary>连续监控异常上限(× 500ms = 10 秒)。超过即归 monitor-error,避免引擎被永久挂住。</summary>
     private const int MaxConsecutiveMonitorErrors = 20;
 
-    // 逐行判定,两个模式各自独立匹配。
-    // **不可合并成一个跨字段正则**:真实 result 行形如
-    // {"type":"result",...,"usage":{...},"is_error":false},中间隔着嵌套对象,
-    // 任何 [^}]* 之类的连接写法都跨不过去,会把成功的运行误判成 exit-null。
-    private static readonly Regex ResultLine = new("\"type\"\\s*:\\s*\"result\"", RegexOptions.Compiled);
-    private static readonly Regex NotErrorLine = new("\"is_error\"\\s*:\\s*false", RegexOptions.Compiled);
-    private static readonly Regex LimitedLine = new(
-        "\"status\"\\s*:\\s*\"(blocked|rejected|limited|exceeded)\"", RegexOptions.Compiled);
+    private static readonly HashSet<string> ReadOnlyTools = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Read",
+        "Glob",
+        "Grep",
+        "WebFetch",
+        "WebSearch",
+        "NotebookRead",
+    };
+
+    private static readonly HashSet<string> LimitedStatuses = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "blocked",
+        "rejected",
+        "limited",
+        "exceeded",
+    };
 
     private readonly IProcessSupervisor _supervisor;
     private readonly string _claudeCommand;
+    private readonly TimeSpan _pollInterval;
+    private readonly int _maxConsecutiveMonitorErrors;
 
-    public ClaudeResumeRunner(IProcessSupervisor supervisor, string? claudeCommand = null)
+    public ClaudeResumeRunner(
+        IProcessSupervisor supervisor,
+        string? claudeCommand = null,
+        TimeSpan? pollInterval = null,
+        int maxConsecutiveMonitorErrors = MaxConsecutiveMonitorErrors)
     {
         _supervisor = supervisor ?? throw new ArgumentNullException(nameof(supervisor));
         _claudeCommand = string.IsNullOrWhiteSpace(claudeCommand) ? "claude" : claudeCommand;
+        _pollInterval = pollInterval is { } interval && interval > TimeSpan.Zero
+            ? interval
+            : TimeSpan.FromMilliseconds(500);
+        _maxConsecutiveMonitorErrors = maxConsecutiveMonitorErrors > 0
+            ? maxConsecutiveMonitorErrors
+            : MaxConsecutiveMonitorErrors;
     }
 
     /// <summary>
     /// 执行一次续跑。前置校验任一不过立即返回且**绝不 spawn**;
     /// 运行期不设客户端总时限(RunContract:续跑无总时限)。
     /// </summary>
-    public async Task<ResumeRunResult> RunAsync(ProjectRef project, ProductConfig config, CancellationToken cancellationToken)
+    public async Task<ResumeRunResult> RunAsync(
+        ProjectRef project,
+        ProductConfig config,
+        CancellationToken cancellationToken,
+        Func<RunId, bool>? beforeStart = null,
+        Func<RunId, bool?>? shouldContinue = null)
     {
         ArgumentNullException.ThrowIfNull(project);
         ArgumentNullException.ThrowIfNull(config);
@@ -110,6 +149,27 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
 
         try
         {
+            // product_state 必须先持久化本次 RunId,再交给 ProcessSupervisor 登记并 spawn。
+            // 否则 Worker 在 spawn 成功到回调落盘之间崩溃时,新 Worker 无法识别这次运行,
+            // 可能自动重放已经产生过副作用的项目。
+            if (beforeStart is not null)
+            {
+                bool accepted;
+                try
+                {
+                    accepted = beforeStart(runId);
+                }
+                catch (Exception)
+                {
+                    accepted = false;
+                }
+
+                if (!accepted)
+                {
+                    return result with { Status = "stopped", StopRound = true };
+                }
+            }
+
             var request = new ProcessStartRequest
             {
                 RunId = runId,
@@ -132,7 +192,7 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                return result with { Status = "stopped" };
+                return result with { Status = "stopped", StopRound = true };
             }
             catch (Exception)
             {
@@ -150,10 +210,31 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
                 };
             }
 
-            string? terminalStatus = await WaitForExitAsync(runId, cancellationToken).ConfigureAwait(false);
+            result = result with { RunId = runId };
+
+            // 进程确实启动、但未能加入 Job 时，Supervisor 会保留精确 PID/Process 供取消收敛。
+            // 这不是可继续运行的“带警告成功”：必须立即终止，不能先经过默认 10 秒监控窗口。
+            if (!string.IsNullOrEmpty(startResult.ErrorCode))
+            {
+                bool stopped = await TryCancelAsync(runId).ConfigureAwait(false);
+                return result with
+                {
+                    Status = stopped ? "launch-error" : "cancel-pending",
+                    StopRound = true,
+                };
+            }
+
+            string? terminalStatus = await WaitForExitAsync(
+                runId,
+                cancellationToken,
+                shouldContinue).ConfigureAwait(false);
             if (terminalStatus is not null)
             {
-                return result with { Status = terminalStatus };
+                return result with
+                {
+                    Status = terminalStatus,
+                    StopRound = terminalStatus is "stopped" or "monitor-error" or "cancel-pending",
+                };
             }
 
             // 权威重扫:流式输出会把一行拆成多个 chunk 落盘,只有读全文才能可靠判定(现役已踩)。
@@ -163,8 +244,7 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
             long outputBytes = FileLength(tmpOut) + FileLength(tmpErr);
             string blob = SafeRead(tmpOut) + "\n" + SafeRead(tmpErr);
 
-            bool resultOk = false;
-            bool limited = false;
+            var evidence = new NdjsonEvidence();
             foreach (string line in blob.Split('\n', '\r'))
             {
                 if (line.Length == 0)
@@ -172,28 +252,26 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
                     continue;
                 }
 
-                if (!resultOk && ResultLine.IsMatch(line) && NotErrorLine.IsMatch(line))
-                {
-                    resultOk = true;
-                }
-
-                if (!limited && LimitedLine.IsMatch(line))
-                {
-                    limited = true;
-                }
+                InspectNdjsonLine(line, evidence);
             }
 
             // 判定顺序:ResultOk 必须压过 Limited。一次成功的运行可能在正文里*谈论*限流,
             // 而真被限流的运行永远不会以 is_error:false 收尾;顺序反了会把成功误判成限流,
             // 进而错误地把整轮续跑打回等待。
             // ProcessStatus 不提供退出码,兜底一律 exit-null(不得据退出码判成功)。
-            string status = resultOk ? "success" : limited ? "limited" : "exit-null";
+            string status = evidence.ResultOk
+                ? "success"
+                : evidence.Limited
+                    ? evidence.SideEffectsStarted ? "limited-side-effects" : "limited"
+                    : "exit-null";
 
             return result with
             {
                 Status = status,
-                ResultOk = resultOk,
-                Limited = limited,
+                ResultOk = evidence.ResultOk,
+                Limited = evidence.Limited,
+                SideEffectsStarted = evidence.SideEffectsStarted,
+                StopRound = status == "limited-side-effects",
                 OutputBytes = outputBytes,
             };
         }
@@ -212,7 +290,10 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
     /// 等待进程结束。返回 <c>null</c> 表示正常退出(交由调用方做重扫判定);
     /// 返回非 null 表示提前终态(stopped / monitor-error)。
     /// </summary>
-    private async Task<string?> WaitForExitAsync(RunId runId, CancellationToken cancellationToken)
+    private async Task<string?> WaitForExitAsync(
+        RunId runId,
+        CancellationToken cancellationToken,
+        Func<RunId, bool?>? shouldContinue)
     {
         int consecutiveMonitorErrors = 0;
 
@@ -220,35 +301,67 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
         {
             if (cancellationToken.IsCancellationRequested)
             {
-                await TryCancelAsync(runId).ConfigureAwait(false);
-                return "stopped";
+                return await TryCancelAsync(runId).ConfigureAwait(false) ? "stopped" : "cancel-pending";
+            }
+
+            if (shouldContinue is not null)
+            {
+                bool? allowed;
+                try
+                {
+                    allowed = shouldContinue(runId);
+                }
+                catch (Exception)
+                {
+                    allowed = null;
+                }
+
+                if (allowed != true)
+                {
+                    return await TryCancelAsync(runId).ConfigureAwait(false) ? "stopped" : "cancel-pending";
+                }
             }
 
             ProcessStatus status;
             try
             {
                 status = await _supervisor.StatusAsync(runId, cancellationToken).ConfigureAwait(false);
-                consecutiveMonitorErrors = 0;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                await TryCancelAsync(runId).ConfigureAwait(false);
-                return "stopped";
+                return await TryCancelAsync(runId).ConfigureAwait(false) ? "stopped" : "cancel-pending";
             }
             catch (Exception)
             {
                 // 监控异常本身不是任务失败,但也不能无限等下去把引擎挂死:
                 // 连续失败超过上限归 monitor-error(RunContract 的 failed_local 类)。
-                if (++consecutiveMonitorErrors >= MaxConsecutiveMonitorErrors)
+                if (++consecutiveMonitorErrors >= _maxConsecutiveMonitorErrors)
                 {
-                    return "monitor-error";
+                    return await TryCancelAsync(runId).ConfigureAwait(false)
+                        ? "monitor-error"
+                        : "cancel-pending";
                 }
 
                 await DelayAsync(cancellationToken).ConfigureAwait(false);
                 continue;
             }
 
-            if (status.Liveness == ProcessLiveness.Gone)
+            if (!string.IsNullOrWhiteSpace(status.MonitorError))
+            {
+                if (++consecutiveMonitorErrors >= _maxConsecutiveMonitorErrors)
+                {
+                    return await TryCancelAsync(runId).ConfigureAwait(false)
+                        ? "monitor-error"
+                        : "cancel-pending";
+                }
+            }
+            else
+            {
+                consecutiveMonitorErrors = 0;
+            }
+
+            if (status.Liveness == ProcessLiveness.Gone &&
+                string.IsNullOrWhiteSpace(status.MonitorError))
             {
                 return null;
             }
@@ -258,11 +371,11 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
         }
     }
 
-    private static async Task DelayAsync(CancellationToken cancellationToken)
+    private async Task DelayAsync(CancellationToken cancellationToken)
     {
         try
         {
-            await Task.Delay(PollIntervalMs, cancellationToken).ConfigureAwait(false);
+            await Task.Delay(_pollInterval, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -270,15 +383,135 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
         }
     }
 
-    private async Task TryCancelAsync(RunId runId)
+    private static void InspectNdjsonLine(string line, NdjsonEvidence evidence)
     {
         try
         {
-            await _supervisor.CancelAsync(runId, CancellationToken.None).ConfigureAwait(false);
+            using JsonDocument document = JsonDocument.Parse(line);
+            JsonElement root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                // Claude stream-json 的每个非空 NDJSON 行都应是对象。数组/标量即使语法合法，
+                // 也不在已知协议内，无法证明其中没有工具活动，按 fail-closed 记为可能有副作用。
+                evidence.SideEffectsStarted = true;
+                return;
+            }
+
+            if (root.TryGetProperty("type", out JsonElement typeElement) &&
+                typeElement.ValueKind == JsonValueKind.String)
+            {
+                string? type = typeElement.GetString();
+                if (string.Equals(type, "result", StringComparison.Ordinal) &&
+                    root.TryGetProperty("is_error", out JsonElement isError) &&
+                    isError.ValueKind == JsonValueKind.False)
+                {
+                    evidence.ResultOk = true;
+                }
+
+                if (string.Equals(type, "rate_limit_event", StringComparison.Ordinal) &&
+                    root.TryGetProperty("rate_limit_info", out JsonElement info) &&
+                    info.ValueKind == JsonValueKind.Object &&
+                    info.TryGetProperty("status", out JsonElement status) &&
+                    status.ValueKind == JsonValueKind.String &&
+                    LimitedStatuses.Contains(status.GetString() ?? string.Empty))
+                {
+                    evidence.Limited = true;
+                }
+            }
+
+            if (ContainsSideEffectingTool(root, evidence))
+            {
+                evidence.SideEffectsStarted = true;
+            }
+        }
+        catch (JsonException)
+        {
+            // Claude 的流式契约要求每个非空行都是完整 JSON。任何损坏/截断行都无法证明
+            // 它不是工具活动，按 RunContract fail-closed 视为可能已有副作用。
+            evidence.SideEffectsStarted = true;
+        }
+    }
+
+    private static bool ContainsSideEffectingTool(JsonElement element, NdjsonEvidence evidence)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                if (element.TryGetProperty("type", out JsonElement type) &&
+                    type.ValueKind == JsonValueKind.String)
+                {
+                    string activityType = type.GetString() ?? string.Empty;
+                    if (string.Equals(activityType, "tool_use", StringComparison.OrdinalIgnoreCase))
+                    {
+                        evidence.ToolUseObserved = true;
+                        if (!element.TryGetProperty("name", out JsonElement name) ||
+                            name.ValueKind != JsonValueKind.String ||
+                            !ReadOnlyTools.Contains(name.GetString() ?? string.Empty))
+                        {
+                            return true;
+                        }
+                    }
+                    else if (activityType.Contains("tool", StringComparison.OrdinalIgnoreCase) &&
+                        !IsKnownReadOnlyToolResult(activityType, evidence.ToolUseObserved))
+                    {
+                        // 新版/未知工具事件在没有明确只读语义时必须 fail-closed。
+                        return true;
+                    }
+                }
+
+                foreach (JsonProperty property in element.EnumerateObject())
+                {
+                    if (ContainsSideEffectingTool(property.Value, evidence))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+
+            case JsonValueKind.Array:
+                foreach (JsonElement item in element.EnumerateArray())
+                {
+                    if (ContainsSideEffectingTool(item, evidence))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+
+            default:
+                return false;
+        }
+    }
+
+    private static bool IsKnownReadOnlyToolResult(string activityType, bool toolUseObserved) =>
+        (string.Equals(activityType, "tool_result", StringComparison.OrdinalIgnoreCase) && toolUseObserved) ||
+        string.Equals(activityType, "web_search_tool_result", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(activityType, "web_fetch_tool_result", StringComparison.OrdinalIgnoreCase);
+
+    private sealed class NdjsonEvidence
+    {
+        public bool ResultOk { get; set; }
+
+        public bool Limited { get; set; }
+
+        public bool SideEffectsStarted { get; set; }
+
+        public bool ToolUseObserved { get; set; }
+    }
+
+    private async Task<bool> TryCancelAsync(RunId runId)
+    {
+        try
+        {
+            ProcessStopResult stop = await _supervisor.CancelAsync(runId, CancellationToken.None).ConfigureAwait(false);
+            return !stop.ChildPending;
         }
         catch (Exception)
         {
-            // 终止失败不掩盖 stopped 语义;残留由监督器的观察/恢复流程核验。
+            // 无法确认退出时必须保留 pending 语义,禁止继续下一项目。
+            return false;
         }
     }
 

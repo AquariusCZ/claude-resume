@@ -9,16 +9,14 @@ namespace AiResume.Worker.Supervision;
 /// <summary>
 /// ProcessSupervisor(规格 §3.3;全项目安全关键包,每个决策都写注释):
 ///
-/// 1. 先落盘登记后 spawn:占位登记(spawn 前事务提交成功)保证任何崩溃窗口内"进程必先有登记",
-///    恢复流程不丢孤儿;首次登记失败 = internal 拒绝,进程绝不启动。
-/// 2. 占位行 child_pid/真实启动时间未知(spawn 后才能取得),spawn 后立即 Complete 补全;
-///    补全失败不阻塞启动 —— Job Object 句柄随宿主存活,崩溃时 kill-on-close 兜底杀整树。
-/// 3. 核验四类(ProcessVerdict):只有 Matched 可终止;Mismatched 只删登记不终止;
-///    Unverifiable(查询失败/特征缺失)一律 fail-closed 保留;Gone(明确不存在)运行期保留登记
-///    (无法区分"已退出"与"损坏登记",防误清),清理只授权给 RecoverAsync(恢复流程是宿主
-///    崩溃后唯一知道"所有 Job 子进程理应已死"的时机)。
-/// 4. 终止优先关闭 Job 句柄(kill-on-close 杀整棵进程树),再以宽限期轮询确认主进程 gone;
-///    未确认退出前返回 childPending=true 且保留登记(S2-E 观察循环继续核验)。
+/// 1. 先落盘占位登记再 spawn:首次登记失败 = internal 拒绝,进程绝不启动。Process.Start
+///    不能 suspended create，Start→Assign 仍有极短崩溃窗口；这是现役明确记录的残余风险。
+/// 2. spawn 后立即补全 child_pid/创建时间/签名并加入 Job。Assign 失败先保留精确 PID，
+///    只有确认进程退出才删登记；杀不掉时继续由 Status/Cancel 持有并收敛。
+/// 3. 本进程持有的 Job 是精确 RunId 所有权证据，状态与取消优先直接查询 Job，不依赖
+///    registry 可读；没有本地 Job 时才按 ProcessVerifier 的 Matched/Mismatched/Unverifiable/Gone 语义处理。
+/// 4. 正常终态和取消都以 Job 的 ActiveProcesses=0 为完整进程树证据。取消调用
+///    TerminateJobObject 后保持句柄并轮询整棵树，不能只看外层 cmd PID。
 /// 5. 无总时限语义:等待退出使用固定 3 秒终止宽限期,不是任务总时限;宽限期后照常返回。
 /// </summary>
 public sealed class ProcessSupervisor : IProcessSupervisor, IDisposable
@@ -122,53 +120,48 @@ public sealed class ProcessSupervisor : IProcessSupervisor, IDisposable
                 };
             }
 
-            // 4) 入 Job;失败必须显式杀进程 + 删登记 + 关闭句柄,不允许留下无登记进程。
+            // 4) 入 Job。Process.Start 本身不支持 suspended create，这里仍存在极短的
+            // Start→Assign 崩溃窗口；因此 Assign 失败时先补全精确 PID 登记，再终止并确认。
+            // 若无法确认退出，必须继续把这次运行交给 Status/Cancel 收敛，绝不能删登记后失联。
             try
             {
                 job.Assign(process);
             }
             catch (Exception)
             {
-                SafeKillProcess(process);
-                SafeDeleteRegistry(request.RunId);
-                job.Dispose();
+                CompleteRegistryBestEffort(request.RunId, process, placeholderSignature);
+                if (TryKillProcessAndConfirm(process))
+                {
+                    SafeDeleteRegistry(request.RunId);
+                    process.Dispose();
+                    job.Dispose();
+                    return new ProcessStartResult
+                    {
+                        RunId = request.RunId,
+                        Started = false,
+                        ErrorClass = ErrorClass.Internal,
+                        ErrorCode = "assign_job_failed",
+                    };
+                }
+
+                _jobs[request.RunId] = new JobEntry(job, process, isAssigned: false);
                 return new ProcessStartResult
                 {
                     RunId = request.RunId,
-                    Started = false,
+                    Started = true,
+                    WrapperPid = Environment.ProcessId,
+                    ChildPid = process.Id,
+                    JobId = job.JobId,
                     ErrorClass = ErrorClass.Internal,
-                    ErrorCode = "assign_job_failed",
+                    ErrorCode = "assign_job_failed_child_pending",
                 };
             }
 
             // 5) spawn 后补全登记:真实创建时间、child_pid、实际 exe 签名。
             //    补全失败不阻塞启动(占位行 + Job 兜底);后续核验若特征不可得归 Unverifiable 保留。
-            DateTimeOffset startedAt = DateTimeOffset.UtcNow;
-            string signature = placeholderSignature;
-            ProcessProbeResult probe = _probe.Probe(process.Id);
-            if (probe.Liveness == ProcessLiveness.Alive)
-            {
-                if (probe.StartedAt.HasValue)
-                {
-                    startedAt = probe.StartedAt.Value;
-                }
+            CompleteRegistryBestEffort(request.RunId, process, placeholderSignature);
 
-                if (!string.IsNullOrEmpty(probe.ExePath))
-                {
-                    signature = ProcessSignature.Compute(probe.ExePath);
-                }
-            }
-
-            try
-            {
-                _registry.Complete(request.RunId, process.Id, startedAt, signature);
-            }
-            catch (Exception)
-            {
-                // 补全失败:保留占位登记,恢复流程按特征核验处置。
-            }
-
-            _jobs[request.RunId] = new JobEntry(job, process);
+            _jobs[request.RunId] = new JobEntry(job, process, isAssigned: true);
             return new ProcessStartResult
             {
                 RunId = request.RunId,
@@ -190,10 +183,14 @@ public sealed class ProcessSupervisor : IProcessSupervisor, IDisposable
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            if (_jobs.TryGetValue(runId, out JobEntry? ownedJob))
+            {
+                return InspectOwnedJob(runId, ownedJob);
+            }
+
             ProcessRegistryEntry? entry = _registry.Get(runId);
             if (entry is null)
             {
-                // 未登记 = 从未 spawn 或已清理:无进程。
                 return new ProcessStatus { RunId = runId, Liveness = ProcessLiveness.Gone, ChildPending = false, ObservedAt = DateTimeOffset.UtcNow };
             }
 
@@ -211,33 +208,35 @@ public sealed class ProcessSupervisor : IProcessSupervisor, IDisposable
             }
 
             ProcessProbeResult probe = _probe.Probe(entry.ChildPid.Value);
-            return probe.Liveness switch
+            if (probe.Liveness == ProcessLiveness.Alive)
             {
-                ProcessLiveness.Alive => new ProcessStatus
+                return new ProcessStatus
                 {
                     RunId = runId,
                     Liveness = ProcessLiveness.Alive,
                     ChildPending = true,
                     ObservedAt = DateTimeOffset.UtcNow,
                     MonitorError = ProcessVerifier.Verify(entry, probe) == ProcessVerdict.Matched ? null : "registration_mismatch",
-                },
-                ProcessLiveness.Gone => new ProcessStatus
+                };
+            }
+
+            return probe.Liveness == ProcessLiveness.Gone
+                ? new ProcessStatus
                 {
-                    // 运行期 Gone:保留登记(fail-closed),清理授权给 RecoverAsync。
+                    // 重启后没有本地 Job 句柄时仍保留登记，清理由 RecoverAsync 授权。
                     RunId = runId,
                     Liveness = ProcessLiveness.Gone,
                     ChildPending = false,
                     ObservedAt = DateTimeOffset.UtcNow,
-                },
-                _ => new ProcessStatus
+                }
+                : new ProcessStatus
                 {
                     RunId = runId,
                     Liveness = ProcessLiveness.Unknown,
                     ChildPending = true,
                     ObservedAt = DateTimeOffset.UtcNow,
                     MonitorError = "probe_failed",
-                },
-            };
+                };
         }
         finally
         {
@@ -251,6 +250,11 @@ public sealed class ProcessSupervisor : IProcessSupervisor, IDisposable
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            if (_jobs.TryGetValue(runId, out JobEntry? ownedJob))
+            {
+                return await TerminateOwnedAsync(runId, ownedJob, cancellationToken).ConfigureAwait(false);
+            }
+
             ProcessRegistryEntry? entry = _registry.Get(runId);
             if (entry is null)
             {
@@ -266,7 +270,7 @@ public sealed class ProcessSupervisor : IProcessSupervisor, IDisposable
             ProcessProbeResult probe = _probe.Probe(entry.ChildPid.Value);
             return ProcessVerifier.Verify(entry, probe) switch
             {
-                ProcessVerdict.Matched => await TerminateMatchedAsync(runId, entry, cancellationToken).ConfigureAwait(false),
+                ProcessVerdict.Matched => await TerminateMatchedExternalAsync(runId, entry, cancellationToken).ConfigureAwait(false),
                 ProcessVerdict.Mismatched => HandleMismatched(runId),
                 ProcessVerdict.Gone => new ProcessStopResult { RunId = runId, TerminateRequested = false, ChildPending = false },
                 _ => new ProcessStopResult { RunId = runId, TerminateRequested = false, ChildPending = true },
@@ -347,20 +351,116 @@ public sealed class ProcessSupervisor : IProcessSupervisor, IDisposable
         _gate.Dispose();
     }
 
-    private async Task<ProcessStopResult> TerminateMatchedAsync(RunId runId, ProcessRegistryEntry entry, CancellationToken cancellationToken)
+    private ProcessStatus InspectOwnedJob(RunId runId, JobEntry jobEntry)
     {
-        _jobs.TryRemove(runId, out JobEntry? jobEntry);
+        if (!jobEntry.IsAssigned)
+        {
+            try
+            {
+                if (_probe.Probe(jobEntry.Process.Id).Liveness == ProcessLiveness.Gone)
+                {
+                    CleanupOwnedRun(runId, deleteRegistry: true);
+                    return GoneStatus(runId);
+                }
+            }
+            catch (Exception)
+            {
+                // 继续按未知处理，保留精确 Process 对象供 Cancel/Dispose 收敛。
+            }
 
-        // 1) 关闭 Job 句柄 → kill-on-close 终止整棵进程树(终止的优先手段)。
-        jobEntry?.Job.CloseAndKill();
+            return new ProcessStatus
+            {
+                RunId = runId,
+                Liveness = ProcessLiveness.Unknown,
+                ChildPending = true,
+                ObservedAt = DateTimeOffset.UtcNow,
+                MonitorError = "job_assignment_failed",
+            };
+        }
 
-        // 2) 宽限期轮询确认主进程确实退出;未确认前返回 childPending=true 且保留登记。
-        bool confirmedGone = false;
+        try
+        {
+            if (jobEntry.Job.GetActiveProcessCount() == 0)
+            {
+                CleanupOwnedRun(runId, deleteRegistry: true);
+                return GoneStatus(runId);
+            }
+
+            return new ProcessStatus
+            {
+                RunId = runId,
+                Liveness = ProcessLiveness.Alive,
+                ChildPending = true,
+                ObservedAt = DateTimeOffset.UtcNow,
+            };
+        }
+        catch (Exception)
+        {
+            return new ProcessStatus
+            {
+                RunId = runId,
+                Liveness = ProcessLiveness.Unknown,
+                ChildPending = true,
+                ObservedAt = DateTimeOffset.UtcNow,
+                MonitorError = "job_query_failed",
+            };
+        }
+    }
+
+    private async Task<ProcessStopResult> TerminateOwnedAsync(
+        RunId runId,
+        JobEntry jobEntry,
+        CancellationToken cancellationToken)
+    {
+        if (!jobEntry.IsAssigned)
+        {
+            bool requested = TryKillProcessAndConfirm(jobEntry.Process);
+            if (requested)
+            {
+                CleanupOwnedRun(runId, deleteRegistry: true);
+                return new ProcessStopResult { RunId = runId, TerminateRequested = true, ChildPending = false };
+            }
+
+            return new ProcessStopResult { RunId = runId, TerminateRequested = true, ChildPending = true };
+        }
+
+        int activeCount;
+        try
+        {
+            activeCount = jobEntry.Job.GetActiveProcessCount();
+        }
+        catch (Exception)
+        {
+            return new ProcessStopResult { RunId = runId, TerminateRequested = false, ChildPending = true };
+        }
+
+        if (activeCount == 0)
+        {
+            CleanupOwnedRun(runId, deleteRegistry: true);
+            return new ProcessStopResult { RunId = runId, TerminateRequested = false, ChildPending = false };
+        }
+
+        try
+        {
+            jobEntry.Job.TerminateAll();
+        }
+        catch (Exception)
+        {
+            return new ProcessStopResult { RunId = runId, TerminateRequested = false, ChildPending = true };
+        }
+
         for (int i = 0; i < CloseProbeMaxTries && !cancellationToken.IsCancellationRequested; i++)
         {
-            if (_probe.Probe(entry.ChildPid!.Value).Liveness == ProcessLiveness.Gone)
+            try
             {
-                confirmedGone = true;
+                if (jobEntry.Job.GetActiveProcessCount() == 0)
+                {
+                    CleanupOwnedRun(runId, deleteRegistry: true);
+                    return new ProcessStopResult { RunId = runId, TerminateRequested = true, ChildPending = false };
+                }
+            }
+            catch (Exception)
+            {
                 break;
             }
 
@@ -374,15 +474,63 @@ public sealed class ProcessSupervisor : IProcessSupervisor, IDisposable
             }
         }
 
-        if (confirmedGone)
+        return new ProcessStopResult { RunId = runId, TerminateRequested = true, ChildPending = true };
+    }
+
+    private async Task<ProcessStopResult> TerminateMatchedExternalAsync(
+        RunId runId,
+        ProcessRegistryEntry entry,
+        CancellationToken cancellationToken)
+    {
+        bool terminateRequested = false;
+        try
+        {
+            using var process = Process.GetProcessById(entry.ChildPid!.Value);
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                terminateRequested = true;
+            }
+        }
+        catch (ArgumentException)
         {
             SafeDeleteRegistry(runId);
-            jobEntry?.Process.Dispose();
-            return new ProcessStopResult { RunId = runId, TerminateRequested = true, ChildPending = false };
+            return new ProcessStopResult { RunId = runId, TerminateRequested = false, ChildPending = false };
+        }
+        catch (Exception)
+        {
+            return new ProcessStopResult { RunId = runId, TerminateRequested = terminateRequested, ChildPending = true };
         }
 
-        // 未确认退出:登记保留,运行键不释放;S2-E 观察循环继续核验。
-        return new ProcessStopResult { RunId = runId, TerminateRequested = true, ChildPending = true };
+        for (int i = 0; i < CloseProbeMaxTries && !cancellationToken.IsCancellationRequested; i++)
+        {
+            if (_probe.Probe(entry.ChildPid!.Value).Liveness == ProcessLiveness.Gone)
+            {
+                SafeDeleteRegistry(runId);
+                return new ProcessStopResult
+                {
+                    RunId = runId,
+                    TerminateRequested = terminateRequested,
+                    ChildPending = false,
+                };
+            }
+
+            try
+            {
+                await Task.Delay(CloseProbeInterval, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+        }
+
+        return new ProcessStopResult
+        {
+            RunId = runId,
+            TerminateRequested = terminateRequested,
+            ChildPending = true,
+        };
     }
 
     /// <summary>mismatched:PID 存在但特征不符 —— 不是我们的进程,只删登记,绝不终止。</summary>
@@ -404,7 +552,59 @@ public sealed class ProcessSupervisor : IProcessSupervisor, IDisposable
         }
     }
 
-    private static void SafeKillProcess(Process process)
+    private void CompleteRegistryBestEffort(RunId runId, Process process, string placeholderSignature)
+    {
+        DateTimeOffset startedAt = DateTimeOffset.UtcNow;
+        string signature = placeholderSignature;
+        try
+        {
+            ProcessProbeResult probe = _probe.Probe(process.Id);
+            if (probe.Liveness == ProcessLiveness.Alive)
+            {
+                startedAt = probe.StartedAt ?? startedAt;
+                if (!string.IsNullOrEmpty(probe.ExePath))
+                {
+                    signature = ProcessSignature.Compute(probe.ExePath);
+                }
+            }
+        }
+        catch (Exception)
+        {
+            // 仍使用当前时间与占位签名补全 PID；后续核验会按 Unverifiable fail-closed。
+        }
+
+        try
+        {
+            _registry.Complete(runId, process.Id, startedAt, signature);
+        }
+        catch (Exception)
+        {
+            // 补全失败:保留占位登记与本地 Job/Process 所有权。
+        }
+    }
+
+    private void CleanupOwnedRun(RunId runId, bool deleteRegistry)
+    {
+        if (_jobs.TryRemove(runId, out JobEntry? jobEntry))
+        {
+            jobEntry.Dispose();
+        }
+
+        if (deleteRegistry)
+        {
+            SafeDeleteRegistry(runId);
+        }
+    }
+
+    private static ProcessStatus GoneStatus(RunId runId) => new()
+    {
+        RunId = runId,
+        Liveness = ProcessLiveness.Gone,
+        ChildPending = false,
+        ObservedAt = DateTimeOffset.UtcNow,
+    };
+
+    private static bool TryKillProcessAndConfirm(Process process)
     {
         try
         {
@@ -413,10 +613,19 @@ public sealed class ProcessSupervisor : IProcessSupervisor, IDisposable
                 process.Kill(entireProcessTree: true);
                 process.WaitForExit((int)CloseProbeInterval.TotalMilliseconds * CloseProbeMaxTries);
             }
+
+            return process.HasExited;
         }
         catch (Exception)
         {
-            // 杀失败时 Job 句柄仍会随宿主 Dispose 兜底。
+            try
+            {
+                return process.HasExited;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
     }
 
@@ -426,14 +635,22 @@ public sealed class ProcessSupervisor : IProcessSupervisor, IDisposable
 
         public Process Process { get; }
 
-        public JobEntry(JobObject job, Process process)
+        public bool IsAssigned { get; }
+
+        public JobEntry(JobObject job, Process process, bool isAssigned)
         {
             Job = job;
             Process = process;
+            IsAssigned = isAssigned;
         }
 
         public void Dispose()
         {
+            if (!IsAssigned)
+            {
+                TryKillProcessAndConfirm(Process);
+            }
+
             Job.Dispose();
             Process.Dispose();
         }

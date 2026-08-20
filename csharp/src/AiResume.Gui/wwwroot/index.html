@@ -482,7 +482,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   <span class="sn" id="snPlate"><b>MODEL AR-2</b>BUILD 读取中</span>
   <div class="beacon" id="beacon" role="status" aria-live="polite">
     <span class="lamp"></span>
-    <span class="txt"><b id="armLine">未布防</b><span class="sub2" id="phaseLine">额度恢复后按队列续跑</span></span>
+    <span class="txt"><b id="armLine">未布防</b><span class="sub2" id="phaseLine">布防后将在额度恢复时按队列续跑</span></span>
   </div>
   <div class="rt">
     <button type="button" class="lnk refresh" id="refreshBtn" aria-busy="false">
@@ -536,7 +536,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       <button class="btn" id="armBtn" disabled>布防所选项目</button>
       <div class="brow">
         <button class="btn line" id="dryBtn" disabled>预演</button>
-        <button class="btn line" id="nowBtn" disabled title="需在 Worker 进程内触发,跨进程通道尚未接入">立即续跑</button>
+        <button class="btn line" id="armRefreshBtn" aria-busy="false" title="重新读取布防周期与全部项目状态">刷新状态</button>
       </div>
       <div class="note" id="armNote">勾选项目后布防;引擎会在下一拍探测额度。</div>
     </div>
@@ -989,7 +989,26 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
 
   // ───────── 队列与布防 ─────────
   const picked = new Set();
-  let projects = [], hidden = [], arm = null, armBusy = false, queueBusy = false, lastQueueSig = null;
+  function pathKey(path) {
+    let key = String(path || '').replaceAll('/', '\\').toLocaleLowerCase('en-US');
+    while (key.length > 3 && key.endsWith('\\')) key = key.slice(0, -1);
+    return key;
+  }
+  const pickedHas = path => {
+    const key = pathKey(path);
+    return [...picked].some(value => pathKey(value) === key);
+  };
+  function pickedAdd(path) {
+    pickedDelete(path);
+    picked.add(path);
+  }
+  function pickedDelete(path) {
+    const key = pathKey(path);
+    [...picked].forEach(value => { if (pathKey(value) === key) picked.delete(value); });
+  }
+  let projects = [], hidden = [], arm = null, armBusy = false, armRefreshBusy = false;
+  let queueBusy = false, lastQueueSig = null, lastArmSig = null;
+  let armReadIssued = 0, armReadApplied = 0, armMutationVersion = 0;
 
   function renderProjects(p) {
     projects = p.items;
@@ -1007,33 +1026,34 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     const fresh = sig !== lastQueueSig;
     lastQueueSig = sig;
 
-    const st = new Map((arm && arm.projectStatus || []).map(s => [s.path, s.status]));
+    const st = new Map((arm && arm.projectStatus || []).map(s => [pathKey(s.path), s]));
     list.innerHTML = p.items.map((it, i) => {
-      const s = st.get(it.path);
+      const status = st.get(pathKey(it.path));
+      const s = status && status.status;
       // limited 是「在等额度」,不是故障 —— 给琥珀。原来它和 error 一样是红的,
       // 于是"正常排队等恢复"看着跟"跑挂了"一模一样。
-      const cls = s === 'success' ? ' ok' : s === 'limited' ? ' wait' : s === 'error' ? ' bad' : '';
-      // 状态词直接落中文:面板上其余全是中文,只有这里蹦出 success/limited/error。
-      const stText = { success: '已完成', limited: '等额度', error: '失败', running: '进行中' }[s] || s;
+      const cls = status && status.category === 'success' ? ' ok'
+        : status && status.category === 'waiting' ? ' wait'
+        : status && status.category === 'failure' ? ' bad' : '';
       // 首次出现才轻微错开,封顶 120ms;列表仍在动画开始前即可交互。
-      const cn = 'r' + (picked.has(it.path) ? ' on' : '') + (fresh ? ' in' : '');
+      const cn = 'r' + (pickedHas(it.path) ? ' on' : '') + (fresh ? ' in' : '');
       const style = fresh ? ` style="--d:${Math.min(i * 24, 120)}ms"` : '';
       return `<div class="${cn}"${style} data-path="${esc(it.path)}"
-        role="checkbox" tabindex="0" aria-checked="${picked.has(it.path)}"
+        role="checkbox" tabindex="0" aria-checked="${pickedHas(it.path)}"
         aria-label="选择项目 ${esc(it.name)}">
         <div class="i">${i + 1}</div>
         <div class="m"><div class="nm">${esc(it.name)}${it.isGit ? '<span class="tag">git</span>' : ''}</div>
         <div class="pa">${esc(it.path)}</div></div>
-        <div class="rt${cls}">${s ? esc(stText) : (it.lastUsed ? esc(it.lastUsed) : '手动添加')}</div>
+        <div class="rt${cls}">${status ? esc(status.text) : (it.lastUsed ? esc(it.lastUsed) : '手动添加')}</div>
         <button class="rm" data-path="${esc(it.path)}" title="从队列移除"
           aria-label="从队列移除 ${esc(it.name)}">&times;</button>
       </div>`;
     }).join('');
     const toggleRow = (el) => {
       const path = el.dataset.path;
-      const on = !picked.has(path);
-      if (on) { picked.add(path); el.classList.add('on'); }
-      else { picked.delete(path); el.classList.remove('on'); }
+      const on = !pickedHas(path);
+      if (on) { pickedAdd(path); el.classList.add('on'); }
+      else { pickedDelete(path); el.classList.remove('on'); }
       el.setAttribute('aria-checked', String(on));
       syncArm();
     };
@@ -1084,19 +1104,20 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   // 增删都由后端写 shadow config 后回吐完整列表,前端不自己拼状态——
   // 免得界面显示的和真正持久化下来的对不上。
   async function mutateProjects(type, extra, busyText) {
-    if (queueBusy) return;
+    if (queueBusy || armBusy || armRefreshBusy) return;
     queueBusy = true;
+    syncArm();
     $('fl').textContent = busyText;
     try {
       const p = await call(type, extra);
       // 已移除的项目要一并退出勾选,否则它会继续计入"布防 N 个"。
-      const live = new Set(p.items.map(i => i.path));
-      [...picked].forEach(x => { if (!live.has(x)) picked.delete(x); });
+      const live = new Set(p.items.map(i => pathKey(i.path)));
+      [...picked].forEach(x => { if (!live.has(pathKey(x))) picked.delete(x); });
       renderProjects(p);
-      try { arm = await call('arm.get'); } catch { /* 布防态读不到不阻断列表更新 */ }
-      syncArm();
+      try { await readAndApplyArm({ forceRows: true }); }
+      catch { applyArmReadFailure(); }
     } catch (e) { $('fl').textContent = `${busyText.replace('…', '')}失败:${e.message}`; }
-    finally { queueBusy = false; }
+    finally { queueBusy = false; syncArm(); }
   }
 
   async function addProject() {
@@ -1115,16 +1136,20 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     const on = !!(arm && arm.armed);
     const b = $('armBtn');
     b.textContent = on ? '解除布防' : `布防所选项目${picked.size ? ` (${picked.size})` : ''}`;
-    b.disabled = armBusy || (!on && picked.size === 0);
+    const armUnknown = !!(arm && arm.engine === 'StateUnverified');
+    b.disabled = armBusy || armRefreshBusy || queueBusy || (!on && (armUnknown || picked.size === 0));
     b.classList.toggle('busy', armBusy);
-    $('dryBtn').disabled = armBusy || (!on && picked.size === 0);
+    $('dryBtn').disabled = armBusy || armRefreshBusy || queueBusy || armUnknown || (!on && picked.size === 0);
+    $('armRefreshBtn').disabled = armBusy || armRefreshBusy || queueBusy;
+    $('armRefreshBtn').classList.toggle('busy', armRefreshBusy);
 
     // ── 状态灯 ──
     // 这是整块面板上唯一回答「它到底在不在干活」的元件,所以它必须自己带颜色:
     //   绿 = 正常工作 / 琥珀 = 在等(不是故障) / 红 = 有问题 / 灰 = 没布防。
     // 「等额度恢复」刻意给琥珀而不是红:那是这台机器的正常工作状态,不是故障——
     // 拿红色去标它,真出问题时的红就不值钱了。
-    const failed = ((arm && arm.projectStatus) || []).filter(s => s.status === 'error').length;
+    const failed = ((arm && arm.projectStatus) || []).filter(s => s.category === 'failure').length;
+    const stopped = ((arm && arm.projectStatus) || []).filter(s => s.status === 'stopped').length;
     const n = on ? arm.selected.length : 0;
     let cls = '', head, sub;
     // **布防是意图,不是事实。** 引擎被杀掉之后面板照旧写「监视中」,
@@ -1146,10 +1171,51 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       $('armNote').textContent = '解除只停自动续跑';
       return;
     }
+    if (arm.engine === 'CancelPending') {
+      $('beacon').className = 'beacon bad';
+      $('armLine').textContent = '续跑终止待确认';
+      $('phaseLine').textContent = '已请求终止,但对应进程仍在运行';
+      $('armNote').textContent = '确认进程退出前不会启动新的续跑';
+      return;
+    }
+    if (arm.engine === 'RunActive') {
+      $('beacon').className = 'beacon wait';
+      $('armLine').textContent = '续跑仍在进行';
+      $('phaseLine').textContent = on
+        ? '已有项目进程仍在运行,新周期会等待它结束'
+        : '已解除布防,但已启动的项目进程仍在运行';
+      $('armNote').textContent = '确认进程退出前不会启动新的续跑';
+      return;
+    }
+    if (arm.engine === 'StateUnverified') {
+      $('beacon').className = 'beacon bad';
+      $('armLine').textContent = '布防状态未核实';
+      $('phaseLine').textContent = arm.engineText || '状态数据库或续跑引擎暂时无法核实';
+      $('armNote').textContent = '可刷新状态再次核验';
+      return;
+    }
+    if (arm.engine === 'RunMissing') {
+      $('beacon').className = 'beacon bad';
+      $('armLine').textContent = '续跑已中断';
+      $('phaseLine').textContent = '项目仍标记进行中,但对应进程已不存在';
+      $('armNote').textContent = '可刷新状态或解除后重新布防';
+      return;
+    }
+    if (arm.engine === 'RunUnverified') {
+      $('beacon').className = 'beacon wait';
+      $('armLine').textContent = '续跑状态未确认';
+      $('phaseLine').textContent = '暂时无法核验对应进程';
+      $('armNote').textContent = '可刷新状态再次核验';
+      return;
+    }
     if (!on) {
-      head = '未布防'; sub = '额度恢复后按队列续跑';
+      head = '未布防'; sub = '布防后将在额度恢复时按队列续跑';
     } else if (failed) {
-      cls = 'bad'; head = `${failed} 个续跑失败`; sub = '失败项见队列右侧,其余照常排队';
+      cls = 'bad'; head = `${failed} 个续跑失败`; sub = '本周期已停止,需解除并重新布防';
+    } else if (stopped) {
+      cls = 'bad'; head = `${stopped} 个续跑已停止`; sub = '不会自动重试,需解除并重新布防';
+    } else if (arm.phase === 'blocked') {
+      cls = 'bad'; head = '本周期已停止'; sub = '需解除并重新布防后才能再次续跑';
     } else if (arm.phase === 'resuming') {
       cls = 'on'; head = '正在续跑'; sub = `共 ${n} 个项目`;
     } else if (arm.phase === 'waiting') {
@@ -1168,23 +1234,156 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     $('armNote').textContent = on ? '解除只停自动续跑' : '勾选项目后布防';
   }
 
+  function armSignature(value) {
+    if (!value) return '';
+    const statuses = (value.projectStatus || [])
+      .map(s => `${s.path}\u0001${s.status}`).sort();
+    return JSON.stringify({
+      armed: value.armed, cycleId: value.cycleId, phase: value.phase,
+      sawLimited: value.sawLimited, engine: value.engine,
+      selected: value.selected || [], statuses,
+    });
+  }
+
+  function armSummary() {
+    if (arm && arm.engine === 'StateUnverified') return '布防状态未核实';
+    if (!arm || !arm.armed) {
+      return picked.size ? `未布防 · 已选择 ${picked.size} 个项目` : '未布防';
+    }
+
+    if (arm.engine === 'RunMissing') return '续跑已中断 · 对应进程不存在';
+    if (arm.engine === 'RunUnverified') return '续跑状态未确认';
+    if (arm.engine === 'CancelPending') return '续跑终止待确认';
+    const statuses = arm.projectStatus || [];
+    const done = statuses.filter(s => s.category === 'success').length;
+    const failed = statuses.filter(s => s.category === 'failure').length;
+    const stopped = statuses.filter(s => s.status === 'stopped').length;
+    const waiting = statuses.filter(s => s.status === 'limited').length;
+    const total = arm.selected.length;
+    if (arm.phase === 'resuming') return `正在续跑 · 已完成 ${done}/${total}`;
+    if (failed) return `已布防 ${total} 个项目 · ${failed} 个失败`;
+    if (stopped) return `已布防 ${total} 个项目 · ${stopped} 个已停止`;
+    if (arm.phase === 'blocked') return `已布防 ${total} 个项目 · 本周期已停止`;
+    if (waiting || arm.sawLimited) return `已布防 ${total} 个项目 · 等待额度恢复`;
+    return `已布防 ${total} 个项目`;
+  }
+
+  function applyArmState(next, { forceRows = false, announce = false } = {}) {
+    const previousSig = lastArmSig;
+    // 未布防时任何逐项目结果都只能属于历史周期。即使后端版本错配或未来回归
+    // 意外回传了旧 success，也不能让项目行继续渲染成绿色“已完成”。
+    arm = next && !next.armed
+      ? { ...next, phase: '', sawLimited: false, projectStatus: [] }
+      : next;
+    if (arm && arm.armed) {
+      picked.clear();
+      (arm.selected || []).forEach(p => pickedAdd(p));
+    }
+
+    const nextSig = armSignature(arm);
+    const changed = nextSig !== previousSig;
+    lastArmSig = nextSig;
+    if ((forceRows || changed) && projects.length) {
+      renderProjects({ items: projects, hidden, elapsedMs: 0 });
+    } else {
+      syncArm();
+    }
+    if (announce || changed) $('fl').textContent = armSummary();
+  }
+
+  function applyArmReadFailure() {
+    const previous = arm || {};
+    applyArmState({
+      armed: !!previous.armed,
+      continuous: !!previous.continuous,
+      cycleId: previous.cycleId || '',
+      phase: '',
+      sawLimited: false,
+      selected: previous.selected || [],
+      projectStatus: [],
+      engine: 'StateUnverified',
+      engineText: '布防状态暂时无法核实',
+    }, { forceRows: true });
+  }
+
+  async function readAndApplyArm(options = {}) {
+    const requestId = ++armReadIssued;
+    const mutationVersion = armMutationVersion;
+    const next = await call('arm.get');
+    if (mutationVersion !== armMutationVersion || requestId < armReadApplied) return false;
+    armReadApplied = requestId;
+    applyArmState(next, options);
+    return true;
+  }
+
+  async function refreshArmState({ forceRows = false, announce = false } = {}) {
+    if (armBusy || armRefreshBusy || queueBusy) return;
+    const refreshBtn = $('armRefreshBtn');
+    armRefreshBusy = true;
+    refreshBtn.setAttribute('aria-busy', 'true');
+    refreshBtn.textContent = '刷新中…';
+    syncArm();
+    try {
+      await readAndApplyArm({ forceRows, announce });
+    } catch (e) {
+      applyArmReadFailure();
+      if (announce) $('fl').textContent = `刷新布防状态失败:${e.message}`;
+    } finally {
+      armRefreshBusy = false;
+      refreshBtn.setAttribute('aria-busy', 'false');
+      refreshBtn.textContent = '刷新状态';
+      syncArm();
+    }
+  }
+
   async function toggleArm() {
-    if (armBusy) return;
+    if (armBusy || armRefreshBusy || queueBusy) return;
+    armMutationVersion++;
     armBusy = true; syncArm();
     const want = !(arm && arm.armed);
     try {
-      arm = await call('arm.set', { armed: want, paths: [...picked] });
-      $('fl').textContent = want ? `已布防 ${arm.selected.length} 个项目` : '已解除布防';
-      renderProjects({ items: projects, elapsedMs: 0 });
-    } catch (e) { $('fl').textContent = `布防操作失败:${e.message}`; }
+      const next = await call('arm.set', { armed: want, paths: [...picked] });
+      applyArmState(next, { forceRows: true, announce: true });
+    } catch (e) {
+      let readSucceeded = false;
+      let targetObserved = false;
+      // 失败后立即、1 秒、5 秒三个时间点对账，覆盖后端超时但稍后提交的情况。
+      for (const waitMs of [0, 1000, 4000]) {
+        if (waitMs) await new Promise(resolve => setTimeout(resolve, waitMs));
+        try {
+          await readAndApplyArm({ forceRows: true });
+          readSucceeded = true;
+          if (arm && arm.engine !== 'StateUnverified' && !!arm.armed === want) {
+            targetObserved = true;
+            break;
+          }
+        } catch { }
+      }
+
+      if (targetObserved) {
+        $('fl').textContent = armSummary();
+      } else if (!readSucceeded) {
+        applyArmReadFailure();
+        $('fl').textContent = `布防操作结果未确认:${e.message}`;
+      } else if (arm.engine === 'StateUnverified') {
+        $('fl').textContent = `布防操作结果未确认:${e.message}`;
+      } else {
+        // arm.set 超时不会取消宿主任务，也没有 operation id 可证明它稍后绝不会提交。
+        // 读到反状态只能说明本轮 5 秒窗口内未观察到目标态，不能宣称“已确认未生效”。
+        $('fl').textContent = `布防操作结果未确认,5 秒内未观察到生效;请刷新状态继续核验:${e.message}`;
+      }
+    }
     finally { armBusy = false; syncArm(); }
   }
 
   function dryRun() {
     const order = (arm && arm.armed) ? arm.selected : [...picked];
-    const st = new Map((arm && arm.projectStatus || []).map(s => [s.path, s.status]));
-    const nm = new Map(projects.map(p => [p.path, p.name]));
-    const lines = order.map((p, i) => `${i + 1}. ${nm.get(p) || p}${st.has(p) ? ' — 上轮 ' + st.get(p) : ''}`);
+    const st = new Map((arm && arm.projectStatus || []).map(s => [pathKey(s.path), s.status]));
+    const nm = new Map(projects.map(p => [pathKey(p.path), p.name]));
+    const lines = order.map((p, i) => {
+      const key = pathKey(p);
+      return `${i + 1}. ${nm.get(key) || p}${st.has(key) ? ' — 本周期 ' + st.get(key) : ''}`;
+    });
     $('fl').textContent = lines.length ? `预演(不执行):${lines.join(' · ')}` : '预演:没有可续跑的项目。';
   }
 
@@ -1422,8 +1621,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   // 30 秒一拍:只读两个小文件加一次进程枚举,便宜到可以常跑。
   if (!armTimer) {
     armTimer = setInterval(async () => {
-      try { arm = await call('arm.get'); syncArm(); }
-      catch { /* 读不到就保持上一次显示,不把面板打成错误页 */ }
+      await refreshArmState();
     }, 30000);
   }
 
@@ -1431,9 +1629,11 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     refreshQuota(false, false);   // 不 await:本地块先画,服务端探测在后台补
 
     try {
-      arm = await call('arm.get');
-      if (arm.armed) { picked.clear(); arm.selected.forEach(p => picked.add(p)); }
-    } catch (e) { $('armNote').textContent = '读取布防状态失败:' + e.message; }
+      await readAndApplyArm();
+    } catch (e) {
+      applyArmReadFailure();
+      $('armNote').textContent = '读取布防状态失败:' + e.message;
+    }
 
     call('feishu.status').then(p => {
       renderFeishu(p);
@@ -1487,10 +1687,12 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   $('fsGen').addEventListener('click', genCutover);
   $('fsPre').addEventListener('click', preflight);
   $('armBtn').addEventListener('click', toggleArm);
+  $('armRefreshBtn').addEventListener('click', () => refreshArmState({ forceRows: true, announce: true }));
   $('dryBtn').addEventListener('click', dryRun);
   $('rescanBtn').addEventListener('click', async () => {
-    if (queueBusy) return;
+    if (queueBusy || armBusy || armRefreshBusy) return;
     queueBusy = true;
+    syncArm();
     const btn = $('rescanBtn');
     btn.classList.add('busy');
     btn.setAttribute('aria-busy', 'true');
@@ -1503,6 +1705,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       const rest = 300 - (Date.now() - t0);
       if (rest > 0) await new Promise(resolve => setTimeout(resolve, rest));
       queueBusy = false;
+      syncArm();
       btn.classList.remove('busy');
       btn.removeAttribute('aria-busy');
       btn.textContent = '重新扫描';

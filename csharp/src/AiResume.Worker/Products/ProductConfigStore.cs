@@ -28,6 +28,19 @@ public sealed class ProductConfigStore
     public ProductConfig Load() => LoadUnlocked();
 
     /// <summary>
+    /// 在与 <see cref="Update"/> 相同的配置锁内读取快照。用于需要把配置与其它状态边界
+    /// 组合成一致视图的调用方，避免读到一次提交中间的半成品。
+    /// </summary>
+    public T ReadLocked<T>(Func<ProductConfig, T> read)
+    {
+        ArgumentNullException.ThrowIfNull(read);
+        EnsureDirectory();
+
+        using var lockFs = AcquireLock(_configPath + ".write.lock");
+        return read(LoadUnlocked());
+    }
+
+    /// <summary>
     /// **锁内**读-改-写:独占锁 → 重新读最新配置 → 只改本次负责的字段 → 原子替换。
     ///
     /// 这是本类唯一安全的修改入口。<see cref="Save"/> 写的是调用方在锁外读到的整份快照,

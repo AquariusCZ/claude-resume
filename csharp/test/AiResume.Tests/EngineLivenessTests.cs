@@ -1,4 +1,7 @@
+using AiResume.Core;
+using AiResume.Core.Contracts;
 using AiResume.Worker.Products;
+using AiResume.Worker.Supervision;
 using Xunit;
 
 namespace AiResume.Tests;
@@ -61,6 +64,25 @@ public sealed class EngineLivenessTests
     }
 
     [Fact]
+    public void 正在续跑时久未探额度不算卡住()
+    {
+        // 项目执行本身可能持续数小时;静默时长不是失败证据。
+        Assert.Equal(
+            EngineVerdict.Alive,
+            EngineLiveness.Evaluate(
+                true, true, Now.AddHours(-3), Now, 15, workInProgress: true));
+    }
+
+    [Fact]
+    public void 正在续跑但引擎进程不在仍然要报错()
+    {
+        Assert.Equal(
+            EngineVerdict.NotRunning,
+            EngineLiveness.Evaluate(
+                true, false, Now.AddHours(-3), Now, 15, workInProgress: true));
+    }
+
+    [Fact]
     public void 间隔配得极小时用五分钟地板()
     {
         // 间隔配成 1 分钟时,3 分钟就报卡住会一直误报。
@@ -105,6 +127,11 @@ public sealed class EngineLivenessTests
     {
         Assert.Contains("没在运行", EngineLiveness.Describe(EngineVerdict.NotRunning));
         Assert.Contains("久未探测", EngineLiveness.Describe(EngineVerdict.Stalled));
+        Assert.Contains("不存在", EngineLiveness.Describe(EngineVerdict.RunMissing));
+        Assert.Contains("无法核验", EngineLiveness.Describe(EngineVerdict.RunUnverified));
+        Assert.Contains("仍在运行", EngineLiveness.Describe(EngineVerdict.RunActive));
+        Assert.Contains("无法核实", EngineLiveness.Describe(EngineVerdict.StateUnverified));
+        Assert.Contains("仍在运行", EngineLiveness.Describe(EngineVerdict.CancelPending));
         Assert.DoesNotContain("没在运行", EngineLiveness.Describe(EngineVerdict.Alive));
     }
 
@@ -117,5 +144,71 @@ public sealed class EngineLivenessTests
         Assert.Equal(
             EngineVerdict.Alive,
             EngineLiveness.Evaluate(true, unknown ?? true, Now.AddMinutes(-1), Now, 15));
+    }
+
+    [Fact]
+    public void 只有指定RunId对应的登记进程能作为活动证据()
+    {
+        RunId requested = RunId.New();
+        RunId other = RunId.New();
+        var registry = new MemoryRegistry();
+        registry.Add(Entry(other, childPid: 4321));
+        var probe = new FixedProbe(new ProcessProbeResult(ProcessLiveness.Alive, Now, "cmd.exe"));
+
+        Assert.False(EngineLiveness.TryDetectActiveOwnedProcess(requested, registry, probe));
+
+        registry.Add(Entry(requested, childPid: 1234));
+        Assert.True(EngineLiveness.TryDetectActiveOwnedProcess(requested, registry, probe));
+    }
+
+    [Fact]
+    public void 指定RunId登记仍在但外层进程已消失_无Job句柄时返回未核实()
+    {
+        RunId requested = RunId.New();
+        var registry = new MemoryRegistry();
+        registry.Add(Entry(requested, childPid: 1234));
+        var probe = new FixedProbe(new ProcessProbeResult(ProcessLiveness.Gone, null, null));
+
+        Assert.Null(EngineLiveness.TryDetectActiveOwnedProcess(requested, registry, probe));
+    }
+
+    private static ProcessRegistryEntry Entry(RunId runId, int? childPid) => new(
+        runId,
+        Environment.ProcessId,
+        childPid,
+        "job-test",
+        Now,
+        ProcessSignature.Compute("cmd.exe"),
+        Now);
+
+    private sealed class FixedProbe : IProcessProbe
+    {
+        private readonly ProcessProbeResult _result;
+
+        public FixedProbe(ProcessProbeResult result) => _result = result;
+
+        public ProcessProbeResult Probe(int pid) => _result;
+
+        public IReadOnlyList<ProcessSnapshotEntry> EnumerateAll() => Array.Empty<ProcessSnapshotEntry>();
+    }
+
+    private sealed class MemoryRegistry : IProcessRegistry
+    {
+        private readonly Dictionary<RunId, ProcessRegistryEntry> _entries = new();
+
+        public void Add(ProcessRegistryEntry entry) => _entries[entry.RunId] = entry;
+
+        public ProcessRegistryEntry? Get(RunId runId) =>
+            _entries.TryGetValue(runId, out ProcessRegistryEntry? entry) ? entry : null;
+
+        public IReadOnlyList<ProcessRegistryEntry> EnumerateAll() => _entries.Values.ToList();
+
+        public void InsertPlaceholder(RunId runId, int parentPid, string jobId, string commandSignature) =>
+            throw new NotSupportedException();
+
+        public void Complete(RunId runId, int childPid, DateTimeOffset startedAt, string commandSignature) =>
+            throw new NotSupportedException();
+
+        public void Delete(RunId runId) => throw new NotSupportedException();
     }
 }

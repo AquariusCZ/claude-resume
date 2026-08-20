@@ -47,6 +47,8 @@ public sealed class ControlPlaneBridge
     private readonly Func<CancellationToken, Task<DeepSeekProbeResult>> _deepSeekProbe;
     private readonly Action<string, string> _probeFailureReporter;
     private readonly Action<string, string> _requestFailureReporter;
+    private readonly Func<bool?> _engineProcessDetector;
+    private readonly Func<string, bool?> _activeResumeDetector;
     private readonly string _cutoverConfigPath;
     private readonly bool _demoMode;
     private int _cutoverInProgress;
@@ -71,6 +73,8 @@ public sealed class ControlPlaneBridge
         Func<CancellationToken, Task<DeepSeekProbeResult>>? deepSeekProbe = null,
         Action<string, string>? probeFailureReporter = null,
         Action<string, string>? requestFailureReporter = null,
+        Func<bool?>? engineProcessDetector = null,
+        Func<string, bool?>? activeResumeDetector = null,
         bool demoMode = false)
     {
         _demoMode = demoMode;
@@ -90,6 +94,11 @@ public sealed class ControlPlaneBridge
         _deepSeekProbe = deepSeekProbe ?? (ct => new DeepSeekProbe().ProbeAsync(ct));
         _probeFailureReporter = probeFailureReporter ?? ((_, _) => { });
         _requestFailureReporter = requestFailureReporter ?? ((_, _) => { });
+        _engineProcessDetector = engineProcessDetector ?? (() => EngineLiveness.TryDetectEngineProcess());
+        // 测试注入自有 stateStore 时默认不碰生产 process_registry;生产窗口才读现役数据库。
+        _activeResumeDetector = activeResumeDetector ?? (stateStore is null
+            ? runId => EngineLiveness.TryDetectActiveOwnedProcess(ShadowPaths.RunDatabasePath, runId)
+            : _ => false);
         _cutoverConfigPath = cutoverConfigPath ?? CutoverConfigCommand.DefaultConfigPath;
         _quota = quotaService ?? new QuotaService();
         // 与 Worker 的续跑引擎读写同一份 shadow 配置/状态:GUI 布防 → 引擎消费。
@@ -223,12 +232,9 @@ public sealed class ControlPlaneBridge
                 phase = "waiting",
                 sawLimited = true,
                 selected,
-                projectStatus = new object[]
-                {
-                    new { path = selected[0], status = "limited" },
-                    new { path = selected[1], status = "limited" },
-                    new { path = selected[2], status = "limited" },
-                },
+                projectStatus = selected
+                    .Select(path => DescribeProjectStatus(path, "limited"))
+                    .ToArray(),
                 engine = "Healthy",
                 engineText = "运行中",
                 probeAgeSeconds = 12,
@@ -583,21 +589,171 @@ public sealed class ControlPlaneBridge
             windows);
     }
 
-    /// <summary>读布防现状 + 上一轮逐项目结果(供「预演」展示将按什么顺序续跑)。</summary>
+    /// <summary>读当前布防周期与逐项目进度。</summary>
     private ArmPayload GetArm()
     {
-        ProductConfig config = _configStore.Load();
-        CheckerState state = _stateStore.Load();
+        ArmReadSnapshot snapshot = _configStore.ReadLocked(config =>
+        {
+            try
+            {
+                return new ArmReadSnapshot(config, _stateStore.LoadStrict(), null);
+            }
+            catch (Exception ex)
+            {
+                return new ArmReadSnapshot(config, null, ex);
+            }
+        });
 
+        ProductConfig config = snapshot.Config;
+        Exception? readError = snapshot.Error;
+        if (readError is not null || snapshot.State is null)
+        {
+            ReportRequestFailure("arm.get", readError ?? new InvalidDataException("布防状态快照为空。"));
+            var unreadableSelected = config.Selected.Select(p => p.Path).ToList();
+            EngineVerdict unreadableVerdict = config.Armed && _engineProcessDetector() == false
+                ? EngineVerdict.NotRunning
+                : EngineVerdict.StateUnverified;
+            return new ArmPayload(
+                config.Armed,
+                config.Continuous,
+                config.ArmCycleId,
+                string.Empty,
+                false,
+                unreadableSelected,
+                Array.Empty<ProjectStatusItem>(),
+                unreadableVerdict.ToString(),
+                EngineLiveness.Describe(unreadableVerdict),
+                null);
+        }
+
+        CheckerState state = snapshot.State;
         var selected = config.Selected.Select(p => p.Path).ToList();
-        var statuses = (state.ProjectStatus ?? new Dictionary<string, string>())
-            .Select(kv => new ProjectStatusItem(kv.Key, kv.Value)).ToList();
+
+        bool currentCycle = config.Armed &&
+            !string.IsNullOrEmpty(config.ArmCycleId) &&
+            string.Equals(config.ArmCycleId, state.CycleId, StringComparison.Ordinal);
+        var statuses = new List<ProjectStatusItem>();
+        if (currentCycle && state.ProjectStatus is not null)
+        {
+            foreach (string selectedPath in selected)
+            {
+                KeyValuePair<string, string> match = state.ProjectStatus.FirstOrDefault(kv =>
+                    PathEquals(kv.Key, selectedPath));
+                if (match.Value is not null)
+                {
+                    statuses.Add(DescribeProjectStatus(selectedPath, match.Value));
+                }
+            }
+        }
 
         // **布防是意图,不是事实。** 只回 armed 的话,续跑 Worker 被杀掉之后
         // 面板照旧写着「监视中」(2026-08-08 审计 A4)——而用户会真的去睡觉。
         DateTimeOffset now = DateTimeOffset.UtcNow;
-        EngineVerdict verdict = EngineLiveness.Evaluate(config, state, now);
-        long? probeAge = state.LastProbeUtc is { } lp
+        bool cancellationPending = currentCycle &&
+            statuses.Any(s => s.Status == "cancel-pending");
+        bool hasActiveRun = !string.IsNullOrEmpty(state.ActiveRunId);
+        bool hasRunningClaim = currentCycle &&
+            statuses.Any(s => s.Status is "running" or "cancel-pending");
+        bool claimsWorkInProgress = currentCycle &&
+            state.Phase == CheckerState.PhaseResuming &&
+            hasActiveRun &&
+            !string.IsNullOrEmpty(state.ActiveProjectPath) &&
+            statuses.Any(s =>
+                PathEquals(s.Path, state.ActiveProjectPath) &&
+                s.Status is "running" or "cancel-pending");
+        bool? activeRunEvidence = hasActiveRun
+            ? _activeResumeDetector(state.ActiveRunId)
+            : null;
+        bool? engineRunning = _engineProcessDetector();
+        EngineVerdict verdict = config.Armed && engineRunning is null
+            ? EngineVerdict.StateUnverified
+            : EngineLiveness.Evaluate(
+                config.Armed,
+                engineRunning == true,
+                currentCycle ? state.LastProbeUtc : null,
+                now,
+                config.ProbeIntervalMinutes,
+                (claimsWorkInProgress && activeRunEvidence == true) ||
+                    (currentCycle && state.ReplayBlocked));
+        bool canApplyRunVerdict = verdict != EngineVerdict.NotRunning &&
+            !(config.Armed && verdict == EngineVerdict.StateUnverified);
+        bool pendingRunBlocks = false;
+        if (!string.IsNullOrEmpty(state.PendingCancellationRunId))
+        {
+            bool? pendingEvidence = _activeResumeDetector(state.PendingCancellationRunId);
+            if (canApplyRunVerdict)
+            {
+                verdict = pendingEvidence switch
+                {
+                    true => EngineVerdict.CancelPending,
+                    null => EngineVerdict.RunUnverified,
+                    _ => verdict,
+                };
+                pendingRunBlocks = pendingEvidence != false;
+            }
+        }
+
+        if (!pendingRunBlocks && cancellationPending && canApplyRunVerdict)
+        {
+            verdict = activeRunEvidence == false
+                ? EngineVerdict.RunMissing
+                : EngineVerdict.RunUnverified;
+        }
+        else if (!pendingRunBlocks && hasActiveRun && canApplyRunVerdict)
+        {
+            verdict = activeRunEvidence switch
+            {
+                true when !claimsWorkInProgress => EngineVerdict.RunActive,
+                false => EngineVerdict.RunMissing,
+                null => EngineVerdict.RunUnverified,
+                _ => verdict,
+            };
+        }
+        else if (!pendingRunBlocks && hasRunningClaim && canApplyRunVerdict)
+        {
+            // 项目行声称 running/cancel-pending 却没有精确 RunId,不能继续肯定地写“进行中”。
+            verdict = EngineVerdict.RunMissing;
+        }
+
+        if (verdict == EngineVerdict.StateUnverified)
+        {
+            ReplaceClaimedRunningStatuses(statuses, "run-unverified");
+        }
+        else if (verdict == EngineVerdict.NotRunning && hasRunningClaim)
+        {
+            if (activeRunEvidence == false)
+            {
+                ReplaceClaimedRunningStatuses(statuses, "exit-null");
+            }
+            else if (activeRunEvidence is null)
+            {
+                ReplaceClaimedRunningStatuses(statuses, "run-unverified");
+            }
+        }
+        else if (verdict == EngineVerdict.RunMissing)
+        {
+            if (hasActiveRun)
+            {
+                ReplaceProjectStatus(statuses, state.ActiveProjectPath, "exit-null");
+            }
+            else
+            {
+                ReplaceClaimedRunningStatuses(statuses, "exit-null");
+            }
+        }
+        else if (verdict == EngineVerdict.RunUnverified)
+        {
+            string? affectedPath = !string.IsNullOrEmpty(state.PendingCancellationProjectPath)
+                ? state.PendingCancellationProjectPath
+                : state.ActiveProjectPath;
+            ReplaceProjectStatus(statuses, affectedPath, "run-unverified");
+        }
+
+        if (!hasActiveRun && hasRunningClaim)
+        {
+            ReplaceClaimedRunningStatuses(statuses, "exit-null");
+        }
+        long? probeAge = currentCycle && state.LastProbeUtc is { } lp
             ? (long)Math.Max(0, (now - lp).TotalSeconds)
             : null;
 
@@ -605,13 +761,69 @@ public sealed class ControlPlaneBridge
             config.Armed,
             config.Continuous,
             config.ArmCycleId,
-            state.Phase,
-            state.SawLimited,
+            currentCycle ? state.Phase : string.Empty,
+            currentCycle && state.SawLimited,
             selected,
             statuses,
             verdict.ToString(),
             EngineLiveness.Describe(verdict),
             probeAge);
+    }
+
+    private static ProjectStatusItem DescribeProjectStatus(string path, string? status)
+    {
+        string normalizedStatus = status ?? string.Empty;
+        (string category, string text) = normalizedStatus switch
+        {
+            "success" => ("success", "已完成"),
+            "limited" => ("waiting", "等额度"),
+            "running" => ("running", "进行中"),
+            "cancel-pending" => ("waiting", "终止待确认"),
+            "stopped" => ("waiting", "已停止"),
+            "error" => ("failure", "失败"),
+            "no-claude" => ("failure", "Claude 或项目不可用"),
+            "prompt-multiline" => ("failure", "续跑提示词无效"),
+            "launch-error" => ("failure", "启动失败"),
+            "registry-error" => ("failure", "进程登记失败"),
+            "monitor-error" => ("failure", "进程监控失败"),
+            "limited-side-effects" => ("failure", "限流前已执行操作"),
+            "exit-null" => ("failure", "未确认完成"),
+            "run-unverified" => ("waiting", "状态未核实"),
+            _ when normalizedStatus.StartsWith("exit-", StringComparison.Ordinal) => ("failure", "进程异常退出"),
+            _ => ("failure", "未知异常"),
+        };
+
+        return new ProjectStatusItem(path, normalizedStatus, category, text);
+    }
+
+    private static void ReplaceProjectStatus(
+        List<ProjectStatusItem> statuses,
+        string? projectPath,
+        string replacementStatus)
+    {
+        if (string.IsNullOrEmpty(projectPath))
+        {
+            return;
+        }
+
+        int index = statuses.FindIndex(item => PathEquals(item.Path, projectPath));
+        if (index >= 0)
+        {
+            statuses[index] = DescribeProjectStatus(statuses[index].Path, replacementStatus);
+        }
+    }
+
+    private static void ReplaceClaimedRunningStatuses(
+        List<ProjectStatusItem> statuses,
+        string replacementStatus)
+    {
+        for (int index = 0; index < statuses.Count; index++)
+        {
+            if (statuses[index].Status is "running" or "cancel-pending")
+            {
+                statuses[index] = DescribeProjectStatus(statuses[index].Path, replacementStatus);
+            }
+        }
     }
 
     /// <summary>
@@ -1528,7 +1740,14 @@ public sealed class ControlPlaneBridge
 
     private sealed record ProjectStatusItem(
         [property: JsonPropertyName("path")] string Path,
-        [property: JsonPropertyName("status")] string Status);
+        [property: JsonPropertyName("status")] string Status,
+        [property: JsonPropertyName("category")] string Category,
+        [property: JsonPropertyName("text")] string Text);
+
+    private sealed record ArmReadSnapshot(
+        ProductConfig Config,
+        CheckerState? State,
+        Exception? Error);
 
     private sealed record QuotaPayload(
         [property: JsonPropertyName("provider")] string Provider,

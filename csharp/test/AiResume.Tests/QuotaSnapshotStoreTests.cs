@@ -233,7 +233,7 @@ public sealed class QuotaSnapshotStoreTests
         {
             using var version = migrated.CreateCommand();
             version.CommandText = "SELECT MAX(version) FROM schema_version;";
-            Assert.Equal(5L, (long)version.ExecuteScalar()!);
+            Assert.Equal((long)StorageDatabase.CurrentSchemaVersion, (long)version.ExecuteScalar()!);
             using var columns = migrated.CreateCommand();
             columns.CommandText = "SELECT COUNT(*) FROM pragma_table_info('quota_snapshots');";
             Assert.Equal(5L, (long)columns.ExecuteScalar()!);

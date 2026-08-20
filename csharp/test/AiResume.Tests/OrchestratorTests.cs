@@ -282,6 +282,292 @@ public sealed class OrchestratorTests : IDisposable
         Assert.Equal(0, supervisor.StartCalls);
     }
 
+    [Fact]
+    public async Task Process_started_with_error_is_cancelled_before_running()
+    {
+        var store = new RunStore(_dbPath);
+        var supervisor = new FakeProcessSupervisor
+        {
+            StartErrorCode = "assign_job_failed_child_pending",
+        };
+        var provider = new FakeProviderAdapter();
+        var orchestrator = new TaskOrchestrator(store, supervisor, provider);
+
+        StartResponse start = await orchestrator.StartAsync(
+            NewStart("query|c:\\p8b|ou_8b"), CancellationToken.None);
+
+        Assert.Equal(RunState.FailedLocal, start.State);
+        Assert.Equal("assign_job_failed_child_pending", start.ErrorCode);
+        Assert.Equal(1, supervisor.StartCalls);
+        Assert.Equal(1, supervisor.CancelCalls);
+        Assert.Equal(1, provider.CancelCalls);
+    }
+
+    [Fact]
+    public async Task Process_started_with_error_keeps_run_key_until_cancel_is_confirmed()
+    {
+        var store = new RunStore(_dbPath);
+        var supervisor = new FakeProcessSupervisor
+        {
+            StartErrorCode = "assign_job_failed_child_pending",
+            CancelChildPending = true,
+        };
+        var provider = new FakeProviderAdapter();
+        var orchestrator = new TaskOrchestrator(store, supervisor, provider);
+        string runKey = "query|c:\\p8c|ou_8c";
+
+        StartResponse start = await orchestrator.StartAsync(NewStart(runKey), CancellationToken.None);
+        Assert.Equal(RunState.Starting, start.State);
+        Assert.Equal(1, supervisor.StartCalls);
+        Assert.Equal(1, supervisor.CancelCalls);
+
+        StartResponse blocked = await orchestrator.StartAsync(NewStart(runKey), CancellationToken.None);
+        Assert.False(blocked.Accepted);
+        Assert.Equal(ConflictKind.RunKeyBusy, blocked.Conflict);
+
+        await orchestrator.ObserveAsync(CancellationToken.None);
+        Assert.Equal(RunState.Starting, (await orchestrator.StatusAsync(start.RunId, CancellationToken.None)).State);
+        Assert.Equal(1, supervisor.StartCalls);
+        Assert.Equal(2, supervisor.CancelCalls);
+
+        supervisor.CancelChildPending = false;
+        await orchestrator.ObserveAsync(CancellationToken.None);
+        RunSnapshot failed = await orchestrator.StatusAsync(start.RunId, CancellationToken.None);
+        Assert.Equal(RunState.FailedLocal, failed.State);
+        Assert.Equal("assign_job_failed_child_pending", failed.ErrorCode);
+        Assert.Equal(1, supervisor.StartCalls);
+        Assert.Equal(3, supervisor.CancelCalls);
+        Assert.Equal(1, provider.CancelCalls);
+    }
+
+    [Fact]
+    public async Task User_cancel_wins_while_failed_start_is_still_pending()
+    {
+        var store = new RunStore(_dbPath);
+        var supervisor = new FakeProcessSupervisor
+        {
+            StartErrorCode = "assign_job_failed_child_pending",
+            CancelChildPending = true,
+        };
+        var orchestrator = new TaskOrchestrator(store, supervisor, new FakeProviderAdapter());
+
+        StartResponse start = await orchestrator.StartAsync(
+            NewStart("query|c:\\p8d|ou_8d"), CancellationToken.None);
+        CancelResponse cancel = await orchestrator.CancelAsync(
+            NewCancel(start.RunId), CancellationToken.None);
+        Assert.Equal(RunState.Starting, cancel.State);
+        Assert.True(cancel.ChildPending);
+
+        supervisor.CancelChildPending = false;
+        await orchestrator.ObserveAsync(CancellationToken.None);
+
+        RunSnapshot final = await orchestrator.StatusAsync(start.RunId, CancellationToken.None);
+        Assert.Equal(RunState.Cancelled, final.State);
+        Assert.Equal(ErrorClass.Cancelled, final.ErrorClass);
+    }
+
+    [Fact]
+    public async Task Recovered_starting_process_resumes_running_without_second_spawn()
+    {
+        var store = new RunStore(_dbPath);
+        var supervisor = new FakeProcessSupervisor
+        {
+            StatusProvider = () => new ProcessStatus
+            {
+                Liveness = ProcessLiveness.Alive,
+                ChildPending = true,
+            },
+        };
+        var provider = new FakeProviderAdapter();
+        var orchestrator = new TaskOrchestrator(store, supervisor, provider);
+        StartRequest request = NewStart("query|c:\\recovered|ou_recovered");
+        StartResponse accepted = await store.StartAsync(request, CancellationToken.None);
+        Assert.True(await store.AdvanceStateAsync(
+            accepted.RunId,
+            RunState.Starting,
+            cancellationToken: CancellationToken.None));
+
+        await orchestrator.ObserveAsync(CancellationToken.None);
+
+        Assert.Equal(RunState.Running, (await store.StatusAsync(accepted.RunId, CancellationToken.None)).State);
+        Assert.Equal(1, supervisor.StatusCalls);
+        Assert.Equal(0, supervisor.StartCalls);
+        Assert.Equal(0, provider.StartCalls);
+    }
+
+    [Fact]
+    public async Task Recovered_starting_process_with_unknown_status_stays_starting()
+    {
+        var store = new RunStore(_dbPath);
+        var supervisor = new FakeProcessSupervisor
+        {
+            StatusProvider = () => new ProcessStatus
+            {
+                Liveness = ProcessLiveness.Unknown,
+                ChildPending = true,
+                MonitorError = "registry_incomplete",
+            },
+        };
+        var orchestrator = new TaskOrchestrator(store, supervisor, new FakeProviderAdapter());
+        StartRequest request = NewStart("query|c:\\unknown|ou_unknown");
+        StartResponse accepted = await store.StartAsync(request, CancellationToken.None);
+        Assert.True(await store.AdvanceStateAsync(
+            accepted.RunId,
+            RunState.Starting,
+            cancellationToken: CancellationToken.None));
+
+        await orchestrator.ObserveAsync(CancellationToken.None);
+
+        Assert.Equal(RunState.Starting, (await store.StatusAsync(accepted.RunId, CancellationToken.None)).State);
+        Assert.Equal(1, supervisor.StatusCalls);
+        Assert.Equal(0, supervisor.StartCalls);
+    }
+
+    [Fact]
+    public async Task Recovered_starting_process_with_cancel_request_retries_exact_run_cancel()
+    {
+        var store = new RunStore(_dbPath);
+        var supervisor = new FakeProcessSupervisor
+        {
+            CancelChildPending = true,
+            StatusProvider = () => new ProcessStatus
+            {
+                Liveness = ProcessLiveness.Alive,
+                ChildPending = true,
+            },
+        };
+        var orchestrator = new TaskOrchestrator(store, supervisor, new FakeProviderAdapter());
+        StartRequest request = NewStart("query|c:\\cancel-recovered|ou_cancel_recovered");
+        StartResponse accepted = await store.StartAsync(request, CancellationToken.None);
+        Assert.True(await store.AdvanceStateAsync(
+            accepted.RunId,
+            RunState.Starting,
+            cancellationToken: CancellationToken.None));
+        await store.CancelAsync(NewCancel(accepted.RunId), CancellationToken.None);
+
+        await orchestrator.ObserveAsync(CancellationToken.None);
+
+        Assert.Equal(RunState.Starting, (await store.StatusAsync(accepted.RunId, CancellationToken.None)).State);
+        Assert.Equal(1, supervisor.CancelCalls);
+        Assert.Equal(0, supervisor.StartCalls);
+
+        supervisor.CancelChildPending = false;
+        await orchestrator.ObserveAsync(CancellationToken.None);
+
+        RunSnapshot cancelled = await store.StatusAsync(accepted.RunId, CancellationToken.None);
+        Assert.Equal(RunState.Cancelled, cancelled.State);
+        Assert.Equal(2, supervisor.CancelCalls);
+        Assert.Equal(0, supervisor.StartCalls);
+    }
+
+    [Fact]
+    public async Task Concurrent_start_driver_and_observer_spawn_only_once()
+    {
+        var store = new RunStore(_dbPath);
+        var startEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseStart = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var supervisor = new FakeProcessSupervisor
+        {
+            StatusProvider = () => new ProcessStatus
+            {
+                Liveness = ProcessLiveness.Gone,
+                ChildPending = false,
+            },
+            StartHandler = async (request, cancellationToken) =>
+            {
+                startEntered.TrySetResult();
+                await releaseStart.Task.WaitAsync(cancellationToken);
+                return FakeProcessSupervisor.SuccessfulStart(request.RunId);
+            },
+        };
+        var provider = new FakeProviderAdapter();
+        var orchestrator = new TaskOrchestrator(store, supervisor, provider);
+
+        Task<StartResponse> startTask = orchestrator.StartAsync(
+            NewStart("query|c:\\concurrent-start|ou_concurrent"),
+            CancellationToken.None);
+        await startEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Task<(int RunsObserved, int ChildPending)> observeTask = orchestrator.ObserveAsync(CancellationToken.None);
+        await Task.Delay(50);
+        Assert.False(observeTask.IsCompleted);
+
+        releaseStart.TrySetResult();
+        StartResponse start = await startTask;
+        await observeTask;
+
+        Assert.Equal(RunState.Running, start.State);
+        Assert.Equal(1, provider.StartCalls);
+        Assert.Equal(1, supervisor.StartCalls);
+    }
+
+    [Fact]
+    public async Task Distinct_runs_do_not_share_start_driver_gate()
+    {
+        var store = new RunStore(_dbPath);
+        var firstStartEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirstStart = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int startSequence = 0;
+        var supervisor = new FakeProcessSupervisor
+        {
+            StartHandler = async (request, cancellationToken) =>
+            {
+                if (Interlocked.Increment(ref startSequence) == 1)
+                {
+                    firstStartEntered.TrySetResult();
+                    await releaseFirstStart.Task.WaitAsync(cancellationToken);
+                }
+
+                return FakeProcessSupervisor.SuccessfulStart(request.RunId);
+            },
+        };
+        var orchestrator = new TaskOrchestrator(store, supervisor, new FakeProviderAdapter());
+
+        Task<StartResponse> first = orchestrator.StartAsync(
+            NewStart("query|c:\\parallel-a|ou_parallel"),
+            CancellationToken.None);
+        await firstStartEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Task<StartResponse> second = orchestrator.StartAsync(
+            NewStart("query|c:\\parallel-b|ou_parallel"),
+            CancellationToken.None);
+        StartResponse secondResult = await second.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(RunState.Running, secondResult.State);
+        Assert.False(first.IsCompleted);
+
+        releaseFirstStart.TrySetResult();
+        Assert.Equal(RunState.Running, (await first).State);
+        Assert.Equal(2, supervisor.StartCalls);
+    }
+
+    [Fact]
+    public async Task Recovered_starting_without_registered_process_spawns_once()
+    {
+        var store = new RunStore(_dbPath);
+        var supervisor = new FakeProcessSupervisor
+        {
+            StatusProvider = () => new ProcessStatus
+            {
+                Liveness = ProcessLiveness.Gone,
+                ChildPending = false,
+            },
+        };
+        var orchestrator = new TaskOrchestrator(store, supervisor, new FakeProviderAdapter());
+        StartRequest request = NewStart("query|c:\\pre-spawn|ou_pre_spawn");
+        StartResponse accepted = await store.StartAsync(request, CancellationToken.None);
+        Assert.True(await store.AdvanceStateAsync(
+            accepted.RunId,
+            RunState.Starting,
+            cancellationToken: CancellationToken.None));
+
+        await orchestrator.ObserveAsync(CancellationToken.None);
+
+        Assert.Equal(RunState.Running, (await store.StatusAsync(accepted.RunId, CancellationToken.None)).State);
+        Assert.Equal(1, supervisor.StatusCalls);
+        Assert.Equal(1, supervisor.StartCalls);
+    }
+
     /// <summary>RUN-CONTRACT §13 #9:同 requestId 重复 Start 返回同 runId,spawn 恰为 1(绝不二次驱动)。</summary>
     [Fact]
     public async Task DuplicateStart_sameRequestId_returnsSameRunId_noSecondSpawn()
@@ -376,6 +662,10 @@ public sealed class FakeProcessSupervisor : IProcessSupervisor
     /// <summary>终止是否保持 childPending(未确认真实退出)。</summary>
     public bool CancelChildPending { get; set; }
 
+    public string? StartErrorCode { get; set; }
+
+    public Func<ProcessStartRequest, CancellationToken, Task<ProcessStartResult>>? StartHandler { get; set; }
+
     public Func<ProcessStatus> StatusProvider { get; set; } = () => new ProcessStatus
     {
         Liveness = ProcessLiveness.Alive,
@@ -384,15 +674,24 @@ public sealed class FakeProcessSupervisor : IProcessSupervisor
     public Task<ProcessStartResult> StartAsync(ProcessStartRequest request, CancellationToken cancellationToken)
     {
         StartCalls++;
-        return Task.FromResult(new ProcessStartResult
+        if (StartHandler is not null)
         {
-            RunId = request.RunId,
+            return StartHandler(request, cancellationToken);
+        }
+
+        return Task.FromResult(SuccessfulStart(request.RunId, StartErrorCode));
+    }
+
+    public static ProcessStartResult SuccessfulStart(RunId runId, string? errorCode = null) => new()
+        {
+            RunId = runId,
             Started = true,
             WrapperPid = 4242,
             ChildPid = 4343,
             JobId = "job-fake",
-        });
-    }
+            ErrorClass = errorCode is null ? null : ErrorClass.Internal,
+            ErrorCode = errorCode,
+        };
 
     public Task<ProcessStatus> StatusAsync(RunId runId, CancellationToken cancellationToken)
     {

@@ -24,6 +24,9 @@ public enum ProjectOutcome
 
     /// <summary>布防周期已变化,停止本轮且不写状态。</summary>
     CycleSuperseded,
+
+    /// <summary>项目出现不可自动重放的结果,停止本轮并等待用户重新布防。</summary>
+    Blocked,
 }
 
 /// <summary>Complete 的完成语义(对齐现役 Complete-CcuCycle)。</summary>
@@ -37,6 +40,9 @@ public enum CycleCompletionKind
 
     /// <summary>周期已变化/未启用 → 本周期作废。</summary>
     Superseded,
+
+    /// <summary>本周期出现失败、停止或未确认结果;保持布防和结果可见,禁止自动重放。</summary>
+    Blocked,
 }
 
 /// <summary>
@@ -77,6 +83,11 @@ public sealed class CheckerCycle
     {
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(state);
+
+        if (RequiresExplicitRearm(state))
+        {
+            return false;
+        }
 
         int interval = DefaultProbeIntervalMinutes;
         if (config.ProbeIntervalMinutes >= 2)
@@ -122,6 +133,8 @@ public sealed class CheckerCycle
         state.ProjectStatus = new Dictionary<string, string>();
         state.SawLimited = false;
         state.LimitedRefires = 0;
+        state.ReplayBlocked = false;
+        ClearActiveRun(state);
         SaveChecked(config, state);
         return true;
     }
@@ -152,6 +165,14 @@ public sealed class CheckerCycle
             return false;
         }
 
+        if (RequiresExplicitRearm(state))
+        {
+            state.ReplayBlocked = true;
+            state.Phase = CheckerState.PhaseBlocked;
+            ApplyRealReset(state, probe);
+            return SaveChecked(config, state);
+        }
+
         if (!state.SawLimited)
         {
             state.ProjectStatus = new Dictionary<string, string>();
@@ -160,6 +181,7 @@ public sealed class CheckerCycle
 
         state.SawLimited = true;
         state.Phase = CheckerState.PhaseWaiting;
+        ClearActiveRun(state);
         ApplyRealReset(state, probe);
         return SaveChecked(config, state);
     }
@@ -180,14 +202,24 @@ public sealed class CheckerCycle
 
         ApplyRealReset(state, probe);
 
+        if (RequiresExplicitRearm(state))
+        {
+            state.ReplayBlocked = true;
+            state.Phase = CheckerState.PhaseBlocked;
+            SaveChecked(config, state);
+            return ProbeDecision.KeepWatching;
+        }
+
         if (!state.SawLimited)
         {
             state.Phase = CheckerState.PhaseWaiting;
+            ClearActiveRun(state);
             SaveChecked(config, state);
             return ProbeDecision.KeepWatching;
         }
 
         state.Phase = CheckerState.PhaseResuming;
+        ClearActiveRun(state);
         return SaveChecked(config, state) ? ProbeDecision.StartResuming : ProbeDecision.KeepWatching;
     }
 
@@ -202,7 +234,49 @@ public sealed class CheckerCycle
             return false;
         }
 
-        state.Phase = CheckerState.PhaseWaiting;
+        if (RequiresExplicitRearm(state))
+        {
+            state.ReplayBlocked = true;
+            state.Phase = CheckerState.PhaseBlocked;
+        }
+        else
+        {
+            state.Phase = CheckerState.PhaseWaiting;
+        }
+        ClearActiveRun(state);
+        return SaveChecked(config, state);
+    }
+
+    /// <summary>在 spawn 前把 running、项目路径与精确 RunId 一次性持久化。</summary>
+    public bool PrepareActiveRun(ProductConfig config, CheckerState state, string path, RunId runId)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        ArgumentNullException.ThrowIfNull(path);
+
+        if (!TestCycleActive(config, state.CycleId) || RequiresExplicitRearm(state))
+        {
+            return false;
+        }
+
+        state.ProjectStatus ??= new Dictionary<string, string>();
+        state.ProjectStatus[path] = "running";
+        state.ActiveProjectPath = path;
+        state.ActiveRunId = runId.ToString();
+        return SaveChecked(config, state);
+    }
+
+    /// <summary>把升级前遗留的失败/停止/running 等状态锁存为当前周期阻断。</summary>
+    public bool LatchReplayBlock(ProductConfig config, CheckerState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        if (!TestCycleActive(config, state.CycleId) || !RequiresExplicitRearm(state))
+        {
+            return false;
+        }
+
+        state.ReplayBlocked = true;
+        state.Phase = CheckerState.PhaseBlocked;
+        ClearActiveRun(state);
         return SaveChecked(config, state);
     }
 
@@ -210,7 +284,12 @@ public sealed class CheckerCycle
     /// 续跑单项目完成:更新 pstat;status=limited 时 refire 计数(≥6 → 该项目标记 error 继续,
     /// 防误判死循环;否则回等待)。周期失效 → CycleSuperseded(不写)。
     /// </summary>
-    public ProjectOutcome ApplyProjectResult(ProductConfig config, CheckerState state, string path, string status)
+    public ProjectOutcome ApplyProjectResult(
+        ProductConfig config,
+        CheckerState state,
+        string path,
+        string status,
+        bool stopRound = false)
     {
         ArgumentNullException.ThrowIfNull(state);
         ArgumentNullException.ThrowIfNull(path);
@@ -223,11 +302,27 @@ public sealed class CheckerCycle
 
         state.ProjectStatus ??= new Dictionary<string, string>();
         state.ProjectStatus[path] = status;
+        if (status is not "success" and not "limited" and not "running")
+        {
+            state.ReplayBlocked = true;
+            state.Phase = CheckerState.PhaseBlocked;
+        }
+        if (!string.Equals(status, "running", StringComparison.Ordinal) &&
+            !string.Equals(status, "cancel-pending", StringComparison.Ordinal) &&
+            string.Equals(state.ActiveProjectPath, path, StringComparison.OrdinalIgnoreCase))
+        {
+            ClearActiveRun(state);
+        }
+        if (stopRound)
+        {
+            state.ReplayBlocked = true;
+            state.Phase = CheckerState.PhaseBlocked;
+        }
         SaveChecked(config, state);
 
         if (status != "limited")
         {
-            return ProjectOutcome.Continue;
+            return state.ReplayBlocked ? ProjectOutcome.Blocked : ProjectOutcome.Continue;
         }
 
         state.LimitedRefires++;
@@ -235,8 +330,10 @@ public sealed class CheckerCycle
         {
             // 真实账户级限流等待约 5 小时/次,快速增长的 refire 说明是误判 → 标记 error 继续。
             state.ProjectStatus[path] = "error";
+            state.ReplayBlocked = true;
+            state.Phase = CheckerState.PhaseBlocked;
             SaveChecked(config, state);
-            return ProjectOutcome.MarkedError;
+            return ProjectOutcome.Blocked;
         }
 
         state.SawLimited = true;
@@ -260,9 +357,20 @@ public sealed class CheckerCycle
             return CycleCompletionKind.Superseded;
         }
 
+        if (RequiresExplicitRearm(state))
+        {
+            state.ReplayBlocked = true;
+            state.Phase = CheckerState.PhaseBlocked;
+            ClearActiveRun(state);
+            SaveChecked(config, state);
+            return CycleCompletionKind.Blocked;
+        }
+
         state.Phase = CheckerState.PhaseDone;
         state.SawLimited = false;
         state.LimitedRefires = 0;
+        state.ReplayBlocked = false;
+        ClearActiveRun(state);
         SaveChecked(config, state);
 
         if (config.Continuous)
@@ -292,6 +400,16 @@ public sealed class CheckerCycle
             state.RealResetProbedUtc = _clock();
         }
     }
+
+    private static void ClearActiveRun(CheckerState state)
+    {
+        state.ActiveRunId = string.Empty;
+        state.ActiveProjectPath = string.Empty;
+    }
+
+    private static bool RequiresExplicitRearm(CheckerState state) =>
+        state.ReplayBlocked ||
+        state.ProjectStatus?.Values.Any(status => status is not "success" and not "limited") == true;
 
     /// <summary>周期活跃才持久化;失效返回 false 且不写(对齐现役 Save-ThisCycleState)。</summary>
     private bool SaveChecked(ProductConfig config, CheckerState state)

@@ -158,6 +158,61 @@ public sealed class GuiMotionContractTests
             StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void 布防状态支持手动刷新且轮询会重绘项目状态()
+    {
+        string html = File.ReadAllText(FindRepositoryFile(
+            Path.Combine("csharp", "src", "AiResume.Gui", "wwwroot", "index.html")));
+
+        Assert.Contains("id=\"armRefreshBtn\"", html, StringComparison.Ordinal);
+        Assert.Contains(">刷新状态</button>", html, StringComparison.Ordinal);
+        Assert.Contains("async function refreshArmState", html, StringComparison.Ordinal);
+        Assert.Contains("const next = await call('arm.get');", html, StringComparison.Ordinal);
+        Assert.Contains("async function readAndApplyArm", html, StringComparison.Ordinal);
+        Assert.Contains("requestId < armReadApplied", html, StringComparison.Ordinal);
+        Assert.Contains("mutationVersion !== armMutationVersion", html, StringComparison.Ordinal);
+        Assert.Contains("renderProjects({ items: projects, hidden, elapsedMs: 0 });", html,
+            StringComparison.Ordinal);
+        Assert.Contains("armTimer = setInterval", html, StringComparison.Ordinal);
+        Assert.Contains("await refreshArmState();", html, StringComparison.Ordinal);
+        Assert.Contains("applyArmState(next, { forceRows: true, announce: true });", html,
+            StringComparison.Ordinal);
+        Assert.Contains("b.disabled = armBusy || armRefreshBusy || queueBusy", html, StringComparison.Ordinal);
+        Assert.Contains("(!on && (armUnknown || picked.size === 0))", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("b.disabled = armBusy || armRefreshBusy || queueBusy || armUnknown", html,
+            StringComparison.Ordinal);
+        Assert.Contains("if (armBusy || armRefreshBusy || queueBusy) return;", html, StringComparison.Ordinal);
+        Assert.Contains("refreshBtn.setAttribute('aria-busy', 'true');", html, StringComparison.Ordinal);
+        Assert.Contains("refreshBtn.textContent = '刷新中…';", html, StringComparison.Ordinal);
+        Assert.Contains("refreshBtn.setAttribute('aria-busy', 'false');", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("id=\"nowBtn\"", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("arm = await call('arm.get')", html, StringComparison.Ordinal);
+        Assert.Contains("arm.engine === 'CancelPending'", html, StringComparison.Ordinal);
+        Assert.Contains("arm.engine === 'RunActive'", html, StringComparison.Ordinal);
+        Assert.Contains("已有项目进程仍在运行,新周期会等待它结束", html, StringComparison.Ordinal);
+        Assert.Contains("arm.engine === 'StateUnverified'", html, StringComparison.Ordinal);
+        Assert.Contains("布防状态未核实", html, StringComparison.Ordinal);
+        Assert.Contains("确认进程退出前不会启动新的续跑", html, StringComparison.Ordinal);
+        Assert.Contains("s.category === 'failure'", html, StringComparison.Ordinal);
+        Assert.Contains("status ? esc(status.text)", html, StringComparison.Ordinal);
+        Assert.Contains("s.status === 'stopped'", html, StringComparison.Ordinal);
+        Assert.Contains("不会自动重试,需解除并重新布防", html, StringComparison.Ordinal);
+        Assert.Contains("function applyArmReadFailure()", html, StringComparison.Ordinal);
+        Assert.Contains("try { await readAndApplyArm({ forceRows: true }); }", html, StringComparison.Ordinal);
+        Assert.Contains("projectStatus: []", html, StringComparison.Ordinal);
+        Assert.Contains("next && !next.armed", html, StringComparison.Ordinal);
+        Assert.Contains("{ ...next, phase: '', sawLimited: false, projectStatus: [] }", html,
+            StringComparison.Ordinal);
+        Assert.Contains("let targetObserved = false;", html, StringComparison.Ordinal);
+        Assert.Contains("5 秒内未观察到生效;请刷新状态继续核验", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("状态已核对为未生效", html, StringComparison.Ordinal);
+        Assert.Contains("engine: 'StateUnverified'", html, StringComparison.Ordinal);
+        Assert.Contains("function pathKey(path)", html, StringComparison.Ordinal);
+        Assert.Contains("st.get(pathKey(it.path))", html, StringComparison.Ordinal);
+        Assert.Contains("布防后将在额度恢复时按队列续跑", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("}[s] || s", html, StringComparison.Ordinal);
+    }
+
     private static string FindRepositoryFile(string relativePath)
     {
         DirectoryInfo? current = new(AppContext.BaseDirectory);
