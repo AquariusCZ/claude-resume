@@ -99,6 +99,12 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 
 9. **`rate_limit_event` 只在窗口被用到一定程度才由服务器下发**(5h 窗口很空时根本不发 5h 数字)。所以额度显示要能处理"某个窗口暂时没数据"。位置:`Test-ClaudeReady` / GUI 额度 chip 显示 `5h 低`。
 
+10. **★ IDE Hook 能力必须按版本和真实事件复核，不能把一次缺失写成永久结论。**
+    - 历史现象:2026-08-14 的 Claude Code 2.1.232 实测中，`claude-vscode` 会话没有触发 `Stop` / `Notification`，而桌面应用会触发；当时据此记录了扩展完成通知缺失。
+    - 新证据:2026-08-19 的 `claude-vscode` 会话已明确执行全局 `Stop` command Hook。VS Code 日志记录 Hook 返回，同一 session transcript 保留正确中文 cwd，11 秒后 Worker 以同一来源投递成功；本机证据覆盖 Claude Code 2.1.233/2.1.235 代次。官方现行文档也把 IDE extensions 列入相同 Hook 事件范围。
+    - 结论:VS Code 扩展没有“原生飞书完成通知”，但它会加载 `~/.claude/settings.json`，从而通过 AI Resume 注册的 `AiResume.Hook.exe claudecode` 间接通知。2.1.232 的缺失是历史版本行为，至少从本机后续版本实证已经恢复。
+    - 诊断:仍需同时关联 VS Code Hook 日志、Claude transcript、`completion-events` 和 `worker.notify.item`；`notify list` 全绿只证明配置可执行，不能单独证明某个宿主版本会产生事件。
+
 ---
 
 ## 三、飞书(Feishu)机器人的坑

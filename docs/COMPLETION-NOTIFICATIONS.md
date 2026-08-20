@@ -1,6 +1,6 @@
 # 完成通知协议、实现与验证手册
 
-最后验证：2026-08-13（Windows 11，AI Resume v2）
+最后验证：2026-08-20（Windows 11，AI Resume v2）
 
 ## 1. 从第一性原理定义“可用”
 
@@ -39,6 +39,7 @@ AiResume.Worker NotificationWorker --> lark-cli --> Feishu
 
 - Codex 官方配置把 `notify` 定义为命令数组，目前完成事件为 `agent-turn-complete`，JSON 负载追加在命令参数末尾：[Codex configuration reference](https://developers.openai.com/codex/config-reference/)、[Advanced configuration](https://developers.openai.com/codex/config-advanced/)。
 - Claude Code 命令 Hook 从 stdin 接收 JSON，`Stop` 代表主 agent 停止；`stop_hook_active=true` 用于防递归：[Claude Code hooks](https://code.claude.com/docs/en/hooks)。
+- Claude Code 现行 Hook 契约同时适用于 terminal、IDE extensions、Desktop 和 Web。本机 `claude-vscode` 会话已在 2026-08-19 实证触发全局 `Stop` Hook；这不是 VS Code 扩展直接发飞书，而是扩展执行 AI Resume 写入 `~/.claude/settings.json` 的 command Hook。
 - Qoder 的命令 Hook 同样从 stdin 接收 JSON，`Stop` 是 agent 完成响应的边界：[Qoder hooks](https://docs.qoder.com/extensions/hooks)、[Qoder CLI hooks](https://docs.qoder.com/cli/hooks)。
 - OpenCode 插件可以订阅事件；上游 schema 的 `session.idle` 携带 `sessionID`，插件输入提供 client，Task 工具创建的子 session 带 `parentID`。因此插件必须查询 session 并只承认顶层 idle；运行时由 Bun 提供：[OpenCode plugins](https://opencode.ai/docs/plugins/)、[Bun spawn](https://bun.sh/docs/api/spawn)。
 - Cline 使用本机已安装扩展的 `TaskComplete.ps1` 契约；wrapper 必须保留用户原脚本的输入、输出和取消语义。
@@ -65,7 +66,7 @@ AiResume.Worker NotificationWorker --> lark-cli --> Feishu
 - Codex 的 `Documents\Codex\<日期>\<slug>` 临时 projectless 目录；目录内确有 Git 根时例外。
 - OpenCode 在 `session.idle` 后必须查询 session；`parentID` 非空的 Task/subagent 会话拒绝通知，查询失败也 fail-closed。
 
-Hook 的退出码始终为 0，stdout 保持为空；通知故障不能阻断 agent 自己的收尾流程。Codex 原有 `notify` 用 `--previous-notify` 继续转发。历史 `%LOCALAPPDATA%\AI` 截断命令没有不可伪造的所有权证据，可能也是用户命令，因此保守保留，不自动删除。
+Hook 的退出码始终为 0，stdout 保持为空；通知故障不能阻断 agent 自己的收尾流程。stdin 型来源必须从标准输入流显式按严格 UTF-8 解码，不能继承 Windows 控制台 CP936；否则 `公司内网SOP项目` 会在入队前稳定损坏成 `鍏徃鍐呯綉SOP椤圭洰`。Codex 原有 `notify` 用 `--previous-notify` 继续转发。历史 `%LOCALAPPDATA%\AI` 截断命令没有不可伪造的所有权证据，可能也是用户命令，因此保守保留，不自动删除。
 
 cc-connect 使用两层抑制，缺一层都不能把激活报告为完整成功：
 
@@ -79,7 +80,7 @@ cc-connect 使用两层抑制，缺一层都不能把激活报告为完整成功
 - Claude Code / Qoder：只有“首个可执行文件名精确为 `AiResume.Hook.exe`，且后面无参数或只有对应来源参数”才算我方 command；参数文本里偶然出现文件名不算所有权。
 - Codex：只改顶层单行 `notify`，用 Tomlyn 解析外层 TOML argv 数组，支持 basic/literal string 混用和字符串内部的嵌套 JSON 方括号；数组必须全部是字符串。已有命令作为 JSON 文本串在 `--previous-notify` 后；多行、非字符串数组或无法安全解析时拒绝修改。
 - Codex 配置修复只在 TOML 语句边界识别 `notify`；多行字符串、数组和内联表内容中的同形文本必须逐字保留。当前版本不能假设已经运行的 Codex app-server 会自动重载该写入，安装或切换后需重启当时已打开的 Codex Desktop。
-- Cline：用户原 `TaskComplete.ps1` 备份为 `TaskComplete.airesume-previous.ps1`，wrapper 先执行原脚本；stdout 与 stderr 分开保留，只用 stdout 解析 `cancel`，原脚本要求取消时不再发我方通知。
+- Cline：用户原 `TaskComplete.ps1` 备份为 `TaskComplete.ai-resume-previous.ps1`，wrapper 先执行原脚本；wrapper 的读取、原脚本 stdin 和 AI Resume Hook stdin 都固定为 UTF-8，stdout 与 stderr 分开保留，只用 stdout 解析 `cancel`，原脚本要求取消时不再发我方通知。
 - OpenCode：文件名和文件内稳定 marker 必须同时匹配才算我方插件；同名用户插件拒绝覆盖，停用时也不删除。
 - `ProductConfig.NotifySources` 保存用户意图；重装按意图对账，卸载只移除 AI Resume 自己的条目。
 
@@ -111,8 +112,8 @@ dotnet test csharp\AiResume.sln
 关键覆盖：
 
 - 五类来源的事件匹配、内部运行/递归 Stop 抑制、Codex rollout 准入。
-- 真正启动 `AiResume.Hook.exe`，覆盖 Codex argv 与其余来源 stdin。
-- 真正执行 Cline PowerShell wrapper，验证旧脚本和 AI Resume 同时收到事件。
+- 真正启动 `AiResume.Hook.exe`，覆盖 Codex argv 与其余来源的 UTF-8 stdin，并用中文 cwd 断言字节边界。
+- 真正执行 Cline PowerShell wrapper，验证旧脚本和 AI Resume 同时收到未经损坏的中文事件。
 - OpenCode 真实执行生成插件，确认顶层 session 通知一次、Task/subagent 与 session 查询失败均不通知。
 - 配置合并、幂等启停、含空格路径、严格所有权和同名用户文件保护。
 - Worker 启动即扫描、发送/失败/重复/坏事件状态机、失败退避，以及安装后 Named Pipe 就绪核验。
@@ -137,6 +138,8 @@ dotnet test csharp\AiResume.sln
 | 现象 | 首查 | 判据 |
 |---|---|---|
 | 开关打开但从未入队 | 客户端配置和 Hook 命令 | 来源参数正确，路径有引号/argv 保护，Hook 文件存在 |
+| Claude VS Code 曾经不通知 | VS Code Claude 日志、版本、全局 `settings.json` | 2.1.232 曾实测缺失；后续版本已实证执行 `Stop`，不要沿用旧版本结论 |
+| 只有中文项目名乱码 | Hook stdin 与 Cline wrapper | stdin 必须按 UTF-8 解码；不要在 Worker/飞书端猜测反转乱码 |
 | Codex 独有不通知 | `~/.codex/config.toml`、主进程启动时间与 rollout | JSON 位于最后一个 argv，顶层 persisted rollout 可找到；主进程早于配置写入时先重启 Codex Desktop |
 | Cline 独有不通知 | `TaskComplete.ps1` | `$stdin` 同时管道给旧脚本和 `AiResume.Hook.exe cline` |
 | OpenCode 独有不通知 | `airesume-notify.ts` | 监听 `session.idle`，查询 session 后拒绝 `parentID` 子会话，使用 `Bun.spawn` + stdin，而不是 shell 模板字符串 |

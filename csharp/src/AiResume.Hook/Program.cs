@@ -13,6 +13,7 @@ namespace AiResume.Hook;
 public static class Program
 {
     private const int MaxRolloutScanDepth = 6;
+    private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private static readonly Regex CodexThreadIdRegex = new(
         "^[0-9a-z][0-9a-z-]{0,99}$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     private static readonly Regex CodexGeneratedDateRegex = new(
@@ -237,7 +238,7 @@ public static class Program
             string? stdinJson = string.Equals(source, "codex", StringComparison.Ordinal) &&
                                 sourceArgs.Any(IsJsonObject)
                 ? null
-                : Console.In.ReadToEnd();
+                : ReadUtf8StandardInput();
             string? payload = ResolvePayload(source, sourceArgs, stdinJson);
             Dictionary<string, string?> env = SnapshotEnvironment();
 
@@ -255,6 +256,25 @@ public static class Program
         }
 
         return 0;
+    }
+
+    /// <summary>
+    /// Claude Code、Cline、Qoder 和 OpenCode 都按 UTF-8 向 Hook stdin 写 JSON。
+    /// Windows 控制台默认代码页可能是 CP936，不能通过 <see cref="Console.In"/> 解码。
+    /// </summary>
+    private static string ReadUtf8StandardInput()
+    {
+        using Stream input = Console.OpenStandardInput();
+        using var reader = new StreamReader(
+            input,
+            StrictUtf8,
+            detectEncodingFromByteOrderMarks: false,
+            bufferSize: 1024,
+            leaveOpen: false);
+        string payload = reader.ReadToEnd();
+        return payload.Length > 0 && payload[0] == '\uFEFF'
+            ? payload[1..]
+            : payload;
     }
 
     /// <summary>把 Codex 既有 notify 链继续向后转发;失败不影响本次 AI Resume 入队。</summary>

@@ -149,19 +149,39 @@ public sealed class ClineNotificationAdapter : INotificationAdapter
         sb.AppendLine($"# {Marker}");
         sb.AppendLine("# 此脚本由 AI Resume 管理,请勿手动修改");
         sb.AppendLine();
-        sb.AppendLine("$stdin = [Console]::In.ReadToEnd()");
+        sb.AppendLine("$utf8 = [Text.UTF8Encoding]::new($false, $true)");
+        sb.AppendLine("$OutputEncoding = [Text.UTF8Encoding]::new($false)");
+        sb.AppendLine("[Console]::OutputEncoding = $OutputEncoding");
+        sb.AppendLine("$stdinReader = [IO.StreamReader]::new([Console]::OpenStandardInput(), $utf8, $false)");
+        sb.AppendLine("try {");
+        sb.AppendLine("    $stdin = $stdinReader.ReadToEnd()");
+        sb.AppendLine("    if ($stdin.Length -gt 0 -and $stdin[0] -eq [char]0xFEFF) { $stdin = $stdin.Substring(1) }");
+        sb.AppendLine("} catch {");
+        sb.AppendLine("    Write-Output '{\"cancel\":false}'");
+        sb.AppendLine("    exit 0");
+        sb.AppendLine("} finally {");
+        sb.AppendLine("    $stdinReader.Dispose()");
+        sb.AppendLine("}");
         sb.AppendLine();
 
         if (!string.IsNullOrEmpty(previousPath) && File.Exists(previousPath))
         {
             var escapedPreviousPath = EscapePowerShellString(previousPath);
             var escapedHookCommand = EscapePowerShellString(hookCommand);
+            string previousPathBase64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(previousPath));
+            string previousCommand =
+                "[Console]::InputEncoding = [Text.UTF8Encoding]::new($false, $true); " +
+                "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); " +
+                $"$previousScript = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{previousPathBase64}')); " +
+                "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $previousScript; " +
+                "exit $LASTEXITCODE";
+            string encodedPreviousCommand = Convert.ToBase64String(Encoding.Unicode.GetBytes(previousCommand));
 
             sb.AppendLine($"$previousScript = '{escapedPreviousPath}'");
             sb.AppendLine("if (Test-Path $previousScript) {");
             sb.AppendLine("    $previousErrorPath = [IO.Path]::GetTempFileName()");
             sb.AppendLine("    try {");
-            sb.AppendLine("        $previousOutput = $stdin | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $previousScript 2> $previousErrorPath | Out-String");
+            sb.AppendLine($"        $previousOutput = $stdin | & powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand '{encodedPreviousCommand}' 2> $previousErrorPath | Out-String");
             sb.AppendLine("        $previousExitCode = $LASTEXITCODE");
             sb.AppendLine("        $previousError = if (Test-Path $previousErrorPath) { Get-Content -LiteralPath $previousErrorPath -Raw -ErrorAction SilentlyContinue } else { '' }");
             sb.AppendLine("    } finally {");

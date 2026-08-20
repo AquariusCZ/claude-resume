@@ -222,6 +222,8 @@ public class ClineNotificationAdapterTests : IDisposable
 
         Assert.Contains("$previousOutput = $stdin | & powershell.exe", script);
         Assert.Contains("$stdin | & 'C:\\tools\\AiResume.Hook.exe' cline", script);
+        Assert.Contains("[IO.StreamReader]::new([Console]::OpenStandardInput(), $utf8, $false)", script);
+        Assert.Contains("$OutputEncoding = [Text.UTF8Encoding]::new($false)", script);
     }
 
     [Fact]
