@@ -114,6 +114,24 @@ public sealed class TaskOrchestrator : ITaskOrchestrator
             return response;
         }
 
+        // Cancel 先落盘，再等待同 RunId 的启动驱动越过最后一个可 spawn 点。
+        // 驱动会在 provider 返回、恢复核验后和进程启动后重读 cancel_requested_at：
+        // - 尚未 spawn 时直接收敛 cancelled；
+        // - 已经进入 StartAsync 时先完成安全登记，再由驱动或本方法精确终止。
+        // 不同 RunId 仍各自并行，不共享全局启动锁。
+        await AwaitActiveStartDriverAsync(request.RunId, cancellationToken).ConfigureAwait(false);
+        RunSnapshot current = await _store.StatusAsync(request.RunId, cancellationToken).ConfigureAwait(false);
+        if (RunStateMachine.IsTerminal(current.State))
+        {
+            return response with
+            {
+                State = current.State,
+                StateVersion = current.StateVersion,
+                ChildPending = false,
+                CancelRequestedAt = current.CancelRequestedAt,
+            };
+        }
+
         // starting/running:终止进程;确认 gone 才推进 cancelled(settle-once)。
         ProcessStopResult stop = await _supervisor.CancelAsync(request.RunId, cancellationToken).ConfigureAwait(false);
         if (!stop.ChildPending)
@@ -121,28 +139,23 @@ public sealed class TaskOrchestrator : ITaskOrchestrator
             await _store.AdvanceStateAsync(request.RunId, RunState.Cancelled, "cancelled",
                 ErrorClass.Cancelled, "user_stop", cancellationToken).ConfigureAwait(false);
             _launches.TryRemove(request.RunId, out _);
-            return new CancelResponse
+            RunSnapshot settled = await _store.StatusAsync(request.RunId, cancellationToken).ConfigureAwait(false);
+            return response with
             {
-                CommandId = request.CommandId,
-                RunId = request.RunId,
-                State = RunState.Cancelled,
-                StateVersion = response.StateVersion + 1,
+                State = settled.State,
+                StateVersion = settled.StateVersion,
                 ChildPending = false,
-                TerminationRequested = true,
-                CancelRequestedAt = response.CancelRequestedAt,
+                CancelRequestedAt = settled.CancelRequestedAt,
             };
         }
 
         // 未确认真实退出:登记与运行键保留,观察循环继续核验。
-        return new CancelResponse
+        return response with
         {
-            CommandId = request.CommandId,
-            RunId = request.RunId,
-            State = response.State,
-            StateVersion = response.StateVersion,
+            State = current.State,
+            StateVersion = current.StateVersion,
             ChildPending = true,
-            TerminationRequested = true,
-            CancelRequestedAt = response.CancelRequestedAt,
+            CancelRequestedAt = current.CancelRequestedAt,
         };
     }
 
@@ -172,44 +185,84 @@ public sealed class TaskOrchestrator : ITaskOrchestrator
                     bool cancelled = snapshot.CancelRequestedAt is not null;
                     ProcessStatus processStatus = await _supervisor.StatusAsync(runId, cancellationToken).ConfigureAwait(false);
 
+                    if (cancelled)
+                    {
+                        if (processStatus.Liveness == ProcessLiveness.Gone)
+                        {
+                            SettleStoppedRun(runId, null, cancellationToken);
+                            break;
+                        }
+
+                        try
+                        {
+                            ProcessStopResult stop = await _supervisor.CancelAsync(runId, cancellationToken).ConfigureAwait(false);
+                            if (!stop.ChildPending)
+                            {
+                                SettleStoppedRun(runId, null, cancellationToken);
+                            }
+                            else
+                            {
+                                childPending++;
+                            }
+                        }
+                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                        {
+                            throw;
+                        }
+                        catch (Exception)
+                        {
+                            // 取消失败不能清掉运行键；下一拍继续按精确 RunId 重试。
+                            childPending++;
+                        }
+
+                        break;
+                    }
+
                     // 单次 provider 状态读取:结果同时用于失败判定与副作用标记,脚本步只消费一次。
                     ProviderStatus? providerStatus = null;
-                    ProviderFailedException? providerFailure = null;
-                    try
+                    ProviderFailedException? providerFailure = PendingFailureFrom(snapshot);
+                    if (providerFailure is null)
                     {
-                        providerStatus = await _provider.StatusAsync(runId, cancellationToken).ConfigureAwait(false);
-                    }
-                    catch (ProviderFailedException ex)
-                    {
-                        providerFailure = ex;
+                        try
+                        {
+                            providerStatus = await _provider.StatusAsync(runId, cancellationToken).ConfigureAwait(false);
+                        }
+                        catch (ProviderFailedException ex)
+                        {
+                            providerFailure = ex;
+                        }
                     }
 
                     if (processStatus.Liveness == ProcessLiveness.Gone)
                     {
-                        if (cancelled)
-                        {
-                            await _store.AdvanceStateAsync(runId, RunState.Cancelled, "cancelled",
-                                ErrorClass.Cancelled, "user_stop", cancellationToken).ConfigureAwait(false);
-                        }
-                        else if (providerFailure is not null)
-                        {
-                            await FailAsync(runId, providerFailure, cancellationToken).ConfigureAwait(false);
-                        }
-                        else
-                        {
-                            // 骨架级:假 provider 干净退出 = 成功(真实结果解析属 Stage 4/5)。
-                            await _store.AdvanceStateAsync(runId, RunState.Succeeded, "succeeded",
-                                null, null, cancellationToken).ConfigureAwait(false);
-                        }
-
-                        _launches.TryRemove(runId, out _);
+                        SettleStoppedRun(runId, providerFailure, cancellationToken);
                     }
                     else if (providerFailure is not null)
                     {
-                        // provider 明确失败:先终止进程,再落 failed(terminal 后运行键释放)。
-                        await _supervisor.CancelAsync(runId, cancellationToken).ConfigureAwait(false);
-                        await FailAsync(runId, providerFailure, cancellationToken).ConfigureAwait(false);
-                        _launches.TryRemove(runId, out _);
+                        // provider 失败意图先持久化；只有完整进程树确认退出后才能落 terminal
+                        // 并释放 runKey。终止暂未确认时，下一拍从 error 字段恢复同一失败。
+                        _store.RecordPendingFailure(runId, providerFailure.ErrorClass, providerFailure.ErrorCode);
+                        try
+                        {
+                            ProcessStopResult stop = await _supervisor.CancelAsync(runId, cancellationToken).ConfigureAwait(false);
+                            if (!stop.ChildPending)
+                            {
+                                SettleStoppedRun(runId, providerFailure, cancellationToken);
+                            }
+                            else
+                            {
+                                childPending++;
+                            }
+                        }
+                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                        {
+                            throw;
+                        }
+                        catch (Exception)
+                        {
+                            // 保持 running/runKey 和持久失败意图，下一拍继续终止。
+                            childPending++;
+                        }
                     }
                     else
                     {
@@ -231,6 +284,27 @@ public sealed class TaskOrchestrator : ITaskOrchestrator
 
         return (runsObserved, childPending);
     }
+
+    private void SettleStoppedRun(
+        RunId runId,
+        ProviderFailedException? observedFailure,
+        CancellationToken cancellationToken)
+    {
+        _store.SettleStoppedRun(
+            runId,
+            observedFailure?.ErrorClass,
+            observedFailure?.ErrorCode,
+            cancellationToken);
+        _launches.TryRemove(runId, out _);
+    }
+
+    private static ProviderFailedException? PendingFailureFrom(RunSnapshot snapshot) =>
+        snapshot.State == RunState.Running && snapshot.ErrorClass is not null
+            ? new ProviderFailedException(
+                snapshot.ErrorClass.Value,
+                snapshot.ErrorCode ?? "provider_failed",
+                "等待进程树退出的持久化 provider 失败。")
+            : null;
 
     /// <summary>
     /// 启动序列(幂等分两段,基于持久状态):
@@ -261,6 +335,8 @@ public sealed class TaskOrchestrator : ITaskOrchestrator
     private async Task DriveStartCoreAsync(RunId runId, StartRequest request, CancellationToken cancellationToken)
     {
         RunSnapshot snapshot = await _store.StatusAsync(runId, cancellationToken).ConfigureAwait(false);
+        bool providerStarted = false;
+        bool recoveringStartingRun = snapshot.State == RunState.Starting;
 
         if (snapshot.State == RunState.Queued)
         {
@@ -291,15 +367,39 @@ public sealed class TaskOrchestrator : ITaskOrchestrator
                 },
                 cancellationToken).ConfigureAwait(false);
 
-            if (!providerResult.Accepted)
+            snapshot = await _store.StatusAsync(runId, cancellationToken).ConfigureAwait(false);
+            if (RunStateMachine.IsTerminal(snapshot.State))
             {
-                // provider 明确拒绝:按 ErrorClass 归类 terminal(骨架级,绝无第二次调用)。
-                await FailAsync(runId,
-                    new ProviderFailedException(providerResult.ErrorClass ?? ErrorClass.Internal,
-                        providerResult.ErrorCode ?? "provider_start_rejected", "provider 启动被拒绝。"),
+                if (providerResult.Accepted)
+                {
+                    await TryCancelProviderAsync(runId, cancellationToken).ConfigureAwait(false);
+                }
+
+                return;
+            }
+
+            if (snapshot.CancelRequestedAt is not null)
+            {
+                await SettleCancellationAsync(
+                    runId,
+                    processStarted: false,
+                    cancelProvider: providerResult.Accepted,
                     cancellationToken).ConfigureAwait(false);
                 return;
             }
+
+            if (!providerResult.Accepted)
+            {
+                // provider 明确拒绝:按 ErrorClass 归类 terminal(骨架级,绝无第二次调用)。
+                _store.SettleStartingFailure(
+                    runId,
+                    providerResult.ErrorClass ?? ErrorClass.Internal,
+                    providerResult.ErrorCode ?? "provider_start_rejected",
+                    cancellationToken);
+                return;
+            }
+
+            providerStarted = true;
         }
 
         if (snapshot.State is not (RunState.Queued or RunState.Starting))
@@ -319,7 +419,7 @@ public sealed class TaskOrchestrator : ITaskOrchestrator
             return;
         }
 
-        if (snapshot.State == RunState.Starting)
+        if (recoveringStartingRun && snapshot.State == RunState.Starting)
         {
             ProcessStatus recoveredStatus;
             try
@@ -392,18 +492,66 @@ public sealed class TaskOrchestrator : ITaskOrchestrator
             }
         }
 
-        // 进程启动段(崩溃恢复时 queued 已被上段推进到 starting,这里只走一次)。
-        ProcessStartResult processResult = await _supervisor.StartAsync(
-            BuildProcessStartRequest(runId, request), cancellationToken).ConfigureAwait(false);
-        if (!processResult.Started)
+        // StatusAsync(Gone) 与实际 spawn 之间仍允许 Cancel 落盘，因此必须在最后
+        // 一个可启动点重读。CancelAsync 会等待本驱动，不能再先把“尚无登记”当作
+        // 已停止并释放 runKey。
+        snapshot = await _store.StatusAsync(runId, cancellationToken).ConfigureAwait(false);
+        if (RunStateMachine.IsTerminal(snapshot.State))
         {
-            await _provider.CancelAsync(runId, cancellationToken).ConfigureAwait(false);
-            await _store.AdvanceStateAsync(runId, RunState.FailedLocal, processResult.ErrorCode ?? "process_start_failed",
-                ErrorClass.Internal, processResult.ErrorCode ?? "process_start_failed", cancellationToken).ConfigureAwait(false);
+            if (providerStarted)
+            {
+                await TryCancelProviderAsync(runId, cancellationToken).ConfigureAwait(false);
+            }
+
             return;
         }
 
-        _launches[runId] = processResult;
+        if (snapshot.State != RunState.Starting)
+        {
+            return;
+        }
+
+        if (snapshot.CancelRequestedAt is not null)
+        {
+            await SettleCancellationAsync(
+                runId,
+                processStarted: false,
+                cancelProvider: providerStarted,
+                cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        // 进程启动段(崩溃恢复时 queued 已被上段推进到 starting,这里只走一次)。
+        ProcessStartResult processResult = await _supervisor.StartAsync(
+            BuildProcessStartRequest(runId, request), cancellationToken).ConfigureAwait(false);
+
+        if (processResult.Started)
+        {
+            _launches[runId] = processResult;
+        }
+
+        RunSnapshot postStart = await _store.StatusAsync(runId, cancellationToken).ConfigureAwait(false);
+        if (postStart.CancelRequestedAt is not null)
+        {
+            await SettleCancellationAsync(
+                runId,
+                processStarted: processResult.Started,
+                cancelProvider: providerStarted,
+                cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        if (!processResult.Started)
+        {
+            await TryCancelProviderAsync(runId, cancellationToken).ConfigureAwait(false);
+            _store.SettleStartingFailure(
+                runId,
+                ErrorClass.Internal,
+                processResult.ErrorCode ?? "process_start_failed",
+                cancellationToken);
+            return;
+        }
+
         if (!string.IsNullOrEmpty(processResult.ErrorCode))
         {
             // Started=true + ErrorCode 表示子进程已经存在、但监督器未能完成安全接管。
@@ -417,6 +565,86 @@ public sealed class TaskOrchestrator : ITaskOrchestrator
         }
 
         await _store.AdvanceStateAsync(runId, RunState.Running, null, null, null, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task AwaitActiveStartDriverAsync(RunId runId, CancellationToken cancellationToken)
+    {
+        if (!_startDrivers.TryGetValue(runId, out Lazy<Task>? drive))
+        {
+            return;
+        }
+
+        try
+        {
+            await drive.Value.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            // 启动驱动的原调用方负责报告异常；取消仍必须继续核验并终止精确 RunId。
+        }
+    }
+
+    private async Task SettleCancellationAsync(
+        RunId runId,
+        bool processStarted,
+        bool cancelProvider,
+        CancellationToken cancellationToken)
+    {
+        ProcessStopResult? stop = null;
+        if (processStarted)
+        {
+            try
+            {
+                stop = await _supervisor.CancelAsync(runId, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                // 保持 starting/runKey；等待 CancelAsync 或观察循环继续精确终止。
+            }
+        }
+
+        if (cancelProvider)
+        {
+            await TryCancelProviderAsync(runId, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (processStarted && (stop is null || stop.ChildPending))
+        {
+            return;
+        }
+
+        await _store.AdvanceStateAsync(
+            runId,
+            RunState.Cancelled,
+            "cancelled",
+            ErrorClass.Cancelled,
+            "user_stop",
+            cancellationToken).ConfigureAwait(false);
+        _launches.TryRemove(runId, out _);
+    }
+
+    private async Task TryCancelProviderAsync(RunId runId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _provider.CancelAsync(runId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            // provider 清理不能覆盖精确进程终止和持久状态结论。
+        }
     }
 
     private async Task SettleFailedProcessStartAsync(
@@ -460,40 +688,8 @@ public sealed class TaskOrchestrator : ITaskOrchestrator
             return;
         }
 
-        RunSnapshot current = await _store.StatusAsync(runId, cancellationToken).ConfigureAwait(false);
-        if (current.CancelRequestedAt is not null)
-        {
-            await _store.AdvanceStateAsync(
-                runId,
-                RunState.Cancelled,
-                "cancelled",
-                ErrorClass.Cancelled,
-                "user_stop",
-                cancellationToken).ConfigureAwait(false);
-        }
-        else
-        {
-            await _store.AdvanceStateAsync(
-                runId,
-                RunState.FailedLocal,
-                errorCode,
-                ErrorClass.Internal,
-                errorCode,
-                cancellationToken).ConfigureAwait(false);
-        }
-
+        _store.SettleStartingFailure(runId, ErrorClass.Internal, errorCode, cancellationToken);
         _launches.TryRemove(runId, out _);
-    }
-
-    private async Task FailAsync(RunId runId, ProviderFailedException failure, CancellationToken cancellationToken)
-    {
-        RunState terminal = failure.ErrorClass switch
-        {
-            ErrorClass.Internal or ErrorClass.Config => RunState.FailedLocal,
-            _ => RunState.FailedProvider,
-        };
-        await _store.AdvanceStateAsync(runId, terminal, failure.ErrorCode,
-            failure.ErrorClass, failure.ErrorCode, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>骨架级假 provider 进程启动命令(cmd + 回环 ping);真实 provider 启动命令属 Stage 4/5。</summary>

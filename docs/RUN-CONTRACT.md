@@ -137,6 +137,8 @@ queued -> starting -> running -> succeeded
 
 其余转换全部拒绝。terminal 状态为 `succeeded|failed_provider|failed_local|cancelled`。
 
+同一 `RunId` 的启动与取消必须串行收敛：取消先持久化，已进入的启动驱动在 provider 返回、恢复核验后和 supervisor 启动后重读取消标记。`running` 取消未确认时每个观察周期继续按精确 RunId 重试。provider 失败但完整进程树尚未确认退出时保持 `running` 并持久化失败意图，不能提前释放 runKey；确认退出后的 terminal 选择必须在单个 SQLite `IMMEDIATE` 事务内读取取消与失败意图，先提交的用户取消优先。
+
 ### queued
 
 - Start 已持久接纳;
@@ -346,3 +348,6 @@ RunStore 为每次变化分配单调 `seq`。Transport 可推送 `run.state_chan
 12. 结果发送 timeout 时 run 保持 succeeded,outbox 保留;
 13. 同一入站事件重放 100 次,run/远端消息重复数为 0;
 14. GUI/飞书只通过 Transport 消费事件,不存在直接 spawn 路径。
+15. provider 启动或恢复核验期间并发 Cancel 不 spawn 新进程；已进入 supervisor 启动则完成登记后精确终止；
+16. Cancel 未确认时每拍重试，provider 失败且 childPending=true 时保持 runKey；
+17. 进程退出收尾中，已提交的用户 Cancel 优先于 provider 失败终态。

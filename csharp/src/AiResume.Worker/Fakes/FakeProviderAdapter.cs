@@ -66,9 +66,16 @@ public sealed class FakeProviderAdapter : IProviderAdapter
 
     public bool Completed { get; private set; }
 
+    public Func<ProviderStartRequest, CancellationToken, Task<ProviderStartResult>>? StartHandler { get; set; }
+
     public Task<ProviderStartResult> StartAsync(ProviderStartRequest request, CancellationToken cancellationToken)
     {
         StartCalls++;
+        if (StartHandler is not null)
+        {
+            return StartHandler(request, cancellationToken);
+        }
+
         if (_startRejected)
         {
             return Task.FromResult(new ProviderStartResult

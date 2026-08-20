@@ -174,6 +174,123 @@ public sealed class OrchestratorTests : IDisposable
         Assert.True(again.Accepted);
     }
 
+    [Fact]
+    public async Task Running_cancel_retries_each_observation_until_stop_is_confirmed()
+    {
+        var store = new RunStore(_dbPath);
+        var supervisor = new FakeProcessSupervisor
+        {
+            CancelChildPending = true,
+            StatusProvider = () => new ProcessStatus
+            {
+                Liveness = ProcessLiveness.Alive,
+                ChildPending = true,
+            },
+        };
+        var orchestrator = new TaskOrchestrator(store, supervisor, new FakeProviderAdapter());
+
+        StartResponse start = await orchestrator.StartAsync(
+            NewStart("query|c:\\retry-cancel|ou_retry_cancel"), CancellationToken.None);
+        CancelResponse cancel = await orchestrator.CancelAsync(NewCancel(start.RunId), CancellationToken.None);
+        Assert.True(cancel.ChildPending);
+        Assert.Equal(1, supervisor.CancelCalls);
+
+        await orchestrator.ObserveAsync(CancellationToken.None);
+        await orchestrator.ObserveAsync(CancellationToken.None);
+        Assert.Equal(3, supervisor.CancelCalls);
+        Assert.Equal(RunState.Running, (await store.StatusAsync(start.RunId, CancellationToken.None)).State);
+
+        supervisor.CancelChildPending = false;
+        await orchestrator.ObserveAsync(CancellationToken.None);
+
+        RunSnapshot final = await store.StatusAsync(start.RunId, CancellationToken.None);
+        Assert.Equal(RunState.Cancelled, final.State);
+        Assert.Equal(4, supervisor.CancelCalls);
+    }
+
+    [Fact]
+    public async Task Provider_failure_keeps_run_key_until_process_stop_is_confirmed()
+    {
+        var store = new RunStore(_dbPath);
+        var supervisor = new FakeProcessSupervisor
+        {
+            CancelChildPending = true,
+            StatusProvider = () => new ProcessStatus
+            {
+                Liveness = ProcessLiveness.Alive,
+                ChildPending = true,
+            },
+        };
+        var provider = new FakeProviderAdapter(new[]
+        {
+            FakeProviderAdapter.Step.FailStep(ErrorClass.Transient, "upstream_failed"),
+        });
+        var orchestrator = new TaskOrchestrator(store, supervisor, provider);
+        string runKey = "query|c:\\pending-provider-failure|ou_pending_failure";
+
+        StartResponse start = await orchestrator.StartAsync(NewStart(runKey), CancellationToken.None);
+        await orchestrator.ObserveAsync(CancellationToken.None);
+
+        RunSnapshot pending = await store.StatusAsync(start.RunId, CancellationToken.None);
+        Assert.Equal(RunState.Running, pending.State);
+        Assert.Equal(ErrorClass.Transient, pending.ErrorClass);
+        Assert.Equal("upstream_failed", pending.ErrorCode);
+        Assert.Equal(1, supervisor.CancelCalls);
+
+        StartResponse blocked = await orchestrator.StartAsync(NewStart(runKey), CancellationToken.None);
+        Assert.False(blocked.Accepted);
+        Assert.Equal(ConflictKind.RunKeyBusy, blocked.Conflict);
+
+        await orchestrator.ObserveAsync(CancellationToken.None);
+        Assert.Equal(2, supervisor.CancelCalls);
+        Assert.Equal(1, provider.StatusCalls);
+        Assert.Equal(RunState.Running, (await store.StatusAsync(start.RunId, CancellationToken.None)).State);
+
+        supervisor.CancelChildPending = false;
+        await orchestrator.ObserveAsync(CancellationToken.None);
+
+        RunSnapshot final = await store.StatusAsync(start.RunId, CancellationToken.None);
+        Assert.Equal(RunState.FailedProvider, final.State);
+        Assert.Equal("upstream_failed", final.ErrorCode);
+        Assert.Equal(3, supervisor.CancelCalls);
+    }
+
+    [Fact]
+    public async Task User_cancel_wins_over_persisted_provider_failure()
+    {
+        var store = new RunStore(_dbPath);
+        var supervisor = new FakeProcessSupervisor
+        {
+            CancelChildPending = true,
+            StatusProvider = () => new ProcessStatus
+            {
+                Liveness = ProcessLiveness.Alive,
+                ChildPending = true,
+            },
+        };
+        var provider = new FakeProviderAdapter(new[]
+        {
+            FakeProviderAdapter.Step.FailStep(ErrorClass.Transient, "upstream_failed"),
+        });
+        var orchestrator = new TaskOrchestrator(store, supervisor, provider);
+
+        StartResponse start = await orchestrator.StartAsync(
+            NewStart("query|c:\\cancel-pending-failure|ou_cancel_pending_failure"),
+            CancellationToken.None);
+        await orchestrator.ObserveAsync(CancellationToken.None);
+
+        CancelResponse cancel = await orchestrator.CancelAsync(NewCancel(start.RunId), CancellationToken.None);
+        Assert.True(cancel.ChildPending);
+        supervisor.CancelChildPending = false;
+        await orchestrator.ObserveAsync(CancellationToken.None);
+
+        RunSnapshot final = await store.StatusAsync(start.RunId, CancellationToken.None);
+        Assert.Equal(RunState.Cancelled, final.State);
+        Assert.Equal(ErrorClass.Cancelled, final.ErrorClass);
+        Assert.Equal("user_stop", final.ErrorCode);
+        Assert.Equal(1, provider.StatusCalls);
+    }
+
     /// <summary>provider 挂起(Hang 步):3 个观察周期仍 running,静默永不触发失败。</summary>
     [Fact]
     public async Task ProviderHang_three_cycles_stays_running_no_failure()
@@ -280,6 +397,58 @@ public sealed class OrchestratorTests : IDisposable
         StartResponse start = await orchestrator.StartAsync(NewStart("query|c:\\p8|ou_8"), CancellationToken.None);
         Assert.Equal(RunState.FailedLocal, start.State);
         Assert.Equal(0, supervisor.StartCalls);
+    }
+
+    [Fact]
+    public async Task Starting_failure_settlement_prefers_already_committed_cancel()
+    {
+        var store = new RunStore(_dbPath);
+        StartResponse accepted = await store.StartAsync(
+            NewStart("query|c:\\atomic-start-cancel|ou_atomic_start_cancel"),
+            CancellationToken.None);
+        Assert.True(await store.AdvanceStateAsync(
+            accepted.RunId,
+            RunState.Starting,
+            cancellationToken: CancellationToken.None));
+        await store.CancelAsync(NewCancel(accepted.RunId), CancellationToken.None);
+
+        RunState settled = store.SettleStartingFailure(
+            accepted.RunId,
+            ErrorClass.Transient,
+            "provider_start_rejected",
+            CancellationToken.None);
+        RunSnapshot final = await store.StatusAsync(accepted.RunId, CancellationToken.None);
+
+        Assert.Equal(RunState.Cancelled, settled);
+        Assert.Equal(RunState.Cancelled, final.State);
+        Assert.Equal(ErrorClass.Cancelled, final.ErrorClass);
+        Assert.Equal("user_stop", final.ErrorCode);
+    }
+
+    [Fact]
+    public async Task Process_not_started_settles_failed_local_and_cancels_provider()
+    {
+        var store = new RunStore(_dbPath);
+        var supervisor = new FakeProcessSupervisor
+        {
+            StartHandler = (request, _) => Task.FromResult(new ProcessStartResult
+            {
+                RunId = request.RunId,
+                Started = false,
+                ErrorClass = ErrorClass.Internal,
+                ErrorCode = "spawn_failed",
+            }),
+        };
+        var provider = new FakeProviderAdapter();
+        var orchestrator = new TaskOrchestrator(store, supervisor, provider);
+
+        StartResponse start = await orchestrator.StartAsync(
+            NewStart("query|c:\\spawn-failed|ou_spawn_failed"), CancellationToken.None);
+
+        Assert.Equal(RunState.FailedLocal, start.State);
+        Assert.Equal("spawn_failed", start.ErrorCode);
+        Assert.Equal(1, supervisor.StartCalls);
+        Assert.Equal(1, provider.CancelCalls);
     }
 
     [Fact]
@@ -502,6 +671,96 @@ public sealed class OrchestratorTests : IDisposable
     }
 
     [Fact]
+    public async Task Cancel_while_provider_start_is_blocked_prevents_process_spawn()
+    {
+        var store = new RunStore(_dbPath);
+        var supervisor = new FakeProcessSupervisor();
+        var providerEntered = new TaskCompletionSource<RunId>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseProvider = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var provider = new FakeProviderAdapter
+        {
+            StartHandler = async (request, cancellationToken) =>
+            {
+                providerEntered.TrySetResult(request.RunId);
+                await releaseProvider.Task.WaitAsync(cancellationToken);
+                return new ProviderStartResult { RunId = request.RunId, Accepted = true };
+            },
+        };
+        var orchestrator = new TaskOrchestrator(store, supervisor, provider);
+
+        Task<StartResponse> startTask = orchestrator.StartAsync(
+            NewStart("query|c:\\cancel-provider-start|ou_cancel_provider"),
+            CancellationToken.None);
+        RunId runId = await providerEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Task<CancelResponse> cancelTask = orchestrator.CancelAsync(NewCancel(runId), CancellationToken.None);
+        RunSnapshot pending = await WaitForCancelRequestAsync(store, runId);
+        Assert.Equal(RunState.Starting, pending.State);
+        Assert.False(cancelTask.IsCompleted);
+
+        releaseProvider.TrySetResult();
+        StartResponse start = await startTask.WaitAsync(TimeSpan.FromSeconds(5));
+        CancelResponse cancel = await cancelTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(RunState.Cancelled, start.State);
+        Assert.Equal(RunState.Cancelled, cancel.State);
+        Assert.False(cancel.ChildPending);
+        Assert.Equal(1, provider.StartCalls);
+        Assert.Equal(1, provider.CancelCalls);
+        Assert.Equal(0, supervisor.StartCalls);
+        Assert.Equal(0, supervisor.CancelCalls);
+    }
+
+    [Fact]
+    public async Task Cancel_after_recovered_gone_check_prevents_process_spawn()
+    {
+        var store = new RunStore(_dbPath);
+        var statusEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseStatus = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var supervisor = new FakeProcessSupervisor
+        {
+            StatusHandler = async (_, cancellationToken) =>
+            {
+                statusEntered.TrySetResult();
+                await releaseStatus.Task.WaitAsync(cancellationToken);
+                return new ProcessStatus
+                {
+                    Liveness = ProcessLiveness.Gone,
+                    ChildPending = false,
+                };
+            },
+        };
+        var provider = new FakeProviderAdapter();
+        var orchestrator = new TaskOrchestrator(store, supervisor, provider);
+        StartRequest request = NewStart("query|c:\\cancel-recovered-gone|ou_cancel_recovered_gone");
+        StartResponse accepted = await store.StartAsync(request, CancellationToken.None);
+        Assert.True(await store.AdvanceStateAsync(
+            accepted.RunId,
+            RunState.Starting,
+            cancellationToken: CancellationToken.None));
+
+        Task<(int RunsObserved, int ChildPending)> observeTask = orchestrator.ObserveAsync(CancellationToken.None);
+        await statusEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Task<CancelResponse> cancelTask = orchestrator.CancelAsync(NewCancel(accepted.RunId), CancellationToken.None);
+        RunSnapshot pending = await WaitForCancelRequestAsync(store, accepted.RunId);
+        Assert.Equal(RunState.Starting, pending.State);
+        Assert.False(cancelTask.IsCompleted);
+
+        releaseStatus.TrySetResult();
+        await observeTask.WaitAsync(TimeSpan.FromSeconds(5));
+        CancelResponse cancel = await cancelTask.WaitAsync(TimeSpan.FromSeconds(5));
+        RunSnapshot final = await store.StatusAsync(accepted.RunId, CancellationToken.None);
+
+        Assert.Equal(RunState.Cancelled, final.State);
+        Assert.Equal(RunState.Cancelled, cancel.State);
+        Assert.False(cancel.ChildPending);
+        Assert.Equal(0, provider.StartCalls);
+        Assert.Equal(0, supervisor.StartCalls);
+        Assert.Equal(0, supervisor.CancelCalls);
+    }
+
+    [Fact]
     public async Task Distinct_runs_do_not_share_start_driver_gate()
     {
         var store = new RunStore(_dbPath);
@@ -645,6 +904,22 @@ public sealed class OrchestratorTests : IDisposable
         Assert.Equal("fake_failed", final.ErrorCode);
         Assert.False(final.ChildPending);
     }
+
+    private static async Task<RunSnapshot> WaitForCancelRequestAsync(RunStore store, RunId runId)
+    {
+        for (int i = 0; i < 100; i++)
+        {
+            RunSnapshot snapshot = await store.StatusAsync(runId, CancellationToken.None);
+            if (snapshot.CancelRequestedAt is not null)
+            {
+                return snapshot;
+            }
+
+            await Task.Delay(10);
+        }
+
+        throw new TimeoutException($"run {runId} 未在 1 秒内持久化取消请求。");
+    }
 }
 
 /// <summary>
@@ -665,6 +940,8 @@ public sealed class FakeProcessSupervisor : IProcessSupervisor
     public string? StartErrorCode { get; set; }
 
     public Func<ProcessStartRequest, CancellationToken, Task<ProcessStartResult>>? StartHandler { get; set; }
+
+    public Func<RunId, CancellationToken, Task<ProcessStatus>>? StatusHandler { get; set; }
 
     public Func<ProcessStatus> StatusProvider { get; set; } = () => new ProcessStatus
     {
@@ -696,6 +973,11 @@ public sealed class FakeProcessSupervisor : IProcessSupervisor
     public Task<ProcessStatus> StatusAsync(RunId runId, CancellationToken cancellationToken)
     {
         StatusCalls++;
+        if (StatusHandler is not null)
+        {
+            return StatusHandler(runId, cancellationToken);
+        }
+
         ProcessStatus status = StatusProvider();
         return Task.FromResult(status with { RunId = runId });
     }

@@ -81,6 +81,8 @@ ResumeEngine 获取 Claude 用量/限流状态
 
 已登记的 `ActiveRunId` 和终止待确认的 `PendingCancellationRunId` 都是跨周期安全门禁：精确进程仍存活或无法核验时禁止新续跑，只有确认 gone/mismatched 后才清理。运行期间每拍核对布防周期与最新 `Selected`；新增项目会按最新顺序进入当前轮，完成提交也在配置锁内复核最新队列全部成功，不能漏跑后直接解除。解除布防或移除正在执行的项目会按精确 RunId 请求终止；终止未确认时保留门禁，不启动下一个项目。续跑输出只把结构化 `rate_limit_event.rate_limit_info.status` 识别为限流；若此前出现 Write/Edit/Bash、未知工具活动、损坏或非对象的 NDJSON 行，则落为 `limited-side-effects` 并锁住本周期，禁止额度恢复后自动重放。一次性周期若在 SQLite 已写 `done`、配置尚未解除时崩溃，重启后只补做解除，不再探测或重跑。控制面会把旧周期仍存活的进程明确显示为“续跑仍在进行”，无法核验时显示“续跑状态未确认”，不会在重新布防后伪装成“待初始化”。Worker 对 `product_state` 使用严格读取，SQLite/JSON/默认行读取失败时整拍停止，不能把未知状态降级为空状态；GUI 同样不作肯定判断，而是清空旧项目行并显示红色“布防状态未核实”。裸 `ActiveRunId` 消失但没有终止证据时标记红色“未确认完成”，只有 `PendingCancellationRunId` 的确认退出才显示“已停止”。本进程持有的 Windows Job Object 会通过 `ActiveProcesses` 核验完整进程树，`ResumeEngine`、编排器状态和取消都以同一个 supervisor/Job 为权威，不先依赖 SQLite registry；外层 `cmd` 消失但后代仍在时按正常 `Alive` 继续等待，不得报完成或累计成监控失败，取消用 `TerminateJobObject` 并保持句柄直到整树归零。GUI 不持有 Job 句柄，登记仍在但外层 PID 消失时只能显示“状态未核实”，不得说已结束。任何消费者收到 `Started=true` 且带错误码的启动结果都必须立即取消，退出未确认前保留运行键。Worker 启动时先调用现有 `RecoverAsync` 对账遗留登记，并显式串行启动 hosted services，再开放 IPC、观察与续跑服务；恢复后若 `starting` 的登记仍精确匹配，就直接恢复为 `running` 而不二次 spawn，未知则继续保持 `starting` 和运行键。现有依赖没有同类 Job 封装，因此沿用项目已有的 `kernel32` 薄封装；`Process.Start` 到 `AssignProcessToJobObject` 之间仍有极短的已知残余窗口，Assign 失败会保留精确 PID、立即请求终止并 fail-closed 收敛。这个对账不依赖当前是否仍布防，因此用户解除布防后进程退出，状态也会自动恢复；Worker 不在时，“引擎没在运行”仍优先于阶段文案。
 
+RunContract 的同一 `RunId` 启动驱动与取消共享串行边界：取消先持久化，再等待已进入的启动驱动完成最后一次取消复核；provider 返回、恢复核验后以及进程启动后都会重读取消标记，不能出现“状态已取消、进程随后才启动”。`running` 的未确认取消会在每个观察周期按精确 RunId 重试。provider 失败先写入 SQLite 作为待收尾意图，只有 Job 中完整进程树确认退出后才在同一个 `IMMEDIATE` 事务内按“已提交的用户取消优先，否则失败/成功”选择 terminal，因此 child pending 期间不会释放 runKey，重启也不会把待收尾失败误判为成功。
+
 额度主路径是官方 `GET https://api.anthropic.com/api/oauth/usage`,只读 Claude Code 已有 OAuth access token;请求按 Claude Code 协议携带 OAuth beta、Anthropic version 与本机 `claude-code/<version>` User-Agent,避免普通 UA 的激进 429。解析逐字段优先使用现代 `limits` 的 `session` / `weekly_all` / 全部 `weekly_scoped`,同时兼容旧顶层窗口;percent/reset 都缺失的空对象不算数据。失败时降级到 `ClaudeCodeProbe`。权威快照延迟写入 SQLite `quota_snapshots` 并按 `organizationUuid` 的 SHA-256 指纹隔离;跨窗口更新在单个 SQLite `IMMEDIATE` 事务内重读、合并、写回。OAuth 与 CLI 都视为稀疏观测,缺字段不作删除;同一 reset 代次的已用百分比单调不回退,旧观测也不能把新 reset 代次倒写成旧代次。scoped 以规范化完整 scope 的 SHA-256 作内部身份,同名模型重排不会串窗。只在同账号、同身份、同一未来重置周期内承接并标记 `carriedForward`;账号变化、reset 换代或到期立即清除,承接值显示琥珀“最近读数”而非“已限流”或绿色实时正常。窗口只有 reset、没有百分比时,GUI 保留分段轨道并显示无数值含义的移动未知扫描,不伪造 0%/100%;CLI 只知道全局限流时也不把具体 5H/7D 窗口猜成已满,整体失败但取得部分窗口时也不显示绿色正常,并只负缓存 30 秒。Codex home 统一按“显式参数 → `AI_RESUME_CODEX_HOME` → `CODEX_HOME` → `%USERPROFILE%\.codex`”解析,doctor、models、responses、usage 与通知配置都使用同一路径。开窗/定时 shallow 跑 doctor、带凭据的 `{base_url}/models` 与第三方零 token `/v1/usage`;Sub2API 请求成功、账户未显式失效且余额大于 0 时按 CC Switch 语义直接点绿,没有有效余额证据时保持未核实。用户主动刷新时 deep 才额外向 `{base_url}/responses` 发一次 `max_output_tokens=1` 的最小推理请求。HTTP 探针复现 provider 的 `query_params`、`http_headers` 与 `env_http_headers`,环境头覆盖静态头;余额字段依次兼容 `remaining` / `quota.remaining` / `balance` 并默认 USD,余额为 0、账户失效、鉴权失败、402/429 等明确失败优先。官方 OpenAI/ChatGPT 和 ChatGPT OAuth token 不走该第三方接口,因此这里不是 ChatGPT Plus/Pro 订阅额度。完整协议、状态机和冒烟步骤见 `docs/CLAUDE-QUOTA-ACQUISITION.md`。
 
 ### 2.4 cc-connect 配置激活
@@ -150,7 +152,7 @@ Windows 上裸 `daemon restart`、`restart --force` 的退出码和 `daemon stat
 | `csharp/src/AiResume.Gui/` | WPF + WebView2 控制面 | `MainWindow`、`ControlPlaneBridge.HandleAsync` |
 | `csharp/src/AiResume.Gui/wwwroot/index.html` | 单页前端、交互和视觉 | `call`、`render*`、`genCutover` |
 | `csharp/src/AiResume.Hook/Program.cs` | agent hook 入口 | 解析来源、内部运行抑制、事件落队列 |
-| `csharp/test/AiResume.Tests/` | 隔离的 xUnit 回归 | 1300 项,不触碰真实会话/项目运行 |
+| `csharp/test/AiResume.Tests/` | 隔离的 xUnit 回归 | 1307 项,不触碰真实会话/项目运行 |
 
 ## 4. 测试 / 运行流程
 
@@ -166,7 +168,7 @@ dotnet build csharp\AiResume.sln
 dotnet test csharp\AiResume.sln
 ```
 
-当前完整回归:1300 个 xUnit,0 skipped。测试通过临时目录、注入 runner/API、假 PID/时钟和合成 session 隔离生产状态,不发付费 API 请求；通知回归会启动真实 Hook 进程和 Cline wrapper,但不启动 agent。
+当前完整回归:1307 个 xUnit,0 skipped。测试通过临时目录、注入 runner/API、假 PID/时钟和合成 session 隔离生产状态,不发付费 API 请求；通知回归会启动真实 Hook 进程和 Cline wrapper,但不启动 agent。
 
 ### 4.2 部署现役副本
 

@@ -410,6 +410,181 @@ public sealed class RunStore : IRunStore
         tx.Commit();
     }
 
+    /// <summary>
+    /// provider 已失败但进程树尚未确认退出时持久化失败意图。运行保持 non-terminal，
+    /// 因而 runKey 继续占用；首个失败胜出，用户取消一旦落盘则不再写入失败意图。
+    /// </summary>
+    public void RecordPendingFailure(RunId runId, ErrorClass errorClass, string errorCode)
+    {
+        using var connection = StorageDatabase.Open(_databasePath);
+        using var tx = connection.BeginTransaction(System.Data.IsolationLevel.Serializable, deferred: false);
+        StorageDatabase.Execute(connection, """
+            UPDATE runs SET
+                error_class = COALESCE(error_class, $error_class),
+                error_code = COALESCE(error_code, $error_code),
+                updated_at = $now
+            WHERE run_id = $run_id
+              AND state = 'running'
+              AND cancel_requested_at IS NULL;
+            """, tx,
+            ("$error_class", errorClass.ToWireCode()),
+            ("$error_code", errorCode),
+            ("$now", DateTimeOffset.UtcNow.ToString("o")),
+            ("$run_id", runId.ToString()));
+        tx.Commit();
+    }
+
+    /// <summary>
+    /// 进程树确认退出后的唯一终态提交点。取消标记、持久失败意图与当前 state
+    /// 在同一个 IMMEDIATE 事务内读取并选择终态，确保先提交的用户取消不会在
+    /// 读取与 terminal 写入之间被 provider 失败覆盖。
+    /// </summary>
+    public RunState SettleStoppedRun(
+        RunId runId,
+        ErrorClass? observedErrorClass,
+        string? observedErrorCode,
+        CancellationToken cancellationToken = default) =>
+        SettleTerminal(
+            runId,
+            RunState.Running,
+            observedErrorClass,
+            observedErrorCode,
+            allowSuccess: true,
+            cancellationToken);
+
+    /// <summary>
+    /// starting 阶段失败的原子收尾；若用户取消已先提交，则取消优先于 provider
+    /// 拒绝、进程启动失败或监督接管失败。
+    /// </summary>
+    public RunState SettleStartingFailure(
+        RunId runId,
+        ErrorClass errorClass,
+        string errorCode,
+        CancellationToken cancellationToken = default) =>
+        SettleTerminal(
+            runId,
+            RunState.Starting,
+            errorClass,
+            errorCode,
+            allowSuccess: false,
+            cancellationToken);
+
+    private RunState SettleTerminal(
+        RunId runId,
+        RunState expectedState,
+        ErrorClass? observedErrorClass,
+        string? observedErrorCode,
+        bool allowSuccess,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var connection = StorageDatabase.Open(_databasePath);
+        using var tx = connection.BeginTransaction(System.Data.IsolationLevel.Serializable, deferred: false);
+
+        RunState current;
+        long seq;
+        bool cancelled;
+        ErrorClass? storedErrorClass;
+        string? storedErrorCode;
+        using (var reader = Query(connection, tx, """
+            SELECT state, seq, cancel_requested_at, error_class, error_code
+            FROM runs WHERE run_id = $run_id;
+            """, ("$run_id", runId.ToString())))
+        {
+            if (!reader.Read())
+            {
+                throw new KeyNotFoundException($"run {runId} 不存在。");
+            }
+
+            current = ParseState(reader.GetString(0));
+            seq = reader.GetInt64(1);
+            cancelled = !reader.IsDBNull(2);
+            storedErrorClass = reader.IsDBNull(3) ? null : ParseErrorClass(reader.GetString(3));
+            storedErrorCode = reader.IsDBNull(4) ? null : reader.GetString(4);
+        }
+
+        if (RunStateMachine.IsTerminal(current) || current != expectedState)
+        {
+            tx.Commit();
+            return current;
+        }
+
+        ErrorClass? failureClass = storedErrorClass ?? observedErrorClass;
+        string? failureCode = storedErrorCode ?? observedErrorCode;
+        RunState next;
+        string terminalReason;
+        ErrorClass? terminalErrorClass;
+        string? terminalErrorCode;
+        if (cancelled)
+        {
+            next = RunState.Cancelled;
+            terminalReason = "cancelled";
+            terminalErrorClass = ErrorClass.Cancelled;
+            terminalErrorCode = "user_stop";
+        }
+        else if (failureClass is not null)
+        {
+            next = failureClass is ErrorClass.Internal or ErrorClass.Config
+                ? RunState.FailedLocal
+                : RunState.FailedProvider;
+            terminalReason = failureCode ?? "provider_failed";
+            terminalErrorClass = failureClass;
+            terminalErrorCode = failureCode ?? "provider_failed";
+        }
+        else
+        {
+            if (!allowSuccess)
+            {
+                throw new InvalidOperationException("starting 失败收尾必须提供 errorClass。");
+            }
+
+            next = RunState.Succeeded;
+            terminalReason = "succeeded";
+            terminalErrorClass = null;
+            terminalErrorCode = null;
+        }
+
+        long newSeq = seq + 1;
+        string now = DateTimeOffset.UtcNow.ToString("o");
+        StorageDatabase.Execute(connection, """
+            UPDATE runs SET state = $state, state_version = state_version + 1, seq = $seq,
+                terminal_reason = $reason, terminal_at = $now, error_class = $error_class,
+                error_code = $error_code, updated_at = $now
+            WHERE run_id = $run_id;
+            """, tx,
+            ("$state", next.ToWireCode()),
+            ("$seq", newSeq),
+            ("$reason", terminalReason),
+            ("$now", now),
+            ("$error_class", terminalErrorClass is null
+                ? (object)DBNull.Value
+                : terminalErrorClass.Value.ToWireCode()),
+            ("$error_code", (object?)terminalErrorCode ?? DBNull.Value),
+            ("$run_id", runId.ToString()));
+        tx.Commit();
+
+        try
+        {
+            TryAppendEvent(runId, newSeq, new EventEnvelopeV1
+            {
+                EventId = Guid.NewGuid(),
+                Type = "run.terminal",
+                Source = "worker",
+                Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                IdempotencyKey = $"{runId}|{newSeq}",
+                RunId = runId.Value,
+                Seq = newSeq,
+                Payload = next.ToWireCode(),
+            });
+        }
+        catch (Exception)
+        {
+            // 事件是投影，失败不阻塞已经原子提交的终态。
+        }
+
+        return next;
+    }
+
     private static SqliteDataReader Query(SqliteConnection connection, SqliteTransaction? tx, string sql,
         params (string Name, object Value)[] args)
     {
