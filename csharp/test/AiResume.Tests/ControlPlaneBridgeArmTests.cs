@@ -122,6 +122,7 @@ public class ControlPlaneBridgeArmTests : IDisposable
 
         JsonElement payload = GetPayload(response);
         Assert.False(payload.GetProperty("armed").GetBoolean());
+        Assert.Equal(string.Empty, payload.GetProperty("resumeModel").GetString());
         Assert.Empty(payload.GetProperty("selected").EnumerateArray());
     }
 
@@ -132,7 +133,7 @@ public class ControlPlaneBridgeArmTests : IDisposable
         var bridge = CreateBridge();
         string[] paths = { @"C:\proj\alpha", @"C:\proj\beta" };
         string request = $$"""
-            {"id":"req2","type":"arm.set","armed":true,"paths":["{{J(paths[0])}}","{{J(paths[1])}}"]}
+            {"id":"req2","type":"arm.set","armed":true,"resumeModel":"fable","paths":["{{J(paths[0])}}","{{J(paths[1])}}"]}
             """;
 
         // Act
@@ -144,8 +145,10 @@ public class ControlPlaneBridgeArmTests : IDisposable
 
         JsonElement payload = GetPayload(response);
         Assert.True(payload.GetProperty("armed").GetBoolean());
+        Assert.Equal("fable", payload.GetProperty("resumeModel").GetString());
         Assert.Equal(paths, payload.GetProperty("selected").EnumerateArray().Select(e => e.GetString()).ToArray());
         Assert.False(string.IsNullOrEmpty(payload.GetProperty("cycleId").GetString()));
+        Assert.Equal("fable", new ProductConfigStore(_configDir).Load().ResumeModel);
     }
 
     [Fact]
@@ -155,7 +158,7 @@ public class ControlPlaneBridgeArmTests : IDisposable
         var bridge1 = CreateBridge();
         string[] paths = { @"C:\proj\alpha" };
         string armRequest = $$"""
-            {"id":"req3","type":"arm.set","armed":true,"paths":["{{J(paths[0])}}"]}
+            {"id":"req3","type":"arm.set","armed":true,"resumeModel":"fable","paths":["{{J(paths[0])}}"]}
             """;
         await bridge1.HandleAsync(armRequest, CancellationToken.None);
 
@@ -167,6 +170,7 @@ public class ControlPlaneBridgeArmTests : IDisposable
         // Assert
         JsonElement payload = GetPayload(response);
         Assert.True(payload.GetProperty("armed").GetBoolean());
+        Assert.Equal("fable", payload.GetProperty("resumeModel").GetString());
         Assert.Equal(paths, payload.GetProperty("selected").EnumerateArray().Select(e => e.GetString()).ToArray());
     }
 
@@ -177,10 +181,10 @@ public class ControlPlaneBridgeArmTests : IDisposable
         var bridge = CreateBridge();
         string[] paths = { @"C:\proj\alpha" };
         string request1 = $$"""
-            {"id":"req5","type":"arm.set","armed":true,"paths":["{{J(paths[0])}}"]}
+            {"id":"req5","type":"arm.set","armed":true,"resumeModel":"fable","paths":["{{J(paths[0])}}"]}
             """;
         string request2 = $$"""
-            {"id":"req6","type":"arm.set","armed":true,"paths":["{{J(paths[0])}}"]}
+            {"id":"req6","type":"arm.set","armed":true,"resumeModel":"fable","paths":["{{J(paths[0])}}"]}
             """;
 
         // Act
@@ -202,7 +206,7 @@ public class ControlPlaneBridgeArmTests : IDisposable
         var bridge = CreateBridge();
         string[] paths = { @"C:\proj\alpha" };
         string armRequest = $$"""
-            {"id":"req7","type":"arm.set","armed":true,"paths":["{{J(paths[0])}}"]}
+            {"id":"req7","type":"arm.set","armed":true,"resumeModel":"fable","paths":["{{J(paths[0])}}"]}
             """;
         await bridge.HandleAsync(armRequest, CancellationToken.None);
 
@@ -216,6 +220,8 @@ public class ControlPlaneBridgeArmTests : IDisposable
         JsonElement payload = GetPayload(response);
         Assert.False(payload.GetProperty("armed").GetBoolean());
         Assert.Equal(string.Empty, payload.GetProperty("cycleId").GetString());
+        Assert.Equal("fable", payload.GetProperty("resumeModel").GetString());
+        Assert.Equal("fable", new ProductConfigStore(_configDir).Load().ResumeModel);
     }
 
     [Fact]
@@ -223,7 +229,7 @@ public class ControlPlaneBridgeArmTests : IDisposable
     {
         // Arrange
         var bridge = CreateBridge();
-        string request = """{"id":"req9","type":"arm.set","armed":true,"paths":[]}""";
+        string request = """{"id":"req9","type":"arm.set","armed":true,"resumeModel":"fable","paths":[]}""";
 
         // Act
         string response = await bridge.HandleAsync(request, CancellationToken.None);
@@ -245,7 +251,7 @@ public class ControlPlaneBridgeArmTests : IDisposable
         var bridge = CreateBridge();
         string[] paths = { @"C:\proj\alpha" };
         string request = $$"""
-            {"id":"req10","type":"arm.set","armed":true,"paths":["{{J(paths[0])}}"],"continuous":true}
+            {"id":"req10","type":"arm.set","armed":true,"resumeModel":"fable","paths":["{{J(paths[0])}}"],"continuous":true}
             """;
 
         // Act
@@ -255,6 +261,79 @@ public class ControlPlaneBridgeArmTests : IDisposable
         Assert.Equal("arm.set.result", GetType(response));
         JsonElement payload = GetPayload(response);
         Assert.True(payload.GetProperty("continuous").GetBoolean());
+    }
+
+    [Fact]
+    public async Task 布防缺少续跑模型_原子拒绝且不改变配置()
+    {
+        var store = new ProductConfigStore(_configDir);
+        store.Update(config => config.ResumeModel = "opus");
+        string request = $$"""
+            {"id":"req-model-missing","type":"arm.set","armed":true,"paths":["{{J(@"C:\proj\alpha")}}"]}
+            """;
+
+        string response = await CreateBridge().HandleAsync(request, CancellationToken.None);
+
+        Assert.Equal("arm.set.error", GetType(response));
+        Assert.Contains("续跑模型", GetError(response), StringComparison.Ordinal);
+        ProductConfig preserved = store.Load();
+        Assert.False(preserved.Armed);
+        Assert.Equal("opus", preserved.ResumeModel);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("notfable")]
+    [InlineData("claude-preview-fable-5")]
+    [InlineData("fable\nopus")]
+    [InlineData("claude-opus-sonnet-5")]
+    [InlineData("claude-fable-5\"&calc")]
+    public async Task 布防续跑模型非法_原子拒绝(string requestedModel)
+    {
+        var store = new ProductConfigStore(_configDir);
+        store.Update(config => config.ResumeModel = "haiku");
+        string request = JsonSerializer.Serialize(new
+        {
+            id = "req-model-invalid",
+            type = "arm.set",
+            armed = true,
+            resumeModel = requestedModel,
+            paths = new[] { @"C:\proj\alpha" },
+        });
+
+        string response = await CreateBridge().HandleAsync(request, CancellationToken.None);
+
+        Assert.Equal("arm.set.error", GetType(response));
+        ProductConfig preserved = store.Load();
+        Assert.False(preserved.Armed);
+        Assert.Equal("haiku", preserved.ResumeModel);
+    }
+
+    [Theory]
+    [InlineData("fable", "fable")]
+    [InlineData("OPUS", "opus")]
+    [InlineData("Sonnet", "sonnet")]
+    [InlineData("haiku", "haiku")]
+    [InlineData("claude-fable-5", "fable")]
+    [InlineData("claude-3-5-sonnet-20241022", "sonnet")]
+    public async Task 布防续跑模型规范化后原子持久化(string requestedModel, string expectedModel)
+    {
+        string request = JsonSerializer.Serialize(new
+        {
+            id = "req-model-normalize",
+            type = "arm.set",
+            armed = true,
+            resumeModel = requestedModel,
+            paths = new[] { @"C:\proj\alpha" },
+        });
+
+        string response = await CreateBridge().HandleAsync(request, CancellationToken.None);
+
+        Assert.Equal("arm.set.result", GetType(response));
+        Assert.Equal(expectedModel, GetPayload(response).GetProperty("resumeModel").GetString());
+        ProductConfig persisted = new ProductConfigStore(_configDir).Load();
+        Assert.True(persisted.Armed);
+        Assert.Equal(expectedModel, persisted.ResumeModel);
     }
 
     [Fact]
@@ -637,7 +716,7 @@ public class ControlPlaneBridgeArmTests : IDisposable
 
         var bridge = CreateBridge();
         await bridge.HandleAsync(
-            $$"""{"id":"req16","type":"arm.set","armed":true,"paths":["{{J(@"C:\proj\beta")}}"]}""",
+            $$"""{"id":"req16","type":"arm.set","armed":true,"resumeModel":"fable","paths":["{{J(@"C:\proj\beta")}}"]}""",
             CancellationToken.None);
 
         JsonElement payload = GetPayload(await bridge.HandleAsync(

@@ -452,6 +452,126 @@ public sealed class QuotaServiceTests
         Assert.Equal(2, probeCalls);
     }
 
+    [Fact]
+    public void 稀疏合并区分仅Scoped满额与另有未归因限流()
+    {
+        DateTimeOffset now = DateTimeOffset.Parse("2026-08-21T08:00:00Z");
+        long fiveReset = now.AddHours(4).ToUnixTimeSeconds();
+        long sevenReset = now.AddDays(3).ToUnixTimeSeconds();
+        UsageSnapshot previous = new(
+            "claudecode",
+            now.AddMinutes(-1),
+            new[]
+            {
+                new UsageBucket("Usage", true, false, new[]
+                {
+                    new UsageWindow("five_hour", "allowed", UsageWindow.FiveHourSeconds,
+                        fiveReset, null, 40),
+                    new UsageWindow("seven_day", "allowed", UsageWindow.SevenDaySeconds,
+                        sevenReset, null, 80),
+                }),
+            },
+            null);
+        UsageWindow[] currentWindows =
+        [
+            new UsageWindow("five_hour", "allowed", UsageWindow.FiveHourSeconds,
+                fiveReset, null, 43),
+            new UsageWindow("seven_day", "allowed", UsageWindow.SevenDaySeconds,
+                sevenReset, null, 81),
+            new UsageWindow("weekly_scoped:Sonnet", "blocked", UsageWindow.SevenDaySeconds,
+                sevenReset, null, 100, Identity: "weekly_scoped:sonnet"),
+        ];
+        UsageSnapshot withUnknown = new(
+            "claudecode",
+            now,
+            new[]
+            {
+                new UsageBucket("Usage", false, true, currentWindows)
+                {
+                    UnattributedLimitReached = true,
+                },
+            },
+            null);
+
+        UsageSnapshot mergedUnknown = QuotaService.MergeSparseObservation(withUnknown, previous, now);
+        Assert.True(Assert.Single(mergedUnknown.Buckets).UnattributedLimitReached);
+
+        UsageSnapshot scopedOnly = withUnknown with
+        {
+            Buckets = new[]
+            {
+                new UsageBucket("Usage", false, true, currentWindows),
+            },
+        };
+        UsageSnapshot mergedScopedOnly = QuotaService.MergeSparseObservation(scopedOnly, previous, now);
+        Assert.False(Assert.Single(mergedScopedOnly.Buckets).UnattributedLimitReached);
+    }
+
+    [Fact]
+    public void 较旧观测不能清除较新的未归因限流()
+    {
+        DateTimeOffset now = DateTimeOffset.Parse("2026-08-21T08:00:00Z");
+        long fiveReset = now.AddHours(4).ToUnixTimeSeconds();
+        long sevenReset = now.AddDays(3).ToUnixTimeSeconds();
+        UsageWindow[] windows =
+        [
+            new UsageWindow("five_hour", "allowed", UsageWindow.FiveHourSeconds,
+                fiveReset, null, 43),
+            new UsageWindow("seven_day", "allowed", UsageWindow.SevenDaySeconds,
+                sevenReset, null, 81),
+            new UsageWindow("weekly_scoped:Fable", "allowed", UsageWindow.SevenDaySeconds,
+                sevenReset, null, 20, Identity: "weekly_scoped:fable"),
+        ];
+        UsageSnapshot newerLimited = new(
+            "claudecode",
+            now,
+            new[]
+            {
+                new UsageBucket("Usage", false, true, windows)
+                {
+                    UnattributedLimitReached = true,
+                },
+            },
+            null);
+        UsageSnapshot olderAllowed = new(
+            "claudecode",
+            now.AddMinutes(-1),
+            new[] { new UsageBucket("Usage", true, false, windows) },
+            null);
+
+        UsageSnapshot merged = QuotaService.MergeSparseObservation(olderAllowed, newerLimited, now);
+
+        UsageBucket bucket = Assert.Single(merged.Buckets);
+        Assert.True(bucket.UnattributedLimitReached);
+        Assert.True(bucket.LimitReached);
+        Assert.False(bucket.Allowed);
+        Assert.Equal(now, merged.CapturedAt);
+
+        UsageSnapshot newerUnknownOnly = newerLimited with
+        {
+            Buckets = new[]
+            {
+                new UsageBucket("Usage", false, true, Array.Empty<UsageWindow>())
+                {
+                    UnattributedLimitReached = true,
+                },
+            },
+        };
+        UsageSnapshot olderEmpty = olderAllowed with
+        {
+            Buckets = new[]
+            {
+                new UsageBucket("Usage", true, false, Array.Empty<UsageWindow>()),
+            },
+        };
+
+        UsageBucket emptyMerged = Assert.Single(
+            QuotaService.MergeSparseObservation(olderEmpty, newerUnknownOnly, now).Buckets);
+        Assert.True(emptyMerged.UnattributedLimitReached);
+        Assert.True(emptyMerged.LimitReached);
+        Assert.False(emptyMerged.Allowed);
+    }
+
     private static UsageSnapshot Authoritative(DateTimeOffset now, bool includeScoped)
     {
         var windows = new List<UsageWindow>

@@ -265,6 +265,35 @@ public sealed class CheckerCycle
         return SaveChecked(config, state);
     }
 
+    /// <summary>
+    /// supervisor 明确在任何登记/spawn 前取消时，撤销同一个 RunId 的 product_state
+    /// 预登记。精确 id、项目或 running 状态任一不匹配都拒绝回滚。
+    /// </summary>
+    public bool RollbackPreparedRun(
+        ProductConfig config,
+        CheckerState state,
+        string path,
+        RunId runId)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        ArgumentNullException.ThrowIfNull(path);
+
+        if (!TestCycleActive(config, state.CycleId) ||
+            !string.Equals(state.ActiveRunId, runId.ToString(), StringComparison.Ordinal) ||
+            !string.Equals(state.ActiveProjectPath, path, StringComparison.OrdinalIgnoreCase) ||
+            state.ProjectStatus is null ||
+            !state.ProjectStatus.TryGetValue(path, out string? status) ||
+            !string.Equals(status, "running", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        state.ProjectStatus.Remove(path);
+        state.Phase = CheckerState.PhaseWaiting;
+        ClearActiveRun(state);
+        return SaveChecked(config, state);
+    }
+
     /// <summary>把升级前遗留的失败/停止/running 等状态锁存为当前周期阻断。</summary>
     public bool LatchReplayBlock(ProductConfig config, CheckerState state)
     {
@@ -318,10 +347,9 @@ public sealed class CheckerCycle
             state.ReplayBlocked = true;
             state.Phase = CheckerState.PhaseBlocked;
         }
-        SaveChecked(config, state);
-
         if (status != "limited")
         {
+            SaveChecked(config, state);
             return state.ReplayBlocked ? ProjectOutcome.Blocked : ProjectOutcome.Continue;
         }
 

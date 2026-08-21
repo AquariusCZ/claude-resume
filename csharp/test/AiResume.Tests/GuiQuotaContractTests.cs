@@ -12,7 +12,8 @@ public sealed class GuiQuotaContractTests
 
         Assert.DoesNotContain("lastQuotaOk = true", html, StringComparison.Ordinal);
         Assert.Contains("detail: lastQuotaDetail || head.txt", html, StringComparison.Ordinal);
-        Assert.Contains("const globalLimited = !!(", html, StringComparison.Ordinal);
+        Assert.Contains("const globalHasCurrentData = !!p.globalHasCurrentData;", html,
+            StringComparison.Ordinal);
         Assert.Contains("const scopedInfos = (p.windows || [])", html,
             StringComparison.Ordinal);
         Assert.Contains("scopedRows = scopedInfos.map(info => info.row);", html, StringComparison.Ordinal);
@@ -20,10 +21,21 @@ public sealed class GuiQuotaContractTests
             StringComparison.Ordinal);
         Assert.Contains("ws.status === 'blocked'", html, StringComparison.Ordinal);
         Assert.Contains("scopedPercent == null ? '未报告'", html, StringComparison.Ordinal);
-        Assert.Contains("const hasCarried = (p.windows || []).some(window => window.carriedForward);", html,
+        Assert.Contains("const isBlockedWindow = window => !!window", html,
             StringComparison.Ordinal);
-        Assert.Contains("anyLimited ? 'limited' : hasCarried ? 'stale' : p.allowed ? true : false", html,
+        Assert.Contains("const globalHasCarried = !!p.globalHasCarried;", html,
             StringComparison.Ordinal);
+        Assert.Contains("const globalLimited = !!p.globalLimitReached;", html,
+            StringComparison.Ordinal);
+        Assert.Contains("lastQuotaState = globalLimited", html, StringComparison.Ordinal);
+        Assert.Contains(": globalHasCurrentData ? true : false;", html, StringComparison.Ordinal);
+        Assert.Contains("Claude Code 总额度未限流", html, StringComparison.Ordinal);
+        Assert.Contains("Claude Code 总额度窗口未完整核实", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("const anyLimited = globalLimited || scopedLimited;", html,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("p.limitReached && !scopedLimited", html,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("const globalHasData =", html, StringComparison.Ordinal);
         Assert.Contains("if (ok === 'limited') return { cls: 'wait', txt: '已限流' };", html,
             StringComparison.Ordinal);
         Assert.Contains("if (ok === 'stale') return { cls: 'wait', txt: '最近读数' };", html,
@@ -65,7 +77,7 @@ public sealed class GuiQuotaContractTests
             StringComparison.Ordinal);
         Assert.DoesNotContain("(o.used ?? 0)", html, StringComparison.Ordinal);
         Assert.Contains("重置时间未报告", html, StringComparison.Ordinal);
-        Assert.Contains("const blocked7 = !!(w7 &&", html, StringComparison.Ordinal);
+        Assert.Contains("const blocked7 = isBlockedWindow(w7);", html, StringComparison.Ordinal);
         Assert.Contains("warn: false,", html, StringComparison.Ordinal);
         Assert.Contains("同一重置周期的最近一次服务端读数", html, StringComparison.Ordinal);
         Assert.Contains("if (p.storageWarning) lastQuotaDetail", html, StringComparison.Ordinal);

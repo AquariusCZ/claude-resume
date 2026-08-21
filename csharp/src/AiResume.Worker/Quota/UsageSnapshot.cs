@@ -19,6 +19,12 @@ public sealed record UsageSnapshot(
     string? UnavailableReason)
 {
     /// <summary>
+    /// 本次快照的直接证据来源。历史 JSON 缺少该字段时默认为 Unknown，
+    /// 不能把升级前无法证明来源的快照当成续跑放行证据。
+    /// </summary>
+    public UsageEvidenceSource EvidenceSource { get; init; } = UsageEvidenceSource.Unknown;
+
+    /// <summary>
     /// 是否拿到了至少一条有事实内容的限额窗口。空对象不是额度证据:
     /// percent/reset 都缺失时不能仅凭一个窗口壳把 provider 点成绿色。
     /// </summary>
@@ -30,12 +36,28 @@ public sealed record UsageSnapshot(
         new(provider, capturedAt, Array.Empty<UsageBucket>(), reason);
 }
 
+/// <summary>额度快照本次直接观测的来源；历史承接不会把 CLI 升格为 OAuth。</summary>
+public enum UsageEvidenceSource
+{
+    Unknown = 0,
+    OAuth = 1,
+    Cli = 2,
+}
+
 /// <summary>一组逻辑配额(对齐 cc-connect 的 <c>UsageBucket</c>)。</summary>
 public sealed record UsageBucket(
     string Name,
     bool Allowed,
     bool LimitReached,
-    IReadOnlyList<UsageWindow> Windows);
+    IReadOnlyList<UsageWindow> Windows)
+{
+    /// <summary>
+    /// provider 明确报告限流、但无法归因到任何已知窗口的聚合事实。
+    /// <see cref="LimitReached"/> 仍表示任一主/scoped/未知限额已满；本字段只供
+    /// 展示层区分“仅模型 scoped 已满”与“另有账户级未知限流”，不得替代总门禁。
+    /// </summary>
+    public bool UnattributedLimitReached { get; init; }
+}
 
 /// <summary>
 /// 单个配额窗口。

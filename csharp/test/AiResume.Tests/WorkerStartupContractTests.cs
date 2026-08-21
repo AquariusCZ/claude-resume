@@ -1,3 +1,6 @@
+using AiResume.Worker.Probes;
+using AiResume.Worker.Quota;
+using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
 namespace AiResume.Tests;
@@ -21,6 +24,26 @@ public sealed class WorkerStartupContractTests
         Assert.True(transport > recovery);
         Assert.True(observation > recovery);
         Assert.True(resume > recovery);
+    }
+
+    [Fact]
+    public void Resume_engine_uses_complete_quota_service_in_production()
+    {
+        string source = File.ReadAllText(FindRepositoryFile(
+            Path.Combine("csharp", "src", "AiResume.Worker", "Program.cs")));
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddQuotaResumeAdmission();
+        using ServiceProvider provider = services.BuildServiceProvider(
+            new ServiceProviderOptions { ValidateOnBuild = true, ValidateScopes = true });
+
+        IClaudeUsageProbe admission = provider.GetRequiredService<IClaudeUsageProbe>();
+
+        Assert.IsType<QuotaResumeProbe>(admission);
+        Assert.Same(admission, provider.GetRequiredService<IClaudeUsageProbe>());
+        Assert.Contains("builder.Services.AddQuotaResumeAdmission();", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("AddSingleton<IClaudeUsageProbe>", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("new ClaudeCodeProbe()", source, StringComparison.Ordinal);
     }
 
     private static string FindRepositoryFile(string relativePath)

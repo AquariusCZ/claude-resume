@@ -66,7 +66,7 @@ Quota comes from Anthropic's OAuth usage endpoint using Claude Code's real reque
 
 Responses are sparse, so a missing field is not treated as a deletion. A carried-over value is shown amber as a *recent server reading*, never green. Reset-only data uses an indeterminate scan instead of inventing a percentage.
 
-Select projects, press **Arm**, close the window. The Worker keeps the queue and resumes only after the reset evidence is valid. Details: [Claude quota acquisition](docs/CLAUDE-QUOTA-ACQUISITION.md).
+Select the resume model, select projects, press **Arm**, then close the window. The Worker resumes only when a fresh scoped quota reading for that same model is available, and launches Claude Code with the same explicit `--model`. A five-hour reset alone is not enough. Details: [Claude quota acquisition](docs/CLAUDE-QUOTA-ACQUISITION.md).
 
 ## Chat from your phone
 

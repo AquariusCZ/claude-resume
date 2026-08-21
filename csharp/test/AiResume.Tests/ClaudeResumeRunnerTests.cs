@@ -452,6 +452,8 @@ public sealed class ClaudeResumeRunnerTests : IDisposable
         Assert.Equal("stopped", result.Status);
         Assert.True(result.StopRound);
         Assert.Null(result.RunId);
+        Assert.True(result.StartCancelledBeforeSpawn);
+        Assert.Null(result.PreparedRunId);
     }
 
     [Theory]
@@ -484,6 +486,19 @@ public sealed class ClaudeResumeRunnerTests : IDisposable
 
         var request = Assert.Single(supervisor.StartRequests);
         Assert.Equal(shouldContain, request.Arguments.Contains("--model"));
+    }
+
+    [Fact]
+    public async Task ResumeModel_is_passed_as_the_exact_cli_model()
+    {
+        var supervisor = new FakeSupervisor("{\"type\":\"result\",\"is_error\":false}");
+        var runner = CreateRunner(supervisor);
+        _config.ResumeModel = "fable";
+
+        await runner.RunAsync(_project, _config, CancellationToken.None);
+
+        ProcessStartRequest request = Assert.Single(supervisor.StartRequests);
+        Assert.Contains("--model \"fable\"", request.Arguments, StringComparison.Ordinal);
     }
 
     [Fact]

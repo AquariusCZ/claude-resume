@@ -66,7 +66,7 @@ csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe insta
 
 响应是稀疏的，所以缺字段不等于被删除。承接下来的旧值显示为琥珀色的*最近服务端读数*，绝不点绿；只有重置时间没有百分比时用不确定态扫描，而不是编一个数字出来。
 
-勾选项目、点**布防**、关窗即可。Worker 保管队列，只有在重置证据成立后才续跑。细节见[额度获取](docs/CLAUDE-QUOTA-ACQUISITION.md)。
+先选择续跑模型，再勾选项目、点**布防**、关窗即可。Worker 只有在同一目标模型的实时 scoped 额度明确可用后才续跑，并用同一个显式 `--model` 启动 Claude Code；5H 单独重置不等于可以续跑。细节见[额度获取](docs/CLAUDE-QUOTA-ACQUISITION.md)。
 
 ## 用手机指挥
 

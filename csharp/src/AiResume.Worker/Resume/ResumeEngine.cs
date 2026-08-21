@@ -311,21 +311,48 @@ public sealed class ResumeEngine : BackgroundService
             return;
         }
 
-        // 6. 执行探测(工作目录固定 shadow 根,不落进用户项目)。
+        // 6. 执行探测(工作目录固定 shadow 根,不落进用户项目)。模型是额度授权的一部分；
+        // 若它在异步请求期间变化，旧证据立即作废并针对新模型重新取证。
         ClaudeProbeResult probe;
-        try
+        string admittedModel;
+        while (true)
         {
-            probe = await _probe.ProbeAsync(config.ProbeModel, ShadowPaths.Root, cancellationToken);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            // 探测异常:记日志,本拍结束(不触发任何状态变更)。
-            _logger.LogError(ex, "resume.probe.error 探测执行异常,cycleId={CycleId}", config.ArmCycleId);
-            return;
+            admittedModel = config.ResumeModel;
+            try
+            {
+                probe = await _probe.ProbeAsync(admittedModel, ShadowPaths.Root, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // 探测异常:记日志,本拍结束(不触发任何状态变更)。
+                _logger.LogError(ex, "resume.probe.error 探测执行异常,cycleId={CycleId}", config.ArmCycleId);
+                return;
+            }
+
+            ProductConfig afterProbe = _configStore.Load();
+            if (!afterProbe.Armed || !_cycle.TestCycleActive(afterProbe, state.CycleId))
+            {
+                return;
+            }
+
+            if (SameResumeModel(afterProbe.ResumeModel, admittedModel))
+            {
+                config = afterProbe;
+                break;
+            }
+
+            _logger.LogInformation(
+                "resume.probe.model_changed 探测期间续跑模型变化,丢弃旧证据并重新取证,cycleId={CycleId},oldModel={OldModel},newModel={NewModel}",
+                state.CycleId, admittedModel, afterProbe.ResumeModel);
+            config = afterProbe;
+            if (!_cycle.MarkProbeAttempt(config, state))
+            {
+                return;
+            }
         }
 
         // 7. 按探测结果分派。
@@ -344,7 +371,7 @@ public sealed class ResumeEngine : BackgroundService
                 config.ArmCycleId, state.Phase, decision);
             if (decision == ProbeDecision.StartResuming)
             {
-                await RunResumeRoundAsync(state, cancellationToken);
+                await RunResumeRoundAsync(state, probe, admittedModel, cancellationToken);
             }
         }
         else
@@ -361,8 +388,14 @@ public sealed class ResumeEngine : BackgroundService
     /// 这样运行中新增的项目会进入本轮，移除的项目会自然消失；只有锁内复核最新队列
     /// 已全部成功后才能完成周期并解除布防。
     /// </summary>
-    private async Task RunResumeRoundAsync(CheckerState state, CancellationToken cancellationToken)
+    private async Task RunResumeRoundAsync(
+        CheckerState state,
+        ClaudeProbeResult initialAdmission,
+        string initialAdmittedModel,
+        CancellationToken cancellationToken)
     {
+        ClaudeProbeResult? admission = initialAdmission;
+        string? admittedModel = initialAdmittedModel;
         while (true)
         {
             // 每个项目开始前重新加载配置,并校验"仍然布防 + 周期未变"。
@@ -380,6 +413,15 @@ public sealed class ResumeEngine : BackgroundService
             if (cancellationToken.IsCancellationRequested)
             {
                 return;
+            }
+
+            if (admission is not null && !SameResumeModel(freshConfig.ResumeModel, admittedModel))
+            {
+                _logger.LogInformation(
+                    "resume.project.quota.model_changed 启动项目前续跑模型变化,丢弃旧证据并重新取证,cycleId={CycleId},oldModel={OldModel},newModel={NewModel}",
+                    state.CycleId, admittedModel, freshConfig.ResumeModel);
+                admission = null;
+                admittedModel = null;
             }
 
             ProjectRef? project = freshConfig.Selected.FirstOrDefault(candidate =>
@@ -451,8 +493,97 @@ public sealed class ResumeEngine : BackgroundService
                 return;
             }
 
+            // 上一项目可能恰好耗尽某个 scoped 窗口。首项目复用刚触发本轮的实时证据；
+            // 后续每个项目都重新探测，确保一次 round-level ready 不会放行整支队列。
+            if (admission is null)
+            {
+                if (!_cycle.MarkProbeAttempt(freshConfig, state))
+                {
+                    return;
+                }
+
+                string probeModel = freshConfig.ResumeModel;
+                try
+                {
+                    admission = await _probe.ProbeAsync(
+                        probeModel,
+                        ShadowPaths.Root,
+                        cancellationToken);
+                    admittedModel = probeModel;
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "resume.project.quota.error 项目启动前额度复核异常,cycleId={CycleId},project={Project}",
+                        state.CycleId, project.Name);
+                    ProductConfig afterError = _configStore.Load();
+                    if (afterError.Armed && _cycle.TestCycleActive(afterError, state.CycleId))
+                    {
+                        _cycle.OnNotReady(
+                            afterError, state, new ClaudeProbeResult { Reason = "probe-error" });
+                    }
+                    return;
+                }
+            }
+
+            // 额度请求是异步边界；等待期间用户可能解除/重新布防或移除项目。
+            // 必须基于请求完成后的配置决定是否写状态、是否启动，不能拿旧周期快照回写。
+            ProductConfig admissionConfig = _configStore.Load();
+            if (!admissionConfig.Armed || !_cycle.TestCycleActive(admissionConfig, state.CycleId))
+            {
+                _logger.LogInformation(
+                    "resume.cycle.superseded 额度复核后周期已失效,中止本轮,cycleId={CycleId},project={Project}",
+                    state.CycleId, project.Name);
+                return;
+            }
+            if (!ContainsSelectedProject(admissionConfig, project.Path))
+            {
+                _logger.LogInformation(
+                    "resume.queue.changed 额度复核后项目已移除,重新读取队列,cycleId={CycleId},project={Project}",
+                    state.CycleId, project.Name);
+                continue;
+            }
+            if (!SameResumeModel(admissionConfig.ResumeModel, admittedModel))
+            {
+                _logger.LogInformation(
+                    "resume.project.quota.model_changed 额度复核期间续跑模型变化,丢弃旧证据并重新取证,cycleId={CycleId},project={Project},oldModel={OldModel},newModel={NewModel}",
+                    state.CycleId, project.Name, admittedModel, admissionConfig.ResumeModel);
+                admission = null;
+                admittedModel = null;
+                continue;
+            }
+            freshConfig = admissionConfig;
+
+            if (admission.IsLimited)
+            {
+                _logger.LogInformation(
+                    "resume.project.quota.limited 项目启动前额度已收紧,回到等待,cycleId={CycleId},project={Project}",
+                    state.CycleId, project.Name);
+                _cycle.OnLimited(freshConfig, state, admission);
+                return;
+            }
+
+            if (!admission.Ready)
+            {
+                _logger.LogWarning(
+                    "resume.project.quota.unverified 项目启动前没有可用证据,回到等待,cycleId={CycleId},project={Project},reason={Reason}",
+                    state.CycleId, project.Name, admission.Reason);
+                _cycle.OnNotReady(freshConfig, state, admission);
+                return;
+            }
+
+            string modelForRun = admittedModel!;
+            admission = null;
+            admittedModel = null;
+
             // 执行续跑。
             ResumeRunResult result;
+            string? startGateRejection = null;
+            string? startGateObservedModel = null;
             try
             {
                 result = await _runner.RunAsync(
@@ -462,15 +593,31 @@ public sealed class ResumeEngine : BackgroundService
                     beforeStart: runId =>
                     {
                         ProductConfig activeConfig = _configStore.Load();
-                        return activeConfig.Armed &&
-                            ContainsSelectedProject(activeConfig, project.Path) &&
-                            _cycle.PrepareActiveRun(activeConfig, state, project.Path, runId);
+                        if (!activeConfig.Armed || !_cycle.TestCycleActive(activeConfig, state.CycleId))
+                        {
+                            startGateRejection = "cycle";
+                            return false;
+                        }
+                        if (!SameResumeModel(activeConfig.ResumeModel, modelForRun))
+                        {
+                            startGateRejection = "model";
+                            startGateObservedModel = activeConfig.ResumeModel;
+                            return false;
+                        }
+                        if (!ContainsSelectedProject(activeConfig, project.Path))
+                        {
+                            startGateRejection = "project";
+                            return false;
+                        }
+
+                        return _cycle.PrepareActiveRun(activeConfig, state, project.Path, runId);
                     },
                     shouldContinue: _ =>
                     {
                         ProductConfig activeConfig = _configStore.Load();
                         return activeConfig.Armed &&
                             _cycle.TestCycleActive(activeConfig, state.CycleId) &&
+                            SameResumeModel(activeConfig.ResumeModel, modelForRun) &&
                             ContainsSelectedProject(activeConfig, project.Path);
                     });
             }
@@ -489,6 +636,63 @@ public sealed class ResumeEngine : BackgroundService
                     ProjectPath = project.Path,
                     Status = "error",
                 };
+            }
+
+            if (result.StartCancelledBeforeSpawn)
+            {
+                ProductConfig cancellationConfig = _configStore.Load();
+                RunId? preparedRunId = result.PreparedRunId;
+                bool rolledBack = preparedRunId is { } exactRunId &&
+                    cancellationConfig.Armed &&
+                    _cycle.RollbackPreparedRun(
+                        cancellationConfig, state, project.Path, exactRunId);
+                if (rolledBack)
+                {
+                    _logger.LogInformation(
+                        "resume.project.start_cancelled Worker关闭发生在spawn前,已撤销精确预登记,cycleId={CycleId},project={Project},runId={RunId}",
+                        state.CycleId, project.Name, preparedRunId);
+                }
+                else if (cancellationConfig.Armed &&
+                    _cycle.TestCycleActive(cancellationConfig, state.CycleId))
+                {
+                    _logger.LogWarning(
+                        "resume.project.start_cancelled_unverified Worker关闭发生在spawn前,但预登记无法精确撤销,保持失败关闭,cycleId={CycleId},project={Project}",
+                        state.CycleId, project.Name);
+                }
+                return;
+            }
+
+            // beforeStart 是最后一道 spawn 门禁。项目若恰好在额度复核后被移除，runner
+            // 会在尚未创建进程时返回 stopped；这不是执行失败，不能把整个周期锁死。
+            if (result.RunId is null &&
+                result.Status == "stopped" &&
+                result.StopRound)
+            {
+                ProductConfig notStartedConfig = _configStore.Load();
+                if (!notStartedConfig.Armed ||
+                    !_cycle.TestCycleActive(notStartedConfig, state.CycleId))
+                {
+                    _logger.LogInformation(
+                        "resume.cycle.superseded 项目在最终启动门禁前周期已失效,未创建进程,cycleId={CycleId},project={Project}",
+                        state.CycleId, project.Name);
+                    return;
+                }
+
+                if (startGateRejection == "project")
+                {
+                    _logger.LogInformation(
+                        "resume.queue.changed 项目在最终启动门禁前被移除,未创建进程并重新读取队列,cycleId={CycleId},project={Project}",
+                        state.CycleId, project.Name);
+                    continue;
+                }
+
+                if (startGateRejection == "model")
+                {
+                    _logger.LogInformation(
+                        "resume.project.model_changed 项目在最终启动门禁前续跑模型变化,未创建进程并重新取证,cycleId={CycleId},project={Project},oldModel={OldModel},newModel={NewModel}",
+                        state.CycleId, project.Name, modelForRun, startGateObservedModel);
+                    continue;
+                }
             }
 
             if (result.SideEffectsStarted && result.Status == "limited")
@@ -588,6 +792,9 @@ public sealed class ResumeEngine : BackgroundService
             }
         }
     }
+
+    private static bool SameResumeModel(string? left, string? right) =>
+        string.Equals(left, right, StringComparison.Ordinal);
 
     private void SettleInactiveCycleRun(string cycleId, string projectPath, ResumeRunResult result)
     {

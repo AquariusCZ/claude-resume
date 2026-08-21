@@ -10,6 +10,7 @@ using AiResume.Worker.Migration;
 using AiResume.Worker.Orchestration;
 using AiResume.Worker.Probes;
 using AiResume.Worker.Products;
+using AiResume.Worker.Quota;
 using AiResume.Worker.Resume;
 using AiResume.Worker.Supervision;
 using Microsoft.Extensions.Configuration;
@@ -157,7 +158,7 @@ builder.Services.AddHostedService<AiResume.Worker.Notifications.NotificationWork
 // 探测与续跑都经真实实现(不是 Fake):IProviderAdapter 那条 Fake 链路是 S2 编排器的,与此无关。
 builder.Services.AddSingleton(new ProductConfigStore(ShadowPaths.Root));
 builder.Services.AddSingleton(new ProductStateStore(ShadowPaths.RunDatabasePath));
-builder.Services.AddSingleton<IClaudeUsageProbe>(new ClaudeCodeProbe());
+builder.Services.AddQuotaResumeAdmission();
 builder.Services.AddSingleton<CheckerCycle>(sp => new CheckerCycle(sp.GetRequiredService<ProductStateStore>()));
 builder.Services.AddSingleton<IClaudeResumeRunner>(sp =>
     new ClaudeResumeRunner(sp.GetRequiredService<IProcessSupervisor>()));

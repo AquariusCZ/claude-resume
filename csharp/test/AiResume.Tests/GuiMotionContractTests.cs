@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using Xunit;
 
 namespace AiResume.Tests;
@@ -178,7 +179,7 @@ public sealed class GuiMotionContractTests
         Assert.Contains("applyArmState(next, { forceRows: true, announce: true });", html,
             StringComparison.Ordinal);
         Assert.Contains("b.disabled = armBusy || armRefreshBusy || queueBusy", html, StringComparison.Ordinal);
-        Assert.Contains("(!on && (armUnknown || picked.size === 0))", html, StringComparison.Ordinal);
+        Assert.Contains("picked.size === 0 || !modelSelect.value", html, StringComparison.Ordinal);
         Assert.DoesNotContain("b.disabled = armBusy || armRefreshBusy || queueBusy || armUnknown", html,
             StringComparison.Ordinal);
         Assert.Contains("if (armBusy || armRefreshBusy || queueBusy) return;", html, StringComparison.Ordinal);
@@ -211,6 +212,46 @@ public sealed class GuiMotionContractTests
         Assert.Contains("st.get(pathKey(it.path))", html, StringComparison.Ordinal);
         Assert.Contains("布防后将在额度恢复时按队列续跑", html, StringComparison.Ordinal);
         Assert.DoesNotContain("}[s] || s", html, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void 布防必须显式选择并锁定续跑模型()
+    {
+        string html = File.ReadAllText(FindRepositoryFile(
+            Path.Combine("csharp", "src", "AiResume.Gui", "wwwroot", "index.html")));
+
+        Assert.Contains("<select id=\"resumeModel\" aria-label=\"续跑模型\">", html,
+            StringComparison.Ordinal);
+        foreach (string model in AiResume.Core.ClaudeModelFamilies.Supported)
+        {
+            Assert.Contains($"<option value=\"{model}\">", html, StringComparison.Ordinal);
+        }
+        Match select = Regex.Match(
+            html,
+            "<select id=\"resumeModel\"[^>]*>(?<body>.*?)</select>",
+            RegexOptions.Singleline | RegexOptions.CultureInvariant);
+        Assert.True(select.Success);
+        string[] optionValues = Regex.Matches(
+                select.Groups["body"].Value,
+                "<option value=\"(?<value>[^\"]*)\"",
+                RegexOptions.CultureInvariant)
+            .Select(match => match.Groups["value"].Value)
+            .Where(value => value.Length > 0)
+            .ToArray();
+        Assert.Equal(AiResume.Core.ClaudeModelFamilies.Supported, optionValues);
+        Assert.DoesNotContain("['fable', 'opus', 'sonnet', 'haiku']", html, StringComparison.Ordinal);
+        Assert.Contains("resumeModel: $('resumeModel').value", html, StringComparison.Ordinal);
+        Assert.Contains("modelSelect.disabled = on || armBusy", html, StringComparison.Ordinal);
+        Assert.Contains("if (on && !arm.resumeModel)", html, StringComparison.Ordinal);
+        Assert.Contains("续跑模型未配置", html, StringComparison.Ordinal);
+        Assert.Contains("if (!arm.resumeModel) return '已布防 · 续跑模型未配置';", html,
+            StringComparison.Ordinal);
+        Assert.Contains("resumeModel: previous.resumeModel || ''", html, StringComparison.Ordinal);
+        Assert.Contains("resumeModel: value.resumeModel || ''", html, StringComparison.Ordinal);
+        Assert.Contains(".model-pick select:focus-visible{outline:1px solid var(--ink-2)", html,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(".model-pick select:focus-visible{outline:1px solid var(--vermilion)", html,
+            StringComparison.Ordinal);
     }
 
     private static string FindRepositoryFile(string relativePath)

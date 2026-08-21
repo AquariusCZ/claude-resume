@@ -203,12 +203,40 @@ public sealed class CheckerCycleTests : IDisposable
         var state = CheckerState.CreateDefault();
         state.CycleId = "cycle-1";
         state.SawLimited = true;
-        state.ProjectStatus = new Dictionary<string, string> { ["C:\\Repo\\A"] = "error" };
+        state.LimitedRefires = 4;
+        state.ProjectStatus = new Dictionary<string, string> { ["C:\\Repo\\A"] = "limited" };
 
         Assert.True(cycle.OnLimited(config, state, Probe("limited")));
 
-        // 已 sawLimited:不清 pstat、不重置 refire(现役仅新限流时清)。
+        // 没有 reset 代次变化证据时必须保留累计值，避免 limited/ready 振荡绕过熔断。
         Assert.Single(state.ProjectStatus!);
+        Assert.Equal(4, state.LimitedRefires);
+    }
+
+    [Fact]
+    public void 同一周期Limited与误放行交替时仍会触发Refire熔断()
+    {
+        var cycle = NewCycle();
+        var config = Config();
+        var state = CheckerState.CreateDefault();
+        state.CycleId = "cycle-1";
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseWaiting;
+        state.LimitedRefires = 4;
+        state.ProjectStatus = new Dictionary<string, string> { ["C:\\Repo\\A"] = "limited" };
+
+        Assert.True(cycle.OnLimited(config, state, Probe("limited")));
+        Assert.Equal(
+            ProjectOutcome.BackToWaiting,
+            cycle.ApplyProjectResult(config, state, "C:\\Repo\\A", "limited"));
+        Assert.True(cycle.OnLimited(config, state, Probe("limited")));
+        Assert.Equal(
+            ProjectOutcome.Blocked,
+            cycle.ApplyProjectResult(config, state, "C:\\Repo\\A", "limited"));
+
+        Assert.Equal(6, state.LimitedRefires);
+        Assert.True(state.ReplayBlocked);
+        Assert.Equal(CheckerState.PhaseBlocked, state.Phase);
     }
 
     [Fact]
@@ -338,6 +366,51 @@ public sealed class CheckerCycleTests : IDisposable
     }
 
     [Fact]
+    public void Spawn前取消只撤销精确RunId对应的预登记()
+    {
+        var cycle = NewCycle();
+        var config = Config();
+        var state = CheckerState.CreateDefault();
+        state.CycleId = "cycle-1";
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseResuming;
+        RunId runId = RunId.New();
+
+        Assert.True(cycle.PrepareActiveRun(config, state, "C:\\Repo\\A", runId));
+        Assert.True(cycle.RollbackPreparedRun(config, state, "C:\\Repo\\A", runId));
+
+        Assert.Equal(CheckerState.PhaseWaiting, state.Phase);
+        Assert.Empty(state.ActiveRunId);
+        Assert.Empty(state.ActiveProjectPath);
+        Assert.False(state.ProjectStatus!.ContainsKey("C:\\Repo\\A"));
+        CheckerState persisted = new ProductStateStore(_dbPath).Load();
+        Assert.Empty(persisted.ActiveRunId);
+        Assert.False(persisted.ProjectStatus!.ContainsKey("C:\\Repo\\A"));
+    }
+
+    [Fact]
+    public void Spawn前取消的RunId不匹配时保持失败关闭()
+    {
+        var cycle = NewCycle();
+        var config = Config();
+        var state = CheckerState.CreateDefault();
+        state.CycleId = "cycle-1";
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseResuming;
+        RunId activeRunId = RunId.New();
+
+        Assert.True(cycle.PrepareActiveRun(config, state, "C:\\Repo\\A", activeRunId));
+        Assert.False(cycle.RollbackPreparedRun(config, state, "C:\\Repo\\A", RunId.New()));
+
+        Assert.Equal(activeRunId.ToString(), state.ActiveRunId);
+        Assert.Equal("C:\\Repo\\A", state.ActiveProjectPath);
+        Assert.Equal("running", state.ProjectStatus!["C:\\Repo\\A"]);
+        CheckerState persisted = new ProductStateStore(_dbPath).Load();
+        Assert.Equal(activeRunId.ToString(), persisted.ActiveRunId);
+        Assert.Equal("running", persisted.ProjectStatus!["C:\\Repo\\A"]);
+    }
+
+    [Fact]
     public void 终止待确认时保留精确RunId供后续核验()
     {
         var cycle = NewCycle();
@@ -401,6 +474,9 @@ public sealed class CheckerCycleTests : IDisposable
         Assert.Equal(CheckerState.PhaseWaiting, state.Phase);
         Assert.True(state.SawLimited);
         Assert.Equal("limited", state.ProjectStatus!["C:\\Repo\\A"]);
+        CheckerState persisted = new ProductStateStore(_dbPath).Load();
+        Assert.Equal(5, persisted.LimitedRefires);
+        Assert.Equal("limited", persisted.ProjectStatus!["C:\\Repo\\A"]);
     }
 
     [Fact]

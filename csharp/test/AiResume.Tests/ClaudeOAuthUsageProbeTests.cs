@@ -231,6 +231,39 @@ public class ClaudeOAuthUsageProbeTests
         Assert.Equal(100, blocked.UsedPercent);
         Assert.Equal("blocked", blocked.Status);
         Assert.True(bucket.LimitReached);
+        Assert.False(bucket.UnattributedLimitReached);
+    }
+
+    [Fact]
+    public async Task Scoped与未知限额同时满额时保留未归因限流事实()
+    {
+        string json = """
+        {
+          "limits": [
+            { "kind": "session", "percent": 43, "resets_at": "2026-08-22T02:00:00Z" },
+            { "kind": "weekly_all", "percent": 81, "resets_at": "2026-08-24T14:00:00Z" },
+            {
+              "kind": "weekly_scoped", "percent": 100,
+              "resets_at": "2026-08-24T14:00:00Z",
+              "scope": { "model": { "display_name": "Fable" } }
+            },
+            { "kind": "future_global_limit", "percent": 100, "resets_at": "2026-08-22T02:00:00Z" }
+          ]
+        }
+        """;
+        using var handler = new FakeHandler(json);
+        using var http = new HttpClient(handler);
+        var probe = new ClaudeOAuthUsageProbe(http, WriteCredentials());
+
+        OAuthUsageResult result = await probe.TryFetchAsync(CancellationToken.None);
+
+        UsageBucket bucket = Assert.Single(result.Snapshot!.Buckets);
+        Assert.True(bucket.LimitReached);
+        Assert.True(bucket.UnattributedLimitReached);
+        Assert.Equal(43, Assert.Single(bucket.Windows, window => window.Name == "five_hour").UsedPercent);
+        Assert.Equal(81, Assert.Single(bucket.Windows, window => window.Name == "seven_day").UsedPercent);
+        Assert.Equal(100,
+            Assert.Single(bucket.Windows, window => window.Name == "weekly_scoped:Fable").UsedPercent);
     }
 
     [Theory]

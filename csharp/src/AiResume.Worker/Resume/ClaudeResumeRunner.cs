@@ -39,6 +39,15 @@ public sealed record ResumeRunResult
     /// <summary>当前项目结束后必须终止本轮,避免未确认退出的进程与下一项目并发。</summary>
     public bool StopRound { get; init; }
 
+    /// <summary>spawn 前已写入 product_state、但尚未交给 supervisor 的精确 RunId。</summary>
+    public RunId? PreparedRunId { get; init; }
+
+    /// <summary>
+    /// supervisor 以取消异常明确保证没有登记或 spawn。调用方只能据此回滚
+    /// <see cref="PreparedRunId"/> 对应的预登记，不能套用到普通启动失败。
+    /// </summary>
+    public bool StartCancelledBeforeSpawn { get; init; }
+
     /// <summary>本次运行已经出现写入、命令或未知工具活动;一旦为 true 就禁止自动重放。</summary>
     public bool SideEffectsStarted { get; init; }
 }
@@ -168,6 +177,8 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
                 {
                     return result with { Status = "stopped", StopRound = true };
                 }
+
+                result = result with { PreparedRunId = runId };
             }
 
             var request = new ProcessStartRequest
@@ -192,7 +203,12 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                return result with { Status = "stopped", StopRound = true };
+                return result with
+                {
+                    Status = "stopped",
+                    StopRound = true,
+                    StartCancelledBeforeSpawn = true,
+                };
             }
             catch (Exception)
             {

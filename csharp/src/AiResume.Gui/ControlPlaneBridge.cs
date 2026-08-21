@@ -206,6 +206,10 @@ public sealed class ControlPlaneBridge
                 hasData = true,
                 allowed = false,
                 limitReached = true,
+                unattributedLimitReached = false,
+                globalHasCurrentData = true,
+                globalHasCarried = false,
+                globalLimitReached = false,
                 unavailableReason = (string?)null,
                 storageWarning = (string?)null,
                 windows = new object[]
@@ -228,6 +232,7 @@ public sealed class ControlPlaneBridge
             {
                 armed = true,
                 continuous = true,
+                resumeModel = "fable",
                 cycleId = "demo-cycle",
                 phase = "waiting",
                 sawLimited = true,
@@ -566,6 +571,7 @@ public sealed class ControlPlaneBridge
 
         UsageSnapshot snapshot = await _quota.GetAsync(force, cancellationToken).ConfigureAwait(false);
         UsageBucket? bucket = snapshot.Buckets.FirstOrDefault();
+        QuotaGlobalFacts global = ClassifyGlobalQuota(snapshot);
 
         var windows = (bucket?.Windows ?? Array.Empty<UsageWindow>()).Select(w => new QuotaWindow(
             w.Name,
@@ -584,10 +590,47 @@ public sealed class ControlPlaneBridge
             snapshot.HasData,
             bucket?.Allowed ?? false,
             bucket?.LimitReached ?? false,
+            global.UnattributedLimitReached,
+            global.HasCurrentData,
+            global.HasCarried,
+            global.LimitReached,
             snapshot.UnavailableReason,
             _quota.StorageWarning,
             windows);
     }
+
+    /// <summary>
+    /// 把安全聚合 bucket 拆成 GUI 的账户主窗口事实。只有 5H/7D 两窗都来自本次
+    /// 成功观测且未满时才可显示正常；scoped 满额留给模型行，未归因限流仍归总行。
+    /// </summary>
+    internal static QuotaGlobalFacts ClassifyGlobalQuota(UsageSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        UsageBucket? bucket = snapshot.Buckets.FirstOrDefault();
+        UsageWindow? fiveHour = bucket?.Windows.FirstOrDefault(window =>
+            window.Name.Equals("five_hour", StringComparison.OrdinalIgnoreCase));
+        UsageWindow? sevenDay = bucket?.Windows.FirstOrDefault(window =>
+            window.Name.Equals("seven_day", StringComparison.OrdinalIgnoreCase));
+        UsageWindow?[] globalWindows = [fiveHour, sevenDay];
+        bool hasCurrentData = snapshot.UnavailableReason is null && snapshot.HasData &&
+            globalWindows.All(window =>
+                window is { UsedPercent: not null, CarriedForward: false } &&
+                !IsBlockedQuotaWindow(window));
+        bool hasCarried = globalWindows.Any(window => window?.CarriedForward == true);
+        bool unattributedLimitReached = bucket?.UnattributedLimitReached == true ||
+            (bucket is { LimitReached: true } && !bucket.Windows.Any(IsBlockedQuotaWindow));
+        bool limitReached = globalWindows.Any(window =>
+            window is not null && IsBlockedQuotaWindow(window)) || unattributedLimitReached;
+        return new QuotaGlobalFacts(
+            hasCurrentData,
+            hasCarried,
+            limitReached,
+            unattributedLimitReached);
+    }
+
+    private static bool IsBlockedQuotaWindow(UsageWindow window) =>
+        window.Status.Equals("blocked", StringComparison.OrdinalIgnoreCase) ||
+        window.UsedPercent is >= 100;
 
     /// <summary>读当前布防周期与逐项目进度。</summary>
     private ArmPayload GetArm()
@@ -616,6 +659,7 @@ public sealed class ControlPlaneBridge
             return new ArmPayload(
                 config.Armed,
                 config.Continuous,
+                ResumeModelSelection(config.ResumeModel),
                 config.ArmCycleId,
                 string.Empty,
                 false,
@@ -760,6 +804,7 @@ public sealed class ControlPlaneBridge
         return new ArmPayload(
             config.Armed,
             config.Continuous,
+            ResumeModelSelection(config.ResumeModel),
             config.ArmCycleId,
             currentCycle ? state.Phase : string.Empty,
             currentCycle && state.SawLimited,
@@ -838,8 +883,18 @@ public sealed class ControlPlaneBridge
         bool armed = root.TryGetProperty("armed", out JsonElement armedEl) && armedEl.ValueKind == JsonValueKind.True;
 
         var paths = new List<string>();
+        string resumeModel = string.Empty;
         if (armed)
         {
+            string? requestedModel = root.TryGetProperty("resumeModel", out JsonElement modelEl) &&
+                modelEl.ValueKind == JsonValueKind.String
+                    ? modelEl.GetString()
+                    : null;
+            if (!ClaudeModelFamilies.TryNormalizeConfiguredModel(requestedModel, out resumeModel))
+            {
+                throw new ArgumentException("请选择有效的续跑模型(Fable、Opus、Sonnet 或 Haiku)。");
+            }
+
             if (root.TryGetProperty("paths", out JsonElement pathsEl) && pathsEl.ValueKind == JsonValueKind.Array)
             {
                 paths.AddRange(pathsEl.EnumerateArray()
@@ -869,6 +924,7 @@ public sealed class ControlPlaneBridge
 
                 config.Enabled = true;
                 config.Armed = true;
+                config.ResumeModel = resumeModel;
                 config.ArmCycleId = Guid.NewGuid().ToString("N");
 
                 if (root.TryGetProperty("continuous", out JsonElement contEl))
@@ -885,6 +941,11 @@ public sealed class ControlPlaneBridge
 
         return GetArm();
     }
+
+    private static string ResumeModelSelection(string? configuredModel) =>
+        ClaudeModelFamilies.TryNormalizeConfiguredModel(configuredModel, out string family)
+            ? family
+            : string.Empty;
 
     /// <summary>
     /// 本地 5 小时块:直接读会话 jsonl 计算,**不起进程、毫秒级**,所以开窗即可渲染。
@@ -1729,6 +1790,7 @@ public sealed class ControlPlaneBridge
     private sealed record ArmPayload(
         [property: JsonPropertyName("armed")] bool Armed,
         [property: JsonPropertyName("continuous")] bool Continuous,
+        [property: JsonPropertyName("resumeModel")] string ResumeModel,
         [property: JsonPropertyName("cycleId")] string CycleId,
         [property: JsonPropertyName("phase")] string Phase,
         [property: JsonPropertyName("sawLimited")] bool SawLimited,
@@ -1755,6 +1817,10 @@ public sealed class ControlPlaneBridge
         [property: JsonPropertyName("hasData")] bool HasData,
         [property: JsonPropertyName("allowed")] bool Allowed,
         [property: JsonPropertyName("limitReached")] bool LimitReached,
+        [property: JsonPropertyName("unattributedLimitReached")] bool UnattributedLimitReached,
+        [property: JsonPropertyName("globalHasCurrentData")] bool GlobalHasCurrentData,
+        [property: JsonPropertyName("globalHasCarried")] bool GlobalHasCarried,
+        [property: JsonPropertyName("globalLimitReached")] bool GlobalLimitReached,
         [property: JsonPropertyName("unavailableReason")] string? UnavailableReason,
         [property: JsonPropertyName("storageWarning")] string? StorageWarning,
         [property: JsonPropertyName("windows")] IReadOnlyList<QuotaWindow> Windows);
@@ -1769,6 +1835,12 @@ public sealed class ControlPlaneBridge
         [property: JsonPropertyName("resetAfterSeconds")] int? ResetAfterSeconds,
         [property: JsonPropertyName("windowStartUnix")] long? WindowStartUnix,
         [property: JsonPropertyName("carriedForward")] bool CarriedForward);
+
+    internal readonly record struct QuotaGlobalFacts(
+        bool HasCurrentData,
+        bool HasCarried,
+        bool LimitReached,
+        bool UnattributedLimitReached);
 
     private sealed record NotificationItem(
         [property: JsonPropertyName("kind")] string Kind,

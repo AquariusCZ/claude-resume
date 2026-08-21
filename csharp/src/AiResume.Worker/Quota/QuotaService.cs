@@ -79,6 +79,7 @@ public sealed class QuotaService
                 OAuthUsageResult oauth = await TryOAuthAsync(cancellationToken).ConfigureAwait(false);
                 if (oauth is { Ok: true, Snapshot: { HasData: true } viaOAuth })
                 {
+                    viaOAuth = viaOAuth with { EvidenceSource = UsageEvidenceSource.OAuth };
                     if (_authoritativeStore is not null && oauth.CredentialFingerprint.Length > 0 &&
                         _authoritativeStore.TryUpdate(
                             UsageSnapshotMapper.ProviderName,
@@ -108,7 +109,10 @@ public sealed class QuotaService
                 else
                 {
                     ClaudeProbeResult result = await _probe(cancellationToken).ConfigureAwait(false);
-                    UsageSnapshot fallback = UsageSnapshotMapper.FromProbe(result, now);
+                    UsageSnapshot fallback = UsageSnapshotMapper.FromProbe(result, now) with
+                    {
+                        EvidenceSource = UsageEvidenceSource.Cli,
+                    };
                     UsageSnapshot? authoritative = ResolveAuthoritative(oauth.CredentialFingerprint);
                     snapshot = MergeSparseObservation(fallback, authoritative, now);
                 }
@@ -304,7 +308,12 @@ public sealed class QuotaService
 
             // 旧观测的 aggregate 限流位与旧 reset 属于同一时间边界。窗口已拒绝倒写时,
             // 不能再让这个旧布尔值把新的未限流代次重新标成 limited。
-            bool limitReached = (!observationIsOlder && (observedBucket?.LimitReached ?? false)) || merged.Any(window =>
+            // 未归因限流没有可绑定的 reset 窗口，只能按快照时间排序。较旧观测
+            // 不能清掉较新快照已经确认的限流；较新的明确观测才有权解除它。
+            bool unattributedLimitReached = observationIsOlder
+                ? HasUnattributedLimit(previous.Buckets.FirstOrDefault())
+                : HasUnattributedLimit(observedBucket);
+            bool limitReached = unattributedLimitReached || merged.Any(window =>
                 window.Status.Equals("blocked", StringComparison.OrdinalIgnoreCase) ||
                 window.UsedPercent is >= 100);
             UsageBucket mergedBucket = (observedBucket ?? new UsageBucket(
@@ -315,6 +324,7 @@ public sealed class QuotaService
                           !merged.Any(window => window.CarriedForward) &&
                           (observedBucket?.Allowed ?? false),
                 LimitReached = limitReached,
+                UnattributedLimitReached = unattributedLimitReached,
                 Windows = merged,
             };
 
@@ -339,15 +349,54 @@ public sealed class QuotaService
 
     private static UsageSnapshot WithMonotonicCaptureTime(
         UsageSnapshot snapshot,
-        UsageSnapshot previous) => snapshot.CapturedAt >= previous.CapturedAt
-        ? snapshot
-        : snapshot with { CapturedAt = previous.CapturedAt };
+        UsageSnapshot previous)
+    {
+        if (snapshot.CapturedAt >= previous.CapturedAt)
+        {
+            return snapshot;
+        }
+
+        // 所有提前返回与异常降级都经过这里。即使双方都没有窗口，较旧观测
+        // 也不能清掉较新快照的未归因限流事实。
+        if (!HasUnattributedLimit(previous.Buckets.FirstOrDefault()))
+        {
+            return snapshot with { CapturedAt = previous.CapturedAt };
+        }
+
+        UsageBucket? observedBucket = snapshot.Buckets.FirstOrDefault();
+        UsageBucket preservedBucket = (observedBucket ?? new UsageBucket(
+            "Usage", Allowed: false, LimitReached: true, Windows: Array.Empty<UsageWindow>())) with
+        {
+            Allowed = false,
+            LimitReached = true,
+            UnattributedLimitReached = true,
+        };
+        UsageBucket[] buckets = snapshot.Buckets.Count == 0
+            ? new[] { preservedBucket }
+            : snapshot.Buckets.ToArray();
+        if (snapshot.Buckets.Count > 0)
+        {
+            buckets[0] = preservedBucket;
+        }
+
+        return snapshot with
+        {
+            CapturedAt = previous.CapturedAt,
+            Buckets = buckets,
+        };
+    }
 
     private static bool IsSameWindowGeneration(UsageWindow current, UsageWindow prior) =>
         current.ResetAtUnix is null || current.ResetAtUnix == prior.ResetAtUnix;
 
     private static string WindowIdentity(UsageWindow window) =>
         string.IsNullOrEmpty(window.Identity) ? "name:" + window.Name : "id:" + window.Identity;
+
+    private static bool HasUnattributedLimit(UsageBucket? bucket) =>
+        bucket?.UnattributedLimitReached == true ||
+        (bucket?.LimitReached == true && !bucket.Windows.Any(window =>
+            window.Status.Equals("blocked", StringComparison.OrdinalIgnoreCase) ||
+            window.UsedPercent is >= 100));
 
     private static bool HasStableScopedReplacement(UsageWindow prior, IReadOnlyList<UsageWindow> observed) =>
         string.IsNullOrEmpty(prior.Identity) &&

@@ -6,11 +6,12 @@
 
 ## 1. 第一性目标
 
-额度功能必须回答三个不同的问题:
+额度功能必须回答四个不同的问题:
 
 1. 服务端当前报告了哪些额度窗口、已用百分比和重置时间?
 2. Claude Code 此刻是否因任一总额度或模型额度而不能继续运行?
 3. 服务端本次响应稀疏、网络失败或多个 AI Resume 进程并发刷新时,上一次仍有效的服务端证据应如何连续展示?
+4. 自动续跑将要创建进程时,是否有与本账号全部已知额度窗口一致的实时可运行证据?
 
 由此得到不可破坏的约束:
 
@@ -19,6 +20,8 @@
 - **缺失不是删除。** OAuth 与 CLI 都是稀疏观测;一次没返回 Fable 或百分比,不等于服务端明确撤销了它。
 - **连续性必须有边界。** 只能在同账号、同稳定窗口身份、同一尚未到期的 reset 周期内承接旧值；主窗口身份是协议 kind，scoped 身份是规范化完整 scope 的 SHA-256。
 - **任一限额打满都算限流。** 总窗口未满但 `weekly_scoped` 已满时,任务仍可能被拒绝。
+- **显示证据不等于执行许可。** CLI 降级和未到期的历史承接可用于诊断/连续显示,但都不能授权自动续跑;5H reset 也只表示可以重新取证。
+- **额度许可按项目消费。** 首项目可复用刚触发恢复的实时证据;前一个项目执行后,下一个项目 spawn 前必须再次强刷并过闸。
 - **凭据只读且不外泄。** AI Resume 不刷新、不写回 Claude Code token,不把 token、响应正文或凭据路径写进日志与 UI。
 - **首帧不依赖 I/O。** 凭据读取、Claude 版本探测、SQLite 迁移和网络请求都发生在后台额度请求路径,不得进入 WPF 构造函数。
 
@@ -151,6 +154,7 @@ ResetAtUnix = modern.resets_at ?? legacy.resets_at
 - `DerivedWindowStart`:由 `ResetAtUnix - WindowSeconds` 推导,不是服务端原始字段,UI 必须标“推导”。
 - `Status`:窗口自身百分比达到 100 时为 `blocked`;百分比低于 100 或本次探测整体成功时可为 `allowed`;只有 reset 的失败/全局限流降级观测保持未知,不自行判满或判可用。
 - `LimitReached`:任一主窗口或 `limits` 条目的 percent 达到 100 即为 true。
+- `UnattributedLimitReached`:provider 已明确限流,但结论无法归因到已知主/scoped 窗口时为 true。它让 GUI 能区分“仅 scoped 已满”和“scoped 之外还有未知限流”；自动续跑仍使用更严格的 `LimitReached` 全量聚合。该事实没有可绑定的 reset 窗口,跨实例合并时按 `CapturedAt` 排序:较旧观测不能清除较新的未归因限流,只有不早于现有快照的新观测才有权解除。
 - `severity=critical` 不是限流判据。实测未到 100% 也可能为 critical,它只能表示接近上限。
 
 ### 5.3 Fable 与其它 scoped 限额
@@ -167,6 +171,8 @@ ResetAtUnix = modern.resets_at ?? legacy.resets_at
 ```
 
 映射为 `weekly_scoped:Fable`。同一次响应里的每条逻辑 `weekly_scoped` 都要保留并分别显示,不能只取第一条;否则后一条模型已满时会被侧栏隐藏。内部身份不是显示名或数组序号,而是完整 scope JSON 经过属性名排序后的 SHA-256;同名 scope 即使响应顺序互换也不会串窗。完全相同的重复 scope 合并为一条:同 reset 取更高百分比,不同 reset 取更新代次。即使 percent 缺失,只要 scoped 条目有 reset,也保留窗口名并显示“未报告”;不得把它删除或显示成 `0%`。模型名中的冒号会被移除,避免破坏内部窗口名分隔。
+
+OAuth `limits` 响应没有 `complete`、cursor 或 `has_more` 一类完整性信号。因此 HTTP 200、`limits != null` 或“出现了任意一个 scoped”都不能证明目标模型已被覆盖;自动续跑必须看到与布防目标模型族明确匹配的本次 scoped 条目。缺失时结论是 Unknown,不是可用。
 
 ## 6. 失败分类与 CLI 降级
 
@@ -274,6 +280,37 @@ SQLite 在后台额度请求时才迁移/打开,不阻塞 WPF 首帧。存储失
 - 同进程并发请求通过 single-flight 合并,避免同时启动多个 Claude 探测。
 - 降级前重新读取 SQLite,让另一个 GUI/Worker 进程刚提交的快照立即可见。
 
+### 8.4 自动续跑放行契约
+
+生产注册只有一个入口:`AddQuotaResumeAdmission()` 将 `ResumeEngine` 的 `IClaudeUsageProbe` 解析为 `QuotaResumeProbe`,后者复用 GUI 同一套 `QuotaService`。生产不得直接注入 `ClaudeCodeProbe`;Haiku 探针成功不能证明 `claude --continue` 继承的 Fable 会话可运行。
+
+每次状态机探测都调用 `QuotaService.GetAsync(forceRefresh:true)`,绕过 5 分钟 GUI 成功缓存。判定如下:
+
+```text
+Limited = EvidenceSource == OAuth
+       AND ResumeModel 是显式选择的已知模型族
+       AND (任一主窗口或目标模型 scoped 已 blocked
+            OR bucket 报告 LimitReached 且没有可归因的 blocked 窗口)
+
+Ready = HasData
+     AND EvidenceSource == OAuth
+     AND StorageWarning == null
+     AND UnavailableReason == null
+     AND 每个 bucket Allowed 且未 LimitReached
+     AND five_hour / seven_day 都有本次百分比
+     AND ResumeModel 是显式选择的已知模型族
+     AND 存在与 ResumeModel 匹配的本次 weekly_scoped 窗口
+     AND 每个合并窗口都有本次百分比且不是 CarriedForward
+
+其它 = Unknown -> waiting
+```
+
+`EvidenceSource` 会随快照持久化。升级前 JSON 没有该字段时默认 `Unknown`;CLI 观测即使与历史 OAuth 窗口合并也仍是 `Cli`,不得被历史数据升格。OAuth 失败、账号变化、存储/网络不可验证、只有 CLI 主窗口、目标模型未配置、目标 `weekly_scoped` 缺失或只有非满额历史读数都不能返回 Ready。CLI/Haiku 限流和其它模型的 scoped 满额也不能替目标模型建立 `SawLimited`;否则日后会把“其它模型恢复”误当成本任务的恢复触发。其它模型满额仍使完整 Ready 证据不成立并保持 Unknown。未到 reset 的目标 carried 100% 继续阻塞;reset 到点只允许下一次强刷,绝不自动视为恢复。这个门禁有意选择安全优先:如果某个账号的 OAuth 响应始终不提供目标 scoped,它会一直等待人工处理,不会用 5H/7D 正常去猜测 Fable 等目标模型可用。
+
+布防区要求用户显式选择 Fable/Opus/Sonnet/Haiku;选择器在布防后锁定,解除布防保留上次选择。升级遗留的已布防空模型会在 GUI 明确报错并永久 fail-closed,直到用户解除后重新选择。`StartResuming` 使用刚取得的“证据 + 模型”放行首项目,runner 用同一个值构造 `--model`。每个项目运行过后,下一项目启动前再次强刷;等待期间还会重新读取配置并复核 `Armed`、cycle id、目标模型与项目仍在最新 `Selected` 中。探测期间或最终 spawn 门禁前模型变化时旧证据作废,未创建进程的项目重新取证,不能落成 stopped/blocked。若额度收紧、证据未知、周期变化或项目移除,不会创建该项目进程。运行中已经返回 `limited-side-effects` 的周期继续 `ReplayBlocked=true`,本门禁不会清除或重放它。
+
+runner 在最终门禁后先把精确 `RunId` 预登记到 `product_state`,再交给 `IProcessSupervisor`。只有 supervisor 以取消异常明确保证尚未登记、尚未 spawn 时,引擎才按同一 cycle、项目、`running` 状态与精确 `RunId` 撤销这条预登记并回到 waiting;任一字段不匹配、普通启动失败或启动结果不确定都继续 fail-closed。
+
 ## 9. GUI 呈现契约
 
 额度区有两个不同来源,不能混为一谈:
@@ -300,6 +337,7 @@ SQLite 在后台额度请求时才迁移/打开,不阻塞 WPF 首帧。存储失
 - 光柱表示额度已用百分比,不是时间流逝;时间位置使用独立细刻度。
 - 已知百分比的轨道使用具名 `meter`;未知读数使用具名 `status`,不冒充任务进度条,不设置 `aria-valuenow`,也不对应 0% 或 100%。
 - scoped 限额只影响对应模型行;不得把 5 小时 18% 的卡片因为 Fable 满额而整块涂红。
+- `Claude Code` provider 总行只表示 5H/7D 主窗口;仅 `weekly_scoped:Fable` 满额时总行保持正常、Fable 行显示红色“已用尽”。这只是展示分层,聚合 `LimitReached` 与自动续跑门禁仍必须把 scoped 满额算作阻断。
 - CLI 降级只提供全局限流结论时,结论留在 bucket/provider 层;没有窗口自身的 100% 证据就不得给 5H/7D 单窗贴“已限流”。
 - 已过期的同一 `resetAt` 代次最多按当前自动刷新周期强刷一次;上游持续返回旧 reset 时不得形成每秒探测循环,新 reset 代次可立即刷新。
 - provider 绿色状态只来自本次探测成功、有数据、未限流且未承接的真实证据;失败探测中的部分窗口不得点绿。
@@ -313,17 +351,18 @@ SQLite 在后台额度请求时才迁移/打开,不阻塞 WPF 首帧。存储失
 | OAuth 请求 | 五个协议头、token 只读、到期短路、错误分类、取消传播 | `ClaudeOAuthUsageProbeTests` |
 | 响应解析 | modern-only、modern 逐字段优先 legacy、空对象、多条/同名重排 scoped、缺 percent、ISO/epoch reset、100% 限流 | `ClaudeOAuthUsageProbeTests` |
 | CLI 映射 | `rate_limit_event`、无窗口、部分失败不 Allowed、状态/错误分类、未报告不当 0 | `ClaudeProbeTests`,`UsageSnapshotMapperTests` |
-| 稀疏合并 | 同 reset 承接与百分比单调、旧 reset 晚提交拒绝、换代/到期清除、纯历史不冒充 Allowed、scoped 稳定身份 | `QuotaServiceTests` |
+| 稀疏合并 | 同 reset 承接与百分比单调、旧 reset 晚提交拒绝、未归因限流按快照时间单调、换代/到期清除、纯历史不冒充 Allowed、scoped 稳定身份 | `QuotaServiceTests` |
 | 账号隔离 | 同账号跨实例可见、不同指纹不承接 | `QuotaServiceTests` |
 | SQLite | schema v5、真实 v4 升级、无账号身份旧行丢弃、旧代次晚提交拒绝、损坏容错、原子并发更新 | `QuotaSnapshotStoreTests` |
 | scoped 安全 | Fable 等多个模型额度全部显示并影响总限流判定 | `ScopedLimitTests`,`ClaudeOAuthUsageProbeTests` |
-| GUI 契约 | 缺数据/部分失败不绿、percent 无 reset 仍画、carried 语义、多 scoped、未知扫描、ARIA、等高布局 | `GuiQuotaContractTests`,`GuiMotionContractTests` + 真机截图 |
+| 续跑放行 | 仅实时 OAuth 可 Ready、目标模型 scoped 匹配、CLI/承接 fail-closed、5H 恢复但 Fable 满额不启动、模型变化废弃旧证据、每项目二次门禁 | `QuotaResumeProbeTests`,`ResumeEngineTests`,`WorkerStartupContractTests` |
+| GUI 契约 | 缺数据/部分失败不绿、主窗口与 scoped/未归因限流分层、多 scoped、显式续跑模型、未知扫描、ARIA、等高布局 | `ControlPlaneBridgeQuotaTests`,`GuiQuotaContractTests`,`GuiMotionContractTests`,`ControlPlaneBridgeArmTests` + 真机截图 |
 
 只改额度链路时的最小自动化验证:
 
 ```powershell
 dotnet test csharp\test\AiResume.Tests\AiResume.Tests.csproj `
-  --filter "FullyQualifiedName~ClaudeOAuthUsageProbeTests|FullyQualifiedName~ClaudeProbeTests|FullyQualifiedName~UsageSnapshotMapperTests|FullyQualifiedName~QuotaServiceTests|FullyQualifiedName~QuotaSnapshotStoreTests|FullyQualifiedName~ScopedLimitTests|FullyQualifiedName~GuiQuotaContractTests"
+  --filter "FullyQualifiedName~ClaudeOAuthUsageProbeTests|FullyQualifiedName~ClaudeProbeTests|FullyQualifiedName~UsageSnapshotMapperTests|FullyQualifiedName~QuotaServiceTests|FullyQualifiedName~QuotaSnapshotStoreTests|FullyQualifiedName~ScopedLimitTests|FullyQualifiedName~QuotaResumeProbeTests|FullyQualifiedName~ControlPlaneBridgeQuotaTests|FullyQualifiedName~GuiQuotaContractTests"
 ```
 
 交付前全量门禁:
@@ -408,6 +447,21 @@ Get-FileHash "$env:LOCALAPPDATA\AI Resume\AiResume.Gui.dll"
 
 这些百分比只证明 2026-08-09 当时的链路与语义,不是长期固定值。以后验证必须以当次服务端响应和截图为准。
 
+### 12.1 2026-08-20 Fable 误放行事故与修复
+
+生产日志与 SQLite/WAL 的脱敏证据给出完整反例:
+
+- 08:29:59 PDT:5H 与 `weekly_scoped:Fable` 都达到 100%。
+- 12:00:00:5H 已进入新代次并降到 0%,Fable 仍为 100%,其周限额要到 2026-08-24 07:00 PDT 才重置。
+- 12:02:20:旧 Worker 的 Haiku CLI 探针返回 ready,状态机进入 `StartResuming`。
+- 12:03:04:`claude --continue` 继承原 Fable 会话,立即再次限流并落为 `limited-side-effects`;安全阻断随后正确禁止重放。
+
+根因是生产 DI 直接把 `ResumeEngine` 接到 `ClaudeCodeProbe`,而 GUI 才在使用能看见全部 `weekly_scoped` 的 `QuotaService`。探针证明的是 Haiku 调用可用,真正执行的是 Fable 会话,两者不是同一份可运行性证据。
+
+本机上游盘点同时确认 Claude Code 2.1.235 的 `--model <model>` 支持短别名或完整模型名,可以把额度门禁与实际执行绑定到同一个显式模型；`--continue` 的语义仍是继续当前目录最近会话。因而本轮复用官方 `--model` 能解决额度错配,但不会把“最近会话”冒充为精确会话身份；后续若要消除同目录多会话选择竞态,应另行绑定已持久化的 session id 与同一显式模型。
+
+修复复用了现有 `ClaudeOAuthUsageProbe + QuotaService + QuotaSnapshotStore`,没有重写上游协议:新增 `QuotaResumeProbe` 和可解析验证的 DI 注册,保留 OAuth/CLI 证据来源,仅在本次 OAuth 响应明确包含目标模型匹配的实时窗口证据时放行,并在多项目队列的每个后续 spawn 前重新取证。cc-connect v1.4.1 的 usage reporter 在 Windows 仍受 `creack/pty` 的 `ErrUnsupported` 限制,管理 API 也无 usage 端点,因此此次自有薄适配继续成立。
+
 ## 13. 修改额度功能时的检查清单
 
 改动前:
@@ -442,6 +496,8 @@ Get-FileHash "$env:LOCALAPPDATA\AI Resume\AiResume.Gui.dll"
 - SQLite 账号快照与原子更新:[`QuotaSnapshotStore.cs`](../csharp/src/AiResume.Worker/Quota/QuotaSnapshotStore.cs)
 - SQLite schema v4/v5 迁移:[`StorageDatabase.cs`](../csharp/src/AiResume.Storage/StorageDatabase.cs)
 - CLI 降级探测:[`ClaudeCodeProbe.cs`](../csharp/src/AiResume.Worker/Probes/ClaudeCodeProbe.cs)
+- 续跑额度适配与生产 DI:[`QuotaResumeProbe.cs`](../csharp/src/AiResume.Worker/Quota/QuotaResumeProbe.cs)、[`QuotaResumeServiceCollectionExtensions.cs`](../csharp/src/AiResume.Worker/Quota/QuotaResumeServiceCollectionExtensions.cs)
+- 多项目 spawn 前复核:[`ResumeEngine.cs`](../csharp/src/AiResume.Worker/Resume/ResumeEngine.cs)
 - provider-neutral 契约:[`UsageSnapshot.cs`](../csharp/src/AiResume.Worker/Quota/UsageSnapshot.cs)
 - GUI RPC 与本地 5 小时块:[`ControlPlaneBridge.cs`](../csharp/src/AiResume.Gui/ControlPlaneBridge.cs)
 - 进度条、Fable 行和状态呈现:[`index.html`](../csharp/src/AiResume.Gui/wwwroot/index.html)

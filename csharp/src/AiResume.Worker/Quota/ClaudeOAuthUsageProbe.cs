@@ -255,7 +255,10 @@ public sealed class ClaudeOAuthUsageProbe
         bool unknownLimitReached = payload.Limits?.Any(limit =>
             !IsKnownLimitKind(limit.Kind) && limit.Percent is >= 100) == true;
         bool limitReached = windows.Any(window => window.UsedPercent is >= 100) || unknownLimitReached;
-        var bucket = new UsageBucket("Usage", !limitReached, limitReached, windows);
+        var bucket = new UsageBucket("Usage", !limitReached, limitReached, windows)
+        {
+            UnattributedLimitReached = unknownLimitReached,
+        };
 
         string? unavailable = windows.Count > 0 ? null : "oauth/usage 未返回任何限额窗口";
         return new UsageSnapshot("claudecode", now, new[] { bucket }, unavailable);

@@ -128,6 +128,7 @@ public sealed class UsageSnapshotMapperTests
 
         Assert.True(snapshot.Buckets[0].LimitReached);
         Assert.False(snapshot.Buckets[0].Allowed);
+        Assert.True(snapshot.Buckets[0].UnattributedLimitReached);
     }
 
     [Fact]
@@ -199,6 +200,7 @@ public sealed class UsageSnapshotMapperTests
         var window = snapshot.Buckets[0].Windows.Single(w => w.Name == "five_hour");
         Assert.Equal("blocked", window.Status);
         Assert.Equal(100, window.UsedPercent);
+        Assert.False(snapshot.Buckets[0].UnattributedLimitReached);
     }
 
     [Fact]

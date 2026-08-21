@@ -32,7 +32,13 @@ public static class UsageSnapshotMapper
         bool limitReached = result.IsLimited;
         // “不是 limited”不等于“探测成功”。CLI 可能先收到部分 rate_limit_info,
         // 随后因网络/认证/进程错误失败;这种快照可展示窗口,但绝不能变成绿色可用。
-        var bucket = new UsageBucket("Usage", result.Ready && !limitReached, limitReached, windows);
+        bool hasAttributedBlock = windows.Any(window =>
+            window.Status.Equals("blocked", StringComparison.OrdinalIgnoreCase) ||
+            window.UsedPercent is >= 100);
+        var bucket = new UsageBucket("Usage", result.Ready && !limitReached, limitReached, windows)
+        {
+            UnattributedLimitReached = limitReached && !hasAttributedBlock,
+        };
 
         // 窗口为空时仍返回 bucket:LimitReached 本身就是有效信息(限流但服务端未附窗口时尤其如此)。
         // HasData 会因此为 false,由 GUI 据 UnavailableReason 如实显示,禁止渲染成 0%。

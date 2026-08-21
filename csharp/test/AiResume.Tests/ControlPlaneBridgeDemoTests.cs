@@ -29,6 +29,24 @@ public sealed class ControlPlaneBridgeDemoTests
     }
 
     [Fact]
+    public async Task 截图额度区分Scoped聚合与未归因限流()
+    {
+        var bridge = new ControlPlaneBridge(demoMode: true);
+
+        string response = await bridge.HandleAsync(
+            """{"id":"demo-quota","type":"quota.get"}""",
+            CancellationToken.None);
+
+        using JsonDocument document = JsonDocument.Parse(response);
+        JsonElement payload = document.RootElement.GetProperty("payload");
+        Assert.True(payload.GetProperty("limitReached").GetBoolean());
+        Assert.False(payload.GetProperty("unattributedLimitReached").GetBoolean());
+        Assert.True(payload.GetProperty("globalHasCurrentData").GetBoolean());
+        Assert.False(payload.GetProperty("globalHasCarried").GetBoolean());
+        Assert.False(payload.GetProperty("globalLimitReached").GetBoolean());
+    }
+
+    [Fact]
     public async Task 截图模式布防状态包含可显示语义()
     {
         var bridge = new ControlPlaneBridge(demoMode: true);
@@ -38,8 +56,9 @@ public sealed class ControlPlaneBridgeDemoTests
             CancellationToken.None);
 
         using JsonDocument document = JsonDocument.Parse(response);
-        JsonElement[] statuses = document.RootElement
-            .GetProperty("payload")
+        JsonElement payload = document.RootElement.GetProperty("payload");
+        Assert.Equal("fable", payload.GetProperty("resumeModel").GetString());
+        JsonElement[] statuses = payload
             .GetProperty("projectStatus")
             .EnumerateArray()
             .ToArray();

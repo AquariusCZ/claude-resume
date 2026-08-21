@@ -8,6 +8,7 @@ using AiResume.Core;
 using AiResume.Storage;
 using AiResume.Worker.Probes;
 using AiResume.Worker.Products;
+using AiResume.Worker.Quota;
 using AiResume.Worker.Resume;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -54,17 +55,19 @@ public sealed class ResumeEngineTests : IDisposable
         _probe = new FakeProbe();
         _runner = new FakeRunner();
         _supervisor = new FakeProcessSupervisor();
-        _engine = new ResumeEngine(
+        _engine = CreateEngine(_probe);
+    }
+
+    private ResumeEngine CreateEngine(IClaudeUsageProbe probe) => new(
             _configStore,
             _stateStore,
             _cycle,
-            _probe,
+            probe,
             _runner,
             _supervisor,
             NullLogger<ResumeEngine>.Instance,
             TimeSpan.FromSeconds(30),
             _ => _activeRunEvidence);
-    }
 
     public void Dispose()
     {
@@ -99,6 +102,35 @@ public sealed class ResumeEngineTests : IDisposable
         };
         return config;
     }
+
+    private static UsageSnapshot QuotaSnapshot(
+        DateTimeOffset capturedAt,
+        bool allowed,
+        params UsageWindow[] windows)
+    {
+        bool limited = windows.Any(window => window.UsedPercent is >= 100);
+        return new UsageSnapshot(
+            "claudecode",
+            capturedAt,
+            new[] { new UsageBucket("Usage", allowed, limited, windows) },
+            null);
+    }
+
+    private static UsageWindow QuotaWindow(
+        string name,
+        int usedPercent,
+        DateTimeOffset reset) => new(
+        name,
+        usedPercent >= 100 ? "blocked" : "allowed",
+        name.Equals("five_hour", StringComparison.OrdinalIgnoreCase)
+            ? UsageWindow.FiveHourSeconds
+            : UsageWindow.SevenDaySeconds,
+        reset.ToUnixTimeSeconds(),
+        null,
+        usedPercent,
+        Identity: name.StartsWith("weekly_scoped", StringComparison.OrdinalIgnoreCase)
+            ? "weekly_scoped:test"
+            : null);
 
     /// <summary>把 state 的 LastProbeUtc 设为"刚刚",使 ShouldProbe 返回 false。</summary>
     private void SetLastProbeJustNow(CheckerState state)
@@ -204,6 +236,364 @@ public sealed class ResumeEngineTests : IDisposable
         Assert.Equal(
             config.Selected.Select(p => p.Path).ToList(),
             _runner.CalledPaths);
+    }
+
+    [Fact]
+    public async Task 完整额度门禁发现Fable满额时不会调用Runner()
+    {
+        ProductConfig config = ArmedConfig();
+        config.ResumeModel = "fable";
+        _configStore.Save(config);
+        var state = CheckerState.CreateDefault();
+        state.CycleId = config.ArmCycleId;
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseWaiting;
+        _stateStore.Save(state);
+        var quota = new QuotaService(
+            probe: _ => Task.FromResult(new ClaudeProbeResult { Reason = "unexpected" }),
+            clock: () => _clock,
+            oauthProbe: _ => Task.FromResult(new OAuthUsageResult(
+                true,
+                QuotaSnapshot(_clock, allowed: false,
+                    QuotaWindow("five_hour", 95, _clock.AddHours(5)),
+                    QuotaWindow("seven_day", 73, _clock.AddDays(4)),
+                    QuotaWindow("weekly_scoped:Fable", 100, _clock.AddDays(4))),
+                null,
+                "account-a")));
+        using ResumeEngine engine = CreateEngine(new QuotaResumeProbe(quota));
+
+        await engine.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(0, _runner.CallCount);
+        CheckerState saved = _stateStore.Load();
+        Assert.True(saved.SawLimited);
+        Assert.Equal(CheckerState.PhaseWaiting, saved.Phase);
+    }
+
+    [Fact]
+    public async Task 未配置续跑模型时即使Fable实时可用也不会调用Runner()
+    {
+        ProductConfig config = ArmedConfig();
+        config.ResumeModel = string.Empty;
+        _configStore.Save(config);
+        CheckerState state = CheckerState.CreateDefault();
+        state.CycleId = config.ArmCycleId;
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseWaiting;
+        _stateStore.Save(state);
+        var quota = new QuotaService(
+            probe: _ => Task.FromResult(new ClaudeProbeResult { Reason = "unexpected" }),
+            clock: () => _clock,
+            oauthProbe: _ => Task.FromResult(new OAuthUsageResult(
+                true,
+                QuotaSnapshot(_clock, allowed: true,
+                    QuotaWindow("five_hour", 25, _clock.AddHours(4)),
+                    QuotaWindow("seven_day", 79, _clock.AddDays(3)),
+                    QuotaWindow("weekly_scoped:Fable", 20, _clock.AddDays(3))),
+                null,
+                "account-a")));
+        using ResumeEngine engine = CreateEngine(new QuotaResumeProbe(quota));
+
+        await engine.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(0, _runner.CallCount);
+        Assert.Equal(CheckerState.PhaseWaiting, _stateStore.Load().Phase);
+    }
+
+    [Fact]
+    public async Task 额度门禁与Runner使用同一个显式续跑模型()
+    {
+        ProductConfig config = ArmedConfig();
+        config.ProbeModel = "haiku";
+        config.ResumeModel = "fable";
+        config.Selected = new List<ProjectRef> { config.Selected[0] };
+        _configStore.Save(config);
+        var state = CheckerState.CreateDefault();
+        state.CycleId = config.ArmCycleId;
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseWaiting;
+        _stateStore.Save(state);
+        _probe.Results.Enqueue(new ClaudeProbeResult { Ready = true, Reason = "ok" });
+
+        await _engine.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(new[] { "fable" }, _probe.Models);
+        Assert.Equal(new[] { "fable" }, _runner.ResumeModels);
+    }
+
+    [Fact]
+    public async Task 初次额度探测期间模型变化_旧证据作废并针对新模型重探()
+    {
+        ProductConfig config = ArmedConfig();
+        config.ResumeModel = "fable";
+        config.Selected = new List<ProjectRef> { config.Selected[0] };
+        _configStore.Save(config);
+        CheckerState state = CheckerState.CreateDefault();
+        state.CycleId = config.ArmCycleId;
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseWaiting;
+        _stateStore.Save(state);
+        _probe.Results.Enqueue(new ClaudeProbeResult { Ready = true, Reason = "ok" });
+        _probe.Results.Enqueue(new ClaudeProbeResult { Ready = true, Reason = "ok" });
+        _probe.AfterProbe = (_, call) =>
+        {
+            if (call == 1)
+            {
+                _configStore.Update(latest => latest.ResumeModel = "opus");
+            }
+        };
+
+        await _engine.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(new[] { "fable", "opus" }, _probe.Models);
+        Assert.Equal(new[] { "opus" }, _runner.ResumeModels);
+        Assert.Equal(1, _runner.CallCount);
+    }
+
+    [Fact]
+    public async Task 后续项目额度复核期间模型变化_旧证据作废且不启动错模型()
+    {
+        ProductConfig config = ArmedConfig();
+        config.ResumeModel = "fable";
+        config.Selected = config.Selected.Take(2).ToList();
+        _configStore.Save(config);
+        CheckerState state = CheckerState.CreateDefault();
+        state.CycleId = config.ArmCycleId;
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseWaiting;
+        _stateStore.Save(state);
+        _probe.Results.Enqueue(new ClaudeProbeResult { Ready = true, Reason = "ok" });
+        _probe.Results.Enqueue(new ClaudeProbeResult { Ready = true, Reason = "ok" });
+        _probe.Results.Enqueue(new ClaudeProbeResult { Ready = true, Reason = "ok" });
+        _probe.AfterProbe = (_, call) =>
+        {
+            if (call == 2)
+            {
+                _configStore.Update(latest => latest.ResumeModel = "opus");
+            }
+        };
+
+        await _engine.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(new[] { "fable", "fable", "opus" }, _probe.Models);
+        Assert.Equal(new[] { "fable", "opus" }, _runner.ResumeModels);
+        Assert.Equal(2, _runner.CallCount);
+    }
+
+    [Fact]
+    public async Task 最终启动门禁前模型变化_不spawn旧授权并重新取证()
+    {
+        ProductConfig config = ArmedConfig();
+        config.ResumeModel = "fable";
+        config.Selected = new List<ProjectRef> { config.Selected[0] };
+        _configStore.Save(config);
+        CheckerState state = CheckerState.CreateDefault();
+        state.CycleId = config.ArmCycleId;
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseWaiting;
+        _stateStore.Save(state);
+        _probe.Results.Enqueue(new ClaudeProbeResult { Ready = true, Reason = "ok" });
+        _probe.Results.Enqueue(new ClaudeProbeResult { Ready = true, Reason = "ok" });
+        bool changed = false;
+        _runner.BeforeStart = _ =>
+        {
+            if (!changed)
+            {
+                changed = true;
+                _configStore.Update(latest => latest.ResumeModel = "opus");
+            }
+        };
+
+        await _engine.RunOnceAsync(CancellationToken.None);
+
+        Assert.True(changed);
+        Assert.Equal(new[] { "fable", "opus" }, _probe.Models);
+        Assert.Equal(new[] { "opus" }, _runner.ResumeModels);
+        Assert.Equal(1, _runner.CallCount);
+        Assert.False(_stateStore.Load().ReplayBlocked);
+    }
+
+    [Fact]
+    public async Task 最终启动门禁前解除布防_不spawn也不把旧周期写成失败()
+    {
+        ProductConfig config = ArmedConfig();
+        config.ResumeModel = "fable";
+        config.Selected = new List<ProjectRef> { config.Selected[0] };
+        _configStore.Save(config);
+        CheckerState state = CheckerState.CreateDefault();
+        state.CycleId = config.ArmCycleId;
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseWaiting;
+        _stateStore.Save(state);
+        _probe.Results.Enqueue(new ClaudeProbeResult { Ready = true, Reason = "ok" });
+        _runner.BeforeStart = _ => _configStore.Update(latest =>
+        {
+            latest.Armed = false;
+            latest.ArmCycleId = string.Empty;
+        });
+
+        await _engine.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(0, _runner.CallCount);
+        Assert.False(_configStore.Load().Armed);
+        Assert.False(_stateStore.Load().ProjectStatus?.ContainsKey(config.Selected[0].Path) == true);
+    }
+
+    [Fact]
+    public async Task Worker在spawn前取消_撤销精确预登记且不锁死周期()
+    {
+        ProductConfig config = ArmedConfig();
+        config.ResumeModel = "fable";
+        config.Selected = new List<ProjectRef> { config.Selected[0] };
+        _configStore.Save(config);
+        CheckerState state = CheckerState.CreateDefault();
+        state.CycleId = config.ArmCycleId;
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseWaiting;
+        _stateStore.Save(state);
+        _probe.Results.Enqueue(new ClaudeProbeResult { Ready = true, Reason = "ok" });
+        _runner.CancelBeforeSpawn = true;
+
+        await _engine.RunOnceAsync(CancellationToken.None);
+
+        ProductConfig persistedConfig = _configStore.Load();
+        CheckerState persistedState = _stateStore.Load();
+        Assert.True(persistedConfig.Armed);
+        Assert.Equal(CheckerState.PhaseWaiting, persistedState.Phase);
+        Assert.True(persistedState.SawLimited);
+        Assert.False(persistedState.ReplayBlocked);
+        Assert.Empty(persistedState.ActiveRunId);
+        Assert.Empty(persistedState.ActiveProjectPath);
+        Assert.False(persistedState.ProjectStatus?.ContainsKey(config.Selected[0].Path) == true);
+        Assert.Equal(0, _runner.CallCount);
+    }
+
+    [Fact]
+    public async Task OAuth失败时Haiku就绪也不会调用Runner()
+    {
+        ProductConfig config = ArmedConfig();
+        config.ResumeModel = "fable";
+        _configStore.Save(config);
+        var state = CheckerState.CreateDefault();
+        state.CycleId = config.ArmCycleId;
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseWaiting;
+        _stateStore.Save(state);
+        var quota = new QuotaService(
+            probe: _ => Task.FromResult(new ClaudeProbeResult
+            {
+                Ready = true,
+                Reason = "ok",
+                FiveHourResetUtc = _clock.AddHours(5),
+                FiveHourUtil = 0.25,
+                SevenDayResetUtc = _clock.AddDays(4),
+                SevenDayUtil = 0.73,
+            }),
+            clock: () => _clock,
+            oauthProbe: _ => Task.FromResult(
+                new OAuthUsageResult(false, null, "failed_local", "account-a")));
+        using ResumeEngine engine = CreateEngine(new QuotaResumeProbe(quota));
+
+        await engine.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(0, _runner.CallCount);
+        Assert.Equal(CheckerState.PhaseWaiting, _stateStore.Load().Phase);
+    }
+
+    [Fact]
+    public async Task Fable新重置代次实时可用后只启动一次续跑()
+    {
+        ProductConfig config = ArmedConfig();
+        config.ResumeModel = "fable";
+        config.Selected = new List<ProjectRef> { config.Selected[0] };
+        _configStore.Save(config);
+        var state = CheckerState.CreateDefault();
+        state.CycleId = config.ArmCycleId;
+        _stateStore.Save(state);
+        int oauthCalls = 0;
+        DateTimeOffset firstFiveHourReset = _clock.AddMinutes(3);
+        DateTimeOffset nextFiveHourReset = _clock.AddHours(6);
+        DateTimeOffset firstFableReset = _clock.AddDays(4);
+        DateTimeOffset nextFableReset = _clock.AddDays(7);
+        var quota = new QuotaService(
+            probe: _ => Task.FromResult(new ClaudeProbeResult { Reason = "unexpected" }),
+            clock: () => _clock,
+            oauthProbe: _ =>
+            {
+                oauthCalls++;
+                bool fiveHourBlocked = oauthCalls == 1;
+                bool fableBlocked = oauthCalls <= 2;
+                return Task.FromResult(new OAuthUsageResult(
+                    true,
+                    QuotaSnapshot(_clock, allowed: !fableBlocked,
+                        QuotaWindow("five_hour", fiveHourBlocked ? 100 : oauthCalls == 2 ? 0 : 5,
+                            fiveHourBlocked ? firstFiveHourReset : nextFiveHourReset),
+                        QuotaWindow("seven_day", 73, _clock.AddDays(4)),
+                        QuotaWindow("weekly_scoped:Fable", fableBlocked ? 100 : 5,
+                            fableBlocked ? firstFableReset : nextFableReset)),
+                    null,
+                    "account-a"));
+            });
+        using ResumeEngine engine = CreateEngine(new QuotaResumeProbe(quota));
+
+        await engine.RunOnceAsync(CancellationToken.None);
+        Assert.Equal(0, _runner.CallCount);
+
+        _clock = _clock.AddMinutes(4);
+        await engine.RunOnceAsync(CancellationToken.None);
+        Assert.Equal(0, _runner.CallCount);
+        Assert.Equal(2, oauthCalls);
+
+        _clock = _clock.AddMinutes(4);
+        await engine.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(3, oauthCalls);
+        Assert.Equal(1, _runner.CallCount);
+        Assert.False(_configStore.Load().Armed);
+        Assert.Equal(CheckerState.PhaseDone, _stateStore.Load().Phase);
+    }
+
+    [Fact]
+    public async Task 第一项目成功后Fable额度收紧_第二项目不会启动()
+    {
+        ProductConfig config = ArmedConfig();
+        config.ResumeModel = "fable";
+        config.Selected = config.Selected.Take(2).ToList();
+        _configStore.Save(config);
+        var state = CheckerState.CreateDefault();
+        state.CycleId = config.ArmCycleId;
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseWaiting;
+        _stateStore.Save(state);
+        int oauthCalls = 0;
+        var quota = new QuotaService(
+            probe: _ => Task.FromResult(new ClaudeProbeResult { Reason = "unexpected" }),
+            clock: () => _clock,
+            oauthProbe: _ =>
+            {
+                oauthCalls++;
+                bool fableBlocked = oauthCalls == 2;
+                return Task.FromResult(new OAuthUsageResult(
+                    true,
+                    QuotaSnapshot(_clock, allowed: !fableBlocked,
+                        QuotaWindow("five_hour", 25, _clock.AddHours(5)),
+                        QuotaWindow("seven_day", 73, _clock.AddDays(4)),
+                        QuotaWindow("weekly_scoped:Fable", fableBlocked ? 100 : 80,
+                            _clock.AddDays(4))),
+                    null,
+                    "account-a"));
+            });
+        using ResumeEngine engine = CreateEngine(new QuotaResumeProbe(quota));
+
+        await engine.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(new[] { config.Selected[0].Path }, _runner.CalledPaths);
+        Assert.Equal(2, oauthCalls);
+        CheckerState waiting = _stateStore.Load();
+        Assert.Equal(CheckerState.PhaseWaiting, waiting.Phase);
+        Assert.Equal("success", waiting.ProjectStatus![config.Selected[0].Path]);
+        Assert.False(waiting.ProjectStatus.ContainsKey(config.Selected[1].Path));
+        Assert.True(_configStore.Load().Armed);
     }
 
     [Fact]
@@ -939,6 +1329,44 @@ public sealed class ResumeEngineTests : IDisposable
     }
 
     [Fact]
+    public async Task 额度复核后最终启动门禁前移除项目_未启动项目不会锁死周期()
+    {
+        var config = ArmedConfig();
+        _configStore.Save(config);
+        var state = CheckerState.CreateDefault();
+        state.CycleId = config.ArmCycleId;
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseWaiting;
+        _stateStore.Save(state);
+
+        _probe.Results.Enqueue(new ClaudeProbeResult { Ready = true, Reason = "ok" });
+        string removedPath = config.Selected[0].Path;
+        bool removed = false;
+        _runner.BeforeStart = project =>
+        {
+            if (!removed && string.Equals(project.Path, removedPath, StringComparison.OrdinalIgnoreCase))
+            {
+                removed = true;
+                _configStore.Update(fresh =>
+                    fresh.Selected.RemoveAll(selected =>
+                        string.Equals(selected.Path, removedPath, StringComparison.OrdinalIgnoreCase)));
+            }
+        };
+
+        await _engine.RunOnceAsync(CancellationToken.None);
+
+        Assert.True(removed);
+        Assert.Equal(
+            new[] { config.Selected[1].Path, config.Selected[2].Path },
+            _runner.CalledPaths);
+        CheckerState completed = _stateStore.Load();
+        Assert.False(completed.ReplayBlocked);
+        Assert.Equal(CheckerState.PhaseDone, completed.Phase);
+        Assert.False(completed.ProjectStatus!.ContainsKey(removedPath));
+        Assert.False(_configStore.Load().Armed);
+    }
+
+    [Fact]
     public async Task 续跑途中新增项目_必须纳入当前轮次后才能完成()
     {
         var config = ArmedConfig();
@@ -1038,7 +1466,7 @@ public sealed class ResumeEngineTests : IDisposable
         await _engine.RunOnceAsync(CancellationToken.None);
 
         // 引擎在异常后仍然正常工作:又探测一次,并按队列跑完三个项目。
-        Assert.Equal(2, _probe.CallCount);
+        Assert.Equal(4, _probe.CallCount);
         Assert.Equal(3, _runner.CallCount);
     }
 
@@ -1046,20 +1474,28 @@ public sealed class ResumeEngineTests : IDisposable
     private sealed class FakeProbe : IClaudeUsageProbe
     {
         public Queue<ClaudeProbeResult> Results { get; } = new();
+        public List<string> Models { get; } = new();
         public int CallCount { get; private set; }
         public bool ThrowOnNext { get; set; }
+        public Action<string, int>? AfterProbe { get; set; }
+        private ClaudeProbeResult _lastResult = new() { Ready = false, Reason = "unknown" };
 
         public Task<ClaudeProbeResult> ProbeAsync(string model, string workingDirectory, CancellationToken cancellationToken)
         {
             CallCount++;
+            Models.Add(model);
             if (ThrowOnNext)
             {
                 ThrowOnNext = false;
                 throw new InvalidOperationException("模拟探测异常");
             }
 
-            var result = Results.Count > 0 ? Results.Dequeue() : new ClaudeProbeResult { Ready = false, Reason = "unknown" };
-            return Task.FromResult(result);
+            if (Results.Count > 0)
+            {
+                _lastResult = Results.Dequeue();
+            }
+            AfterProbe?.Invoke(model, CallCount);
+            return Task.FromResult(_lastResult);
         }
     }
 
@@ -1067,11 +1503,14 @@ public sealed class ResumeEngineTests : IDisposable
     private sealed class FakeRunner : IClaudeResumeRunner
     {
         public List<string> CalledPaths { get; } = new();
+        public List<string> ResumeModels { get; } = new();
         public int CallCount => CalledPaths.Count;
         public Dictionary<string, ResumeRunResult> Results { get; } = new();
         public Dictionary<string, string> ResultByPath { get; } = new();
+        public Action<ProjectRef>? BeforeStart { get; set; }
         public Action? BeforeRun { get; set; }
         public Action<RunId>? AfterStarted { get; set; }
+        public bool CancelBeforeSpawn { get; set; }
         public int ShouldContinueCallCount { get; private set; }
 
         public Task<ResumeRunResult> RunAsync(
@@ -1082,13 +1521,26 @@ public sealed class ResumeEngineTests : IDisposable
             Func<RunId, bool?>? shouldContinue = null)
         {
             RunId runId = RunId.New();
+            BeforeStart?.Invoke(project);
             if (beforeStart is not null && !beforeStart(runId))
             {
                 return Task.FromResult(new ResumeRunResult { Status = "stopped", StopRound = true });
             }
 
+            if (CancelBeforeSpawn)
+            {
+                return Task.FromResult(new ResumeRunResult
+                {
+                    Status = "stopped",
+                    StopRound = true,
+                    PreparedRunId = runId,
+                    StartCancelledBeforeSpawn = true,
+                });
+            }
+
             BeforeRun?.Invoke();
             CalledPaths.Add(project.Path);
+            ResumeModels.Add(config.ResumeModel);
             AfterStarted?.Invoke(runId);
 
             string status;

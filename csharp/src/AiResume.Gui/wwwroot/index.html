@@ -304,6 +304,13 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   box-shadow:inset 0 1px 0 var(--bevel-hi),2px 2px 0 var(--bevel-cast)}
 .brow{display:flex;gap:6px;margin-top:6px}
 .note{margin-top:8px;font-size:1rem;line-height:1.5rem;color:var(--ink-3)}
+.model-pick{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:8px;margin-bottom:7px}
+.model-pick label{font:1rem/1rem var(--mono);color:var(--ink-2);white-space:nowrap}
+.model-pick select{width:100%;min-width:0;height:30px;padding:0 7px;font:1rem/1rem var(--ui);
+  color:var(--ink);background:var(--panel-hi);border:1px solid var(--seam);border-radius:1px;
+  box-shadow:inset 0 1px 1px rgba(0,0,0,.10)}
+.model-pick select:focus-visible{outline:1px solid var(--ink-2);outline-offset:2px}
+.model-pick select:disabled{opacity:.52}
 
 /* 状态指示灯排 */
 .fs-state,.pv{display:flex;align-items:center;gap:7px;font-size:1rem;color:var(--ink-2);
@@ -533,6 +540,16 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       <div id="providers"></div>
     </div>
     <div class="sect">
+      <div class="model-pick">
+        <label for="resumeModel">续跑模型</label>
+        <select id="resumeModel" aria-label="续跑模型">
+          <option value="">请选择</option>
+          <option value="fable">Fable 5</option>
+          <option value="opus">Opus</option>
+          <option value="sonnet">Sonnet</option>
+          <option value="haiku">Haiku</option>
+        </select>
+      </div>
       <button class="btn" id="armBtn" disabled>布防所选项目</button>
       <div class="brow">
         <button class="btn line" id="dryBtn" disabled>预演</button>
@@ -817,11 +834,14 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       const scopedBlockedInfos = scopedInfos.filter(info => info.blocked);
       const scopedBlocked = scopedBlockedInfos.length > 0;
       const scopedBlockedModels = scopedBlockedInfos.map(info => info.model || '按模型').join('、');
+      const isBlockedWindow = window => !!window && (
+        window.status === 'blocked' ||
+        (Number.isFinite(window.usedPercent) && window.usedPercent >= 100));
 
       // **blocked 只标在真正打满的那一块上。**
       // 原来两块都吃全局的 p.limitReached,于是 5 小时才 18% 也整条通红——
       // 那不是"提醒",是错误信息。
-      const blocked7 = !!(w7 && (w7.status === 'blocked' || w7.usedPercent >= 100));
+      const blocked7 = isBlockedWindow(w7);
 
       if (w7 && (w7.windowStartUnix != null || Number.isFinite(w7.usedPercent))) {
         $('q7src').textContent = w7.carriedForward ? '最近服务端读数' : '服务端下发';
@@ -852,7 +872,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
         $('q5src').textContent = w5.carriedForward ? '最近服务端读数' : '服务端下发';
         paint('q5', {
           start: w5.windowStartUnix, end: w5.resetAtUnix, crossesDay: false, derived: true,
-          used: w5.usedPercent, blocked: w5.status === 'blocked', carried: !!w5.carriedForward,
+          used: w5.usedPercent, blocked: isBlockedWindow(w5), carried: !!w5.carriedForward,
           extra: [
             w5.usedPercent == null ? '服务端未下发用量百分比' : '',
             w5.carriedForward ? '同一重置周期的最近一次服务端读数' : '',
@@ -860,22 +880,36 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
         });
       }
       const scopedLimited = scopedBlocked;
-      const hasCarried = (p.windows || []).some(window => window.carriedForward);
-      const globalLimited = !!(
-        (w5 && w5.status === 'blocked') ||
-        (w7 && w7.status === 'blocked') ||
-        (p.limitReached && !scopedLimited));
-      const anyLimited = globalLimited || scopedLimited;
-      lastQuotaState = p.hasData
-        ? (anyLimited ? 'limited' : hasCarried ? 'stale' : p.allowed ? true : false)
-        : (p.limitReached ? 'limited' : false);
-      lastQuotaDetail = p.hasData
-        ? (globalLimited ? 'Claude Code 总额度已限流'
-          : scopedLimited ? `${scopedBlockedModels || '按模型'} 额度已限流`
-            : hasCarried ? '显示同一重置周期的最近服务端读数'
-              : p.allowed ? '服务端额度窗口已读取'
-                : (p.unavailableReason || '仅取得部分额度窗口,本次探测未成功'))
-        : (p.unavailableReason || (p.limitReached ? '已限流,但服务端未附窗口信息' : '额度窗口不可得'));
+      const globalHasCurrentData = !!p.globalHasCurrentData;
+      const globalHasCarried = !!p.globalHasCarried;
+      const globalLimited = !!p.globalLimitReached;
+      // Claude Code 总行回答“账户主窗口是否限流”，模型行回答“这个模型是否用尽”。
+      // bucket 的 allowed/limitReached 为续跑安全保留了“任一窗口”语义，不能直接拿来
+      // 给总行上色，否则 Fable=100% 会把仍有余量的 5H/7D 错画成已限流。
+      lastQuotaState = globalLimited
+        ? 'limited'
+        : globalHasCarried
+          ? 'stale'
+          : globalHasCurrentData ? true : false;
+      lastQuotaDetail = globalLimited
+        ? 'Claude Code 总额度已限流'
+        : globalHasCarried
+          ? (scopedLimited
+            ? `Claude Code 总额度为最近读数；${scopedBlockedModels || '按模型'} 额度已用尽`
+            : 'Claude Code 总额度显示同一重置周期的最近服务端读数')
+          : globalHasCurrentData
+            ? (scopedLimited
+              ? `Claude Code 总额度未限流；${scopedBlockedModels || '按模型'} 额度已用尽`
+              : 'Claude Code 服务端总额度窗口已读取')
+            : p.unavailableReason
+              ? (scopedLimited
+                ? `${p.unavailableReason}；${scopedBlockedModels || '按模型'} 额度已用尽`
+                : p.unavailableReason)
+              : scopedLimited
+                ? `Claude Code 总额度窗口未完整核实；${scopedBlockedModels || '按模型'} 额度已用尽`
+                : (p.limitReached
+                  ? '限流来源无法归因到 5H/7D 总窗口'
+                  : 'Claude Code 总额度窗口不可得');
       if (p.storageWarning) lastQuotaDetail += `；${p.storageWarning}`;
       renderProviders(lastQuotaState);
     } catch (e) {
@@ -1007,6 +1041,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     [...picked].forEach(value => { if (pathKey(value) === key) picked.delete(value); });
   }
   let projects = [], hidden = [], arm = null, armBusy = false, armRefreshBusy = false;
+  let resumeModelDirty = false;
   let queueBusy = false, lastQueueSig = null, lastArmSig = null;
   let armReadIssued = 0, armReadApplied = 0, armMutationVersion = 0;
 
@@ -1135,10 +1170,13 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   function syncArm() {
     const on = !!(arm && arm.armed);
     const b = $('armBtn');
+    const modelSelect = $('resumeModel');
     b.textContent = on ? '解除布防' : `布防所选项目${picked.size ? ` (${picked.size})` : ''}`;
     const armUnknown = !!(arm && arm.engine === 'StateUnverified');
-    b.disabled = armBusy || armRefreshBusy || queueBusy || (!on && (armUnknown || picked.size === 0));
+    b.disabled = armBusy || armRefreshBusy || queueBusy ||
+      (!on && (armUnknown || picked.size === 0 || !modelSelect.value));
     b.classList.toggle('busy', armBusy);
+    modelSelect.disabled = on || armBusy || armRefreshBusy || queueBusy || armUnknown;
     $('dryBtn').disabled = armBusy || armRefreshBusy || queueBusy || armUnknown || (!on && picked.size === 0);
     $('armRefreshBtn').disabled = armBusy || armRefreshBusy || queueBusy;
     $('armRefreshBtn').classList.toggle('busy', armRefreshBusy);
@@ -1208,6 +1246,13 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       $('armNote').textContent = '可刷新状态再次核验';
       return;
     }
+    if (on && !arm.resumeModel) {
+      $('beacon').className = 'beacon bad';
+      $('armLine').textContent = '续跑模型未配置';
+      $('phaseLine').textContent = '需解除布防并选择目标模型';
+      $('armNote').textContent = '解除后可重新布防';
+      return;
+    }
     if (!on) {
       head = '未布防'; sub = '布防后将在额度恢复时按队列续跑';
     } else if (failed) {
@@ -1240,7 +1285,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       .map(s => `${s.path}\u0001${s.status}`).sort();
     return JSON.stringify({
       armed: value.armed, cycleId: value.cycleId, phase: value.phase,
-      sawLimited: value.sawLimited, engine: value.engine,
+      sawLimited: value.sawLimited, engine: value.engine, resumeModel: value.resumeModel || '',
       selected: value.selected || [], statuses,
     });
   }
@@ -1250,6 +1295,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     if (!arm || !arm.armed) {
       return picked.size ? `未布防 · 已选择 ${picked.size} 个项目` : '未布防';
     }
+    if (!arm.resumeModel) return '已布防 · 续跑模型未配置';
 
     if (arm.engine === 'RunMissing') return '续跑已中断 · 对应进程不存在';
     if (arm.engine === 'RunUnverified') return '续跑状态未确认';
@@ -1275,6 +1321,14 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     arm = next && !next.armed
       ? { ...next, phase: '', sawLimited: false, projectStatus: [] }
       : next;
+    if (arm && (arm.armed || !resumeModelDirty)) {
+      const knownModel = [...$('resumeModel').options]
+        .some(option => option.value && option.value === arm.resumeModel);
+      $('resumeModel').value = knownModel
+        ? arm.resumeModel
+        : '';
+      resumeModelDirty = false;
+    }
     if (arm && arm.armed) {
       picked.clear();
       (arm.selected || []).forEach(p => pickedAdd(p));
@@ -1296,6 +1350,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     applyArmState({
       armed: !!previous.armed,
       continuous: !!previous.continuous,
+      resumeModel: previous.resumeModel || '',
       cycleId: previous.cycleId || '',
       phase: '',
       sawLimited: false,
@@ -1342,7 +1397,11 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     armBusy = true; syncArm();
     const want = !(arm && arm.armed);
     try {
-      const next = await call('arm.set', { armed: want, paths: [...picked] });
+      const next = await call('arm.set', {
+        armed: want,
+        paths: [...picked],
+        resumeModel: $('resumeModel').value,
+      });
       applyArmState(next, { forceRows: true, announce: true });
     } catch (e) {
       let readSucceeded = false;
@@ -1687,6 +1746,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   $('fsGen').addEventListener('click', genCutover);
   $('fsPre').addEventListener('click', preflight);
   $('armBtn').addEventListener('click', toggleArm);
+  $('resumeModel').addEventListener('change', () => { resumeModelDirty = true; syncArm(); });
   $('armRefreshBtn').addEventListener('click', () => refreshArmState({ forceRows: true, announce: true }));
   $('dryBtn').addEventListener('click', dryRun);
   $('rescanBtn').addEventListener('click', async () => {

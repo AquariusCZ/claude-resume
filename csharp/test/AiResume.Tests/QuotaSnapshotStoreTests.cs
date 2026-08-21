@@ -25,6 +25,28 @@ public sealed class QuotaSnapshotStoreTests
     }
 
     [Fact]
+    public void 未归因限流事实可经SQLite往返保留()
+    {
+        string path = TestTemp.NewFile("quota-unattributed", ".db");
+        var store = new QuotaSnapshotStore(path);
+        UsageSnapshot snapshot = Snapshot(DateTimeOffset.Parse("2026-08-09T11:00:00Z"), 100);
+        UsageBucket bucket = Assert.Single(snapshot.Buckets);
+        snapshot = snapshot with
+        {
+            Buckets = new[]
+            {
+                bucket with { UnattributedLimitReached = true },
+            },
+        };
+
+        Assert.True(store.TrySave(snapshot, "account-a"));
+
+        UsageBucket loaded = Assert.Single(store.Load("claudecode", "account-a")!.Buckets);
+        Assert.True(loaded.LimitReached);
+        Assert.True(loaded.UnattributedLimitReached);
+    }
+
+    [Fact]
     public void 同一CapturedAt后写的无Scoped快照可以清除旧Fable()
     {
         string path = TestTemp.NewFile("quota-store-tie", ".db");
@@ -161,6 +183,47 @@ public sealed class QuotaSnapshotStoreTests
         var store = new QuotaSnapshotStore(path);
         Assert.Null(store.Load("claudecode", "account-a"));
         Assert.Contains("InvalidSnapshot", store.LastFailure, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void 旧快照缺少EvidenceSource时默认Unknown且不得升格()
+    {
+        string path = TestTemp.NewFile("quota-legacy-source", ".db");
+        StorageDatabase.Migrate(path);
+        using (var connection = StorageDatabase.Open(path))
+        {
+            StorageDatabase.Execute(connection, """
+                INSERT INTO quota_snapshots(
+                    provider, credential_fingerprint, captured_at, snapshot_json, updated_at)
+                VALUES ('claudecode', 'account-a', 1,
+                    '{"Provider":"claudecode","CapturedAt":"2026-08-09T10:00:00Z","Buckets":[{"Name":"Usage","Allowed":true,"LimitReached":false,"Windows":[{"Name":"seven_day","Status":"allowed","WindowSeconds":604800,"ResetAtUnix":1786356000,"ResetAfterSeconds":86400,"UsedPercent":50,"CarriedForward":false,"Identity":null}]}],"UnavailableReason":null}',
+                    '2026-08-09T10:00:00Z');
+                """);
+        }
+
+        var store = new QuotaSnapshotStore(path);
+        UsageSnapshot loaded = Assert.IsType<UsageSnapshot>(
+            store.Load("claudecode", "account-a"));
+
+        Assert.Equal(UsageEvidenceSource.Unknown, loaded.EvidenceSource);
+    }
+
+    [Fact]
+    public void EvidenceSource写入SQLite后可原样读取()
+    {
+        string path = TestTemp.NewFile("quota-source-roundtrip", ".db");
+        var store = new QuotaSnapshotStore(path);
+        UsageSnapshot oauth = Snapshot(
+            DateTimeOffset.Parse("2026-08-09T11:00:00Z"), 50) with
+        {
+            EvidenceSource = UsageEvidenceSource.OAuth,
+        };
+
+        Assert.True(store.TrySave(oauth, "account-a"));
+
+        Assert.Equal(
+            UsageEvidenceSource.OAuth,
+            store.Load("claudecode", "account-a")!.EvidenceSource);
     }
 
     [Fact]
