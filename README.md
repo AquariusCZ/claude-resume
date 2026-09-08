@@ -66,7 +66,7 @@ Quota comes from Anthropic's OAuth usage endpoint using Claude Code's real reque
 
 Responses are sparse, so a missing field is not treated as a deletion. A carried-over value is shown amber as a *recent server reading*, never green. Reset-only data uses an indeterminate scan instead of inventing a percentage.
 
-Select the resume model, select projects, press **Arm**, then close the window. The Worker resumes only when a fresh scoped quota reading for that same model is available, and launches Claude Code with the same explicit `--model`. A five-hour reset alone is not enough. Details: [Claude quota acquisition](docs/CLAUDE-QUOTA-ACQUISITION.md).
+Select a provider and an actual model from its live catalog, select projects, and press **Arm**. This stores the provider/account, model ID, and exact native session IDs for the cycle. Catalog upgrades apply to the next arm operation. Claude resumes only with matching live scoped quota; DeepSeek and compatible third-party providers require verified positive balance after an observed limit. Codex ChatGPT shows its live catalog and account windows, but the current upstream interface cannot prove that a specific model recovered, so an armed target remains waiting. Missing quota data stays unverified. A fixed invocation ID does not freeze a provider's backend revision. See [provider-bound resume](docs/adr/0004-provider-bound-resume.md).
 
 ## Chat from your phone
 
@@ -109,6 +109,8 @@ Three rules the code holds itself to:
 - **Green means verified.** An installed CLI or a filled-in key is not proof — a request has to have succeeded.
 - **One Feishu consumer.** Two long-connection consumers split events randomly, so preflight fails closed.
 - **No PID-only termination.** Identity, start time and command signature must all match before a process is reclaimed.
+
+Existing armed configurations need to be disarmed and bound again. Close the original Claude session before automatic resume; Codex relies on its verified native writer lock. Third-party Codex execution additionally requires an existing managed configuration that can be held stable. Unsupported configurations are rejected with a reason while their models and quota remain readable.
 
 ## Development
 

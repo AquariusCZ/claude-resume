@@ -136,9 +136,9 @@ public sealed class GuiMotionContractTests
         string html = File.ReadAllText(FindRepositoryFile(
             Path.Combine("csharp", "src", "AiResume.Gui", "wwwroot", "index.html")));
 
-        Assert.Contains("if (probedRows == null)", html, StringComparison.Ordinal);
-        Assert.Contains("nm, cls: 'bad', txt: '探测失败', detail: failure", html, StringComparison.Ordinal);
-        Assert.Contains("nm: row.nm, cls: 'wait', txt: '状态过期'", html, StringComparison.Ordinal);
+        Assert.Contains("modelsVerified:false, quotaKnown:false", html, StringComparison.Ordinal);
+        Assert.Contains("balance:null", html, StringComparison.Ordinal);
+        Assert.Contains("数据刷新失败，请重试", html, StringComparison.Ordinal);
         Assert.Contains("renderProviders(lastQuotaState);", html, StringComparison.Ordinal);
         Assert.DoesNotContain("探测失败保持上一次显示", html, StringComparison.Ordinal);
     }
@@ -222,27 +222,13 @@ public sealed class GuiMotionContractTests
 
         Assert.Contains("<select id=\"resumeModel\" aria-label=\"续跑模型\">", html,
             StringComparison.Ordinal);
-        foreach (string model in AiResume.Core.ClaudeModelFamilies.Supported)
-        {
-            Assert.Contains($"<option value=\"{model}\">", html, StringComparison.Ordinal);
-        }
-        Match select = Regex.Match(
-            html,
-            "<select id=\"resumeModel\"[^>]*>(?<body>.*?)</select>",
-            RegexOptions.Singleline | RegexOptions.CultureInvariant);
-        Assert.True(select.Success);
-        string[] optionValues = Regex.Matches(
-                select.Groups["body"].Value,
-                "<option value=\"(?<value>[^\"]*)\"",
-                RegexOptions.CultureInvariant)
-            .Select(match => match.Groups["value"].Value)
-            .Where(value => value.Length > 0)
-            .ToArray();
-        Assert.Equal(AiResume.Core.ClaudeModelFamilies.Supported, optionValues);
+        Assert.Contains("<select id=\"resumeProvider\"", html, StringComparison.Ordinal);
+        Assert.Contains("p.modelsVerified ? p.models : []", html, StringComparison.Ordinal);
+        Assert.Contains("target.modelId", html, StringComparison.Ordinal);
         Assert.DoesNotContain("['fable', 'opus', 'sonnet', 'haiku']", html, StringComparison.Ordinal);
         Assert.Contains("resumeModel: $('resumeModel').value", html, StringComparison.Ordinal);
         Assert.Contains("modelSelect.disabled = on || armBusy", html, StringComparison.Ordinal);
-        Assert.Contains("if (on && !arm.resumeModel)", html, StringComparison.Ordinal);
+        Assert.Contains("if (on && (!arm.resumeModel || !arm.resumeTarget))", html, StringComparison.Ordinal);
         Assert.Contains("续跑模型未配置", html, StringComparison.Ordinal);
         Assert.Contains("if (!arm.resumeModel) return '已布防 · 续跑模型未配置';", html,
             StringComparison.Ordinal);

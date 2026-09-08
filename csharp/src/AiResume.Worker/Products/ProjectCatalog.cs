@@ -377,7 +377,7 @@ public sealed class ProjectCatalog
         }
     }
 
-    private static string? ExtractCwd(string jsonlPath)
+    internal static string? ExtractCwd(string jsonlPath)
     {
         try
         {

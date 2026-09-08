@@ -18,6 +18,11 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
+if (args.Length > 0 && args[0] == "internal-agent-run")
+{
+    return await AgentExecCommand.RunAsync(args);
+}
+
 // S9 数据迁移入口。在建 Host **之前**分支:迁移是一次性命令,不该起
 // BackgroundService,也不该因为 Host 的 DI 装配失败而跑不起来。
 if (args.Length > 0 && string.Equals(args[0], "migrate", StringComparison.OrdinalIgnoreCase))
@@ -159,9 +164,10 @@ builder.Services.AddHostedService<AiResume.Worker.Notifications.NotificationWork
 builder.Services.AddSingleton(new ProductConfigStore(ShadowPaths.Root));
 builder.Services.AddSingleton(new ProductStateStore(ShadowPaths.RunDatabasePath));
 builder.Services.AddQuotaResumeAdmission();
+builder.Services.AddSingleton<ProviderExecutionPlan>();
 builder.Services.AddSingleton<CheckerCycle>(sp => new CheckerCycle(sp.GetRequiredService<ProductStateStore>()));
 builder.Services.AddSingleton<IClaudeResumeRunner>(sp =>
-    new ClaudeResumeRunner(sp.GetRequiredService<IProcessSupervisor>()));
+    new ClaudeResumeRunner(sp.GetRequiredService<IProcessSupervisor>(), execution: sp.GetRequiredService<ProviderExecutionPlan>()));
 builder.Services.AddSingleton<ResumeEngine>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ResumeEngine>());
 builder.Services.Configure<ObservationOptions>(

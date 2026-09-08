@@ -71,7 +71,8 @@ public sealed record CodexAuthResult(
     CodexAuthOutcome Outcome,
     string Detail,
     string? Reason = null,
-    bool UsedCredential = true);
+    bool UsedCredential = true,
+    ProviderModelCatalog? Catalog = null);
 
 public sealed record CodexProviderCredentials(
     string? BaseUrl,
@@ -1064,7 +1065,7 @@ public static partial class CodexAuthProbe
                 BuildApiUrl(provider.BaseUrl, "models", provider.QueryParameters));
             AddRequestHeaders(request, provider);
 
-            // 只要响应头就够判定;不读 body,避免把模型列表(以及任何回显)拉进内存。
+            // 同一次请求同时保留模型目录，目录失败不改变独立的鉴权结论。
             using HttpResponseMessage response = await client
                 .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct)
                 .ConfigureAwait(false);
@@ -1085,19 +1086,39 @@ public static partial class CodexAuthProbe
                 return models;
             }
 
+            ProviderModelCatalog catalog;
+            using (var bodyTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                bodyTimeout.CancelAfter(TimeSpan.FromSeconds(TimeoutSeconds));
+                try
+                {
+                    catalog = ProviderModels.Parse(await ProviderModels.ReadBodyAsync(
+                        response.Content, bodyTimeout.Token).ConfigureAwait(false));
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    catalog = ProviderModelCatalog.Unavailable("模型目录读取超时");
+                }
+                catch (Exception ex) when (ex is InvalidDataException or IOException or HttpRequestException)
+                {
+                    catalog = ProviderModelCatalog.Unavailable("模型目录读取失败");
+                }
+            }
+
             if (!verifyInference)
             {
                 return new CodexAuthResult(
                     CodexAuthOutcome.InferenceUnverified,
                     usedCredential ? "凭据已验证 · 推理权限未核实" : "端点无需凭据 · 推理能力未核实",
-                    UsedCredential: usedCredential);
+                    UsedCredential: usedCredential,
+                    Catalog: catalog);
             }
 
             // **列得出模型 ≠ 跑得动模型。** 这一步是审计 A6 补上的:
             // 列模型往往是低权限路由,真正决定"能不能干活"的是推理路由。
-            return await ProbeInferenceAsync(
+            return (await ProbeInferenceAsync(
                     client, provider, ct)
-                .ConfigureAwait(false);
+                .ConfigureAwait(false)) with { Catalog = catalog };
         }
         catch (TaskCanceledException) when (!ct.IsCancellationRequested)
         {

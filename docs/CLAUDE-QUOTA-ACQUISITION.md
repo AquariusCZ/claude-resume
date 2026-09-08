@@ -174,22 +174,24 @@ ResetAtUnix = modern.resets_at ?? legacy.resets_at
 
 OAuth `limits` 响应没有 `complete`、cursor 或 `has_more` 一类完整性信号。因此 HTTP 200、`limits != null` 或“出现了任意一个 scoped”都不能证明目标模型已被覆盖;自动续跑必须看到与布防目标模型族明确匹配的本次 scoped 条目。缺失时结论是 Unknown,不是可用。
 
-## 6. 失败分类与 CLI 降级
+## 6. 失败分类与显式 CLI 诊断
 
 OAuth 探测不把 token、响应正文或异常正文回传。失败分类如下:
 
 | 场景 | `FailureReason` | 后续动作 |
 | --- | --- | --- |
-| 凭据不存在、不可读、JSON 损坏或无 access token | `no_credentials` | 降级 CLI |
-| token 剩余寿命小于 60 秒 | `token_expired` | 降级 CLI,不发 OAuth 请求 |
-| HTTP 401 / 403 | `token_rejected_401/403` | 降级 CLI |
-| HTTP 408 / 504 | `gateway_timeout` | 降级 CLI |
-| HTTP 429 或其它非 2xx | `http_<status>` | 降级 CLI |
-| DNS/TCP/TLS/reset/HttpClient 自身超时 | `failed_local` | 降级 CLI |
-| 2xx 但 JSON 不可解析 | `malformed_response` | 降级 CLI |
+| 凭据不存在、不可读、JSON 损坏或无 access token | `no_credentials` | 显示未核实 |
+| token 剩余寿命小于 60 秒 | `token_expired` | 显示未核实,不发 OAuth 请求 |
+| HTTP 401 / 403 | `token_rejected_401/403` | 显示未核实 |
+| HTTP 408 / 504 | `gateway_timeout` | 显示未核实 |
+| HTTP 429 或其它非 2xx | `http_<status>` | 显示未核实 |
+| DNS/TCP/TLS/reset/HttpClient 自身超时 | `failed_local` | 显示未核实 |
+| 2xx 但 JSON 不可解析 | `malformed_response` | 显示未核实 |
 | 调用方明确取消 | 抛出取消 | 终止本轮,不得伪装成失败后继续 |
 
-CLI 降级由 [`ClaudeCodeProbe`](../csharp/src/AiResume.Worker/Probes/ClaudeCodeProbe.cs) 执行:
+生产刷新不启动推理，OAuth 失败时返回未核实，并仅按原规则承接同账号未过期读数。以下 CLI 能力仅供显式诊断/兼容注入，不是 GUI 或 Worker 的默认降级。
+
+CLI 诊断由 [`ClaudeCodeProbe`](../csharp/src/AiResume.Worker/Probes/ClaudeCodeProbe.cs) 执行:
 
 ```text
 claude -p ready --model haiku --max-turns 1 --output-format stream-json --verbose
@@ -282,13 +284,13 @@ SQLite 在后台额度请求时才迁移/打开,不阻塞 WPF 首帧。存储失
 
 ### 8.4 自动续跑放行契约
 
-生产注册只有一个入口:`AddQuotaResumeAdmission()` 将 `ResumeEngine` 的 `IClaudeUsageProbe` 解析为 `QuotaResumeProbe`,后者复用 GUI 同一套 `QuotaService`。生产不得直接注入 `ClaudeCodeProbe`;Haiku 探针成功不能证明 `claude --continue` 继承的 Fable 会话可运行。
+生产注册入口 `AddQuotaResumeAdmission()` 现在将 `IClaudeUsageProbe` 解析为 `ProviderResumeProbe`，由 `ProviderCatalogService` 按绑定供应商取证。Claude 订阅仍使用原 `QuotaService + QuotaResumeProbe`，不改变本文的持久化、稀疏合并与 scoped 门禁。其它供应商见 [ADR-0004](adr/0004-provider-bound-resume.md)。
 
 每次状态机探测都调用 `QuotaService.GetAsync(forceRefresh:true)`,绕过 5 分钟 GUI 成功缓存。判定如下:
 
 ```text
 Limited = EvidenceSource == OAuth
-       AND ResumeModel 是显式选择的已知模型族
+       AND ResumeTarget 的实际模型 ID 属于可识别的模型族
        AND (任一主窗口或目标模型 scoped 已 blocked
             OR bucket 报告 LimitReached 且没有可归因的 blocked 窗口)
 
@@ -298,7 +300,7 @@ Ready = HasData
      AND UnavailableReason == null
      AND 每个 bucket Allowed 且未 LimitReached
      AND five_hour / seven_day 都有本次百分比
-     AND ResumeModel 是显式选择的已知模型族
+     AND ResumeTarget 的实际模型 ID 属于可识别的模型族
      AND 存在与 ResumeModel 匹配的本次 weekly_scoped 窗口
      AND 每个合并窗口都有本次百分比且不是 CarriedForward
 
@@ -307,7 +309,7 @@ Ready = HasData
 
 `EvidenceSource` 会随快照持久化。升级前 JSON 没有该字段时默认 `Unknown`;CLI 观测即使与历史 OAuth 窗口合并也仍是 `Cli`,不得被历史数据升格。OAuth 失败、账号变化、存储/网络不可验证、只有 CLI 主窗口、目标模型未配置、目标 `weekly_scoped` 缺失或只有非满额历史读数都不能返回 Ready。CLI/Haiku 限流和其它模型的 scoped 满额也不能替目标模型建立 `SawLimited`;否则日后会把“其它模型恢复”误当成本任务的恢复触发。其它模型满额仍使完整 Ready 证据不成立并保持 Unknown。未到 reset 的目标 carried 100% 继续阻塞;reset 到点只允许下一次强刷,绝不自动视为恢复。这个门禁有意选择安全优先:如果某个账号的 OAuth 响应始终不提供目标 scoped,它会一直等待人工处理,不会用 5H/7D 正常去猜测 Fable 等目标模型可用。
 
-布防区要求用户显式选择 Fable/Opus/Sonnet/Haiku;选择器在布防后锁定,解除布防保留上次选择。升级遗留的已布防空模型会在 GUI 明确报错并永久 fail-closed,直到用户解除后重新选择。`StartResuming` 使用刚取得的“证据 + 模型”放行首项目,runner 用同一个值构造 `--model`。每个项目运行过后,下一项目启动前再次强刷;等待期间还会重新读取配置并复核 `Armed`、cycle id、目标模型与项目仍在最新 `Selected` 中。探测期间或最终 spawn 门禁前模型变化时旧证据作废,未创建进程的项目重新取证,不能落成 stopped/blocked。若额度收紧、证据未知、周期变化或项目移除,不会创建该项目进程。运行中已经返回 `limited-side-effects` 的周期继续 `ReplayBlocked=true`,本门禁不会清除或重放它。
+布防区从供应商实时目录选择实际模型 ID，并写入 `ResumeTarget` 与项目原生 UUID。已布防选择器锁定，目录更新不改变当前周期；旧配置缺少绑定时要求解除后重新布防。版本化 scope（如 Fable 5.1）只能证明同版本，未带版本的 Fable scope 可匹配整个模型族。`StartResuming` 将供应商/账号/模型身份与证据一起带到每个异步和 spawn 门禁；后续每个项目再次强刷。实际执行用精确 `--resume UUID --model ID`，凭据只走子进程环境，不通过命令行或持久配置。运行中已出现副作用的失败周期继续锁住，额度恢复不解除重放阻断。
 
 runner 在最终门禁后先把精确 `RunId` 预登记到 `product_state`,再交给 `IProcessSupervisor`。只有 supervisor 以取消异常明确保证尚未登记、尚未 spawn 时,引擎才按同一 cycle、项目、`running` 状态与精确 `RunId` 撤销这条预登记并回到 waiting;任一字段不匹配、普通启动失败或启动结果不确定都继续 fail-closed。
 
@@ -502,3 +504,7 @@ Get-FileHash "$env:LOCALAPPDATA\AI Resume\AiResume.Gui.dll"
 - GUI RPC 与本地 5 小时块:[`ControlPlaneBridge.cs`](../csharp/src/AiResume.Gui/ControlPlaneBridge.cs)
 - 进度条、Fable 行和状态呈现:[`index.html`](../csharp/src/AiResume.Gui/wwwroot/index.html)
 - 自动化测试:[`AiResume.Tests`](../csharp/test/AiResume.Tests)
+
+## 2026-09-07 动态供应商界面
+
+现役界面改用 `providers.catalog`，不再从名称猜最新模型，也不在刷新时发最小推理。选择供应商后顶部卡片随其余额/订阅窗口变化；Claude 的原有本地诊断与 OAuth 卡片在选择 Claude 订阅时保留。侧栏显示各供应商和服务端返回窗口，source/更新时间保留在提示中。订阅、余额和模型目录互不冒充；ChatGPT 的账号窗口不授权具体模型恢复。完整上游盘点、兼容限制和实际目录录制见 ADR-0004。

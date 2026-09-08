@@ -62,7 +62,14 @@ public class ControlPlaneBridgeArmTests : IDisposable
             configStore: new ProductConfigStore(_configDir),
             stateStore: new ProductStateStore(_dbPath),
             engineProcessDetector: engineProcessDetector ?? (() => true),
-            activeResumeDetector: activeResumeDetector);
+            activeResumeDetector: activeResumeDetector,
+            resumeBinding: (provider, model, paths, config, ct) =>
+            {
+                if (!ClaudeModelFamilies.TryNormalizeConfiguredModel(model, out _))
+                    throw new ArgumentException("供应商目录中不存在所选模型");
+                var target = new ResumeTarget { ProviderId = provider, ProviderIdentity = "test-account", Agent = "claudecode", ModelId = model, ModelName = model, BoundAtUtc = DateTimeOffset.UtcNow };
+                return Task.FromResult(new AiResume.Worker.Resume.BoundResumeSelection(target, paths.Select(p => new ProjectRef { Path = p, Name = Path.GetFileName(p), SessionId = Guid.NewGuid().ToString("D") }).ToArray()));
+            });
     }
 
     /// <summary>
@@ -311,11 +318,11 @@ public class ControlPlaneBridgeArmTests : IDisposable
 
     [Theory]
     [InlineData("fable", "fable")]
-    [InlineData("OPUS", "opus")]
-    [InlineData("Sonnet", "sonnet")]
+    [InlineData("OPUS", "OPUS")]
+    [InlineData("Sonnet", "Sonnet")]
     [InlineData("haiku", "haiku")]
-    [InlineData("claude-fable-5", "fable")]
-    [InlineData("claude-3-5-sonnet-20241022", "sonnet")]
+    [InlineData("claude-fable-5", "claude-fable-5")]
+    [InlineData("claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20241022")]
     public async Task 布防续跑模型规范化后原子持久化(string requestedModel, string expectedModel)
     {
         string request = JsonSerializer.Serialize(new

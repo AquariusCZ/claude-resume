@@ -132,6 +132,7 @@ public sealed class CheckerCycle
         state.Phase = CheckerState.PhaseWaiting;
         state.ProjectStatus = new Dictionary<string, string>();
         state.SawLimited = false;
+        state.LastProbeReason = string.Empty;
         state.LimitedRefires = 0;
         state.ReplayBlocked = false;
         ClearActiveRun(state);
@@ -165,6 +166,7 @@ public sealed class CheckerCycle
             return false;
         }
 
+        state.LastProbeReason = "limited";
         if (RequiresExplicitRearm(state))
         {
             state.ReplayBlocked = true;
@@ -200,6 +202,7 @@ public sealed class CheckerCycle
             return ProbeDecision.KeepWatching;
         }
 
+        state.LastProbeReason = "ok";
         ApplyRealReset(state, probe);
 
         if (RequiresExplicitRearm(state))
@@ -234,6 +237,8 @@ public sealed class CheckerCycle
             return false;
         }
 
+        state.LastProbeReason = probe.Reason is "session-in-use" or "provider-changed" or "model-unverified" or "target-unbound"
+            ? probe.Reason : "unknown";
         if (RequiresExplicitRearm(state))
         {
             state.ReplayBlocked = true;

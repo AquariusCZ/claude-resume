@@ -11,7 +11,7 @@ public sealed class GuiQuotaContractTests
             Path.Combine("csharp", "src", "AiResume.Gui", "wwwroot", "index.html")));
 
         Assert.DoesNotContain("lastQuotaOk = true", html, StringComparison.Ordinal);
-        Assert.Contains("detail: lastQuotaDetail || head.txt", html, StringComparison.Ordinal);
+        Assert.Contains("p.quotaKnown && !p.problem", html, StringComparison.Ordinal);
         Assert.Contains("const globalHasCurrentData = !!p.globalHasCurrentData;", html,
             StringComparison.Ordinal);
         Assert.Contains("const scopedInfos = (p.windows || [])", html,
@@ -36,12 +36,12 @@ public sealed class GuiQuotaContractTests
         Assert.DoesNotContain("p.limitReached && !scopedLimited", html,
             StringComparison.Ordinal);
         Assert.DoesNotContain("const globalHasData =", html, StringComparison.Ordinal);
-        Assert.Contains("if (ok === 'limited') return { cls: 'wait', txt: '已限流' };", html,
+        Assert.Contains("p.limited ? 'wait'", html,
             StringComparison.Ordinal);
-        Assert.Contains("if (ok === 'stale') return { cls: 'wait', txt: '最近读数' };", html,
+        Assert.Contains("w.carriedForward ? ' · 最近'", html,
             StringComparison.Ordinal);
         Assert.Contains("ws.carriedForward ? 'wait'", html, StringComparison.Ordinal);
-        Assert.Contains(".concat(scopedRows)", html, StringComparison.Ordinal);
+        Assert.Contains("p.windows", html, StringComparison.Ordinal);
         Assert.Contains("const hasPercent = Number.isFinite(o.used);", html, StringComparison.Ordinal);
         Assert.Contains("el.classList.toggle('stale', !!o.carried);", html, StringComparison.Ordinal);
         Assert.DoesNotContain("classList.toggle('live'", html, StringComparison.Ordinal);
@@ -51,9 +51,9 @@ public sealed class GuiQuotaContractTests
             html, StringComparison.Ordinal);
         Assert.Contains("carried: !!w7.carriedForward", html, StringComparison.Ordinal);
         Assert.Contains("carried: !!w5.carriedForward", html, StringComparison.Ordinal);
-        Assert.Contains("$('q5src').textContent = '本地会话统计';", html, StringComparison.Ordinal);
-        Assert.Contains("$('q7src').textContent = '服务端未下发';", html, StringComparison.Ordinal);
-        Assert.Contains("$('q7src').textContent = '探测失败';", html, StringComparison.Ordinal);
+        Assert.Contains("claudeSource('q5', '本地会话统计');", html, StringComparison.Ordinal);
+        Assert.Contains("claudeSource('q7', '服务端未下发');", html, StringComparison.Ordinal);
+        Assert.Contains("claudeSource('q7', '探测失败');", html, StringComparison.Ordinal);
         Assert.Contains("bar.classList.toggle('unknown', hasWindow && !hasPercent);", html,
             StringComparison.Ordinal);
         Assert.Contains("bar.setAttribute('role', 'meter');", html, StringComparison.Ordinal);

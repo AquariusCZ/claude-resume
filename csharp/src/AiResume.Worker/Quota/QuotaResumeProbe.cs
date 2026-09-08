@@ -37,6 +37,11 @@ public sealed class QuotaResumeProbe : IClaudeUsageProbe
             .GetAsync(forceRefresh: true, cancellationToken)
             .ConfigureAwait(false);
 
+        return Evaluate(snapshot, model, _quota.StorageWarning);
+    }
+
+    public ClaudeProbeResult Evaluate(UsageSnapshot snapshot, string model, string? storageWarning = null)
+    {
         UsageWindow[] windows = snapshot.Buckets
             .SelectMany(bucket => bucket.Windows)
             .ToArray();
@@ -63,7 +68,7 @@ public sealed class QuotaResumeProbe : IClaudeUsageProbe
                        (relevantWindowBlocked || unattributedAggregateBlock);
         bool ready = snapshot.HasData &&
                      snapshot.EvidenceSource == UsageEvidenceSource.OAuth &&
-                     _quota.StorageWarning is null &&
+                     storageWarning is null &&
                      snapshot.UnavailableReason is null &&
                      snapshot.Buckets.Count > 0 &&
                      snapshot.Buckets.All(bucket => bucket.Allowed && !bucket.LimitReached) &&
@@ -88,7 +93,7 @@ public sealed class QuotaResumeProbe : IClaudeUsageProbe
             _logger.LogWarning(
                 "resume.quota.unverified 模型绑定额度门禁没有取得目标模型的实时 OAuth 可用证据,source={Source},storageVerified={StorageVerified},targetModelValid={TargetModelValid},targetScopeCount={TargetScopeCount},hasData={HasData},bucketCount={BucketCount},scopedCount={ScopedCount},carriedCount={CarriedCount}",
                 snapshot.EvidenceSource,
-                _quota.StorageWarning is null,
+                storageWarning is null,
                 targetModelValid,
                 targetScopedWindows.Length,
                 snapshot.HasData,
@@ -123,9 +128,7 @@ public sealed class QuotaResumeProbe : IClaudeUsageProbe
         }
 
         string displayName = window.Name[(window.Name.IndexOf(':') + 1)..];
-        return ClaudeModelFamilies.TryNormalizeScopeName(displayName, out string scopedFamily) &&
-            ClaudeModelFamilies.TryNormalizeConfiguredModel(model, out string configuredFamily) &&
-            string.Equals(scopedFamily, configuredFamily, StringComparison.Ordinal);
+        return ClaudeModelFamilies.ScopeMatchesModel(displayName, model);
     }
 
     private static bool HasCurrentUtilization(UsageWindow? window) =>

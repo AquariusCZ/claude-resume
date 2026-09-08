@@ -317,10 +317,10 @@ public sealed class ResumeEngine : BackgroundService
         string admittedModel;
         while (true)
         {
-            admittedModel = config.ResumeModel;
+            admittedModel = ResumeTarget.Identity(config);
             try
             {
-                probe = await _probe.ProbeAsync(admittedModel, ShadowPaths.Root, cancellationToken);
+                probe = await _probe.ProbeAsync(config, ShadowPaths.Root, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -339,7 +339,7 @@ public sealed class ResumeEngine : BackgroundService
                 return;
             }
 
-            if (SameResumeModel(afterProbe.ResumeModel, admittedModel))
+            if (SameResumeModel(ResumeTarget.Identity(afterProbe), admittedModel))
             {
                 config = afterProbe;
                 break;
@@ -415,7 +415,7 @@ public sealed class ResumeEngine : BackgroundService
                 return;
             }
 
-            if (admission is not null && !SameResumeModel(freshConfig.ResumeModel, admittedModel))
+            if (admission is not null && !SameResumeModel(ResumeTarget.Identity(freshConfig), admittedModel))
             {
                 _logger.LogInformation(
                     "resume.project.quota.model_changed 启动项目前续跑模型变化,丢弃旧证据并重新取证,cycleId={CycleId},oldModel={OldModel},newModel={NewModel}",
@@ -502,11 +502,11 @@ public sealed class ResumeEngine : BackgroundService
                     return;
                 }
 
-                string probeModel = freshConfig.ResumeModel;
+                string probeModel = ResumeTarget.Identity(freshConfig);
                 try
                 {
                     admission = await _probe.ProbeAsync(
-                        probeModel,
+                        freshConfig,
                         ShadowPaths.Root,
                         cancellationToken);
                     admittedModel = probeModel;
@@ -547,7 +547,7 @@ public sealed class ResumeEngine : BackgroundService
                     state.CycleId, project.Name);
                 continue;
             }
-            if (!SameResumeModel(admissionConfig.ResumeModel, admittedModel))
+            if (!SameResumeModel(ResumeTarget.Identity(admissionConfig), admittedModel))
             {
                 _logger.LogInformation(
                     "resume.project.quota.model_changed 额度复核期间续跑模型变化,丢弃旧证据并重新取证,cycleId={CycleId},project={Project},oldModel={OldModel},newModel={NewModel}",
@@ -598,7 +598,7 @@ public sealed class ResumeEngine : BackgroundService
                             startGateRejection = "cycle";
                             return false;
                         }
-                        if (!SameResumeModel(activeConfig.ResumeModel, modelForRun))
+                        if (!SameResumeModel(ResumeTarget.Identity(activeConfig), modelForRun))
                         {
                             startGateRejection = "model";
                             startGateObservedModel = activeConfig.ResumeModel;
@@ -617,7 +617,7 @@ public sealed class ResumeEngine : BackgroundService
                         ProductConfig activeConfig = _configStore.Load();
                         return activeConfig.Armed &&
                             _cycle.TestCycleActive(activeConfig, state.CycleId) &&
-                            SameResumeModel(activeConfig.ResumeModel, modelForRun) &&
+                            SameResumeModel(ResumeTarget.Identity(activeConfig), modelForRun) &&
                             ContainsSelectedProject(activeConfig, project.Path);
                     });
             }
@@ -705,8 +705,8 @@ public sealed class ResumeEngine : BackgroundService
             }
 
             _logger.LogInformation(
-                "resume.project.done 项目续跑完成,cycleId={CycleId},project={Project},status={Status}",
-                state.CycleId, project.Name, result.Status);
+                "resume.project.done 项目续跑完成,cycleId={CycleId},project={Project},status={Status},exitCode={ExitCode}",
+                state.CycleId, project.Name, result.Status, result.ExitCode);
 
             if (result.Status == "cancel-pending" && result.RunId is { } pendingRunId)
             {

@@ -11,6 +11,7 @@ using AiResume.Worker.Notifications;
 using AiResume.Worker.Probes;
 using AiResume.Worker.Products;
 using AiResume.Worker.Quota;
+using AiResume.Worker.Resume;
 using AiResume.Wrapper;
 
 namespace AiResume.Gui;
@@ -51,6 +52,8 @@ public sealed class ControlPlaneBridge
     private readonly Func<string, bool?> _activeResumeDetector;
     private readonly string _cutoverConfigPath;
     private readonly bool _demoMode;
+    private readonly Func<CancellationToken, Task<IReadOnlyList<ProviderObservation>>> _providerCatalog;
+    private readonly Func<string, string, IReadOnlyList<string>, ProductConfig, CancellationToken, Task<BoundResumeSelection>> _resumeBinding;
     private int _cutoverInProgress;
 
     public bool IsCutoverInProgress => Volatile.Read(ref _cutoverInProgress) != 0;
@@ -75,7 +78,9 @@ public sealed class ControlPlaneBridge
         Action<string, string>? requestFailureReporter = null,
         Func<bool?>? engineProcessDetector = null,
         Func<string, bool?>? activeResumeDetector = null,
-        bool demoMode = false)
+        bool demoMode = false,
+        Func<CancellationToken, Task<IReadOnlyList<ProviderObservation>>>? providerCatalog = null,
+        Func<string, string, IReadOnlyList<string>, ProductConfig, CancellationToken, Task<BoundResumeSelection>>? resumeBinding = null)
     {
         _demoMode = demoMode;
         // 选目录必须回到 UI 线程弹原生对话框,由宿主窗口注入;测试注入替身,不弹窗。
@@ -101,6 +106,9 @@ public sealed class ControlPlaneBridge
             : _ => false);
         _cutoverConfigPath = cutoverConfigPath ?? CutoverConfigCommand.DefaultConfigPath;
         _quota = quotaService ?? new QuotaService();
+        var providers = new ProviderCatalogService(quota: _quota);
+        _providerCatalog = providerCatalog ?? providers.ReadAsync;
+        _resumeBinding = resumeBinding ?? new ResumeBindingService(providers).BindAsync;
         // 与 Worker 的续跑引擎读写同一份 shadow 配置/状态:GUI 布防 → 引擎消费。
         _configStore = configStore ?? new ProductConfigStore(ShadowPaths.Root);
         _stateStore = stateStore ?? new ProductStateStore(ShadowPaths.RunDatabasePath);
@@ -146,7 +154,8 @@ public sealed class ControlPlaneBridge
                 "quota.get" => await GetQuotaAsync(root, cancellationToken).ConfigureAwait(false),
                 "quota.local" => await Task.Run(() => GetLocalBlock(), cancellationToken).ConfigureAwait(false),
                 "arm.get" => await Task.Run(() => GetArm(), cancellationToken).ConfigureAwait(false),
-                "arm.set" => await Task.Run(() => SetArm(root), cancellationToken).ConfigureAwait(false),
+                "arm.set" => await Task.Run(() => SetArmAsync(root, cancellationToken), cancellationToken).ConfigureAwait(false),
+                "providers.catalog" => new { items = (await _providerCatalog(cancellationToken).ConfigureAwait(false)).Select(p => p.ToPayload()) },
                 "providers.probe" => await ProbeProvidersAsync(root, cancellationToken).ConfigureAwait(false),
                 "agent.get" => await Task.Run(() => GetAgent(), cancellationToken).ConfigureAwait(false),
                 "agent.set" => await Task.Run(() => SetAgent(root), cancellationToken).ConfigureAwait(false),
@@ -219,6 +228,11 @@ public sealed class ControlPlaneBridge
                     new { name = "weekly_scoped:fable", label = "Fable", status = "blocked", usedPercent = 100, windowSeconds = 604_800, resetAtUnix = now + 180_000, resetAfterSeconds = 180_000, windowStartUnix = now - 424_800, carriedForward = false },
                 },
             },
+            "providers.catalog" => new { items = new object[] {
+                new { id = "claude-subscription", name = "Claude · Anthropic 订阅", agent = "claudecode", kind = "claude-oauth", models = new[] { new { id = "claude-fable-5-1", name = "Claude Fable 5.1" }, new { id = "claude-opus-5", name = "Claude Opus 5" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = true, resumeNote = "布防后固定调用 ID", windows = new[] { new { name = "Fable", usedPercent = 100, carriedForward = false } } },
+                new { id = "deepseek", name = "DeepSeek · 官方 API", agent = "claudecode", kind = "deepseek", models = new[] { new { id = "deepseek-v4-flash", name = "deepseek-v4-flash" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = false, balance = 47.77, currency = "CNY", resumeNote = "固定调用 ID；同一 ID 的后端可能更新" },
+                new { id = "codex-active", name = "Codex · 第三方供应商", agent = "codex", kind = "openai-api", models = new[] { new { id = "example-model", name = "供应商模型" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = false, balance = 518.52, currency = "USD", resumeNote = "布防后固定调用 ID" }
+            } },
             "providers.probe" => new
             {
                 deep = false,
@@ -230,9 +244,10 @@ public sealed class ControlPlaneBridge
             },
             "arm.get" => new
             {
-                armed = true,
+                armed = !Environment.GetCommandLineArgs().Contains("--screenshot-provider"),
                 continuous = true,
-                resumeModel = "fable",
+                resumeModel = "claude-fable-5-1",
+                resumeTarget = new ResumeTarget { ProviderId = "claude-subscription", ProviderName = "Claude · Anthropic 订阅", ProviderIdentity = "demo", Agent = "claudecode", ModelId = "claude-fable-5-1", ModelName = "Claude Fable 5.1", BoundAtUtc = DateTimeOffset.UtcNow },
                 cycleId = "demo-cycle",
                 phase = "waiting",
                 sawLimited = true,
@@ -659,7 +674,7 @@ public sealed class ControlPlaneBridge
             return new ArmPayload(
                 config.Armed,
                 config.Continuous,
-                ResumeModelSelection(config.ResumeModel),
+                config.ResumeModel,
                 config.ArmCycleId,
                 string.Empty,
                 false,
@@ -667,7 +682,7 @@ public sealed class ControlPlaneBridge
                 Array.Empty<ProjectStatusItem>(),
                 unreadableVerdict.ToString(),
                 EngineLiveness.Describe(unreadableVerdict),
-                null);
+                null, config.ResumeTarget);
         }
 
         CheckerState state = snapshot.State;
@@ -804,7 +819,7 @@ public sealed class ControlPlaneBridge
         return new ArmPayload(
             config.Armed,
             config.Continuous,
-            ResumeModelSelection(config.ResumeModel),
+            config.ResumeModel,
             config.ArmCycleId,
             currentCycle ? state.Phase : string.Empty,
             currentCycle && state.SawLimited,
@@ -812,7 +827,7 @@ public sealed class ControlPlaneBridge
             statuses,
             verdict.ToString(),
             EngineLiveness.Describe(verdict),
-            probeAge);
+            probeAge, config.ResumeTarget, currentCycle ? state.LastProbeReason : string.Empty);
     }
 
     private static ProjectStatusItem DescribeProjectStatus(string path, string? status)
@@ -829,6 +844,8 @@ public sealed class ControlPlaneBridge
             "no-claude" => ("failure", "Claude 或项目不可用"),
             "prompt-multiline" => ("failure", "续跑提示词无效"),
             "launch-error" => ("failure", "启动失败"),
+            "configuration-changed" => ("waiting", "配置已改变，请重新布防"),
+            "execution-unverified" => ("waiting", "执行条件未核实，请重新布防"),
             "registry-error" => ("failure", "进程登记失败"),
             "monitor-error" => ("failure", "进程监控失败"),
             "limited-side-effects" => ("failure", "限流前已执行操作"),
@@ -878,21 +895,24 @@ public sealed class ControlPlaneBridge
     /// **只改本次负责的字段后写回**:配置可能同时被 Worker 的续跑引擎修改(解除布防),
     /// 整体写回旧快照会互相覆盖。
     /// </summary>
-    private ArmPayload SetArm(JsonElement root)
+    private async Task<ArmPayload> SetArmAsync(JsonElement root, CancellationToken ct)
     {
         bool armed = root.TryGetProperty("armed", out JsonElement armedEl) && armedEl.ValueKind == JsonValueKind.True;
 
         var paths = new List<string>();
         string resumeModel = string.Empty;
+        BoundResumeSelection? binding = null;
+        ProductConfig original = _configStore.Load();
+        string originalIntent = JsonSerializer.Serialize(original, ProductConfig.JsonOptions);
         if (armed)
         {
             string? requestedModel = root.TryGetProperty("resumeModel", out JsonElement modelEl) &&
                 modelEl.ValueKind == JsonValueKind.String
                     ? modelEl.GetString()
                     : null;
-            if (!ClaudeModelFamilies.TryNormalizeConfiguredModel(requestedModel, out resumeModel))
+            if (requestedModel is null || !ProviderModels.IsSafeId(requestedModel))
             {
-                throw new ArgumentException("请选择有效的续跑模型(Fable、Opus、Sonnet 或 Haiku)。");
+                throw new ArgumentException("请选择供应商目录中的有效续跑模型。");
             }
 
             if (root.TryGetProperty("paths", out JsonElement pathsEl) && pathsEl.ValueKind == JsonValueKind.Array)
@@ -906,6 +926,10 @@ public sealed class ControlPlaneBridge
             {
                 throw new ArgumentException("未选择任何项目,无法布防。");
             }
+            string providerId = root.TryGetProperty("providerId", out JsonElement providerEl) && providerEl.ValueKind == JsonValueKind.String
+                ? providerEl.GetString()! : "claude-subscription";
+            binding = await _resumeBinding(providerId, requestedModel, paths, original, ct).ConfigureAwait(false);
+            resumeModel = binding.Target.ModelId;
         }
 
         // 锁内重读后只改本次负责的字段:续跑引擎可能正好在周期结束时写同一份配置。
@@ -913,14 +937,10 @@ public sealed class ControlPlaneBridge
         {
             if (armed)
             {
-                // 名称由路径推导即可:它只用于日志与列表显示,GUI 自己那份列表才是展示真身。
-                // **刻意不调 _catalog.Discover 去查名字**——那会为一个纯装饰字段引入一次全盘扫描,
-                // 还会连带写索引文件,让"布防"这个本该纯粹的配置写入变得可能失败。
-                config.Selected = paths.Select(p => new ProjectRef
-                {
-                    Path = p,
-                    Name = Path.GetFileName(p.TrimEnd('\\', '/')) is { Length: > 0 } n ? n : p,
-                }).ToList();
+                if (JsonSerializer.Serialize(config, ProductConfig.JsonOptions) != originalIntent)
+                    throw new InvalidOperationException("布防期间设置已改变，请重试");
+                config.Selected = binding!.Projects.ToList();
+                config.ResumeTarget = binding.Target;
 
                 config.Enabled = true;
                 config.Armed = true;
@@ -941,11 +961,6 @@ public sealed class ControlPlaneBridge
 
         return GetArm();
     }
-
-    private static string ResumeModelSelection(string? configuredModel) =>
-        ClaudeModelFamilies.TryNormalizeConfiguredModel(configuredModel, out string family)
-            ? family
-            : string.Empty;
 
     /// <summary>
     /// 本地 5 小时块:直接读会话 jsonl 计算,**不起进程、毫秒级**,所以开窗即可渲染。
@@ -1798,7 +1813,9 @@ public sealed class ControlPlaneBridge
         [property: JsonPropertyName("projectStatus")] IReadOnlyList<ProjectStatusItem> ProjectStatus,
         [property: JsonPropertyName("engine")] string Engine,
         [property: JsonPropertyName("engineText")] string EngineText,
-        [property: JsonPropertyName("probeAgeSeconds")] long? ProbeAgeSeconds);
+        [property: JsonPropertyName("probeAgeSeconds")] long? ProbeAgeSeconds,
+        [property: JsonPropertyName("resumeTarget")] ResumeTarget? ResumeTarget = null,
+        [property: JsonPropertyName("probeReason")] string ProbeReason = "");
 
     private sealed record ProjectStatusItem(
         [property: JsonPropertyName("path")] string Path,

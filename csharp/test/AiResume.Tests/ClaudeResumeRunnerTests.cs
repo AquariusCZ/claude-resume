@@ -27,6 +27,7 @@ public sealed class FakeSupervisor : IProcessSupervisor
     private readonly bool _throwOnCancel;
     private readonly bool _throwCanceledOnStart;
     private readonly string? _startErrorCode;
+    private readonly int _helperExitCode;
 
     public List<ProcessStartRequest> StartRequests { get; } = new();
     public int StartCallCount { get; private set; }
@@ -41,7 +42,8 @@ public sealed class FakeSupervisor : IProcessSupervisor
         bool cancelChildPending = false,
         bool throwOnCancel = false,
         bool throwCanceledOnStart = false,
-        string? startErrorCode = null)
+        string? startErrorCode = null,
+        int helperExitCode = 0)
     {
         _outText = outText;
         _errText = errText;
@@ -55,6 +57,7 @@ public sealed class FakeSupervisor : IProcessSupervisor
         _throwOnCancel = throwOnCancel;
         _throwCanceledOnStart = throwCanceledOnStart;
         _startErrorCode = startErrorCode;
+        _helperExitCode = helperExitCode;
     }
 
     public Task<ProcessStartResult> StartAsync(ProcessStartRequest request, CancellationToken cancellationToken)
@@ -69,6 +72,14 @@ public sealed class FakeSupervisor : IProcessSupervisor
         // 从 Arguments 中解析重定向目标路径:格式为 > "路径" 2> "路径"
         var outPath = ExtractRedirectPath(request.Arguments, ">");
         var errPath = ExtractRedirectPath(request.Arguments, "2>");
+        if (request.Arguments.StartsWith("internal-agent-run ", StringComparison.Ordinal))
+        {
+            var spec = System.Text.Json.JsonSerializer.Deserialize<AgentExecSpec>(
+                Convert.FromBase64String(request.Arguments["internal-agent-run ".Length..]))!;
+            outPath = spec.OutputPath;
+            errPath = spec.ErrorPath;
+            File.WriteAllText(outPath + ".exit", _helperExitCode.ToString());
+        }
 
         if (outPath != null)
         {
@@ -183,6 +194,35 @@ public sealed class ClaudeResumeRunnerTests : IDisposable
     private ClaudeResumeRunner CreateRunner(IProcessSupervisor supervisor, string? claudeCommand = null)
     {
         return new ClaudeResumeRunner(supervisor, claudeCommand ?? _claudePath);
+    }
+
+    [Theory]
+    [InlineData("", "{\"type\":\"result\",\"is_error\":false}", 0, "exit-null")]
+    [InlineData("", "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"blocked\"}}", 1, "exit-null")]
+    [InlineData("{\"type\":\"result\",\"is_error\":false}", "", 0, "success")]
+    [InlineData("{\"type\":\"result\",\"is_error\":false}", "", 7, "exit-null")]
+    [InlineData("{\"type\":\"result\",\"is_error\":false}\n{\"type\":\"result\",\"is_error\":true}", "", 0, "exit-null")]
+    [InlineData("{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"blocked\"}}", "", 1, "limited")]
+    [InlineData("{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"other\"}\n{\"type\":\"result\",\"is_error\":false}", "", 0, "exit-null")]
+    public async Task 固定模型执行仅从标准输出取得唯一终态(string stdout, string stderr, int exit, string expected)
+    {
+        _config.ResumeModel = "claude-fable-5-1";
+        const string init = "{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"claude-fable-5-1\"}\n";
+        var supervisor = new FakeSupervisor(init + stdout, stderr, helperExitCode: exit);
+        var runner = new ClaudeResumeRunner(supervisor, _claudePath, execution: new IsolatedPlan(_claudePath));
+        ResumeRunResult result = await runner.RunAsync(_project, _config, default);
+        Assert.Equal(expected, result.Status);
+        Assert.Equal(exit, result.ExitCode);
+        Assert.Equal(expected == "success", result.ResultOk);
+        if (expected == "exit-null") Assert.True(result.StopRound);
+    }
+
+    private sealed class IsolatedPlan(string executable) : IProviderExecutionPlan
+    {
+        public ResumeExecutionPlan Create(ProjectRef project, ProductConfig config) =>
+            new(new AgentCommand(executable, Array.Empty<string>()), Array.Empty<string>(),
+                new Dictionary<string, string?>(), "claudecode");
+        public bool IsCurrent(ResumeTarget target) => true;
     }
 
     [Fact]

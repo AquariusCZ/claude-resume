@@ -9,5 +9,8 @@ namespace AiResume.Worker.Probes;
 /// </summary>
 public interface IClaudeUsageProbe
 {
+    Task<ClaudeProbeResult> ProbeAsync(ProductConfig config, string workingDirectory, CancellationToken cancellationToken = default)
+        => ProbeAsync(config.ResumeModel, workingDirectory, cancellationToken);
+
     Task<ClaudeProbeResult> ProbeAsync(string model, string workingDirectory, CancellationToken cancellationToken = default);
 }

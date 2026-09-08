@@ -83,7 +83,11 @@ public static class ClaudeModelFamilies
             value = value[..identitySuffix];
         }
 
-        string[] parts = value.Split([' ', '-', '_'], StringSplitOptions.RemoveEmptyEntries);
+        // 小数点只能分隔版本数字，不能把 Fable..5 或 Fable.5 误认成正常名称。
+        for (int i = 0; i < value.Length; i++)
+            if (value[i] == '.' && (i == 0 || i == value.Length - 1 ||
+                !char.IsAsciiDigit(value[i - 1]) || !char.IsAsciiDigit(value[i + 1]))) return false;
+        string[] parts = value.Split([' ', '-', '_', '.'], StringSplitOptions.RemoveEmptyEntries);
         int familyIndex = parts.Length > 0 &&
             parts[0].Equals("claude", StringComparison.OrdinalIgnoreCase)
                 ? 1
@@ -103,5 +107,20 @@ public static class ClaudeModelFamilies
         family = Families.Single(candidate =>
             candidate.Equals(parts[familyIndex], StringComparison.OrdinalIgnoreCase));
         return true;
+    }
+
+    public static bool ScopeMatchesModel(string scope, string model)
+    {
+        if (!TryNormalizeScopeName(scope, out string family) ||
+            !TryNormalizeConfiguredModel(model, out string configured) || family != configured) return false;
+        string label = scope.Split('#')[0];
+        string[] parts = label.Split([' ', '-', '_', '.'], StringSplitOptions.RemoveEmptyEntries);
+        int index = Array.FindIndex(parts, p => p.Equals(family, StringComparison.OrdinalIgnoreCase));
+        string[] scopeVersion = parts.Skip(index + 1).ToArray();
+        if (scopeVersion.Length == 0 || model.Equals(family, StringComparison.OrdinalIgnoreCase)) return true;
+        if (scopeVersion.Any(p => !p.All(char.IsAsciiDigit))) return false;
+        string[] modelParts = model.Split('-');
+        string[] modelVersion = modelParts.Skip(1).Where(p => p.All(char.IsAsciiDigit) && p.Length < 8).ToArray();
+        return scopeVersion.SequenceEqual(modelVersion, StringComparer.Ordinal);
     }
 }

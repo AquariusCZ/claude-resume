@@ -1,0 +1,154 @@
+using System.Text.Json;
+using AiResume.Core;
+using AiResume.Worker.Probes;
+using Tomlyn;
+using Tomlyn.Model;
+
+namespace AiResume.Worker.Resume;
+
+public sealed record ResumeExecutionPlan(AgentCommand Command, IReadOnlyList<string> Arguments,
+    IReadOnlyDictionary<string, string?> Environment, string Protocol, IDisposable? ConfigurationLease = null) : IDisposable
+{
+    public void Dispose() => ConfigurationLease?.Dispose();
+}
+
+public interface IProviderExecutionPlan
+{
+    ResumeExecutionPlan Create(ProjectRef project, ProductConfig config);
+    bool IsCurrent(ResumeTarget target);
+}
+
+public sealed class ProviderExecutionPlan : IProviderExecutionPlan
+{
+    private readonly ProviderRegistry _registry;
+    private readonly ResumeSessionCatalog _sessions;
+    private readonly Func<string, AgentCommand?> _command;
+    private readonly Func<string, string, IEnumerable<string>> _configurationPaths;
+    private readonly string _codexHome;
+    private readonly Func<bool> _codexWriterLockVerified;
+    public ProviderExecutionPlan(ProviderRegistry registry, ResumeSessionCatalog? sessions = null,
+        Func<string, AgentCommand?>? command = null,
+        Func<string, string, IEnumerable<string>>? configurationPaths = null, string? codexHome = null,
+        Func<bool>? codexWriterLockVerified = null)
+    {
+        _registry = registry;
+        _sessions = sessions ?? new ResumeSessionCatalog();
+        _command = command ?? AgentCommandLocator.Find;
+        _configurationPaths = configurationPaths ?? ExecutionConfigLease.Paths;
+        _codexHome = codexHome ?? CodexAuthProbe.ResolveCodexHome();
+        _codexWriterLockVerified = codexWriterLockVerified ?? (() => AgentCommandLocator.CodexVersion() == "0.148.0");
+    }
+
+    public ResumeExecutionPlan Create(ProjectRef project, ProductConfig config)
+    {
+        string agent = config.ResumeTarget?.Agent ?? "claudecode";
+        var lease = ExecutionConfigLease.Acquire(_configurationPaths(agent, project.Path).Where(path =>
+            !(agent == "claudecode" && Path.GetFileName(path) is ".claude.json" or ".config.json")));
+        try
+        {
+            ResumeExecutionPlan plan = CreateCore(project, config, lease);
+            if (!lease.IsCurrent) throw new InvalidOperationException("配置在验证期间发生变化，请重新布防");
+            return plan with { ConfigurationLease = lease };
+        }
+        catch { lease.Dispose(); throw; }
+    }
+
+    private ResumeExecutionPlan CreateCore(ProjectRef project, ProductConfig config, ExecutionConfigLease lease)
+    {
+        ResumeTarget target = config.ResumeTarget ?? throw new InvalidOperationException("需要重新选择供应商并布防");
+        ProviderConnection? connection = _registry.Find(target.ProviderId);
+        if (!target.IsValid || target.ModelId != config.ResumeModel ||
+            connection?.Identity != target.ProviderIdentity || connection.Agent != target.Agent)
+            throw new InvalidOperationException("供应商或账号已改变，需要重新布防");
+        if (!_sessions.Matches(target.Agent, project)) throw new InvalidOperationException("原生会话归属无法核实");
+        AgentCommand command = _command(target.Agent) ?? throw new InvalidOperationException("执行器未安装");
+        var arguments = new List<string>(command.Prefix);
+        var environment = new Dictionary<string, string?> { ["AI_RESUME_INTERNAL_RUN"] = "1" };
+        if (target.Agent == "claudecode")
+        {
+            if (_sessions.IsClaudeSessionIdle(project.SessionId) != true)
+                throw new InvalidOperationException("原生 Claude 会话仍被客户端占用或状态未核实，请先关闭该会话");
+            ClaudeHostProvider.Validate(command, project.Path);
+            environment[ClaudeHostProvider.Flag] = "1";
+            environment["ANTHROPIC_BASE_URL"] = connection.Credentials.BaseUrl;
+            environment["ANTHROPIC_API_KEY"] = connection.Credentials.CredentialSource == "anthropic-key" ? connection.Credentials.BearerToken : string.Empty;
+            environment["ANTHROPIC_AUTH_TOKEN"] = connection.Kind == "claude-oauth" || connection.Credentials.CredentialSource == "anthropic-key"
+                ? string.Empty : connection.Credentials.BearerToken;
+            environment["CLAUDE_CODE_OAUTH_TOKEN"] = connection.Kind == "claude-oauth" ? connection.Credentials.BearerToken : string.Empty;
+            arguments.AddRange(new[] { "--resume", project.SessionId, "-p", config.ResumePrompt,
+                "--model", target.ModelId, "--output-format", "stream-json", "--verbose" });
+            if (config.SkipPermissions) arguments.Add("--dangerously-skip-permissions");
+        }
+        else
+        {
+            environment["CODEX_HOME"] = _codexHome;
+            if (!_codexWriterLockVerified()) throw new InvalidOperationException("当前 Codex 的原生会话独占锁尚未核实，请使用原客户端续跑");
+            if (connection.Kind == "chatgpt") throw new InvalidOperationException("目标模型订阅额度尚不能核实");
+            CodexProviderCredentials credentials = connection.Credentials;
+            if (credentials.QueryParameters.Count > 0 || credentials.WireApi != "responses")
+                throw new InvalidOperationException("当前供应商协议或查询参数无法固定，请在客户端调整后重新布防");
+            // 使用本次内存连接固定原 provider，凭据只通过环境传递。
+            // 命令行覆盖优先于 profile 和项目配置，保留其沙箱、审批、hooks 等约束。
+            string provider = credentials.ProviderId ?? throw new InvalidOperationException("供应商 ID 未核实");
+            if (!lease.Holds(Path.Combine(_codexHome, "managed_config.toml")))
+                throw new InvalidOperationException("Codex 管理配置的存在性无法锁定，当前只读取模型与额度，请使用原客户端续跑");
+            if (provider is "openai" or "amazon-bedrock" or "amazon-bedrock-streaming" ||
+                !provider.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-'))
+                throw new InvalidOperationException("当前供应商连接无法固定，额度读取仍可使用");
+            ValidateCodexLayers(provider, project.Path);
+            void Override(string key, string value) => arguments.AddRange(new[] { "-c", key + "=" + value });
+            Override("model_provider", JsonSerializer.Serialize(provider));
+            Override("model_providers." + provider + ".name", JsonSerializer.Serialize(connection.Name));
+            Override("model_providers." + provider + ".base_url", JsonSerializer.Serialize(credentials.BaseUrl));
+            Override("model_providers." + provider + ".wire_api", "\"responses\"");
+            Override("model_providers." + provider + ".requires_openai_auth", "false");
+            if (!string.IsNullOrEmpty(credentials.BearerToken))
+            {
+                Override("model_providers." + provider + ".env_key", "\"AI_RESUME_PROVIDER_KEY\"");
+                environment["AI_RESUME_PROVIDER_KEY"] = credentials.BearerToken;
+            }
+            if (credentials.RequestHeaders.Keys.Distinct(StringComparer.OrdinalIgnoreCase).Count() != credentials.RequestHeaders.Count ||
+                credentials.RequestHeaders.Values.Any(string.IsNullOrWhiteSpace))
+                throw new InvalidOperationException("供应商请求头为空或存在大小写冲突，无法固定");
+            var headerVariables = new List<string>();
+            int index = 0;
+            foreach (var header in credentials.RequestHeaders)
+            {
+                string variable = "AI_RESUME_HEADER_" + index++;
+                environment[variable] = header.Value;
+                headerVariables.Add(JsonSerializer.Serialize(header.Key) + "=" + JsonSerializer.Serialize(variable));
+            }
+            Override("model_providers." + provider + ".env_http_headers", "{" + string.Join(",", headerVariables) + "}");
+            arguments.AddRange(new[] { "exec", "resume", project.SessionId, config.ResumePrompt,
+                "--model", target.ModelId, "--json", "--skip-git-repo-check" });
+        }
+        return new(command, arguments, environment, target.Agent);
+    }
+
+    public bool IsCurrent(ResumeTarget target) => _registry.Find(target.ProviderId)?.Identity == target.ProviderIdentity;
+
+    private void ValidateCodexLayers(string provider, string project)
+    {
+        string global = Path.GetFullPath(Path.Combine(_codexHome, "config.toml"));
+        foreach (string path in _configurationPaths("codex", project).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (!File.Exists(path)) continue;
+            TomlTable root = TomlSerializer.Deserialize<TomlTable>(File.ReadAllText(path)) ?? throw new InvalidDataException("Codex 配置无法读取");
+            bool primary = Path.GetFullPath(path).Equals(global, StringComparison.OrdinalIgnoreCase);
+            if (!primary && root.Keys.Any(k => k is "model" or "model_provider" or "model_providers" or "profile" or "profiles" or "openai_base_url"))
+                throw new InvalidOperationException("Codex 项目或管理配置覆盖模型连接，无法固定供应商");
+            if (root.ContainsKey("active_profile") || root.ContainsKey("profile_v2"))
+                throw new InvalidOperationException("Codex 配置版本尚无法核实，请使用客户端续跑");
+            if (root.ContainsKey("experimental_thread_store"))
+                throw new InvalidOperationException("Codex 自定义会话存储的独占锁尚未核实");
+            if (primary && root.TryGetValue("model_providers", out object? providers) && providers is TomlTable map &&
+                map.TryGetValue(provider, out object? configured) && configured is TomlTable fields)
+            {
+                string[] allowed = { "name", "base_url", "wire_api", "env_key", "env_key_instructions", "requires_openai_auth", "http_headers", "env_http_headers", "query_params", "request_max_retries", "stream_max_retries", "stream_idle_timeout_ms", "supports_websockets" };
+                if (fields.Keys.Any(k => !allowed.Contains(k, StringComparer.Ordinal)))
+                    throw new InvalidOperationException("Codex 供应商含有尚不能固定的认证或连接配置");
+            }
+        }
+    }
+
+}

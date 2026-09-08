@@ -34,7 +34,7 @@ public sealed class ClaudeOAuthUsageProbe
 
     /// <summary>默认凭据文件路径: %USERPROFILE%\.claude\.credentials.json。</summary>
     private static readonly string DefaultCredentialsPath =
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", ".credentials.json");
+        Path.Combine(Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude"), ".credentials.json");
 
     private readonly HttpClient _httpClient;
     private readonly string _credentialsPath;
@@ -55,7 +55,7 @@ public sealed class ClaudeOAuthUsageProbe
 
         if (httpClient is null)
         {
-            _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+            _httpClient = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(15) };
         }
         else
         {
@@ -173,7 +173,7 @@ public sealed class ClaudeOAuthUsageProbe
     }
 
     /// <summary>读取凭据文件并提取 access token。失败时返回分类原因,不抛异常。</summary>
-    private (bool Ok, string? AccessToken, string CredentialFingerprint, string? FailureReason) ReadAccessToken()
+    internal (bool Ok, string? AccessToken, string CredentialFingerprint, string? FailureReason) ReadAccessToken()
     {
         string json;
         try
@@ -655,7 +655,7 @@ public sealed class ClaudeOAuthUsageProbe
         string.Equals(kind, "weekly_all", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(kind, "weekly_scoped", StringComparison.OrdinalIgnoreCase);
 
-    private static string ResolveClaudeCodeUserAgent()
+    internal static string ResolveClaudeCodeUserAgent()
     {
         try
         {

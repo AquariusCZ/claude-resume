@@ -194,6 +194,16 @@ public partial class MainWindow : Window
             // 12 秒是被额度探测抬上来的:它要拉起 claude 子进程,冷缓存实测约 7 秒
             // (项目发现只要几十毫秒)。截图是自测通道,宁可慢也不要截出"正在探测"。
             await Task.Delay(_screenshotMode ? 2000 : 20000).ConfigureAwait(true);
+            int providerIndex = Array.FindIndex(args, a => a == "--screenshot-provider");
+            if (_screenshotMode && providerIndex >= 0 && providerIndex + 1 < args.Length &&
+                args[providerIndex + 1] is "deepseek" or "codex-active")
+            {
+                string provider = System.Text.Json.JsonSerializer.Serialize(args[providerIndex + 1]);
+                await Host.CoreWebView2.ExecuteScriptAsync(
+                    "const p=document.getElementById('resumeProvider');p.value=" + provider +
+                    ";p.dispatchEvent(new Event('change'));const m=document.getElementById('resumeModel');m.selectedIndex=1;m.dispatchEvent(new Event('change'));");
+                await Task.Delay(100).ConfigureAwait(true);
+            }
             Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(target))!);
             await using var fs = new FileStream(target, FileMode.Create, FileAccess.Write);
             await Host.CoreWebView2.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png, fs)

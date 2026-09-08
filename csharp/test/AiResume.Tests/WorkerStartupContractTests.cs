@@ -39,7 +39,9 @@ public sealed class WorkerStartupContractTests
 
         IClaudeUsageProbe admission = provider.GetRequiredService<IClaudeUsageProbe>();
 
-        Assert.IsType<QuotaResumeProbe>(admission);
+        Assert.IsType<ProviderResumeProbe>(admission);
+        Assert.NotNull(provider.GetRequiredService<QuotaResumeProbe>());
+        Assert.NotNull(provider.GetRequiredService<ProviderCatalogService>());
         Assert.Same(admission, provider.GetRequiredService<IClaudeUsageProbe>());
         Assert.Contains("builder.Services.AddQuotaResumeAdmission();", source, StringComparison.Ordinal);
         Assert.DoesNotContain("AddSingleton<IClaudeUsageProbe>", source, StringComparison.Ordinal);

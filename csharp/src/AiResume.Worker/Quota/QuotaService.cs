@@ -22,6 +22,7 @@ public sealed class QuotaService
     private readonly Func<CancellationToken, Task<OAuthUsageResult>>? _oauthProbe;
     private readonly Func<DateTimeOffset> _clock;
     private readonly QuotaSnapshotStore? _authoritativeStore;
+    private readonly bool _allowCliFallback;
     private readonly SemaphoreSlim _gate = new(1, 1);
 
     private UsageSnapshot? _cached;
@@ -34,9 +35,12 @@ public sealed class QuotaService
         Func<CancellationToken, Task<ClaudeProbeResult>>? probe = null,
         Func<DateTimeOffset>? clock = null,
         Func<CancellationToken, Task<OAuthUsageResult>>? oauthProbe = null,
-        QuotaSnapshotStore? authoritativeStore = null)
+        QuotaSnapshotStore? authoritativeStore = null,
+        bool? allowCliFallback = null)
     {
         _probe = probe ?? DefaultProbeAsync;
+        // 现役生产刷新只读取元数据。显式注入的探针保留诊断/隔离测试兼容。
+        _allowCliFallback = allowCliFallback ?? probe is not null;
         // 注入了自定义 probe 的调用方(测试)默认不启用 OAuth 主路径,
         // 否则测试会意外走真实凭据与真实网络。
         _oauthProbe = oauthProbe ?? (probe is null ? DefaultOAuthProbeAsync : null);
@@ -79,7 +83,7 @@ public sealed class QuotaService
                 OAuthUsageResult oauth = await TryOAuthAsync(cancellationToken).ConfigureAwait(false);
                 if (oauth is { Ok: true, Snapshot: { HasData: true } viaOAuth })
                 {
-                    viaOAuth = viaOAuth with { EvidenceSource = UsageEvidenceSource.OAuth };
+                    viaOAuth = viaOAuth with { EvidenceSource = UsageEvidenceSource.OAuth, CredentialFingerprint = oauth.CredentialFingerprint };
                     if (_authoritativeStore is not null && oauth.CredentialFingerprint.Length > 0 &&
                         _authoritativeStore.TryUpdate(
                             UsageSnapshotMapper.ProviderName,
@@ -103,10 +107,11 @@ public sealed class QuotaService
                     // oauth/usage 与 CLI rate_limit_event 都是部分观测:某次没出现某个
                     // window/percent 不代表它被撤销。保存合并后的账号级最新证据,
                     // 但任何承接值都受原服务端 resetAt 约束。
+                    snapshot = snapshot with { CredentialFingerprint = oauth.CredentialFingerprint };
                     _lastAuthoritative = snapshot;
                     _lastAuthoritativeFingerprint = oauth.CredentialFingerprint;
                 }
-                else
+                else if (_allowCliFallback)
                 {
                     ClaudeProbeResult result = await _probe(cancellationToken).ConfigureAwait(false);
                     UsageSnapshot fallback = UsageSnapshotMapper.FromProbe(result, now) with
@@ -115,6 +120,12 @@ public sealed class QuotaService
                     };
                     UsageSnapshot? authoritative = ResolveAuthoritative(oauth.CredentialFingerprint);
                     snapshot = MergeSparseObservation(fallback, authoritative, now);
+                }
+                else
+                {
+                    UsageSnapshot unavailable = UsageSnapshot.Unavailable(UsageSnapshotMapper.ProviderName, now,
+                        "Claude 订阅额度未核实，请检查登录或稍后刷新");
+                    snapshot = MergeSparseObservation(unavailable, ResolveAuthoritative(oauth.CredentialFingerprint), now);
                 }
             }
             catch (OperationCanceledException)

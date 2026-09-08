@@ -1470,6 +1470,37 @@ public sealed class ResumeEngineTests : IDisposable
         Assert.Equal(3, _runner.CallCount);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task 同模型供应商身份在异步或最终门禁变化时废弃旧额度(bool atSpawn)
+    {
+        ProductConfig config = ArmedConfig();
+        config.ResumeModel = "claude-fable-5-1";
+        config.ResumeTarget = new() { ProviderId = "claude-subscription", ProviderIdentity = "account-a", Agent = "claudecode", ModelId = config.ResumeModel };
+        _configStore.Save(config);
+        var state = CheckerState.CreateDefault();
+        state.CycleId = config.ArmCycleId;
+        state.SawLimited = true;
+        state.Phase = CheckerState.PhaseWaiting;
+        _stateStore.Save(state);
+        _probe.Results.Enqueue(new ClaudeProbeResult { Ready = true, Reason = "ok" });
+        _probe.Results.Enqueue(new ClaudeProbeResult { Ready = false, Reason = "limited" });
+        bool changed = false;
+        void Change()
+        {
+            if (changed) return;
+            changed = true;
+            _configStore.Update(current => current.ResumeTarget = current.ResumeTarget! with { ProviderIdentity = "account-b" });
+        }
+        if (atSpawn) _runner.BeforeStart = _ => Change();
+        else _probe.AfterProbe = (_, count) => { if (count == 1) Change(); };
+        await _engine.RunOnceAsync(default);
+        Assert.Equal(2, _probe.CallCount);
+        Assert.Equal(0, _runner.CallCount);
+        Assert.True(_stateStore.Load().SawLimited);
+    }
+
     /// <summary>假探测器:按注入序列返回结果,记录调用次数,可配置抛异常。</summary>
     private sealed class FakeProbe : IClaudeUsageProbe
     {

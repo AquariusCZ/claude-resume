@@ -41,7 +41,8 @@ public sealed record CodexProbeResult(
     string Reason,
     string? Summary,
     bool DeepChecked,
-    string? ProviderIdentity = null);
+    string? ProviderIdentity = null,
+    ProviderModelCatalog? Catalog = null);
 
 public sealed class CodexProbe
 {
@@ -111,7 +112,7 @@ public sealed class CodexProbe
         CodexAuthResult auth = await CodexAuthProbe
             .ProbeModelsAsync(provider, _authHandler, ct).ConfigureAwait(false);
 
-        return FromAuthResult(auth) with { ProviderIdentity = providerIdentity };
+        return FromAuthResult(auth) with { ProviderIdentity = providerIdentity, Catalog = auth.Catalog };
     }
 
     public static CodexProbeResult FromAuthResult(CodexAuthResult auth)
@@ -327,7 +328,7 @@ public sealed class CodexProbe
 
         CodexAuthResult auth = await CodexAuthProbe
             .ProbeAsync(provider, _authHandler, ct).ConfigureAwait(false);
-        return FromAuthResult(auth) with { ProviderIdentity = providerIdentity };
+        return FromAuthResult(auth) with { ProviderIdentity = providerIdentity, Catalog = auth.Catalog };
     }
 
     private static bool TryGetCheckStatus(JsonElement checks, string id, out string? status)

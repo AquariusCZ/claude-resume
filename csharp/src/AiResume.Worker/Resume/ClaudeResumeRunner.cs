@@ -99,6 +99,7 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
 
     private readonly IProcessSupervisor _supervisor;
     private readonly string _claudeCommand;
+    private readonly IProviderExecutionPlan? _execution;
     private readonly TimeSpan _pollInterval;
     private readonly int _maxConsecutiveMonitorErrors;
 
@@ -106,8 +107,10 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
         IProcessSupervisor supervisor,
         string? claudeCommand = null,
         TimeSpan? pollInterval = null,
-        int maxConsecutiveMonitorErrors = MaxConsecutiveMonitorErrors)
+        int maxConsecutiveMonitorErrors = MaxConsecutiveMonitorErrors,
+        IProviderExecutionPlan? execution = null)
     {
+        _execution = execution;
         _supervisor = supervisor ?? throw new ArgumentNullException(nameof(supervisor));
         _claudeCommand = string.IsNullOrWhiteSpace(claudeCommand) ? "claude" : claudeCommand;
         _pollInterval = pollInterval is { } interval && interval > TimeSpan.Zero
@@ -147,7 +150,7 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
 
         // 换行必须显式失败:cmd /c 会在首个换行处截断 -p 参数(见 docs/LESSONS.md),
         // 静默截断等于跑了一个与用户意图不同的提示词。
-        if (config.ResumePrompt.Contains('\r') || config.ResumePrompt.Contains('\n'))
+        if (_execution is null && (config.ResumePrompt.Contains('\r') || config.ResumePrompt.Contains('\n')))
         {
             return result with { Status = "prompt-multiline" };
         }
@@ -158,6 +161,10 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
 
         try
         {
+            using ResumeExecutionPlan? plan = _execution?.Create(project, config);
+            bool CurrentPlan() => (plan?.ConfigurationLease is not ExecutionConfigLease lease || lease.IsCurrent) &&
+                (config.ResumeTarget is not { } bound || _execution?.IsCurrent(bound) != false);
+            if (!CurrentPlan()) return result with { Status = "configuration-changed", StopRound = true };
             // product_state 必须先持久化本次 RunId,再交给 ProcessSupervisor 登记并 spawn。
             // 否则 Worker 在 spawn 成功到回调落盘之间崩溃时,新 Worker 无法识别这次运行,
             // 可能自动重放已经产生过副作用的项目。
@@ -180,20 +187,22 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
 
                 result = result with { PreparedRunId = runId };
             }
+            if (!CurrentPlan()) return result with { Status = "configuration-changed", StopRound = true };
 
             var request = new ProcessStartRequest
             {
                 RunId = runId,
-                FileName = "cmd.exe",
-                Arguments = BuildArguments(config, tmpOut, tmpErr),
+                FileName = plan is null ? "cmd.exe" : Path.Combine(AppContext.BaseDirectory, "AiResume.Worker.exe"),
+                Arguments = plan is null ? BuildArguments(config, tmpOut, tmpErr) : "internal-agent-run " +
+                    AgentExecCommand.Encode(new(plan.Command.Executable, plan.Arguments, tmpOut, tmpErr)),
                 WorkingDirectory = projectPath,
                 // 红线:AI Resume 自己启动的进程必须带内部标记,否则 Claude Code 的 Stop hook
                 // 会被 AiResume.Hook 当成用户任务完成,每次续跑伪造一条通知。
-                Environment = new Dictionary<string, string?>
+                Environment = plan?.Environment ?? new Dictionary<string, string?>
                 {
                     [ClaudeCodeProbe.InternalRunEnvName] = "1",
                 },
-                CommandSignature = "cmd.exe",
+                CommandSignature = plan is null ? "cmd.exe" : "AiResume.Worker.exe",
             };
 
             ProcessStartResult startResult;
@@ -243,7 +252,8 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
             string? terminalStatus = await WaitForExitAsync(
                 runId,
                 cancellationToken,
-                shouldContinue).ConfigureAwait(false);
+                run => (shouldContinue is null || shouldContinue(run) == true) &&
+                    CurrentPlan()).ConfigureAwait(false);
             if (terminalStatus is not null)
             {
                 return result with
@@ -258,8 +268,48 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
             await Task.Delay(RescanDelayMs, CancellationToken.None).ConfigureAwait(false);
 
             long outputBytes = FileLength(tmpOut) + FileLength(tmpErr);
-            string blob = SafeRead(tmpOut) + "\n" + SafeRead(tmpErr);
+            string stdout = SafeRead(tmpOut);
+            string stderr = SafeRead(tmpErr);
+            // SDK 终态仅来自 stdout；stderr 不授予成功或自动重放权限。
+            string blob = plan is null ? stdout + "\n" + stderr : stdout;
 
+            int? exitCode = int.TryParse(SafeRead(tmpOut + ".exit").Trim(), out int parsedExit) ? parsedExit : null;
+            result = result with { ExitCode = exitCode };
+            if (plan is not null && exitCode is null)
+                return result with { Status = "exit-null", StopRound = true, SideEffectsStarted = true, OutputBytes = outputBytes };
+            if (plan?.Protocol == "codex")
+            {
+                var codex = new CodexResumeEvidence();
+                foreach (string line in SafeRead(tmpOut).Split('\n', '\r'))
+                    if (!string.IsNullOrWhiteSpace(line)) codex.Inspect(line, project.SessionId);
+                return result with { Status = codex.Success && exitCode == 0 ? "success" : "exit-null", ResultOk = codex.Success && exitCode == 0,
+                    SideEffectsStarted = codex.SideEffects, StopRound = !codex.Success || exitCode != 0, OutputBytes = outputBytes };
+            }
+
+            bool actualModelMatched = plan is null;
+            bool invalidProtocol = false;
+            int initCount = 0, resultCount = 0;
+            if (plan is not null)
+            {
+                foreach (string line in SafeRead(tmpOut).Split('\n', '\r').Where(l => !string.IsNullOrWhiteSpace(l)))
+                {
+                    try
+                    {
+                        using JsonDocument document = JsonDocument.Parse(line);
+                        JsonElement row = document.RootElement;
+                        string? type = row.GetProperty("type").GetString();
+                        if (type == "system" && row.TryGetProperty("subtype", out JsonElement subtype) && subtype.GetString() == "init")
+                        {
+                            invalidProtocol |= ++initCount != 1;
+                            actualModelMatched = row.TryGetProperty("model", out JsonElement model) && model.GetString() == config.ResumeModel;
+                            invalidProtocol |= !actualModelMatched;
+                        }
+                        if (type == "result") invalidProtocol |= ++resultCount != 1 || initCount != 1;
+                        if (type is not ("system" or "assistant" or "user" or "result" or "rate_limit_event" or "stream_event")) invalidProtocol = true;
+                    }
+                    catch (Exception) { invalidProtocol = true; }
+                }
+            }
             var evidence = new NdjsonEvidence();
             foreach (string line in blob.Split('\n', '\r'))
             {
@@ -275,21 +325,28 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
             // 而真被限流的运行永远不会以 is_error:false 收尾;顺序反了会把成功误判成限流,
             // 进而错误地把整轮续跑打回等待。
             // ProcessStatus 不提供退出码,兜底一律 exit-null(不得据退出码判成功)。
-            string status = evidence.ResultOk
+            bool success = evidence.ResultOk && (plan is null || (exitCode == 0 && resultCount == 1)) && actualModelMatched && !invalidProtocol;
+            bool retryableLimit = evidence.Limited && actualModelMatched && !invalidProtocol &&
+                                  (plan is null || string.IsNullOrWhiteSpace(stderr));
+            string status = success
                 ? "success"
-                : evidence.Limited
+                : retryableLimit
                     ? evidence.SideEffectsStarted ? "limited-side-effects" : "limited"
                     : "exit-null";
 
             return result with
             {
                 Status = status,
-                ResultOk = evidence.ResultOk,
+                ResultOk = success,
                 Limited = evidence.Limited,
                 SideEffectsStarted = evidence.SideEffectsStarted,
-                StopRound = status == "limited-side-effects",
+                StopRound = status == "limited-side-effects" || (plan is not null && status == "exit-null"),
                 OutputBytes = outputBytes,
             };
+        }
+        catch (InvalidOperationException) when (_execution is not null && result.RunId is null)
+        {
+            return result with { Status = "execution-unverified", StopRound = true };
         }
         catch (Exception)
         {
@@ -299,6 +356,7 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
         {
             TryDelete(tmpOut);
             TryDelete(tmpErr);
+            TryDelete(tmpOut + ".exit");
         }
     }
 

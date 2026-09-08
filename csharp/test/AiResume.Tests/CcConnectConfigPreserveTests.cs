@@ -467,12 +467,12 @@ public sealed class CcConnectConfigPreserveTests : IDisposable
         Assert.DoesNotContain("model = \"gpt-5.6-sol\"", result, StringComparison.Ordinal);
         Assert.DoesNotContain("model = \"gpt-5.6-terra\"", result, StringComparison.Ordinal);
         Assert.DoesNotContain("model = \"gpt-5.6-luna\"", result, StringComparison.Ordinal);
-        Assert.Contains("alias = \"[AI Resume] GPT-5.6（当前默认）\"", result, StringComparison.Ordinal);
+        Assert.Contains("alias = \"[AI Resume] gpt-5.6\"", result, StringComparison.Ordinal);
         Assert.Equal(1, CountOccurrences(result, "[[providers.agent_model_lists.codex]]"));
     }
 
     [Fact]
-    public void 当前Codex模型列表连续生成保持四项且字节幂等()
+    public void 当前Codex默认模型连续生成保持单项且字节幂等()
     {
         string path = Path.Combine(NewDir(), "config.toml");
         File.WriteAllText(path, """
@@ -491,7 +491,7 @@ public sealed class CcConnectConfigPreserveTests : IDisposable
         byte[] second = File.ReadAllBytes(path);
 
         Assert.Equal(first, second);
-        Assert.Equal(4, CountOccurrences(File.ReadAllText(path), "[[providers.agent_model_lists.codex]]"));
+        Assert.Equal(1, CountOccurrences(File.ReadAllText(path), "[[providers.agent_model_lists.codex]]"));
     }
 
     [Fact]
@@ -515,8 +515,8 @@ public sealed class CcConnectConfigPreserveTests : IDisposable
         CcConnectConfigGenerator.Write(path, sample);
         string result = File.ReadAllText(path);
 
-        Assert.Equal(4, CountOccurrences(result, "[[providers.agent_model_lists.codex]]"));
-        Assert.Contains("alias = \"[AI Resume] GPT-5.6 Sol（旗舰）\"", result, StringComparison.Ordinal);
+        Assert.Equal(1, CountOccurrences(result, "[[providers.agent_model_lists.codex]]"));
+        Assert.Contains("alias = \"[AI Resume] gpt-5.6\"", result, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -572,9 +572,9 @@ public sealed class CcConnectConfigPreserveTests : IDisposable
         CcConnectConfigGenerator.Write(path, sample);
         string result = File.ReadAllText(path);
 
-        Assert.Equal(3, CountOccurrences(result, "[[providers.agent_model_lists.codex]]"));
-        Assert.DoesNotContain("alias = \"[AI Resume] GPT-5.6（当前默认）\"", result, StringComparison.Ordinal);
-        Assert.Contains("alias = \"[AI Resume] GPT-5.6 Luna（经济高吞吐）\"", result, StringComparison.Ordinal);
+        Assert.Equal(1, CountOccurrences(result, "[[providers.agent_model_lists.codex]]"));
+        Assert.DoesNotContain("alias = \"[AI Resume] gpt-5.6\"", result, StringComparison.Ordinal);
+        Assert.Contains("alias = \"[AI Resume] gpt-5.6-luna\"", result, StringComparison.Ordinal);
     }
 
     [Fact]

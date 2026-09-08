@@ -10,6 +10,9 @@ public sealed class ProjectRef
     public string Name { get; set; } = string.Empty;
 
     public string Path { get; set; } = string.Empty;
+
+    /// <summary>布防时固定的原生会话 UUID，执行时禁止用全局 --last 猜测。</summary>
+    public string SessionId { get; set; } = string.Empty;
 }
 
 /// <summary>
@@ -55,6 +58,9 @@ public sealed class ProductConfig
     public string ProbeModel { get; set; } = "haiku";
 
     public string ResumeModel { get; set; } = string.Empty;
+
+    /// <summary>布防时固定的供应商、账号和实际模型；旧配置缺失时需重新布防。</summary>
+    public ResumeTarget? ResumeTarget { get; set; }
 
     public string ResumePrompt { get; set; } = "continue";
 

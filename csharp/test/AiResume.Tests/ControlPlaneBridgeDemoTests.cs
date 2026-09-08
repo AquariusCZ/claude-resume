@@ -57,7 +57,7 @@ public sealed class ControlPlaneBridgeDemoTests
 
         using JsonDocument document = JsonDocument.Parse(response);
         JsonElement payload = document.RootElement.GetProperty("payload");
-        Assert.Equal("fable", payload.GetProperty("resumeModel").GetString());
+        Assert.Equal("claude-fable-5-1", payload.GetProperty("resumeModel").GetString());
         JsonElement[] statuses = payload
             .GetProperty("projectStatus")
             .EnumerateArray()

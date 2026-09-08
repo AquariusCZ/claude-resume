@@ -11,7 +11,11 @@ public static class QuotaResumeServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(services);
 
         services.AddSingleton<QuotaService>();
-        services.AddSingleton<IClaudeUsageProbe, QuotaResumeProbe>();
+        services.AddSingleton<QuotaResumeProbe>();
+        services.AddSingleton<ProviderRegistry>();
+        services.AddSingleton(sp => new ProviderCatalogService(sp.GetRequiredService<ProviderRegistry>(),
+            quota: sp.GetRequiredService<QuotaService>(), quotaProbe: sp.GetRequiredService<QuotaResumeProbe>()));
+        services.AddSingleton<IClaudeUsageProbe, ProviderResumeProbe>();
         return services;
     }
 }

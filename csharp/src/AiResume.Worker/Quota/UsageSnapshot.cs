@@ -22,6 +22,8 @@ public sealed record UsageSnapshot(
     /// 本次快照的直接证据来源。历史 JSON 缺少该字段时默认为 Unknown，
     /// 不能把升级前无法证明来源的快照当成续跑放行证据。
     /// </summary>
+    public string CredentialFingerprint { get; init; } = string.Empty;
+
     public UsageEvidenceSource EvidenceSource { get; init; } = UsageEvidenceSource.Unknown;
 
     /// <summary>

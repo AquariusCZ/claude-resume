@@ -33,6 +33,9 @@ public sealed class CheckerState
     /// <summary>最近一次探测时间(节奏计算基线)。</summary>
     public DateTimeOffset? LastProbeUtc { get; set; }
 
+    /// <summary>最近一次门禁结果的稳定原因码，不含异常正文或凭据。</summary>
+    public string LastProbeReason { get; set; } = string.Empty;
+
     /// <summary>连续被误判限流计数(≥6 防死循环,标记 error 继续)。</summary>
     public int LimitedRefires { get; set; }
 
