@@ -148,7 +148,7 @@ lark-cli 是 larksuite 团队维护的官方 CLI。README 当前声明 18 个业
 
 ## 2026-08-01 Stage 0-11 执行计划
 
-上方旧的 0-4 编号只保留为研究历史；当前执行采用下表。恢复现场与即时工作包顺序见 `RECOVERY-AUDIT-20260801.md`,基线、状态和事件契约分别见 `MIGRATION-BASELINE.md`、`STATE-OWNERSHIP.md`、`EVENT-CONTRACTS.md`，已知问题见 `MIGRATION-DEBT.md`。
+上方旧的 0-4 编号只保留为研究历史；当前执行采用下表。恢复现场与即时工作包顺序见 `history/RECOVERY-AUDIT-20260801.md`,基线、状态和事件契约分别见 `history/MIGRATION-BASELINE.md`、`history/STATE-OWNERSHIP.md`、`EVENT-CONTRACTS.md`，已知问题见 `history/MIGRATION-DEBT.md`。
 
 | 阶段 | 内容 | 出口门禁 |
 |---|---|---|
@@ -186,6 +186,14 @@ lark-cli 是 larksuite 团队维护的官方 CLI。README 当前声明 18 个业
 - 飞书投递继续复用项目已有的 `LarkCliInvoker` 与官方 `lark-cli`，没有自研 SDK 请求的必要。完整证据、准入和冒烟见 `docs/COMPLETION-NOTIFICATIONS.md`。
 - 动态项目发现不依赖当前项目数量。
 
+### 2026-10-12 v2.1 上游盘点(自持凭据、官方 Codex、Codex hooks)
+
+- **Claude Code 2.1.296(CLI)/ 2.1.295(桌面)**:`claude setup-token` 为无人值守签发约一年期 OAuth 令牌,`CLAUDE_CODE_OAUTH_TOKEN` 可供 `-p`;`claude auth status` 给出登录态。原生 `autoContinueAtUsageLimit`(≥2.1.234)只作用于交互式会话,`-p`/后台不生效,不能替代续跑引擎。`Notification` 类型新增 `permission_prompt`、`idle_prompt`、`quota_auto_resume_*`。结论:令牌由官方签发、AI Resume 只保管使用,不实现 OAuth 刷新。
+- **Codex 0.148.0(tag `rust-v0.148.0`)**:hooks 含 `Stop`;非 managed hook 需 `trusted_hash == current_hash`;`hook_key` = `"{key_source}:{event_label}:{group}:{handler}"`,hooks.json 的 `key_source` 为其绝对路径 `display()`;哈希为规范化身份(键排序紧凑 JSON)的 SHA-256,本机 `interrupt` 条目作 oracle 复算一致。`-c key=value` 在 `exec` 前作全局覆盖;内置 `openai` provider 的 base_url 取 `openai_base_url`,缺省按认证模式选 chatgpt backend 或 `api.openai.com/v1`。ChatGPT `/backend-api/wham/usage` 真实返回(本机只读录制):`rate_limit.{allowed,limit_reached,primary_window,secondary_window}`、`additional_rate_limits[]`、`model_usage{slug:{available,available_at}}`、`spend_control.reached`、`rate_limit_reached_type`。
+- **cc-connect v1.4.1**:`cmd` 经 `strings.Fields` 拆分;codex agent 配了 provider 时 `ensureCodexAuth` 重写 `~/.codex/auth.json`(api_key 模式);管理 API 仍无 usage 端点。
+- **Windows DPAPI**:`CRYPTPROTECT_LOCAL_MACHINE (0x4)` 允许同机任何用户解密;S4U session 0 下 CurrentUser 解密会间歇失败(本机 2026-10 日志)。
+- 决策与取舍见 `docs/adr/0005-owned-credentials-official-codex-and-hooks.md`。
+
 ### 执行与成本熔断
 
 1. 每个工作包开始前冻结目标、输入输出、状态所有权、异常边界、验收条件和范围外事项。
@@ -193,5 +201,5 @@ lark-cli 是 larksuite 团队维护的官方 CLI。README 当前声明 18 个业
    DeepSeek 委派统一使用异步 Start/Status/Cancel,每 15-30 秒读取持久状态和进程存活性;静默或本地固定时长不得触发 Cancel。
 3. 单个工作包原则上不超过 4 个生产文件、4 个测试文件或 800 行净变更；超出先拆分。
 4. Codex 审查当前增量并运行针对性测试；完整离线回归和真 API 冒烟只在阶段总门禁各运行一次。
-5. 工作包只做 Codex 主审和针对性测试；整个阶段实现与基础验证完成后，再运行一轮两个独立只读总审查。审查只覆盖冻结门禁、阶段增量和本阶段绑定债务；范围外发现登记到 `MIGRATION-DEBT.md`，不得自动扩大当前阶段。
+5. 工作包只做 Codex 主审和针对性测试；整个阶段实现与基础验证完成后，再运行一轮两个独立只读总审查。审查只覆盖冻结门禁、阶段增量和本阶段绑定债务；范围外发现登记到 `history/MIGRATION-DEBT.md`，不得自动扩大当前阶段。
 6. 未经用户授权不 commit/push/deploy，不连接生产应用，不切换生产消费者。

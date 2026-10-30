@@ -30,7 +30,8 @@ public sealed record CcConnectPlatformOptions(string AppId, string AppSecret, st
 /// </summary>
 public sealed record CcConnectProject(
     string Name, string Agent, string WorkDir, string Mode = "default", string AdminFrom = "",
-    IReadOnlyList<string>? ProviderRefs = null, string SelectedProvider = "", string SelectedModel = "");
+    IReadOnlyList<string>? ProviderRefs = null, string SelectedProvider = "", string SelectedModel = "",
+    string Cmd = "");
 
 /// <summary>cc-connect 整体配置输入;Render 输出确定性 TOML(相同输入 → 相同字节)。</summary>
 public sealed record CcConnectConfig(IReadOnlyList<CcConnectProject> Projects, CcConnectPlatformOptions Feishu)
@@ -142,7 +143,8 @@ public static class CcConnectConfigGenerator
         CcConnectConfig config,
         bool preserveAgentSelection = true,
         Func<string, string?>? validateCandidate = null,
-        bool preserveInlineAgentProviders = true)
+        bool preserveInlineAgentProviders = true,
+        bool removeCodexOnlyProviders = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         CcConnectConfig.Validate(config);
@@ -166,11 +168,16 @@ public static class CcConnectConfigGenerator
                         "切换 agent 时发现项目内联 provider;它不受全局 agent_types 过滤。请先将该 provider 迁移为带 agent_types/endpoints 的全局 [[providers]],或手动移除后重试。");
                 }
                 preserved = ExtractNonProjectSections(existing);
+                if (removeCodexOnlyProviders)
+                {
+                    preserved = RemoveCodexOnlyProviders(preserved, out _);
+                }
                 projectPreservation = ExtractProjectPreservation(
                     existing,
                     preserveAgentSelection,
                     preserveInlineAgentProviders,
-                    config.Projects.FirstOrDefault()?.Name ?? string.Empty);
+                    config.Projects.FirstOrDefault()?.Name ?? string.Empty,
+                    ownCmd: (config.Projects.FirstOrDefault()?.Cmd.Length ?? 0) > 0);
                 preserved = EnsureSelectableProviderModels(preserved, config);
             }
             catch (IOException)
@@ -245,7 +252,7 @@ public static class CcConnectConfigGenerator
 
     private static readonly HashSet<string> OwnedAgentOptionKeys = new(StringComparer.Ordinal)
     {
-        "mode", "work_dir", "env",
+        "mode", "work_dir", "env", "cmd",
     };
 
     /// <summary>
@@ -256,7 +263,8 @@ public static class CcConnectConfigGenerator
         string existingToml,
         bool preserveAgentSelection,
         bool preserveInlineAgentProviders,
-        string projectName)
+        string projectName,
+        bool ownCmd = true)
     {
         if (!TryFindProjectBlock(existingToml, projectName, out string[] lines, out int start, out int end))
         {
@@ -298,6 +306,12 @@ public static class CcConnectConfigGenerator
             else if (HeaderEquals(header, array: false, "projects", "agent", "options"))
             {
                 var owned = new HashSet<string>(OwnedAgentOptionKeys, StringComparer.Ordinal);
+                // cmd 只有在我方真要写它(codex 官方模式)时才算我方字段;claudecode 用户自写的 cmd
+                // (例如指向 shim 的路径)必须原样保留,不能因为键名相同就被当成旧渲染结果丢掉。
+                if (!ownCmd)
+                {
+                    owned.Remove("cmd");
+                }
                 if (!preserveAgentSelection)
                 {
                     owned.Add("provider");
@@ -687,6 +701,78 @@ public static class CcConnectConfigGenerator
     }
 
     /// <summary>
+    /// 删除**只服务 codex** 的全局第三方 provider(<c>agent_types = ["codex"]</c> 精确等于单项)。
+    ///
+    /// 2026-10-12 决策(B1):Codex 一律走官方 ChatGPT/OpenAI 登录。固定上游 v1.4.1
+    /// <c>agent/codex/provider_config.go</c> 的 <c>ensureCodexAuth</c> 会在给 codex 配第三方
+    /// provider 时把 <c>$CODEX_HOME/auth.json</c> 整个改写成 api_key 模式——这会覆盖用户的
+    /// ChatGPT 登录。所以这类 provider 不只是没用,留着就是一颗雷。
+    /// 其它 provider(无 agent_types、或同时服务 claudecode 的)原样保留;被删的名字经
+    /// <paramref name="removed"/> 回报,调用方据此决定要不要先备份。
+    /// </summary>
+    public static string RemoveCodexOnlyProviders(string toml, out IReadOnlyList<string> removed)
+    {
+        var names = new List<string>();
+        removed = names;
+        if (string.IsNullOrWhiteSpace(toml))
+        {
+            return toml;
+        }
+
+        string[] lines = toml.Replace("\r\n", "\n").Split('\n');
+        var drop = new HashSet<int>();
+        foreach (ProviderTextBlock block in FindProviderBlocks(lines))
+        {
+            CcConnectProviderDescriptor? provider;
+            try
+            {
+                provider = CcConnectProviderCatalog.Parse(string.Join("\n", lines[block.Start..block.End])).Providers.LastOrDefault();
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+
+            if (provider is null || provider.AgentTypes.Count != 1 ||
+                !provider.AgentTypes[0].Equals("codex", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            names.Add(provider.Name);
+            for (int i = block.Start; i < block.End; i++)
+            {
+                drop.Add(i);
+            }
+        }
+
+        if (drop.Count == 0)
+        {
+            return toml;
+        }
+
+        var kept = new List<string>(lines.Length);
+        for (int i = 0; i < lines.Length; i++)
+        {
+            if (drop.Contains(i))
+            {
+                continue;
+            }
+
+            // 被删块之前的空行也是它的,不然连续删两个块会留一叠空行。
+            if (string.IsNullOrWhiteSpace(lines[i]) && kept.Count > 0 && string.IsNullOrWhiteSpace(kept[^1]) &&
+                i + 1 < lines.Length && drop.Contains(i + 1))
+            {
+                continue;
+            }
+
+            kept.Add(lines[i]);
+        }
+
+        return string.Join(Environment.NewLine, kept).Trim();
+    }
+
+    /// <summary>
     /// 读回当前 agent 真正可用的全局 provider 名称,供 provider_refs 引用。
     /// TOML 由 Tomlyn 结构化解析;重复名称遵循 cc-connect 的 last-wins 语义。
     /// </summary>
@@ -1032,6 +1118,11 @@ public static class CcConnectConfigGenerator
             sb.Append("    [projects.agent.options]").Append(Environment.NewLine);
             sb.Append("      mode = ").Append(TomlString(project.Mode)).Append(Environment.NewLine);
             sb.Append("      work_dir = ").Append(TomlString(project.WorkDir)).Append(Environment.NewLine);
+            if (project.Cmd.Length > 0)
+            {
+                // 上游 v1.4.1 core/cmdopts.go 以 strings.Fields 切分 cmd:首段是可执行文件,其余逐个成为 argv。
+                sb.Append("      cmd = ").Append(TomlString(project.Cmd)).Append(Environment.NewLine);
+            }
             if (project.SelectedProvider.Length > 0)
             {
                 sb.Append("      provider = ").Append(TomlString(project.SelectedProvider)).Append(Environment.NewLine);

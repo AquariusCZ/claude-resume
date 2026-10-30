@@ -34,6 +34,14 @@ csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe insta
 
 Open **AI Resume** from the Desktop or Start menu.
 
+Then give AI Resume its own Claude credential. In a terminal run `claude` and `/login` once, then:
+
+```powershell
+claude setup-token
+```
+
+Paste the printed token into the panel's **Claude · 凭据** section. It is an official long-lived (about one year) OAuth token meant for unattended use; AI Resume stores it with machine-scope DPAPI, never refreshes it, and never shows it again. Without it, quota and resume fall back to Claude Code's own login, which disappears whenever that session logs out.
+
 `install` is the deploy step: the runtime is the installed copy under `%LOCALAPPDATA%\AI Resume\`, not `bin\Release`, so re-run it after every rebuild. It stages and verifies the payload, waits for the new Worker to answer on its pipe before touching any entry point, and keeps recovery material if a rollback is incomplete. It also registers a logon autostart that starts the engine **without a console window** — see [autostart](docs/ARCHITECTURE.md#logon-autostart) for the elevated scheduled-task upgrade that adds restart-on-failure.
 
 Uninstall keeps your settings and state:
@@ -52,21 +60,21 @@ Two kinds, because they are not equally urgent. **Finished** can wait; **waiting
 |---|---|---|
 | Claude Code | `Stop` hook | `Notification` — agent needs input, confirmation dialog |
 | OpenCode | `session.idle` plugin | `permission.asked` |
-| Codex | `notify` callback | — |
+| Codex | `Stop` hook (`hooks.json`) | — |
 | Cline | `TaskComplete` | — |
 | Qoder | `hooks.Stop` | — |
 
 Adapters merge into your existing configuration and remove only entries they can prove they own. AI Resume's own probes and resume runs are marked internal, so they never notify you about AI Resume's own work.
 
-A Codex Desktop process that was already running will not pick up a later `notify` write — restart it after install. Protocol and smoke procedure: [Completion notifications](docs/COMPLETION-NOTIFICATIONS.md).
+Codex sessions that were already open do not reload `hooks.json`; start a new session after install. If `/hooks` inside Codex lists the AI Resume hook as untrusted, trust it there once. Protocol and smoke procedure: [Completion notifications](docs/COMPLETION-NOTIFICATIONS.md).
 
 ## Quota and resume
 
-Quota comes from Anthropic's OAuth usage endpoint using Claude Code's real request shape. AI Resume reads the existing token and **never refreshes or writes it**.
+Quota comes from Anthropic's OAuth usage endpoint using Claude Code's real request shape. AI Resume uses the `setup-token` you saved, falling back to Claude Code's login file, and **never refreshes or writes either**.
 
 Responses are sparse, so a missing field is not treated as a deletion. A carried-over value is shown amber as a *recent server reading*, never green. Reset-only data uses an indeterminate scan instead of inventing a percentage.
 
-Select a provider and an actual model from its live catalog, select projects, and press **Arm**. This stores the provider/account, model ID, and exact native session IDs for the cycle. Catalog upgrades apply to the next arm operation. Claude resumes only with matching live scoped quota; DeepSeek and compatible third-party providers require verified positive balance after an observed limit. Codex ChatGPT shows its live catalog and account windows, but the current upstream interface cannot prove that a specific model recovered, so an armed target remains waiting. Missing quota data stays unverified. A fixed invocation ID does not freeze a provider's backend revision. See [provider-bound resume](docs/adr/0004-provider-bound-resume.md).
+Select a provider and an actual model from its live catalog, select projects, and press **Arm**. This stores the provider/account, model ID, and exact native session IDs for the cycle. Catalog upgrades apply to the next arm operation. Claude resumes only with matching live scoped quota; DeepSeek and compatible third-party providers require verified positive balance after an observed limit. Codex uses your official ChatGPT or OpenAI login from `~/.codex/auth.json`; third-party routers configured inside Codex are not used by the panel or the engine. It resumes when every account window is below 100%, no additional limit or spend control is hit, and the target model is not marked unavailable. Missing quota data stays unverified. A fixed invocation ID does not freeze a provider's backend revision. See [provider-bound resume](docs/adr/0004-provider-bound-resume.md).
 
 ## Chat from your phone
 
@@ -83,7 +91,7 @@ With cc-connect configured, drive the agent from Feishu or WeChat:
 
 Three things people conflate — **agent** is the local executor that owns the session (Claude Code, Codex); **provider** is the remote endpoint and credential it uses; **model** is the identifier sent to that provider. You can run the Claude Code agent against a DeepSeek provider.
 
-The control panel stages a candidate cc-connect config, validates it with cc-connect's own parser, commits atomically, and verifies a new process generation. It never reports success from an exit code alone.
+The control panel stages a candidate cc-connect config, validates it with cc-connect's own parser, commits atomically, and verifies a new process generation. It never reports success from an exit code alone. The same path is available as `AiResume.Worker.exe cc-connect-apply`. With the Codex agent selected, the generated config uses your official Codex login and removes Codex-only third-party providers after taking a backup.
 
 ## How it fits together
 
@@ -123,7 +131,7 @@ The suite uses temporary state, synthetic sessions and injected runners. It neve
 
 ## Documentation
 
-[Architecture](docs/ARCHITECTURE.md) · [Quota acquisition](docs/CLAUDE-QUOTA-ACQUISITION.md) · [Notification protocol](docs/COMPLETION-NOTIFICATIONS.md) · [Run contract](docs/RUN-CONTRACT.md) · [Engineering lessons](docs/LESSONS.md) · [AI guide](AI_GUIDE.md)
+[Architecture](docs/ARCHITECTURE.md) · [Quota acquisition](docs/CLAUDE-QUOTA-ACQUISITION.md) · [Notification protocol](docs/COMPLETION-NOTIFICATIONS.md) · [Run contract](docs/RUN-CONTRACT.md) · [Decisions (ADR)](docs/adr/) · [Engineering lessons](docs/LESSONS.md) · [AI guide](AI_GUIDE.md)
 
 ## License
 

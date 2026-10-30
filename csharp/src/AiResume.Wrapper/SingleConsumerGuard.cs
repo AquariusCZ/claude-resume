@@ -27,8 +27,9 @@ public sealed record ConsumerGuardResult(
     public bool CanStart => Verdict == ConsumerGuardVerdict.Clear;
 }
 
-/// <summary>一个正在运行的进程的简要信息。</summary>
-public sealed record RunningProcessInfo(int Pid, string Name, string? CommandLine);
+/// <summary>一个正在运行的进程的简要信息。<see cref="ParentPid"/> 由能读到父进程的枚举器填,其它枚举器留 null。</summary>
+/// <summary>一个运行中的进程。<paramref name="CreatedAt"/> 用于识别 PID 复用:父进程不可能比子进程晚启动。</summary>
+public sealed record RunningProcessInfo(int Pid, string Name, string? CommandLine, int? ParentPid = null, DateTime? CreatedAt = null);
 
 /// <summary>进程枚举抽象。</summary>
 public interface IRunningProcessLister
@@ -130,6 +131,12 @@ public sealed class SingleConsumerGuard
                 "进程枚举返回空引用,无法核验,拒绝启动。");
         }
 
+        // 生产 cc-connect 以 S4U 计划任务运行在会话 0:它的 powershell.exe 宿主对交互会话
+        // 不暴露命令行。那不是「另一个消费者」,而是 cc-connect 自己的进程树——
+        // 把它判成无法核验会让控制面永远不能重启守护(2026-10-12 真机复现)。
+        // 因此只豁免「cc-connect 进程的祖先」,其它读不到命令行的脚本宿主仍 fail-closed。
+        HashSet<int> ccConnectAncestors = AncestorsOfCcConnect(processes);
+
         var conflicts = new List<ConflictingProcess>();
         foreach (RunningProcessInfo? proc in processes)
         {
@@ -141,7 +148,8 @@ public sealed class SingleConsumerGuard
             // 进程名统一取文件名并去掉 .exe:传进来的可能是全路径。
             string name = SafeFileName(proc.Name);
 
-            if (LegacyHostNames.Contains(name) && string.IsNullOrWhiteSpace(proc.CommandLine))
+            if (LegacyHostNames.Contains(name) && string.IsNullOrWhiteSpace(proc.CommandLine) &&
+                !ccConnectAncestors.Contains(proc.Pid))
             {
                 return new ConsumerGuardResult(
                     ConsumerGuardVerdict.Unverifiable,
@@ -183,6 +191,65 @@ public sealed class SingleConsumerGuard
 
     private static ConsumerGuardResult Clear() =>
         new(ConsumerGuardVerdict.Clear, Array.Empty<ConflictingProcess>(), null);
+
+    /// <summary>
+    /// 所有 cc-connect 进程的祖先 PID(不含自身)。父子关系来自枚举器;看不到父进程时集合为空,
+    /// 守卫自然回到原有的 fail-closed 行为。向上最多走 16 层,防止 PID 复用造成的环。
+    /// </summary>
+    private static HashSet<int> AncestorsOfCcConnect(IReadOnlyList<RunningProcessInfo> processes)
+    {
+        var parentOf = new Dictionary<int, int>();
+        var createdAt = new Dictionary<int, DateTime>();
+        var ccConnect = new List<int>();
+        foreach (RunningProcessInfo? proc in processes)
+        {
+            if (proc is null)
+            {
+                continue;
+            }
+
+            if (proc.ParentPid is { } parent && parent > 0)
+            {
+                parentOf[proc.Pid] = parent;
+            }
+
+            if (proc.CreatedAt is { } created)
+            {
+                createdAt[proc.Pid] = created;
+            }
+
+            if (string.Equals(SafeFileName(proc.Name), CcConnectName, StringComparison.OrdinalIgnoreCase))
+            {
+                ccConnect.Add(proc.Pid);
+            }
+        }
+
+        var ancestors = new HashSet<int>();
+        foreach (int pid in ccConnect)
+        {
+            int current = pid;
+            for (int depth = 0; depth < 16 && parentOf.TryGetValue(current, out int parent); depth++)
+            {
+                // ParentProcessId 只是一个数字:真正的父进程退出后 PID 可能被别的进程复用。
+                // 比子进程还晚启动的「父进程」不是祖先,不豁免。
+                if (createdAt.TryGetValue(parent, out DateTime parentStarted) &&
+                    createdAt.TryGetValue(current, out DateTime childStarted) &&
+                    parentStarted > childStarted.AddSeconds(2))
+                {
+                    break;
+                }
+
+                if (parent == current || !ancestors.Add(parent))
+                {
+                    break;
+                }
+
+                current = parent;
+            }
+        }
+
+        return ancestors;
+    }
 
     /// <summary>取文件名并去掉 .exe 后缀;异常输入一律退回原串,不抛。</summary>
     private static string SafeFileName(string? raw)

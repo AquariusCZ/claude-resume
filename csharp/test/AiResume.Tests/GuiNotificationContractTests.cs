@@ -13,7 +13,9 @@ public sealed class GuiNotificationContractTests
         Assert.Contains("const kind = el.dataset.kind;", html, StringComparison.Ordinal);
         Assert.Contains("const enabling = !el.classList.contains('on');", html, StringComparison.Ordinal);
         Assert.Contains("kind === 'Codex' && enabling", html, StringComparison.Ordinal);
-        Assert.Contains("重启已运行的 Codex 后生效", html, StringComparison.Ordinal);
+        // Codex 现役走 hooks.json + 信任记录;新开会话即生效,不再要求重启客户端。
+        Assert.Contains("hooks.json 并登记信任", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("重启已运行的 Codex 后生效", html, StringComparison.Ordinal);
     }
 
     private static string FindRepositoryFile(string relativePath)

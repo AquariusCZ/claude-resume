@@ -145,6 +145,38 @@ public static partial class CodexAuthProbe
         return (provider.BaseUrl, provider.BearerToken);
     }
 
+    /// <summary>
+    /// 读取 Codex **官方**连接:只看 <c>auth.json</c> 的登录方式,与 <c>config.toml</c> 里
+    /// <c>model_provider</c> 指向谁无关。ChatGPT 登录 → <c>https://chatgpt.com/backend-api/codex</c>;
+    /// API key → <c>https://api.openai.com/v1</c>。两者都是 Codex 内置 <c>openai</c> provider
+    /// 在对应认证下的默认端点(固定上游 0.148.0 <c>model-provider-info</c>)。
+    /// 本机 config.toml 把 <c>model_provider</c> 指向 codex-chatgpt-web 之类的本地桥接时,
+    /// 这条官方连接仍然成立——桥接借用的正是同一份 ChatGPT 登录。
+    /// </summary>
+    public static CodexProviderCredentials ReadOfficialCredentials(
+        string? codexHome = null,
+        Func<string, string?>? environmentVariable = null)
+    {
+        environmentVariable ??= Environment.GetEnvironmentVariable;
+        string home = ResolveCodexHome(codexHome, environmentVariable);
+        AuthFileCredential auth = ReadAuthFileCredential(Path.Combine(home, "auth.json"));
+        bool chatGpt = string.Equals(auth.Source, "auth.json:chatgpt", StringComparison.Ordinal);
+        bool apiKey = string.Equals(auth.Source, "auth.json:apikey", StringComparison.Ordinal);
+        string? model = TryReadModel(Path.Combine(home, "config.toml"));
+        ProviderConfig config = BuiltInOpenAiConfig(
+            model,
+            chatGpt ? "https://chatgpt.com/backend-api/codex" : apiKey ? "https://api.openai.com/v1" : null,
+            environmentVariable);
+        if (!chatGpt && !apiKey)
+        {
+            return MissingCredential(config, auth.Source, auth.Problem ?? "Codex 未登录:请运行 codex login");
+        }
+
+        return string.IsNullOrWhiteSpace(auth.Token)
+            ? MissingCredential(config, auth.Source, auth.Problem ?? "Codex auth.json 中没有可用凭据")
+            : CreateCredential(config, auth.Token, auth.Source, auth.Problem, auth.AccountId);
+    }
+
     public static CodexProviderCredentials ReadActiveProviderCredentials(
         string? codexHome = null,
         Func<string, string?>? environmentVariable = null)

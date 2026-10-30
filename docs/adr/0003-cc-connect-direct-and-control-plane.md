@@ -4,7 +4,7 @@
 - 日期:2026-08-06
 - 决策者:用户(架构权威)
 - 关系:**修订 ADR-0001 的「C# 与 cc-connect 边界」一节**;不改变 ADR-0002(RunContract)的运行语义,但大幅缩小其适用面(见 §4.3)
-- 关联:`docs/UPSTREAM-ARCHITECTURE-RESEARCH.md`、`docs/MIGRATION-DEBT.md`(D-014)、`docs/STAGE-4-SPEC.md` §7、`docs/STAGE-6-SPEC.md` §7.4
+- 关联:`docs/UPSTREAM-ARCHITECTURE-RESEARCH.md`、`docs/history/MIGRATION-DEBT.md`(D-014)、`docs/history/STAGE-4-SPEC.md` §7、`docs/history/STAGE-6-SPEC.md` §7.4
 
 ## 1. 背景:为什么在 Stage 6 中途翻案
 
@@ -55,7 +55,7 @@ ADR-0001 确定「cc-connect 作为目标编排内核,C# wrapper 承接 AI Resum
 > **【2026-08-06 修订:本节原判断已被平台实证推翻,以下为修订后结论。】**
 > 原文为"不再自行探测 Claude 限额,改为消费 cc-connect 的 `UsageReport`(经管理 API 或等价入口)"。
 
-**修订后结论:限额数据由 AI Resume 自取,但保持 `UsageReport` 兼容形状。** 三条实证(详见 `docs/design/s7c-quota-probe-spec.md` §1):
+**修订后结论:限额数据由 AI Resume 自取,但保持 `UsageReport` 兼容形状。** 三条实证(详见 `docs/history/design/s7c-quota-probe-spec.md` §1):
 
 1. cc-connect 的 `GetUsage` 并非读 API,而是 **PTY 起 Claude Code TUI → 发 `/usage` → ANSI 抓屏 → 正则解析**;
 2. 它依赖 `github.com/creack/pty v1.1.24`。`run.go` 无构建约束(Windows 照常编译),但其调用的 `open()` 来自 `pty_unsupported.go`,该文件构建约束 `//go:build !linux && !darwin && !freebsd && !dragonfly && !netbsd && !openbsd && !solaris && !zos` **命中 Windows**,函数体为 `return nil, nil, ErrUnsupported`。故 **`GetUsage` 在 Windows 上必然失败**;
@@ -103,6 +103,8 @@ ADR-0001 确定「cc-connect 作为目标编排内核,C# wrapper 承接 AI Resum
 | `CcConnectConfigGenerator`(164 行) | **保留** | 确定性生成仓库外 config.toml 仍有效 |
 | S5-B `ClaudeCodeProbe`(17 测试) | ~~作废~~ → **恢复启用**(2026-08-06) | 原因见 §2.3 修订:上游 `GetUsage` 依赖 `creack/pty`,Windows 上返回 `ErrUnsupported`,管理 API 亦无 usage 端点。本探测是该平台上唯一可用通道,且读的是服务端结构化事件而非抓屏 |
 | S6-D 场景 4/6/7 | **暂停** | 验证目标随边界变化;按新边界重新定义后再执行 |
+
+> 2026-10-12 复核(ADR-0005 F1):`CcConnectSessionBridge`、`CcConnectAuthMapper`、`CcConnectSupervisor` 直到 v2.1 都没有生产调用方,已删除;`ClaudeCodeProbe` 只保留显式诊断能力,生产额度刷新不再降级到 CLI 推理。本表其余「保留」结论以当时为准。
 | ADR-0002 RunContract | **保留但缩小适用面** | 仍适用于 AI Resume 自己启动的进程(续跑、探测);不再要求映射 cc-connect 内部 turn |
 
 ## 5. GUI 技术选型(推荐,待用户确认)
@@ -174,7 +176,7 @@ ADR-0001 确定「cc-connect 作为目标编排内核,C# wrapper 承接 AI Resum
 
 用户明确三点,显著改变后续阶段的风险模型:
 
-1. **用户已停止使用现役 AI Resume**,期待的是重构后的成品。→ **不再投入现役维护**;`docs/design/gui-startup-profile.md` 定位的现役 3701ms 性能问题**不在现役上修复**,其价值转为**新实现的设计约束**(项目发现必须索引化,不得沿用 O(全部历史会话) 的全量扫描)。
+1. **用户已停止使用现役 AI Resume**,期待的是重构后的成品。→ **不再投入现役维护**;`docs/history/design/gui-startup-profile.md` 定位的现役 3701ms 性能问题**不在现役上修复**,其价值转为**新实现的设计约束**(项目发现必须索引化,不得沿用 O(全部历史会话) 的全量扫描)。
 2. **允许直接在生产环境修改与测试。** → 取消「独立测试应用 + 测试项目」的强制前提;Stage 10「生产切换」不再需要维护窗口式的谨慎流程。
 3. 飞书侧**本就只有一个在用应用**(`cli_xxxxxxxxxxxxxxxx`);为迁移创建的 `cli_xxxxxxxxxxxxxxxx` 未使用且即将关停。
 
@@ -202,4 +204,4 @@ ADR-0001 确定「cc-connect 作为目标编排内核,C# wrapper 承接 AI Resum
 3. ~~限额数据依赖上游 `UsageReport` 的准确性~~ → 已按 §2.3 修订改为自取:代价是 Windows 上多维护一条探测路径,收益是核心功能不受上游平台缺口拖累;需持续关注上游是否补齐 Windows 通道以便切回。
 4. GUI 选型 D 引入 WebView2 依赖与前后端 IPC 复杂度。
 
-**验收**:本 ADR 生效后,`docs/ARCHITECTURE.md`、`docs/MIGRATION-BASELINE.md`、`docs/MIGRATION-DEBT.md`(D-014 重定性)、`AI_GUIDE.md` 首行标记、各 `STAGE-*-SPEC.md` 须同步;`CLAUDE.md` 中「cc-connect 是目标飞书消息 + Agent 会话编排内核」一段须按 §2.2 改写。
+**验收**:本 ADR 生效后,`docs/ARCHITECTURE.md`、`docs/history/MIGRATION-BASELINE.md`、`docs/history/MIGRATION-DEBT.md`(D-014 重定性)、`AI_GUIDE.md` 首行标记、各 `STAGE-*-SPEC.md` 须同步;`CLAUDE.md` 中「cc-connect 是目标飞书消息 + Agent 会话编排内核」一段须按 §2.2 改写。

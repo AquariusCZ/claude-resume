@@ -552,6 +552,20 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       <div class="note" id="armNote">勾选项目后布防;引擎会在下一拍探测额度。</div>
     </div>
     <div class="sect">
+      <div class="sl">Claude · 凭据</div>
+      <!-- 两份凭据各一行:长期令牌(AI Resume 自持)与 Claude CLI 登录。
+           额度与无人值守续跑优先用前者;它是 Claude 官方为自动化签发的一年期令牌。 -->
+      <div class="fs-line" id="ckTokenLine">
+        <span class="led" id="ckTokenLed"></span><span class="t" id="ckTokenText">读取中…</span>
+        <span class="go" id="ckTokenSet" role="button" tabindex="0">粘贴令牌</span>
+        <span class="go" id="ckTokenClear" role="button" tabindex="0" hidden>清除</span>
+      </div>
+      <div class="fs-line" id="ckCliLine">
+        <span class="led" id="ckCliLed"></span><span class="t" id="ckCliText">读取中…</span>
+      </div>
+      <div class="note" id="ckNote">额度与续跑优先使用长期令牌;没有时才用 Claude CLI 登录。</div>
+    </div>
+    <div class="sect">
       <div class="sl">Quota · 额度模型</div>
       <div id="providers"></div>
     </div>
@@ -591,6 +605,17 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       <input id="fsAllow" type="text" autocomplete="off" spellcheck="false" placeholder="ou_…"></label>
     <p class="hint warn">留空会让 cc-connect 放行所有飞书用户——任何人都能驱动本机 AI 改你的项目。</p>
     <div class="brow"><button class="btn" id="fsSave">保存</button><button class="btn line" id="fsCancel">取消</button></div>
+  </div>
+</div>
+
+<div class="modal" id="tkModal" hidden>
+  <div class="sheet card" role="dialog" aria-modal="true" aria-labelledby="tkModalTitle">
+    <h3 id="tkModalTitle">AI Resume 长期令牌</h3>
+    <p class="hint">在终端运行 claude setup-token,浏览器授权后把打印出来的令牌粘到这里。它由 Claude 官方为无人值守场景签发、有效一年、不参与 Claude Code 自己的刷新;AI Resume 以机器范围 DPAPI 加密存本机,不写入仓库,界面也读不回来。</p>
+    <label class="fld"><span>令牌</span>
+      <input id="tkInput" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-oat01-…"></label>
+    <p class="hint">保存后立即用它刷新一次额度;若服务端拒绝,面板会如实标红并退回 Claude CLI 登录。</p>
+    <div class="brow"><button class="btn" id="tkSave">保存并刷新额度</button><button class="btn line" id="tkCancel">取消</button></div>
   </div>
 </div>
 
@@ -961,6 +986,8 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       btn.setAttribute('aria-busy', 'false');
       $('refreshLabel').textContent = '刷新额度';
       renderProviders(lastQuotaState);
+      // 凭据状态随额度一起刷:后台标记了令牌被拒、CLI 到期或重新登录,侧栏不能停在开窗时的旧值。
+      void loadClaudeToken();
       nextRefreshAt = Date.now() / 1000 + refreshMinutes * 60;
     }
   }
@@ -982,9 +1009,9 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     const rows = providerCatalog.flatMap(p => [{
       nm: p.name.split(' · ')[0], cls: p.limited ? 'wait' : p.quotaKnown && !p.problem ? 'ok' : '',
       txt: p.limited ? '额度不足' : p.balance != null ? `${p.balance} ${p.currency || ''}` : p.quotaKnown ? '窗口已读取' : '额度未核实',
-      detail: `${p.name} · ${p.source} · ${p.observedAtUtc || ''} · ${p.models.length} 个模型；${p.problem || p.resumeNote}`,
+      detail: `${p.name} · ${p.source} · ${p.observedAtUtc || ''} · ${p.models.length} 个模型${p.credentialSource ? ' · 凭据 ' + p.credentialSource : ''}；${p.problem || p.resumeNote}`,
     }, ...(p.windows || []).filter(w => !['five_hour', 'seven_day'].includes(w.name)).map(w => ({
-      nm: w.name.replace('weekly_scoped:', ''),
+      nm: w.name.replace('weekly_scoped:', '').replace('model:', ''),
       cls: w.status === 'blocked' || w.usedPercent >= 100 ? 'wait' : w.carriedForward || w.status !== 'allowed' || w.usedPercent == null ? '' : 'ok',
       txt: w.status === 'blocked' ? '已限额' : w.usedPercent == null ? '未返回' : `${w.usedPercent}%${w.carriedForward ? ' · 最近' : ''}`,
       detail: `${p.name} · ${w.name}${w.resetAtUnix ? '；重置 ' + new Date(w.resetAtUnix * 1000).toLocaleString() : ''}`,
@@ -1009,9 +1036,11 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       });
       return;
     }
+    // 账号窗口才上 CRT;按模型的可用性窗口(model:…)只在侧栏成行,它没有百分比可画。
+    const cardWindows = (p.windows || []).filter(w => !String(w.name).startsWith('model:'));
     ['q5','q7'].forEach((id, i) => {
       cards.delete(id);
-      const w = (p.windows || [])[i];
+      const w = cardWindows[i];
       $(id).classList.toggle('blocked', !!p.limited);
       $(id).classList.remove('stale');
       $(id).querySelector('.h').textContent = w ? p.name + ' · ' + w.name : p.name + (i ? ' · 模型' : ' · 余额');
@@ -1539,7 +1568,7 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     notifyBusy = true; el.classList.add('busy');
     try {
       renderNotify(await call('notifications.setEnabled', { kind, enabled: enabling }));
-      if (kind === 'Codex' && enabling) $('fl').textContent = 'Codex 通知已写入；重启已运行的 Codex 后生效。';
+      if (kind === 'Codex' && enabling) $('fl').textContent = 'Codex Stop 钩子已写入 hooks.json 并登记信任;新开的 Codex 会话即生效,若 codex /hooks 显示未信任请在那里信任一次。';
     }
     catch (e) { el.classList.remove('busy'); $('fl').textContent = `通知源切换失败:${e.message}`; }
     finally { notifyBusy = false; }
@@ -1729,6 +1758,80 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     finally { fsBusy = false; $('fsPre').classList.remove('busy'); }
   }
 
+  // ───────── Claude 凭据(长期令牌)─────────
+  // 实值单向流动:输入框 → 桥 → DPAPI。应答里从来没有令牌字段;保存后输入框立即清空。
+  let tkBusy = false;
+  function renderClaudeToken(p) {
+    const fmtAt = unix => unix ? fmtClock(unix, true) : '';
+    const rejected = !!p.storedRejectedReason;
+    const unreadable = !!p.storedProblem;
+    const tokenActive = p.activeSource === 'ai-resume-token';
+    $('ckTokenLed').className = 'led' + (p.hasStoredToken ? (rejected || unreadable ? ' bad' : tokenActive ? ' ok' : ' wait') : '');
+    $('ckTokenText').textContent = p.hasStoredToken
+      ? (rejected ? `长期令牌被拒 · 存于 ${fmtAt(p.storedTokenSavedAtUnix)}`
+        : unreadable ? `长期令牌不可读 · 存于 ${fmtAt(p.storedTokenSavedAtUnix)}`
+        : `长期令牌 · 存于 ${fmtAt(p.storedTokenSavedAtUnix)}`)
+      : '未保存长期令牌';
+    $('ckTokenText').title = rejected ? p.storedRejectedReason : unreadable ? p.storedProblem : (p.hasStoredToken ? '额度与续跑优先使用它' : '运行 claude setup-token 后粘贴');
+    $('ckTokenClear').hidden = !p.hasStoredToken;
+    $('ckTokenSet').textContent = p.hasStoredToken ? '更换令牌' : '粘贴令牌';
+    const cliActive = p.activeSource === 'claude-cli';
+    $('ckCliLed').className = 'led' + (p.cliLoggedIn ? (cliActive ? ' ok' : ' wait') : (tokenActive ? ' wait' : ' bad'));
+    $('ckCliText').textContent = p.cliLoggedIn
+      ? `Claude CLI 登录有效${p.cliExpiresAtUnix ? ` · 至 ${fmtAt(p.cliExpiresAtUnix)}` : ''}`
+      : (p.cliProblem || 'Claude CLI 未登录');
+    $('ckCliText').title = p.cliLoggedIn ? 'Claude Code 自己维护这份登录;AI Resume 只读,不刷新' : '在终端运行 claude 并执行 /login';
+    $('ckNote').textContent = p.problem
+      ? p.problem
+      : tokenActive ? '当前额度与续跑使用长期令牌。' : cliActive ? '当前使用 Claude CLI 登录;它到期后额度会停摆,建议补一份长期令牌。' : '额度与续跑优先使用长期令牌;没有时才用 Claude CLI 登录。';
+  }
+  async function loadClaudeToken() {
+    try { renderClaudeToken(await call('claude.token.status')); }
+    catch (e) { $('ckTokenText').textContent = '读取失败:' + e.message; $('ckCliText').textContent = ''; }
+  }
+  let tkModalCloseTimer = null;
+  function openTkModal() {
+    const modal = $('tkModal');
+    if (tkModalCloseTimer !== null) { window.clearTimeout(tkModalCloseTimer); tkModalCloseTimer = null; }
+    modal.hidden = false;
+    void modal.offsetWidth;
+    modal.classList.add('open');
+    $('tkInput').focus();
+  }
+  function closeTkModal() {
+    const modal = $('tkModal');
+    modal.classList.remove('open');
+    $('tkInput').value = '';
+    if (tkModalCloseTimer !== null) window.clearTimeout(tkModalCloseTimer);
+    tkModalCloseTimer = window.setTimeout(() => { if (!modal.classList.contains('open')) modal.hidden = true; tkModalCloseTimer = null; }, 220);
+  }
+  async function saveClaudeToken() {
+    if (tkBusy) return;
+    const token = $('tkInput').value.trim();
+    if (!token) { $('fl').textContent = '请先粘贴令牌。'; return; }
+    tkBusy = true; $('tkSave').classList.add('busy');
+    try {
+      renderClaudeToken(await call('claude.token.save', { token }));
+      $('tkInput').value = '';
+      closeTkModal();
+      $('fl').textContent = '长期令牌已加密保存,正在用它刷新额度…(凭据来源变化会改变账号指纹:若当前已布防,请解除后重新布防)';
+      await refreshQuota(true, false);
+      await loadClaudeToken();
+    } catch (e) { $('fl').textContent = '保存令牌失败:' + e.message; }
+    finally { tkBusy = false; $('tkSave').classList.remove('busy'); }
+  }
+  async function clearClaudeToken() {
+    if (tkBusy) return;
+    if (!window.confirm('清除已保存的长期令牌?之后额度与续跑只能依赖 Claude CLI 登录。')) return;
+    tkBusy = true;
+    try {
+      renderClaudeToken(await call('claude.token.clear'));
+      $('fl').textContent = '长期令牌已清除。若当前已布防,请解除后重新布防。';
+      refreshQuota(true, false);
+    } catch (e) { $('fl').textContent = '清除令牌失败:' + e.message; }
+    finally { tkBusy = false; }
+  }
+
   // ───────── 启动 ─────────
   let quotaTimer = null, armTimer = null;
   renderProviders(null);
@@ -1763,6 +1866,8 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
       $('fsState').textContent = '读取失败:' + e.message;
     });
 
+    loadClaudeToken();
+
     call('notifications.list').then(renderNotify).catch(e => {
       $('notify').innerHTML = `<div class="pv"><span class="nm" style="color:var(--alert)">探测失败:${esc(e.message)}</span></div>`;
     });
@@ -1790,9 +1895,8 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
     }
   }
 
-  // 用户主动刷新才允许发一次 max_output_tokens=1 的最小 /responses 请求。
-  // 启动、定时刷新与过期窗口补刷仍保持 shallow,不产生推理用量。
-  $('refreshBtn').addEventListener('click', () => refreshQuota(true, true));
+  // 刷新只读元数据(模型目录、额度/余额窗口),现役不发任何推理请求。
+  $('refreshBtn').addEventListener('click', () => refreshQuota(true, false));
   $('addBtn').addEventListener('click', addProject);
   $('hidToggle').addEventListener('click', () => { hidOpen = !hidOpen; renderHidden(); });
   $('fsOpen').addEventListener('click', openFsModal);
@@ -1800,8 +1904,17 @@ body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;op
   $('fsModal').addEventListener('click', (ev) => { if (ev.target === $('fsModal')) closeFsModal(); });
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape' && !$('fsModal').hidden) closeFsModal({ instant: true });
+    if (ev.key === 'Escape' && !$('tkModal').hidden) closeTkModal();
   });
   $('fsSave').addEventListener('click', saveFeishu);
+  $('ckTokenSet').addEventListener('click', openTkModal);
+  $('ckTokenSet').addEventListener('keydown', (ev) => { if (ev.key === ' ' || ev.key === 'Enter') { ev.preventDefault(); openTkModal(); } });
+  $('ckTokenClear').addEventListener('click', clearClaudeToken);
+  $('ckTokenClear').addEventListener('keydown', (ev) => { if (ev.key === ' ' || ev.key === 'Enter') { ev.preventDefault(); clearClaudeToken(); } });
+  $('tkSave').addEventListener('click', saveClaudeToken);
+  $('tkCancel').addEventListener('click', closeTkModal);
+  $('tkModal').addEventListener('click', (ev) => { if (ev.target === $('tkModal')) closeTkModal(); });
+  $('tkInput').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); saveClaudeToken(); } });
   $('fsGen').addEventListener('click', genCutover);
   $('fsPre').addEventListener('click', preflight);
   $('armBtn').addEventListener('click', toggleArm);

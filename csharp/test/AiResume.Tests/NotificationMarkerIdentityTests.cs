@@ -102,7 +102,7 @@ public sealed class NotificationMarkerIdentityTests : IDisposable
 
         Assert.Contains(ClaudeCodeNotificationAdapter.MarkerFileName, installed, StringComparison.OrdinalIgnoreCase);
         Assert.Contains(QoderNotificationAdapter.MarkerFileName, installed, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains(CodexNotificationAdapter.MarkerFileName, installed, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(CodexHooksNotificationAdapter.MarkerFileName, installed, StringComparison.OrdinalIgnoreCase);
     }
 
     private static int CountOccurrences(string haystack, string needle)

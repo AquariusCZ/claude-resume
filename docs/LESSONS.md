@@ -290,7 +290,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
    Codex 的 thread rollout、cc-connect 的 `~/.cc-connect/sessions/`。
    凡是把 cwd 当成会话身份的工具,随机 cwd = 无限增长的记录。
 3. **`codex exec` 也必须给固定或一次性目录,但理由相反**:它起的是真 agent,
-   不指定工作目录就继承调用方的 cwd,无人值守的探测会落到用户仓库里(见 `CodexProbe`)。
+   不指定工作目录就继承调用方的 cwd,无人值守的探测会落到用户仓库里(v1 的 `CodexProbe` 曾为此固定目录;v2.1 起不再启动 Codex 探测进程,供应商证据全部走 HTTP)。
    两个方向都要想:**别污染别人,也别在别人家里干活。**
 
 ## 十一、静默失败:界面说没事,实际早坏了(2026-08-08 第二轮审计)
@@ -384,6 +384,38 @@ UTF-8 无 BOM 的中文会被解码坏,连 here-string 的结束符都认不出�
 仓库里给用户手动运行的 `.ps1` 必须带 BOM,且要在 5.1(不是 pwsh 7)下实测。
 
 ---
+
+---
+
+## 十三、v2.1 重构挖出来的四条教训(2026-10-12)
+
+项目一个月没动,五项功能静默失效(详见 ADR-0005 §1)。每一条背后都是同一类错误:**把别人的状态当成了自己的保证**。
+
+1. **★★ 寄生在别的程序的登录态上,它一登出你就瞎了。** 额度与续跑全靠读 Claude Code CLI 的
+   `~/.claude/.credentials.json`。CLI 一登出(或 refresh token 过期、`expiresAt=0`),产品就退化成「未核实」,
+   而「未核实」不是通知,没人会看到。`quota_snapshots` 停在 2026-09-09,一个月后才被发现。
+   解法:要一份**自己保管**的凭据(`claude setup-token` 一年期令牌,官方为无人值守签发),CLI 只作回退;
+   仍然只读不刷新。教训:**依赖别人会话的功能,必须把那个依赖本身做成一等状态行**——
+   不是等它失败后显示「未核实」,而是让「它靠谁活着」随时可见。
+2. **★★ 一次成功样本不能证明间歇性故障不存在。** 2026-08-14 验证过「S4U session 0 下 DPAPI 能解密」,
+   `outcome=Sent`,于是写进了文档。2026-10 的日志里 `CryptUnprotectData` 连续失败几个小时后又自愈,
+   `worker.notify.sweep_failed` 刷了一屏。解法:后台进程**只解密它必须解密的东西**——投递只需要
+   收件人 `open_id`(不是秘密),明文存 `config.json`;Worker 真正必须读的 Claude 令牌用 LocalMachine 范围。
+   教训:凡是「在另一个安全上下文里跑」的路径,验证要看**一段时间的失败率**,不是一次结果。
+3. **★ 单值共享键会被任何程序无痕覆盖。** `~/.codex/config.toml` 的 `notify` 只能放一条命令,
+   AI Resume 把自己链在前面、用 `--previous-notify` 转发旧值。Codex Desktop 的 computer-use 功能上线后直接把它
+   改写成自己的命令,AI Resume 的链整体消失,`notify list` 的所有权检查再精巧也救不回来。
+   解法:改用 Codex hooks——`hooks.json` 里每个消费者自己一组,信任记录按组登记;只增删自己的那组。
+   教训:**选落点时先问「这个键还有谁会写」**。能用「多槽位 + 所有权标记」的地方,不要用单值键。
+4. **★ 重写上游的哈希/序列化之前,先在野外找一个 oracle。** Codex 的 hooks 信任哈希要对规范化 JSON
+   做键排序、紧凑序列化再 SHA-256,`timeout`/`async` 的默认值、键名和事件标签任何一处理解偏差都会得到
+   一个「看起来对」但 Codex 不认的哈希——而症状只是钩子静默不执行。本机 codex-chatgpt-web 写过一条
+   `interrupt` 信任记录,拿它复算,一次就对上了。教训:**对接别人的二进制契约,测试里必须有一条来自真实世界的样本**,
+   和「mock 必须照抄线上返回结构」是同一条纪律。
+
+顺带两条平台事实:cc-connect v1.4.1 的 `cmd` 用 Go `strings.Fields` 拆分,参数里不能有空格;
+cc-connect 给 codex agent 配 provider 时会 `ensureCodexAuth` 改写 `~/.codex/auth.json`,与用户自己的 ChatGPT 登录互斥——
+这是把 Codex 固定到官方账号、并从 cc-connect 删除 codex-only 第三方 provider 的直接原因。
 
 ---
 

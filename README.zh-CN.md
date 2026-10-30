@@ -34,6 +34,14 @@ csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe insta
 
 从桌面或开始菜单打开 **AI Resume**。
 
+然后给 AI Resume 一份它自己的 Claude 凭据。在终端运行 `claude` 并 `/login` 一次，再执行：
+
+```powershell
+claude setup-token
+```
+
+把打印出来的令牌粘到控制面的 **Claude · 凭据** 区。这是官方为无人值守场景签发的长期（约一年）OAuth 令牌；AI Resume 用机器范围 DPAPI 存在本机，绝不刷新，界面也读不回来。不保存它时，额度与续跑会回退到 Claude Code 自己的登录态，而那个登录态一登出就没了。
+
 `install` 就是部署这一步：真正运行的是 `%LOCALAPPDATA%\AI Resume\` 下的副本而不是 `bin\Release`，所以每次重新构建后都要再跑一次。它会暂存并校验产物，等新 Worker 在管道上应答之后才去改任何入口；回滚不完整时保留恢复材料。它同时装好登录自启，**不会弹控制台窗口**——想再要"挂了自动重启"，见[开机自启](docs/ARCHITECTURE.md#logon-autostart)里那个需要提权一次的计划任务升级。
 
 卸载会保留你的设置和数据：
@@ -52,21 +60,21 @@ csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe insta
 |---|---|---|
 | Claude Code | `Stop` 钩子 | `Notification`——需要输入、弹出确认框 |
 | OpenCode | `session.idle` 插件 | `permission.asked` |
-| Codex | `notify` 回调 | — |
+| Codex | `Stop` 钩子（`hooks.json`） | — |
 | Cline | `TaskComplete` | — |
 | Qoder | `hooks.Stop` | — |
 
 适配器合并进你已有的配置，且只移除能证明属于自己的条目。AI Resume 自己的探测和续跑运行都带内部标记，不会拿它自己的活儿来通知你。
 
-安装时已经在运行的 Codex Desktop 不会加载后写入的 `notify`，装完请重启它。协议与冒烟步骤见[完成通知](docs/COMPLETION-NOTIFICATIONS.md)。
+安装前已经打开的 Codex 会话不会重载 `hooks.json`，装完请新开会话。若 Codex 里 `/hooks` 显示 AI Resume 的钩子未信任，在那里信任一次即可。协议与冒烟步骤见[完成通知](docs/COMPLETION-NOTIFICATIONS.md)。
 
 ## 额度与续跑
 
-额度取自 Anthropic 的 OAuth usage 接口，复用 Claude Code 的真实请求形状。AI Resume 只读现有令牌，**绝不刷新、绝不写回**。
+额度取自 Anthropic 的 OAuth usage 接口，复用 Claude Code 的真实请求形状。AI Resume 优先使用你保存的 `setup-token`，其次是 Claude Code 的登录文件，两者**只读、绝不刷新、绝不写回**。
 
 响应是稀疏的，所以缺字段不等于被删除。承接下来的旧值显示为琥珀色的*最近服务端读数*，绝不点绿；只有重置时间没有百分比时用不确定态扫描，而不是编一个数字出来。
 
-先选择供应商及其实际模型，再勾选项目、点**布防**。软件固定本周期的供应商、账号、调用模型 ID 和原生会话；模型目录更新在下次布防采用。Claude 订阅需同模型的实时 scoped 额度；DeepSeek 和支持余额接口的第三方需观测到受限后再恢复为实时正余额。Codex ChatGPT 会显示实际目录和账号窗口，但当前上游接口无法证明具体模型已恢复，因此布防后保持等待并说明原因。没有额度接口就显示“未核实”。固定调用 ID 不等于冻结供应商同名 ID 的后端版本。详见[供应商与固定目标续跑](docs/adr/0004-provider-bound-resume.md)。
+先选择供应商及其实际模型，再勾选项目、点**布防**。软件固定本周期的供应商、账号、调用模型 ID 和原生会话；模型目录更新在下次布防采用。Claude 订阅需同模型的实时 scoped 额度；DeepSeek 和支持余额接口的第三方需观测到受限后再恢复为实时正余额。Codex 使用 `~/.codex/auth.json` 里的官方 ChatGPT/OpenAI 登录；Codex 内配置的第三方中转不会被面板或引擎使用。账号各窗口都低于 100%、没有附加限额或消费上限命中、目标模型未被标为不可用时才续跑。没有额度接口就显示“未核实”。固定调用 ID 不等于冻结供应商同名 ID 的后端版本。详见[供应商与固定目标续跑](docs/adr/0004-provider-bound-resume.md)。
 
 旧布防需要解除后重新选择供应商、模型和项目。Claude 原会话仍被客户端占用时会等待，请先关闭该会话；Codex 使用已核实版本的原生会话独占锁。第三方 Codex 自动执行还要求能锁定已有管理配置，缺少该条件或存在不兼容配置时会拒绝布防并给出原因，目录和额度仍可读取。
 
@@ -85,7 +93,7 @@ csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe insta
 
 三个最容易被混为一谈的概念——**agent** 是本地执行器、会话的归属者（Claude Code、Codex）；**provider** 是它用的远端地址和凭据；**model** 是发给该 provider 的模型标识。所以你完全可以用 Claude Code 这个 agent 去跑 DeepSeek。
 
-控制面会先生成候选 cc-connect 配置，用 cc-connect 自己的解析器校验，原子提交，再核验确实换了新的进程代次。它绝不会仅凭退出码就报成功。
+控制面会先生成候选 cc-connect 配置，用 cc-connect 自己的解析器校验，原子提交，再核验确实换了新的进程代次。它绝不会仅凭退出码就报成功。同一路径也可用 `AiResume.Worker.exe cc-connect-apply` 从命令行执行。选择 Codex agent 时，生成的配置使用你的官方 Codex 登录，并在备份后移除只给 Codex 用的第三方 provider。
 
 ## 结构
 
@@ -123,7 +131,7 @@ dotnet build csharp\AiResume.sln -c Release --no-restore -warnaserror
 
 ## 文档
 
-[架构](docs/ARCHITECTURE.md) · [额度获取](docs/CLAUDE-QUOTA-ACQUISITION.md) · [通知协议](docs/COMPLETION-NOTIFICATIONS.md) · [运行契约](docs/RUN-CONTRACT.md) · [工程教训](docs/LESSONS.md) · [AI 导览](AI_GUIDE.md)
+[架构](docs/ARCHITECTURE.md) · [额度获取](docs/CLAUDE-QUOTA-ACQUISITION.md) · [通知协议](docs/COMPLETION-NOTIFICATIONS.md) · [运行契约](docs/RUN-CONTRACT.md) · [决策记录（ADR）](docs/adr/) · [工程教训](docs/LESSONS.md) · [AI 导览](AI_GUIDE.md)
 
 ## 许可
 

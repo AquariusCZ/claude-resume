@@ -327,11 +327,14 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
     private const string NotificationEvent = "Notification";
 
     /// <summary>
-    /// 只订阅"AI 在等你"的那几种。**不含 permission_prompt 与 idle_prompt** ——
-    /// 前者多数被自动放行、通知了也没事可做,后者按时间触发,最容易变成噪音;
-    /// 通知一旦变吵,人就会开始无视它,那比不通知更糟。
+    /// 只订阅"AI 在等你"的那几种。
+    ///
+    /// 2026-10-12 加回 <c>permission_prompt</c>:Claude Desktop / VS Code 经 Agent SDK 跑时,
+    /// 权限等待不会以 agent_needs_input 出现,而是在用户没回应约 6 秒后发 permission_prompt
+    /// (官方 hooks 文档);不订阅它,桌面版"停下来等你批准"就永远推不到飞书。
+    /// 仍不含 idle_prompt:它按时间触发,每次回合结束后都会响,只会变成噪音。
     /// </summary>
-    private const string DecisionMatcher = "agent_needs_input|elicitation_dialog|elicitation_url_dialog";
+    private const string DecisionMatcher = "agent_needs_input|elicitation_dialog|elicitation_url_dialog|permission_prompt";
 
     private const string DecisionArgument = "--kind=decision";
 

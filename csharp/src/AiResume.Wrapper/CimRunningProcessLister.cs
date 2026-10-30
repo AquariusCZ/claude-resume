@@ -25,9 +25,10 @@ public sealed class CimRunningProcessLister : IRunningProcessLister
     {
         var result = new List<RunningProcessInfo>();
 
-        // 只取需要的三列:少一列就少一份把凭据读进内存的理由。
+        // 只取需要的四列:少一列就少一份把凭据读进内存的理由。
+        // ParentProcessId 对 S4U 进程同样可读,SingleConsumerGuard 靠它认出 cc-connect 自己的宿主链。
         using var searcher = new ManagementObjectSearcher(
-            "SELECT ProcessId, Name, CommandLine FROM Win32_Process");
+            "SELECT ProcessId, ParentProcessId, Name, CommandLine, CreationDate FROM Win32_Process");
         using ManagementObjectCollection collection = searcher.Get();
 
         foreach (ManagementBaseObject item in collection)
@@ -49,8 +50,15 @@ public sealed class CimRunningProcessLister : IRunningProcessLister
                     // 安全上下文可能不向交互会话暴露命令行。枚举器如实返回 null;
                     // SingleConsumerGuard 遇到相关脚本宿主时会 fail-closed,不能把它当成无冲突。
                     string? commandLine = item["CommandLine"] as string;
+                    int? parentPid = item["ParentProcessId"] is { } rawParent ? Convert.ToInt32(rawParent) : null;
+                    DateTime? createdAt = null;
+                    if (item["CreationDate"] is string rawCreated && rawCreated.Length > 0)
+                    {
+                        try { createdAt = ManagementDateTimeConverter.ToDateTime(rawCreated).ToUniversalTime(); }
+                        catch (Exception) { }
+                    }
 
-                    result.Add(new RunningProcessInfo(pid, name, commandLine));
+                    result.Add(new RunningProcessInfo(pid, name, commandLine, parentPid, createdAt));
                 }
                 catch (ManagementException)
                 {

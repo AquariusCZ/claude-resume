@@ -112,10 +112,10 @@ public class ClaudeCodeNotificationAdapterTests : IDisposable
         Assert.Equal(string.Empty, stopMatcher);
         Assert.DoesNotContain("--kind=", stopCommand, StringComparison.Ordinal);
 
-        // 只订阅"AI 在等你"的那几种;permission_prompt 与 idle_prompt 会变成噪音。
-        Assert.Equal("agent_needs_input|elicitation_dialog|elicitation_url_dialog", notifyMatcher);
+        // 只订阅"AI 在等你"的那几种。permission_prompt 自 2026-10-12 起订阅:桌面版/VS Code 的
+        // 权限等待只以它出现;idle_prompt 按时间触发会变成噪音,仍不订阅。
+        Assert.Equal("agent_needs_input|elicitation_dialog|elicitation_url_dialog|permission_prompt", notifyMatcher);
         Assert.EndsWith("--kind=decision", notifyCommand, StringComparison.Ordinal);
-        Assert.DoesNotContain("permission_prompt", notifyMatcher, StringComparison.Ordinal);
         Assert.DoesNotContain("idle_prompt", notifyMatcher, StringComparison.Ordinal);
     }
 
@@ -156,7 +156,7 @@ public class ClaudeCodeNotificationAdapterTests : IDisposable
         Assert.Single(hooks.GetProperty("Stop").EnumerateArray());
         Assert.Single(hooks.GetProperty("Notification").EnumerateArray());
         // matcher 也要对齐:后来新增的通知类型不能因为旧配置而永远收不到。
-        Assert.Equal("agent_needs_input|elicitation_dialog|elicitation_url_dialog",
+        Assert.Equal("agent_needs_input|elicitation_dialog|elicitation_url_dialog|permission_prompt",
             ReadOwnEntry(json, "Notification").Matcher);
         Assert.EndsWith("--kind=decision", ReadOwnEntry(json, "Notification").Command, StringComparison.Ordinal);
     }

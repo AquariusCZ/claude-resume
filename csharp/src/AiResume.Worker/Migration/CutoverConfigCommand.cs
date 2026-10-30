@@ -1,23 +1,17 @@
 using AiResume.Core;
+using AiResume.Worker.Probes;
 using AiResume.Worker.Products;
 using AiResume.Wrapper;
 
 namespace AiResume.Worker.Migration;
 
 /// <summary>
-/// <c>AiResume.Worker.exe cutover-config [--out &lt;path&gt;] [--work-dir &lt;path&gt;]</c>(S10):
-/// 从 shadow 产品配置的项目清单生成 cc-connect 的 <c>config.toml</c>。
-///
-/// **飞书凭据只从环境变量取,绝不作为命令行参数**:命令行会进入进程列表、
-/// PowerShell 历史与本工具自己的 CIM 枚举结果,等于把 app_secret 广播出去。
-/// 环境变量由用户在自己的会话里设置,值全程不经过日志、不进仓库、不打印——
-/// 终端上只回显脱敏版本。
+/// 从产品配置的项目清单生成 cc-connect 的 <c>config.toml</c>。
+/// 唯一调用方是 <see cref="CcConnectApplyCommand"/>(GUI「生成并重启」与 CLI <c>cc-connect-apply</c>
+/// 共用),凭据只从 DPAPI 取;本类不再提供只写文件、不验证、不重启的独立 CLI。
 /// </summary>
 public static class CutoverConfigCommand
 {
-    private const string AppIdEnv = "FEISHU_APP_ID";
-    private const string AppSecretEnv = "FEISHU_APP_SECRET";
-
     /// <summary>
     /// cc-connect 侧的项目名是**身份键**:会话、dir 历史、provider 引用、
     /// projects/*.state.json 全部挂在它上面。因此固定不变,不从任何目录名派生。
@@ -33,29 +27,6 @@ public static class CutoverConfigCommand
 
     /// <summary>生成结果。<see cref="SanitizedToml"/> 已脱敏,可安全回显给界面与日志。</summary>
     public sealed record GenerateResult(bool Ok, string Message, int ProjectCount, string? SanitizedToml, string? OutPath);
-
-    public static int Run(string[] args)
-    {
-        string outPath = ReadOption(args, "--out") ?? DefaultConfigPath;
-        string? workDir = ReadOption(args, "--work-dir");
-
-        // 命令行场景仍支持环境变量;为空则回落到 GUI 存进 DPAPI 的凭据。
-        string? appId = Environment.GetEnvironmentVariable(AppIdEnv);
-        string? appSecret = Environment.GetEnvironmentVariable(AppSecretEnv);
-
-        GenerateResult result = Generate(outPath, appId, appSecret, workDir);
-        if (!result.Ok)
-        {
-            Console.Error.WriteLine(result.Message);
-            return 1;
-        }
-
-        Console.WriteLine(result.Message);
-        Console.WriteLine();
-        Console.WriteLine(result.SanitizedToml);
-        Console.WriteLine("下一步:`AiResume.Worker.exe preflight` 必须返回 Clear 之后才能启动 cc-connect。");
-        return 0;
-    }
 
     /// <summary>
     /// 生成 cc-connect 配置。凭据留空时从 DPAPI 取(GUI 存的那份)。
@@ -76,7 +47,7 @@ public static class CutoverConfigCommand
             if (!new FeishuCredentialStore().TryLoad(out string _, out string _, out string storedAllow))
             {
                 return new GenerateResult(false,
-                    "尚未配置飞书凭据与授权名单。请在控制面「飞书接入」里填写,或先运行 import-feishu。",
+                    "尚未配置飞书凭据与授权名单。请在控制面「飞书接入」里填写。",
                     0, null, null);
             }
 
@@ -88,7 +59,7 @@ public static class CutoverConfigCommand
             if (!new FeishuCredentialStore().TryLoad(out string storedId, out string storedSecret, out _))
             {
                 return new GenerateResult(false,
-                    $"尚未配置飞书凭据。请在控制面「飞书接入」里填写,或设置 {AppIdEnv} / {AppSecretEnv} 环境变量。",
+                    "尚未配置飞书凭据。请在控制面「飞书接入」里填写。",
                     0, null, null);
             }
 
@@ -129,10 +100,36 @@ public static class CutoverConfigCommand
         bool preserveAgentSelection = sameAgent && hasAgentSelection && existingCoherence.Count == 0;
         bool projectSelectionReset = existingAgent.Length > 0 && hasAgentSelection && !preserveAgentSelection;
         string? existingWorkDir = CcConnectConfigGenerator.TryReadExistingWorkDir(existingToml, ProjectName);
-        // 顶层 [[providers]] 的全局服务商必须经 provider_refs 引用,否则项目用不到它们。
-        IReadOnlyList<string> providerRefs = CcConnectConfigGenerator.ReadGlobalProviderNames(existingToml, agentType);
-        (string selectedProvider, string selectedModel) = ResolveUnambiguousProviderSelection(
-            existingToml, agentType, providerRefs, preserveAgentSelection);
+        // codex 走官方登录(B1):只服务 codex 的第三方 provider 删除——上游会拿它 ensureCodexAuth 改写 auth.json。
+        // 其它 agent 不动这些 provider:它们与 claudecode 的运行无关,删了只会让用户的配置凭空少一块。
+        bool codexOfficial = agentType.Equals("codex", StringComparison.Ordinal);
+        IReadOnlyList<string> removedProviders = Array.Empty<string>();
+        string withoutCodexProviders = existingToml;
+        if (codexOfficial)
+        {
+            withoutCodexProviders = CcConnectConfigGenerator.RemoveCodexOnlyProviders(existingToml, out removedProviders);
+            if (removedProviders.Count > 0 && File.Exists(outPath) && !TryBackupBeforeProviderRemoval(outPath, existingToml))
+            {
+                return new GenerateResult(false,
+                    "需要删除只服务 codex 的第三方 provider,但无法在 config.toml 同目录写入备份,已中止生成。", 0, null, null);
+            }
+        }
+        IReadOnlyList<string> providerRefs = codexOfficial
+            ? Array.Empty<string>()
+            : CcConnectConfigGenerator.ReadGlobalProviderNames(withoutCodexProviders, agentType);
+        (string selectedProvider, string selectedModel) = codexOfficial
+            ? (string.Empty, string.Empty)
+            : ResolveUnambiguousProviderSelection(
+                withoutCodexProviders, agentType, providerRefs, preserveAgentSelection);
+        string codexCmd;
+        try
+        {
+            codexCmd = codexOfficial ? OfficialCodexCommand() : string.Empty;
+        }
+        catch (InvalidOperationException ex)
+        {
+            return new GenerateResult(false, ex.Message, 0, null, null);
+        }
 
         // 解析 work_dir:显式参数 > 既有配置(目录仍存在) > 已布防项目 > 发现结果(按名排序)。
         // 发现结果要扫盘,所以只在前三级全部落空时才求值——先不传,拿到 null 再补一次。
@@ -170,7 +167,8 @@ public static class CutoverConfigCommand
                 AdminFrom: allowFrom,
                 ProviderRefs: providerRefs,
                 SelectedProvider: selectedProvider,
-                SelectedModel: selectedModel),
+                SelectedModel: selectedModel,
+                Cmd: codexCmd),
         };
 
         var config = new CcConnectConfig(projects, new CcConnectPlatformOptions(appId, appSecret, allowFrom));
@@ -180,9 +178,12 @@ public static class CutoverConfigCommand
             CcConnectConfigGenerator.Write(
                 outPath,
                 config,
-                preserveAgentSelection,
+                // codex 走官方时,旧配置里残留的 provider/model 选择(sub2api 及其模型)必须清掉,
+                // 否则 cc-connect 会拿着一个已被删除的 provider 名启动。
+                preserveAgentSelection && !codexOfficial,
                 requireLoadable ? ValidateCandidateForActivation : null,
-                preserveInlineAgentProviders: sameAgent);
+                preserveInlineAgentProviders: sameAgent,
+                removeCodexOnlyProviders: codexOfficial);
         }
         catch (Exception ex)
         {
@@ -196,6 +197,14 @@ public static class CutoverConfigCommand
         string resetNote = projectSelectionReset
             ? $" 已为 {agentType} 清除项目配置中不一致的默认 provider/model 选择。"
             : string.Empty;
+        if (removedProviders.Count > 0)
+        {
+            resetNote += $" 已删除只服务 codex 的第三方 provider:{string.Join("、", removedProviders)}(Codex 改走官方登录;原文件已备份为 config.toml.bak-ai-resume-<时间>,其中含飞书密钥与管理令牌,请勿外传;飞书会话若曾选择这些 provider,请用 /provider switch 重选)。";
+        }
+        if (codexOfficial)
+        {
+            resetNote += " codex 通过 cmd 固定官方端点,凭据由 Codex 自身的 auth.json 提供。";
+        }
         string selectionNote = selectedProvider.Length > 0
             ? $" 已自动选择唯一兼容 provider「{selectedProvider}」"
               + (selectedModel.Length > 0 ? $"及模型「{selectedModel}」。" : "。")
@@ -206,6 +215,69 @@ public static class CutoverConfigCommand
             projects.Count,
             CcConnectConfigGenerator.RenderSanitized(config, foreignCount),
             outPath);
+    }
+
+    /// <summary>
+    /// 让 cc-connect 的 codex agent 走官方连接。上游 v1.4.1 以 <c>strings.Fields</c> 切分 <c>cmd</c>,
+    /// 所以每个 <c>-c</c> 覆盖值里不能有空白;<c>-c</c> 是 codex 根命令的全局选项,放在 <c>exec</c> 前有效
+    /// (2026-10-12 本机 0.148.0 实测 <c>codex -c … exec --help</c> 正常)。
+    /// 端点按 auth.json 的登录方式选:ChatGPT 登录走 chatgpt.com/backend-api/codex,API key 走 api.openai.com/v1;
+    /// 显式写 <c>openai_base_url</c> 是因为本机桥接可能已把它改成 127.0.0.1,内置 openai provider 会照单全收。
+    /// </summary>
+    public static string OfficialCodexCommand(string? baseUrl = null, string? codexHome = null)
+    {
+        // 未登录时不猜端点:ChatGPT 登录与 API key 走的是两个不同的官方地址,
+        // 写错一个会让 cc-connect 的 codex agent 把以后的 API key 发往 ChatGPT backend。
+        CodexProviderCredentials official = CodexAuthProbe.ReadOfficialCredentials(codexHome);
+        string endpoint = baseUrl ?? (official.Problem is null && official.BaseUrl is { Length: > 0 } url
+            ? url
+            : throw new InvalidOperationException("Codex 未登录(auth.json 无有效登录),拒绝生成官方 cmd;请先运行 codex login 再生成"));
+        if (endpoint.Any(char.IsWhiteSpace) || endpoint.Contains('"'))
+        {
+            throw new InvalidOperationException("Codex 官方端点含空白或引号,无法写入 cc-connect cmd");
+        }
+
+        return "codex -c model_provider=\"openai\" -c openai_base_url=\"" + endpoint + "\"";
+    }
+
+    /// <summary>
+    /// 删除 provider 前给生产文件留一份带时间戳的备份。同一份内容只备份一次——激活失败重试不该每秒堆一个含密钥的文件。
+    /// 返回 false 表示备份没写成;调用方据此中止删除,而不是带着「尽力而为」继续。
+    /// </summary>
+    private static bool TryBackupBeforeProviderRemoval(string outPath, string existingToml)
+    {
+        try
+        {
+            string directory = Path.GetDirectoryName(Path.GetFullPath(outPath)) ?? string.Empty;
+            byte[] content = new System.Text.UTF8Encoding(false).GetBytes(existingToml);
+            string digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(content));
+            foreach (string existing in Directory.EnumerateFiles(directory, "config.toml.bak-ai-resume-*"))
+            {
+                if (Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(existing))) == digest)
+                {
+                    return true;
+                }
+            }
+
+            string stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss", System.Globalization.CultureInfo.InvariantCulture);
+            string backup = Path.Combine(directory, "config.toml.bak-ai-resume-" + stamp);
+            for (int n = 2; File.Exists(backup) && n < 100; n++)
+            {
+                backup = Path.Combine(directory, "config.toml.bak-ai-resume-" + stamp + "-" + n);
+            }
+
+            using (var stream = new FileStream(backup, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                stream.Write(content);
+                stream.Flush(flushToDisk: true);
+            }
+
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     private static string? ValidateCandidateForActivation(string candidatePath)

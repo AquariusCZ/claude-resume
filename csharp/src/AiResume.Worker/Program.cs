@@ -23,13 +23,6 @@ if (args.Length > 0 && args[0] == "internal-agent-run")
     return await AgentExecCommand.RunAsync(args);
 }
 
-// S9 数据迁移入口。在建 Host **之前**分支:迁移是一次性命令,不该起
-// BackgroundService,也不该因为 Host 的 DI 装配失败而跑不起来。
-if (args.Length > 0 && string.Equals(args[0], "migrate", StringComparison.OrdinalIgnoreCase))
-{
-    return MigrationCommand.Run(args);
-}
-
 // S10 生产切换预检:确认本机没有第二个飞书事件消费者。只读、不停任何进程。
 if (args.Length > 0 && string.Equals(args[0], "preflight", StringComparison.OrdinalIgnoreCase))
 {
@@ -52,14 +45,6 @@ if (args.Length > 0 &&
     return InstallCommand.Run(args);
 }
 
-// S10 从现役 AppDir 导入飞书凭据到 DPAPI。切换用的是同一个飞书应用,凭据本来就在本机;
-// 机器到机器搬运,值不显示、不入日志。做成命令而不是 GUI 按钮:它是一次性动作,
-// 界面上常驻一个"导入"按钮只会让人以为需要反复点。
-if (args.Length > 0 && string.Equals(args[0], "import-feishu", StringComparison.OrdinalIgnoreCase))
-{
-    return ImportFeishuCommand.Run();
-}
-
 // 凭据健康检查:用 DPAPI 里的凭据独立换一次 tenant_access_token,
 // 区分「凭据失效」与「客户端坏了」。只打状态码与飞书错误码,不碰 secret 实值。
 if (args.Length > 0 && string.Equals(args[0], "feishu-check", StringComparison.OrdinalIgnoreCase))
@@ -67,16 +52,10 @@ if (args.Length > 0 && string.Equals(args[0], "feishu-check", StringComparison.O
     return FeishuCheckCommand.Run();
 }
 
-// S10 生成 cc-connect 配置(凭据只从环境变量取,不经命令行、不进日志)。
-if (args.Length > 0 && string.Equals(args[0], "cutover-config", StringComparison.OrdinalIgnoreCase))
+// 生成、验证、提交 cc-connect 配置并经管理 API 自重启(与 GUI「生成并重启」同一条路径)。
+if (args.Length > 0 && string.Equals(args[0], "cc-connect-apply", StringComparison.OrdinalIgnoreCase))
 {
-    return CutoverConfigCommand.Run(args);
-}
-
-// S10-P 把 AI Resume 的项目清单同步进 cc-connect 的 /dir 历史。
-if (args.Length > 0 && string.Equals(args[0], "sync-dirs", StringComparison.OrdinalIgnoreCase))
-{
-    return SyncDirsCommand.Run(args);
+    return CcConnectApplyCommand.Run(args);
 }
 
 // 本地完成通知源的启用/禁用(B5 需要;GUI 那个开关无法自动化)。
@@ -96,7 +75,7 @@ if (args.Length > 0 && string.Equals(args[0], "notify", StringComparison.Ordinal
 // (如 `--Observation:IntervalSeconds=00:00:15`,PowerLossRecoveryTests 真在用)
 // 一定带。所以只拦下**不带横线的未知首参**,再单独认掉 help 家族。
 {
-    const string Usage = "可用命令:install / uninstall / migrate / preflight / shortcuts / import-feishu / feishu-check / cutover-config / sync-dirs / notify\n"
+    const string Usage = "可用命令:install / uninstall / preflight / shortcuts / feishu-check / cc-connect-apply / notify\n"
         + "不带任何子命令运行才会以常驻服务启动(此时可传 --Section:Key=Value 形式的宿主配置)。";
 
     if (args.Length > 0 && (args[0] is "--help" or "-h" or "-?" or "/?"))
@@ -119,8 +98,7 @@ HostApplicationBuilder builder = Host.CreateApplicationBuilder(args);
 // ServicesStartConcurrently 打开后让 IPC、观察或续跑引擎抢在 RecoverAsync 前运行。
 builder.Services.Configure<HostOptions>(options => options.ServicesStartConcurrently = false);
 
-// 状态目录与数据库迁移。EnsureRoot 会顺带把旧 ClaudeResumeShadow 的内容
-// 搬到 %LOCALAPPDATA%\AI Resume\state(已存在同名项则跳过,绝不覆盖)。
+// 状态目录与数据库迁移。
 ShadowPaths.EnsureRoot();
 StorageDatabase.Migrate(ShadowPaths.RunDatabasePath);
 
@@ -249,8 +227,8 @@ internal sealed class ProcessRecoveryBootstrap : IHostedService
 /// <summary>
 /// S5-D 测试钩子:宿主启动后自动 Start 一个 fake probe run 并打日志
 /// (供 PowerLossRecoveryTests 在 run 运行中硬杀宿主验证断电恢复)。
-/// runKey 一律经 RunKey.Create 规范生成(D-011);ProfileId="probe" 与 S5-B
-/// ClaudeCodeProviderAdapter 的 probe 判别约定一致。Start 失败仅记录日志,
+/// runKey 一律经 RunKey.Create 规范生成(D-011);ProfileId="probe" 是 RunContract
+/// 探测任务的固定 profile。Start 失败仅记录日志,
 /// 不阻止宿主启动(钩子不得影响生产路径)。
 /// </summary>
 internal sealed class TestAutoProbeHook : IHostedService
@@ -276,7 +254,7 @@ internal sealed class TestAutoProbeHook : IHostedService
                     Path.Combine(Path.GetTempPath(), "s5d-auto-probe"), null),
                 TaskKind = TaskKind.Probe,
                 Actor = "test",
-                ProfileId = ClaudeCodeProviderAdapter.ProbeProfileId,
+                ProfileId = "probe",
                 Cwd = Path.GetTempPath(),
                 InputRef = "auto-probe",
             }, cancellationToken).ConfigureAwait(false);

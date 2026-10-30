@@ -98,9 +98,7 @@ public partial class MainWindow : Window
     {
         try
         {
-            // EnsureRoot 建目录并把旧 ClaudeResumeShadow 的内容搬到
-            // %LOCALAPPDATA%\AI Resume\state —— GUI 常常是先被打开的那一个,
-            // 所以迁移必须在这里也触发,不能只挂在 Worker 上。
+            // EnsureRoot 只负责建状态目录(v2.1 起不再迁移旧 ClaudeResumeShadow 目录)。
             string userData = Path.Combine(AiResume.Worker.ShadowPaths.EnsureRoot(), "webview2");
             Directory.CreateDirectory(userData);
 

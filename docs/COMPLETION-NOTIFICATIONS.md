@@ -1,6 +1,6 @@
 # 完成通知协议、实现与验证手册
 
-最后验证：2026-08-20（Windows 11，AI Resume v2）
+最后验证：2026-08-20（Windows 11，AI Resume v2）；2026-10-12 v2.1 把 Codex 通知改为 hooks、收件人明文化（§2、§3、§4、§5、§7），真机记录见 §6 末尾。
 
 ## 1. 从第一性原理定义“可用”
 
@@ -30,14 +30,14 @@ AiResume.Worker NotificationWorker --> lark-cli --> Feishu
 | 来源 | 整任务边界 | 正文传输 | AI Resume 接入 |
 |---|---|---|---|
 | Claude Code | `Stop` | JSON 写入 stdin | `"AiResume.Hook.exe" claudecode` |
-| Codex | `notify` 的 `agent-turn-complete` | JSON 作为命令最后一个 argv | `AiResume.Hook.exe codex ... <payload>` |
+| Codex | hooks `Stop`（Codex 0.148.0） | JSON 写入 stdin | `~/.codex/hooks.json` 里 AI Resume 自己的 Stop 分组：`"AiResume.Hook.exe" codex`，信任哈希登记在 `config.toml` 的 `[hooks.state]` |
 | Cline | `TaskComplete.ps1` | JSON 写入 stdin | PowerShell wrapper 把同一份 stdin 转给旧脚本和 Hook |
 | Qoder | `hooks.Stop` | JSON 写入 stdin | `"AiResume.Hook.exe" qoder` |
 | OpenCode | 顶层 `session.idle` 插件事件 | 插件先用上游 client 查询 session，`parentID` 非空的子 session 不通知，再用 `Bun.spawn` 把 JSON 写入 stdin | 独立 `airesume-notify.ts` 插件 |
 
 采用依据：
 
-- Codex 官方配置把 `notify` 定义为命令数组，目前完成事件为 `agent-turn-complete`，JSON 负载追加在命令参数末尾：[Codex configuration reference](https://developers.openai.com/codex/config-reference/)、[Advanced configuration](https://developers.openai.com/codex/config-advanced/)。
+- Codex 0.148.0 的 hooks 提供 `Stop` 事件：command hook 从 stdin 读取 JSON（`session_id`、`transcript_path`、`cwd`、`hook_event_name`、`turn_id`、`stop_hook_active`）；非 managed hook 必须在 `config.toml` 有 `[hooks.state."<hooks.json 全路径>:stop:<group>:<handler>"].trusted_hash`，且等于上游对规范化 handler 身份（`{"event_name":"stop","hooks":[{"async":false,"command":…,"timeout":30,"type":"command"}]}` 键排序后的紧凑 JSON）取的 SHA-256 才会执行。算法用本机 codex-chatgpt-web 写入的 `interrupt` 条目作 oracle 复算验证。旧的 `notify` 是单值共享键，2026-10 被 Codex Desktop computer-use 改写为 `[codex-computer-use.exe, turn-ended]`，AI Resume 的链整体丢失，因此所有权不再放在 `notify` 上；Hook 仍兼容旧 argv 负载（`agent-turn-complete`）。
 - Claude Code 命令 Hook 从 stdin 接收 JSON，`Stop` 代表主 agent 停止；`stop_hook_active=true` 用于防递归：[Claude Code hooks](https://code.claude.com/docs/en/hooks)。
 - Claude Code 现行 Hook 契约同时适用于 terminal、IDE extensions、Desktop 和 Web。本机 `claude-vscode` 会话已在 2026-08-19 实证触发全局 `Stop` Hook；这不是 VS Code 扩展直接发飞书，而是扩展执行 AI Resume 写入 `~/.claude/settings.json` 的 command Hook。
 - Qoder 的命令 Hook 同样从 stdin 接收 JSON，`Stop` 是 agent 完成响应的边界：[Qoder hooks](https://docs.qoder.com/extensions/hooks)、[Qoder CLI hooks](https://docs.qoder.com/cli/hooks)。
@@ -62,11 +62,11 @@ AiResume.Worker NotificationWorker --> lark-cli --> Feishu
 - `stop_hook_active=true`，避免 Stop Hook 递归。
 - 空/坏 JSON、不支持的来源、事件类型不匹配、工作目录缺失或不是绝对路径。
 - Claude Code / Qoder 缺少明确的 `Stop` 事件名；Qoder 专属环境变量只允许补 Qoder 负载。
-- Codex 缺少 thread/turn，rollout 未持久化，或 rollout 明确属于 subagent、internal、`memory_consolidation`。
+- Codex 缺少 session/turn，rollout 未持久化，或 rollout 明确属于 subagent、internal、`memory_consolidation`。hooks `Stop` 给出的 `transcript_path` 只有在以 `-<session_id>.jsonl` 结尾、是绝对路径且文件存在时才直接使用，否则回到按 session 扫描 rollout；`stop_hook_active=true` 同样抑制。
 - Codex 的 `Documents\Codex\<日期>\<slug>` 临时 projectless 目录；目录内确有 Git 根时例外。
 - OpenCode 在 `session.idle` 后必须查询 session；`parentID` 非空的 Task/subagent 会话拒绝通知，查询失败也 fail-closed。
 
-Hook 的退出码始终为 0，stdout 保持为空；通知故障不能阻断 agent 自己的收尾流程。stdin 型来源必须从标准输入流显式按严格 UTF-8 解码，不能继承 Windows 控制台 CP936；否则 `公司内网SOP项目` 会在入队前稳定损坏成 `鍏徃鍐呯綉SOP椤圭洰`。Codex 原有 `notify` 用 `--previous-notify` 继续转发。历史 `%LOCALAPPDATA%\AI` 截断命令没有不可伪造的所有权证据，可能也是用户命令，因此保守保留，不自动删除。
+Hook 的退出码始终为 0，stdout 保持为空；通知故障不能阻断 agent 自己的收尾流程。stdin 型来源必须从标准输入流显式按严格 UTF-8 解码，不能继承 Windows 控制台 CP936；否则 `公司内网SOP项目` 会在入队前稳定损坏成 `鍏徃鍐呯綉SOP椤圭洰`。旧版 `notify` 链的 `--previous-notify` 转发仍被 Hook 兼容，但 v2.1 起不再写入 `notify`。历史 `%LOCALAPPDATA%\AI` 截断命令没有不可伪造的所有权证据，可能也是用户命令，因此保守保留，不自动删除。
 
 cc-connect 使用两层抑制，缺一层都不能把激活报告为完整成功：
 
@@ -78,13 +78,12 @@ cc-connect 使用两层抑制，缺一层都不能把激活报告为完整成功
 ## 4. 配置所有权
 
 - Claude Code / Qoder：只有“首个可执行文件名精确为 `AiResume.Hook.exe`，且后面无参数或只有对应来源参数”才算我方 command；参数文本里偶然出现文件名不算所有权。
-- Codex：只改顶层单行 `notify`，用 Tomlyn 解析外层 TOML argv 数组，支持 basic/literal string 混用和字符串内部的嵌套 JSON 方括号；数组必须全部是字符串。已有命令作为 JSON 文本串在 `--previous-notify` 后；多行、非字符串数组或无法安全解析时拒绝修改。
-- Codex 配置修复只在 TOML 语句边界识别 `notify`；多行字符串、数组和内联表内容中的同形文本必须逐字保留。当前版本不能假设已经运行的 Codex app-server 会自动重载该写入，安装或切换后需重启当时已打开的 Codex Desktop。
+- Codex：`hooks.json` 只增删「handler command 的可执行文件精确为 `AiResume.Hook.exe` 且参数为 `codex`」的我方分组，永远追加在 `hooks.Stop` 末尾（信任键按序号定位，插到前面会让用户自己条目的信任记录错位）；根节点不是对象时拒绝修改。`config.toml` 只增删 `trusted_hash` 等于我方命令哈希、且表内除 `trusted_hash` / `enabled` 外没有其它键的 `[hooks.state."…"]` 表；写入按文本追加在文件末尾、原子替换并保留 `.bak`，再用 Tomlyn 读回核验。跨进程用命名互斥体串行。旧版 `notify` 残留只在 `notify list` 提示，不自动改写。已打开的 Codex 会话不会重载 `hooks.json`，新会话才生效；Codex 里 `/hooks` 显示未信任时在那里信任一次即可。
 - Cline：用户原 `TaskComplete.ps1` 备份为 `TaskComplete.ai-resume-previous.ps1`，wrapper 先执行原脚本；wrapper 的读取、原脚本 stdin 和 AI Resume Hook stdin 都固定为 UTF-8，stdout 与 stderr 分开保留，只用 stdout 解析 `cancel`，原脚本要求取消时不再发我方通知。
 - OpenCode：文件名和文件内稳定 marker 必须同时匹配才算我方插件；同名用户插件拒绝覆盖，停用时也不删除。
 - `ProductConfig.NotifySources` 保存用户意图；重装按意图对账，卸载只移除 AI Resume 自己的条目。
 
-路径含空格必须作为一个可执行文件参数处理。Claude/Qoder 写入带引号的命令；Codex 配置是 TOML argv 数组，AI Resume 写回使用其合法的 JSON 字符串数组子集，只有 `--previous-notify` 的值是嵌套 JSON 文本；Cline 使用 PowerShell 单引号；OpenCode 使用 `Bun.spawn([cmd, "opencode"], ...)`，不走 shell 字符串拆分。
+路径含空格必须作为一个可执行文件参数处理。Claude/Qoder/Codex 写入带引号的命令字符串（Codex 的 hooks handler `command` 由 Codex 自己按 shell 规则拆分）；Cline 使用 PowerShell 单引号；OpenCode 使用 `Bun.spawn([cmd, "opencode"], ...)`，不走 shell 字符串拆分。
 
 ## 5. 队列、投递与进程生命周期
 
@@ -92,14 +91,14 @@ cc-connect 使用两层抑制，缺一层都不能把激活报告为完整成功
 - 去重状态：`%LOCALAPPDATA%\AI Resume\state\completion-notify-seen.json`
 - 日志：`%LOCALAPPDATA%\AI Resume\state\logs\`
 - 扫描：Worker 启动后立即扫一轮，之后通常每 30 秒扫描；连续发送失败按 30 秒、60 秒、120 秒指数退避，上限 15 分钟，成功后恢复 30 秒。
-- 收件人：DPAPI 飞书凭据中 `allow_from` 的第一个 `ou_...`。
+- 收件人：`config.json` 的 `notifyRecipientOpenId`——GUI 在读取/保存飞书凭据时从 `allow_from` 第一个 `ou_...` 同步写入，清除凭据时清空；Worker 只对 v2.1 之前没有该字段的旧配置回退读取 DPAPI。S4U session 0 下 `CryptUnprotectData` 会间歇失败数小时（2026-10 实证），投递路径因此不再依赖 DPAPI。
 - 投递：`lark-cli im +messages-send --as bot --user-id ... --idempotency-key <eventId>`。
 
 `install` 先按规范化目标目录获取跨进程命名互斥体，再把三个项目的完整产物复制到同级 staging 目录并校验 GUI/Worker/Hook，写入 payload 清单，再备份本次会覆盖或由新清单淘汰的旧运行文件；只有 staging 与备份都成功后才停止旧 GUI/Worker。新 Worker 必须同时满足“进程未退出”和“Named Pipe `ping` 返回当前协议版本，且 pong PID 等于本次启动 PID”才算就绪；在此之前不修改快捷方式或用户级 Hook。复制、入口创建或就绪核验失败会回滚已替换和已淘汰文件，并在原来有 Worker 时重新启动旧 Worker。回滚不完整时返回独立错误码并保留 staging/backup 的绝对路径。安装目录内的 Worker 不能在 Windows 上删除自己，因此卸载会复制清单拥有的临时运行时：helper 先处理快捷方式和通知源，再把全部 payload、marker 与 manifest 事务性移动到私有退役区，完成后才向父进程返回成功。移动失败原路恢复，恢复不完整则保留 helper 目录；成功后的清理只碰 temp 退役区，不会与立即重装竞争。未知文件存在时写 preserved-root marker，使后续重装可继续，但该 marker 不能授权卸载。
 
 投递成功后删除事件并写入七天去重表；发送失败保留事件供下轮重试；坏 JSON 移入 `completion-events\malformed\`。日志为每个事件记录脱敏后的 `eventId/source/outcome/reason`，去重表损坏、拒绝访问或写入失败也记录稳定诊断码；不会写入消息正文、路径或凭据。通知异常不得拖垮负责额度续跑的 Worker。
 
-当前收件人语义是 `allow_from` 中第一个 `ou_...`。多 owner 的广播、显式通知收件人和排序稳定性属于产品选择，尚未扩展；改变前必须先定义去重与权限语义。Codex 配置适配器按配置路径跨进程串行，提交前比较原文并用 `File.Replace` 的备份核对“实际被替换版本”；若外部写入恰好落在最终比较与原子替换之间，适配器恢复该外部版本、拒绝报告成功，并保留冲突文件。外部编辑器不共享 AI Resume 的锁，运维上仍应避免同时启停通知源和保存 `config.toml`。
+当前收件人语义是 `allow_from` 中第一个 `ou_...`。多 owner 的广播、显式通知收件人和排序稳定性属于产品选择，尚未扩展；改变前必须先定义去重与权限语义。Codex hooks 适配器按 Codex home 跨进程串行（命名互斥体），写 `config.toml` 前比较预期原文，不一致则拒绝提交并保留现场；外部编辑器不共享 AI Resume 的锁，运维上仍应避免同时启停通知源和保存 `config.toml`。
 
 ## 6. 验证层级
 
@@ -127,7 +126,7 @@ dotnet test csharp\AiResume.sln
 & "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe" feishu-check
 ```
 
-`notify list` 中已启用来源必须显示 `可送达=True` 且退出码为 0；`feishu-check` 必须确认凭据可解密、配置可用和 bot token 可获取。随后按五种真实协议各注入一条带 `smoke=true` 的事件，等待 Worker 日志出现 `worker.notify.sweep ... sent=5`，并在飞书收到五条“通知冒烟通过”。这验证的是完整 Hook → 队列 → Worker → lark-cli → 飞书链路，不会启动或修改任何真实 AI 会话。
+`notify list` 中已启用来源必须显示 `可送达=True` 且退出码为 0，Codex 行还必须显示信任哈希已登记（否则为 hookBroken 断链）；`feishu-check` 必须确认凭据可解密、配置可用和 bot token 可获取。随后按五种真实协议各注入一条带 `smoke=true` 的事件，等待 Worker 日志出现 `worker.notify.sweep ... sent=5`，并在飞书收到五条“通知冒烟通过”。这验证的是完整 Hook → 队列 → Worker → lark-cli → 飞书链路，不会启动或修改任何真实 AI 会话。
 
 2026-08-09 最终安装版实证：仓库全量回归为 `972/972`。安装目录 Worker/Hook 与本次构建哈希一致；`notify list` 五源均为 `可送达=True`；`feishu-check` 返回 `code=0`；协议冒烟分别记录 `claudecode/cline/qoder/opencode` 的 `total=4 sent=4 failed=0` 与 Codex 的 `total=1 sent=1 failed=0`，五个来源均出现 `outcome=Sent`，队列归零。Codex 单独一轮是为了使用与真实客户端一致的现代 argv 传递，避免 Windows PowerShell 5.1 改写 JSON 参数。这里验证的是五种真实 Hook 协议到飞书的完整链路，不代表为了测试而让五个客户端各执行了一次真实 AI 任务。
 
@@ -140,7 +139,8 @@ dotnet test csharp\AiResume.sln
 | 开关打开但从未入队 | 客户端配置和 Hook 命令 | 来源参数正确，路径有引号/argv 保护，Hook 文件存在 |
 | Claude VS Code 曾经不通知 | VS Code Claude 日志、版本、全局 `settings.json` | 2.1.232 曾实测缺失；后续版本已实证执行 `Stop`，不要沿用旧版本结论 |
 | 只有中文项目名乱码 | Hook stdin 与 Cline wrapper | stdin 必须按 UTF-8 解码；不要在 Worker/飞书端猜测反转乱码 |
-| Codex 独有不通知 | `~/.codex/config.toml`、主进程启动时间与 rollout | JSON 位于最后一个 argv，顶层 persisted rollout 可找到；主进程早于配置写入时先重启 Codex Desktop |
+| Codex 独有不通知 | `~/.codex/hooks.json`、`config.toml` 的 `[hooks.state]`、会话启动时间 | Stop 分组存在且 `trusted_hash` 等于当前哈希（`notify list` 不报断链；否则在 codex `/hooks` 信任）；会话早于 hooks.json 写入时新开会话；`transcript_path` 指向顶层 persisted rollout |
+| 通知间歇几小时发不出，日志 `worker.notify.sweep_failed` | `config.json` 的 `notifyRecipientOpenId` | v2.1 起收件人明文；字段为空说明旧配置未同步，打开控制面让它读取一次飞书凭据状态即可 |
 | Cline 独有不通知 | `TaskComplete.ps1` | `$stdin` 同时管道给旧脚本和 `AiResume.Hook.exe cline` |
 | OpenCode 独有不通知 | `airesume-notify.ts` | 监听 `session.idle`，查询 session 后拒绝 `parentID` 子会话，使用 `Bun.spawn` + stdin，而不是 shell 模板字符串 |
 | 队列有文件但飞书没有 | Worker、凭据、lark-cli、日志 | Worker 进程存在；`feishu-check` 成功；日志无持续 `failed/skipped` |

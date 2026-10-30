@@ -1342,7 +1342,7 @@ public static class InstallCommand
         }
         else if (done.Contains(NotificationProviderKind.Codex))
         {
-            Console.WriteLine("Codex 通知配置已写入;若客户端此前已在运行,需重启 Codex 后加载。");
+            Console.WriteLine("Codex Stop 钩子已写入 hooks.json 并登记信任;已打开的 Codex 会话不会重载,新开会话即生效;若 codex /hooks 显示未信任,在那里信任一次。");
         }
 
         // 意图代表用户想要的目标,不是本轮偶然成功的子集。失败项必须保留,

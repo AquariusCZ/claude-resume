@@ -42,10 +42,7 @@ public sealed class ControlPlaneBridge
     private readonly Func<CcConnectDaemonController> _daemonControllerFactory;
     private readonly Func<string, CutoverConfigCommand.GenerateResult> _cutoverGenerate;
     private readonly Func<string?> _hookExecutableResolver;
-    private readonly Func<CodexProviderCredentials> _codexProviderSnapshot;
-    private readonly Func<CodexProviderCredentials, bool, CancellationToken, Task<CodexProbeResult>> _codexProbe;
-    private readonly Func<CodexProviderCredentials, CancellationToken, Task<CodexBalanceResult>> _codexBalanceProbe;
-    private readonly Func<CancellationToken, Task<DeepSeekProbeResult>> _deepSeekProbe;
+    private readonly ClaudeCredentialSource _claudeCredentials;
     private readonly Action<string, string> _probeFailureReporter;
     private readonly Action<string, string> _requestFailureReporter;
     private readonly Func<bool?> _engineProcessDetector;
@@ -70,10 +67,7 @@ public sealed class ControlPlaneBridge
         Func<string, CutoverConfigCommand.GenerateResult>? cutoverGenerate = null,
         string? cutoverConfigPath = null,
         Func<string?>? hookExecutableResolver = null,
-        Func<CodexProviderCredentials>? codexProviderSnapshot = null,
-        Func<CodexProviderCredentials, bool, CancellationToken, Task<CodexProbeResult>>? codexProbe = null,
-        Func<CodexProviderCredentials, CancellationToken, Task<CodexBalanceResult>>? codexBalanceProbe = null,
-        Func<CancellationToken, Task<DeepSeekProbeResult>>? deepSeekProbe = null,
+        ClaudeCredentialSource? claudeCredentials = null,
         Action<string, string>? probeFailureReporter = null,
         Action<string, string>? requestFailureReporter = null,
         Func<bool?>? engineProcessDetector = null,
@@ -89,14 +83,6 @@ public sealed class ControlPlaneBridge
         _cutoverGenerate = cutoverGenerate ?? (path => CutoverConfigCommand.Generate(
             path, appId: null, appSecret: null, requireLoadable: true));
         _hookExecutableResolver = hookExecutableResolver ?? HookExecutable.TryResolve;
-        var defaultCodexProbe = new CodexProbe();
-        var defaultBalanceProbe = new CodexBalanceProbe();
-        _codexProviderSnapshot = codexProviderSnapshot ?? (() => CodexAuthProbe.ReadActiveProviderCredentials());
-        _codexProbe = codexProbe ?? ((provider, deep, ct) => deep
-            ? defaultCodexProbe.ProbeDeepAsync(provider, ct)
-            : defaultCodexProbe.ProbeShallowAsync(provider, ct));
-        _codexBalanceProbe = codexBalanceProbe ?? ((provider, ct) => defaultBalanceProbe.ProbeAsync(provider, ct));
-        _deepSeekProbe = deepSeekProbe ?? (ct => new DeepSeekProbe().ProbeAsync(ct));
         _probeFailureReporter = probeFailureReporter ?? ((_, _) => { });
         _requestFailureReporter = requestFailureReporter ?? ((_, _) => { });
         _engineProcessDetector = engineProcessDetector ?? (() => EngineLiveness.TryDetectEngineProcess());
@@ -108,6 +94,8 @@ public sealed class ControlPlaneBridge
         _quota = quotaService ?? new QuotaService();
         var providers = new ProviderCatalogService(quota: _quota);
         _providerCatalog = providerCatalog ?? providers.ReadAsync;
+        // 长期令牌的保存/清除与供应商注册表共用同一个凭据解析器,面板上「现在靠哪份凭据」才和续跑一致。
+        _claudeCredentials = claudeCredentials ?? providers.Registry.ClaudeCredentials;
         _resumeBinding = resumeBinding ?? new ResumeBindingService(providers).BindAsync;
         // 与 Worker 的续跑引擎读写同一份 shadow 配置/状态:GUI 布防 → 引擎消费。
         _configStore = configStore ?? new ProductConfigStore(ShadowPaths.Root);
@@ -156,7 +144,9 @@ public sealed class ControlPlaneBridge
                 "arm.get" => await Task.Run(() => GetArm(), cancellationToken).ConfigureAwait(false),
                 "arm.set" => await Task.Run(() => SetArmAsync(root, cancellationToken), cancellationToken).ConfigureAwait(false),
                 "providers.catalog" => new { items = (await _providerCatalog(cancellationToken).ConfigureAwait(false)).Select(p => p.ToPayload()) },
-                "providers.probe" => await ProbeProvidersAsync(root, cancellationToken).ConfigureAwait(false),
+                "claude.token.status" => await Task.Run(() => ClaudeTokenStatus(), cancellationToken).ConfigureAwait(false),
+                "claude.token.save" => await Task.Run(() => SaveClaudeToken(root), cancellationToken).ConfigureAwait(false),
+                "claude.token.clear" => await Task.Run(() => ClearClaudeToken(), cancellationToken).ConfigureAwait(false),
                 "agent.get" => await Task.Run(() => GetAgent(), cancellationToken).ConfigureAwait(false),
                 "agent.set" => await Task.Run(() => SetAgent(root), cancellationToken).ConfigureAwait(false),
                 _ => throw new NotSupportedException($"未知请求类型:{type}"),
@@ -231,16 +221,19 @@ public sealed class ControlPlaneBridge
             "providers.catalog" => new { items = new object[] {
                 new { id = "claude-subscription", name = "Claude · Anthropic 订阅", agent = "claudecode", kind = "claude-oauth", models = new[] { new { id = "claude-fable-5-1", name = "Claude Fable 5.1" }, new { id = "claude-opus-5", name = "Claude Opus 5" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = true, resumeNote = "布防后固定调用 ID", windows = new[] { new { name = "Fable", usedPercent = 100, carriedForward = false } } },
                 new { id = "deepseek", name = "DeepSeek · 官方 API", agent = "claudecode", kind = "deepseek", models = new[] { new { id = "deepseek-v4-flash", name = "deepseek-v4-flash" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = false, balance = 47.77, currency = "CNY", resumeNote = "固定调用 ID；同一 ID 的后端可能更新" },
-                new { id = "codex-active", name = "Codex · 第三方供应商", agent = "codex", kind = "openai-api", models = new[] { new { id = "example-model", name = "供应商模型" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = false, balance = 518.52, currency = "USD", resumeNote = "布防后固定调用 ID" }
+                new { id = "codex-official", name = "Codex · ChatGPT 官方", agent = "codex", kind = "chatgpt", credentialSource = "auth.json:chatgpt", models = new[] { new { id = "gpt-5.6-sol", name = "GPT-5.6 Sol" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = false, resumeNote = "账号窗口与模型可用性来自 ChatGPT 官方接口", windows = new object[] { new { name = "primary · 7D", usedPercent = 12, resetAtUnix = now + 500_000, windowSeconds = 604_800, carriedForward = false, status = "allowed" } } }
             } },
-            "providers.probe" => new
+            "claude.token.status" => new
             {
-                deep = false,
-                items = new object[]
-                {
-                    new { name = "DeepSeek", state = "ok", text = "¥47.77", detail = "余额接口已验证" },
-                    new { name = "Codex", state = "ok", text = "518.52 USD", detail = "Sub2API 余额接口已验证；余额 518.52 USD" },
-                },
+                hasStoredToken = true,
+                storedTokenSavedAtUnix = now - 86_400,
+                cliLoggedIn = false,
+                cliExpiresAtUnix = (long?)null,
+                cliProblem = "Claude CLI 未登录",
+                activeSource = "ai-resume-token",
+                problem = (string?)null,
+                storedRejectedReason = (string?)null,
+                storedProblem = (string?)null,
             },
             "arm.get" => new
             {
@@ -998,6 +991,10 @@ public sealed class ControlPlaneBridge
     private FeishuPayload FeishuStatus()
     {
         FeishuCredentialStatus status = new FeishuCredentialStore().Describe();
+        if (status.HasCredentials)
+        {
+            SyncNotifyRecipient(status.AllowFrom);
+        }
 
         // **文件在 ≠ cc-connect 加载得了。** 原来这里只回 File.Exists,
         // 于是配置被改坏之后界面照旧说"配置已生成"(2026-08-08 审计 A3)。
@@ -1070,19 +1067,28 @@ public sealed class ControlPlaneBridge
         }
 
         new FeishuCredentialStore().Save(appId, appSecret, allowFrom);
+        SyncNotifyRecipient(allowFrom);
         return FeishuStatus();
     }
 
     private FeishuPayload ClearFeishu()
     {
         new FeishuCredentialStore().Clear();
+        try
+        {
+            _configStore.Update(c => c.NotifyRecipientOpenId = string.Empty);
+        }
+        catch (Exception ex)
+        {
+            ReportRequestFailure("feishu.recipient", ex);
+        }
         return FeishuStatus();
     }
 
 
     /// <summary>
     /// 生成、验证并重启 cc-connect。凭据由 <see cref="CutoverConfigCommand"/> 从 DPAPI 取,
-    /// 不经过本类;整个操作用仓库外文件锁跨窗口串行化。
+    /// 全流程在 <see cref="CcConnectApplyCommand"/>(与 CLI 共用)里完成;本类只做窗口内互斥与应答映射。
     /// </summary>
     private CutoverPayload GenerateAndRestartCutover()
     {
@@ -1094,160 +1100,20 @@ public sealed class ControlPlaneBridge
                 Agent: null, Pid: null, Phase: "busy");
         }
 
-        bool configWritten = false;
-        int projectCount = 0;
-        string? sanitizedToml = null;
-        string outPath = _cutoverConfigPath;
-        string? expectedAgent = null;
-        string? candidatePath = null;
-
         try
         {
-            using CcConnectApplyLock applyLock = CcConnectApplyLock.Acquire(outPath);
-            string directory = Path.GetDirectoryName(Path.GetFullPath(outPath))!;
-            Directory.CreateDirectory(directory);
-            candidatePath = Path.Combine(directory, ".config.toml.ai-resume-candidate-" + Guid.NewGuid().ToString("N"));
-            byte[]? original = File.Exists(outPath) ? File.ReadAllBytes(outPath) : null;
-            byte[]? originalHash = original is null ? null : SHA256.HashData(original);
-            if (original is not null)
+            CcConnectApplyResult r = CcConnectApplyCommand.Apply(_cutoverConfigPath, _cutoverGenerate, _daemonControllerFactory);
+            if (r.Phase == "exception")
             {
-                File.WriteAllBytes(candidatePath, original);
+                ReportRequestFailure("cutover.generate", new InvalidOperationException(r.Message));
             }
 
-            CutoverConfigCommand.GenerateResult r = _cutoverGenerate(candidatePath);
-            projectCount = r.ProjectCount;
-            sanitizedToml = r.SanitizedToml;
-
-            if (!r.Ok || string.IsNullOrWhiteSpace(r.OutPath))
-            {
-                return new CutoverPayload(
-                    false, r.Message, r.ProjectCount, r.SanitizedToml, outPath,
-                    ConfigWritten: false, RestartVerified: false, Agent: null, Pid: null, Phase: "generate");
-            }
-
-            string candidateToml = File.ReadAllText(candidatePath);
-            byte[] candidateHash = SHA256.HashData(File.ReadAllBytes(candidatePath));
-            expectedAgent = CcConnectConfigValidator
-                .ReadProjectAgentTriple(candidateToml, CutoverConfigCommand.ProjectName).Agent;
-            if (expectedAgent.Length == 0)
-            {
-                return new CutoverPayload(
-                    false, "候选配置无法读出 ai-resume 项目的 agent,生产配置未改动。",
-                    r.ProjectCount, r.SanitizedToml, outPath,
-                    ConfigWritten: false, RestartVerified: false, Agent: null, Pid: null, Phase: "validate");
-            }
-
-            CcConnectDaemonRestartResult restart = _daemonControllerFactory().ActivateAndVerify(
-                outPath,
-                candidatePath,
-                CutoverConfigCommand.ProjectName,
-                expectedAgent,
-                commitConfiguration: () =>
-                {
-                    EnsureProductionConfigUnchanged(outPath, originalHash);
-                    File.Move(candidatePath, outPath, overwrite: true);
-                    configWritten = true;
-                },
-                rollbackConfiguration: () =>
-                {
-                    EnsureProductionConfigMatches(outPath, candidateHash);
-                    if (original is null)
-                    {
-                        File.Delete(outPath);
-                    }
-                    else
-                    {
-                        WriteBytesAtomically(outPath, original);
-                    }
-                    configWritten = false;
-                });
-
-            // SanitizedToml 里的 app_secret 已是 [REDACTED],可以安全展示给用户复核。
-            return new CutoverPayload(
-                restart.Ok,
-                restart.Message,
-                r.ProjectCount,
-                r.SanitizedToml,
-                outPath,
-                ConfigWritten: restart.ConfigWritten,
-                RestartVerified: restart.Ok,
-                Agent: expectedAgent,
-                Pid: restart.CurrentPid,
-                Phase: restart.Phase);
-        }
-        catch (Exception ex)
-        {
-            ReportRequestFailure("cutover.generate", ex);
-            return new CutoverPayload(
-                false, SecretRedactor.RedactText(ex.Message), projectCount, sanitizedToml, outPath,
-                ConfigWritten: configWritten, RestartVerified: false, Agent: expectedAgent, Pid: null, Phase: "exception");
+            return new CutoverPayload(r.Ok, r.Message, r.ProjectCount, r.SanitizedToml, r.OutPath,
+                r.ConfigWritten, r.RestartVerified, r.Agent, r.Pid, r.Phase);
         }
         finally
         {
-            if (!string.IsNullOrWhiteSpace(candidatePath) && File.Exists(candidatePath))
-            {
-                try { File.Delete(candidatePath); } catch (Exception) { }
-            }
             Volatile.Write(ref _cutoverInProgress, 0);
-        }
-    }
-
-    private static void EnsureProductionConfigUnchanged(string path, byte[]? expectedHash)
-    {
-        if (expectedHash is null)
-        {
-            if (File.Exists(path))
-            {
-                throw new InvalidOperationException("候选校验期间生产 config.toml 被外部创建,拒绝覆盖。请重新生成。");
-            }
-
-            return;
-        }
-
-        if (!File.Exists(path))
-        {
-            throw new InvalidOperationException("候选校验期间生产 config.toml 被外部删除,拒绝提交。请重新生成。");
-        }
-
-        byte[] currentHash = SHA256.HashData(File.ReadAllBytes(path));
-        if (!CryptographicOperations.FixedTimeEquals(currentHash, expectedHash))
-        {
-            throw new InvalidOperationException("候选校验期间生产 config.toml 已被外部修改,拒绝覆盖。请重新生成。");
-        }
-    }
-
-    private static void EnsureProductionConfigMatches(string path, byte[] expectedHash)
-    {
-        if (!File.Exists(path))
-        {
-            throw new InvalidOperationException("准备回滚时生产 config.toml 已被外部删除,拒绝覆盖。请人工核对。");
-        }
-
-        byte[] currentHash = SHA256.HashData(File.ReadAllBytes(path));
-        if (!CryptographicOperations.FixedTimeEquals(currentHash, expectedHash))
-        {
-            throw new InvalidOperationException("准备回滚时生产 config.toml 已被外部修改,拒绝覆盖。请人工核对。");
-        }
-    }
-
-    private static void WriteBytesAtomically(string path, byte[] content)
-    {
-        string temp = path + ".rollback-" + Guid.NewGuid().ToString("N");
-        try
-        {
-            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            {
-                stream.Write(content);
-                stream.Flush(flushToDisk: true);
-            }
-            File.Move(temp, path, overwrite: true);
-        }
-        finally
-        {
-            if (File.Exists(temp))
-            {
-                try { File.Delete(temp); } catch (Exception) { }
-            }
         }
     }
 
@@ -1265,184 +1131,65 @@ public sealed class ControlPlaneBridge
         return new PreflightPayload(result.Verdict.ToString(), result.CanStart, result.Reason, conflicts);
     }
 
-    /// <summary>
-    /// 探测各 provider 的**可用性**与可零成本读取的余额。
-    ///
-    /// 两档:
-    /// - 打开面板时走 shallow —— Codex 跑 <c>codex doctor --json</c>、零 token <c>/models</c>
-    ///   鉴权与第三方 provider 的零 token 余额接口;
-    /// - 用户点「刷新额度」时传 deep=true —— 才允许发一次最小真实推理请求。
-    ///
-    /// DeepSeek 两档相同:它查的是余额接口,本身不消耗 token,所以没必要分档。
-    /// 对 Sub2API 这类配置了 usage_script 的第三方 provider，有效正余额与 CC Switch
-    /// 使用同一判定，可直接作为绿色可用证据；明确的鉴权、账户失效或限流仍优先。
-    /// </summary>
-    private async Task<object> ProbeProvidersAsync(JsonElement root, CancellationToken ct)
+    // ── Claude 凭据(长期令牌)──
+    // 实值单向流动:输入框 → 桥 → DPAPI(机器范围)。应答只回「有没有、何时存的、现在靠哪份」。
+
+    private object ClaudeTokenStatus()
     {
-        bool deep = root.TryGetProperty("deep", out JsonElement d) && d.ValueKind == JsonValueKind.True;
-        CodexProviderCredentials codexProvider;
-        try
-        {
-            // 一轮刷新只读一次配置。provider 在探测中途被重新导入或切换时，
-            // /models、/responses 与 /usage 仍绑定同一份不可变快照。
-            codexProvider = _codexProviderSnapshot();
-        }
-        catch (Exception ex)
-        {
-            ReportProbeFailure("codex-config", ex);
-            codexProvider = new CodexProviderCredentials(
-                null,
-                null,
-                null,
-                null,
-                new Dictionary<string, string>(StringComparer.Ordinal),
-                new Dictionary<string, string>(StringComparer.Ordinal),
-                null,
-                "读不到 Codex 活动 provider 配置",
-                null,
-                null,
-                IsBuiltInOpenAi: false,
-                RequiresOpenAiAuth: false);
-        }
-
-        Task<CodexProbeResult> codexTask = ProbeCodexSafelyAsync(_codexProbe, codexProvider, deep, ct);
-        Task<CodexBalanceResult> codexBalanceTask = ProbeCodexBalanceSafelyAsync(
-            _codexBalanceProbe,
-            codexProvider,
-            ct);
-        Task<DeepSeekProbeResult> deepSeekTask = ProbeDeepSeekSafelyAsync(_deepSeekProbe, ct);
-
-        await Task.WhenAll(codexTask, codexBalanceTask, deepSeekTask).ConfigureAwait(false);
-
-        CodexProbeResult codex = codexTask.Result;
-        CodexBalanceResult codexBalance = codexBalanceTask.Result;
-        DeepSeekProbeResult ds = deepSeekTask.Result;
-
-        // state 只有三种,前端据此上色:ok(绿) / bad(红) / idle(灰)。
-        // **不存在"看起来应该没问题"这一档** —— 没验证过就是灰。
-        // 四态,与面板的颜色约定一致:ok=绿(正常) / wait=琥珀(在等,不是故障) /
-        // bad=红(需要动手修) / idle=灰(没验证过)。
-        // **被限流不是故障** —— 拿红色标它,真出问题时的红就不值钱了。
-        // 默认探测并行做 /models 与第三方余额请求。Sub2API 的有效正余额按
-        // CC Switch 语义直接给绿；没有余额证据时，仍需 deep 推理成功才给绿。
-        static string DeepSeekState(DeepSeekProbeResult r) => r.Readiness switch
-        {
-            ProviderReadiness.Ok => "ok",
-            // 余额不足要充值,是真的要动手,归红;认证/不可达同理。
-            ProviderReadiness.Auth or ProviderReadiness.Insufficient or ProviderReadiness.Unreachable => "bad",
-            _ => "idle",
-        };
-
+        ClaudeCredentialStatus status = _claudeCredentials.Describe();
         return new
         {
-            deep,
-            items = new object[]
-            {
-                new
-                {
-                    name = "DeepSeek",
-                    state = DeepSeekState(ds),
-                    // **余额本身就是那一行该说的话。** 上一版为了压短统一换成「可用」,
-                    // 把唯一有信息量的数字丢掉了 —— 用户问的正是"我还有多少钱"。
-                    // 而且它本来就短:¥48.23 比「余额充足」还短两个字。
-                    text = ds.Readiness == ProviderReadiness.Ok && ds.BalanceCny is { } bal
-                        ? "¥" + bal.ToString("0.##")
-                        : ShortLabel(ds.Readiness.ToString(), ds.Summary),
-                    detail = ds.Summary ?? "未探测",
-                },
-                new
-                {
-                    name = "Codex",
-                    state = CodexProviderState(codex, codexBalance),
-                    // 余额接口是 CC Switch 同款零 token 读数；有效正余额既显示数字，
-                    // 也作为 Sub2API 当前凭据可用的绿色证据。
-                    text = CodexProviderText(codex, codexBalance),
-                    detail = CodexDetail(codex, codexBalance),
-                },
-            },
+            hasStoredToken = status.HasStoredToken,
+            storedTokenSavedAtUnix = status.StoredTokenSavedAtUtc?.ToUnixTimeSeconds(),
+            cliLoggedIn = status.CliLoggedIn,
+            cliExpiresAtUnix = status.CliExpiresAtUtc?.ToUnixTimeSeconds(),
+            cliProblem = status.CliProblem,
+            activeSource = status.ActiveSource,
+            problem = status.Problem,
+            storedRejectedReason = status.StoredRejectedReason,
+            storedProblem = status.StoredProblem,
         };
     }
 
-    private async Task<CodexProbeResult> ProbeCodexSafelyAsync(
-        Func<CodexProviderCredentials, bool, CancellationToken, Task<CodexProbeResult>> probe,
-        CodexProviderCredentials provider,
-        bool deep,
-        CancellationToken ct)
+    private object SaveClaudeToken(JsonElement root)
     {
-        string providerIdentity = CodexAuthProbe.CreateProviderIdentity(provider);
+        string token = root.TryGetProperty("token", out JsonElement tokenEl) && tokenEl.ValueKind == JsonValueKind.String
+            ? tokenEl.GetString() ?? string.Empty
+            : string.Empty;
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            throw new ArgumentException("请粘贴 claude setup-token 输出的令牌。");
+        }
+
+        // 形状校验失败的异常文案不含输入内容;保存后由下一次额度请求真实验证。
+        _claudeCredentials.SaveToken(token);
+        return ClaudeTokenStatus();
+    }
+
+    private object ClearClaudeToken()
+    {
+        _claudeCredentials.ClearToken();
+        return ClaudeTokenStatus();
+    }
+
+    /// <summary>
+    /// 把通知收件人 open_id 同步进明文产品配置。Worker 的通知路径只读这份明文,
+    /// 不再在 S4U 会话里解 DPAPI(2026-09/10 间歇失败数小时的根因)。只在值变化时写。
+    /// </summary>
+    private void SyncNotifyRecipient(string? allowFrom)
+    {
+        string? recipient = NotificationWorker.FirstOpenId(allowFrom);
         try
         {
-            CodexProbeResult result = await probe(provider, deep, ct).ConfigureAwait(false);
-            return result.ProviderIdentity is null
-                ? result with { ProviderIdentity = providerIdentity }
-                : result;
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
+            if (recipient is not null &&
+                !string.Equals(_configStore.Load().NotifyRecipientOpenId, recipient, StringComparison.Ordinal))
+            {
+                _configStore.Update(c => c.NotifyRecipientOpenId = recipient);
+            }
         }
         catch (Exception ex)
         {
-            ReportProbeFailure("codex", ex);
-            return new CodexProbeResult(
-                CodexReadiness.Unknown, "probe-error", "Codex 探测异常", false, providerIdentity);
-        }
-    }
-
-    private async Task<CodexBalanceResult> ProbeCodexBalanceSafelyAsync(
-        Func<CodexProviderCredentials, CancellationToken, Task<CodexBalanceResult>> probe,
-        CodexProviderCredentials provider,
-        CancellationToken ct)
-    {
-        string providerIdentity = CodexAuthProbe.CreateProviderIdentity(provider);
-        try
-        {
-            CodexBalanceResult result = await probe(provider, ct).ConfigureAwait(false);
-            return result.ProviderIdentity is null
-                ? result with { ProviderIdentity = providerIdentity }
-                : result;
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            ReportProbeFailure("codex-balance", ex);
-            return new CodexBalanceResult(
-                ProviderReadiness.Unknown, "probe-error", "余额探测异常", null, null, providerIdentity);
-        }
-    }
-
-    private async Task<DeepSeekProbeResult> ProbeDeepSeekSafelyAsync(
-        Func<CancellationToken, Task<DeepSeekProbeResult>> probe,
-        CancellationToken ct)
-    {
-        try
-        {
-            return await probe(ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            ReportProbeFailure("deepseek", ex);
-            return new DeepSeekProbeResult(
-                ProviderReadiness.Unknown, "probe-error", "DeepSeek 探测异常", null);
-        }
-    }
-
-    private void ReportProbeFailure(string probe, Exception exception)
-    {
-        try
-        {
-            _probeFailureReporter(probe, exception.GetType().FullName ?? exception.GetType().Name);
-        }
-        catch (Exception)
-        {
-            // 诊断写入是尽力而为，不能让单个探针异常升级成整块 provider 面板失败。
+            ReportRequestFailure("feishu.recipient", ex);
         }
     }
 
@@ -1456,219 +1203,8 @@ public sealed class ControlPlaneBridge
         }
         catch (Exception)
         {
-            // 本地诊断失败不能覆盖原始业务错误，也不能改变前端应答契约。
+            // 本地诊断失败不能覆盖原始业务错误,也不能改变前端应答契约。
         }
-    }
-
-    private static string? CodexBalanceText(CodexBalanceResult balance)
-    {
-        if (balance.Reason == "http-402")
-        {
-            return "余额不足";
-        }
-
-        if (balance.Reason == "http-429")
-        {
-            return "余额限流";
-        }
-
-        if (balance.Reason == "cdn-blocked")
-        {
-            return "CDN 拦截";
-        }
-
-        if (balance.Readiness != ProviderReadiness.Ok && balance.Reason != "empty" ||
-            balance.Remaining is not { } remaining)
-        {
-            return null;
-        }
-
-        return CodexBalanceProbe.FormatAmount(remaining, balance.Unit);
-    }
-
-    /// <summary>
-    /// 两份证据是否来自同一个 provider。刷新途中用户切了 provider 时,
-    /// A 的 /models 与 B 的 /usage 可能各自返回,此时任何一边的结论都不能拿来说话。
-    /// </summary>
-    private static bool EvidenceDisagrees(CodexProbeResult codex, CodexBalanceResult? balance) =>
-        balance is not null &&
-        codex.ProviderIdentity is { Length: > 0 } probeIdentity &&
-        balance.ProviderIdentity is { Length: > 0 } balanceIdentity &&
-        !string.Equals(probeIdentity, balanceIdentity, StringComparison.Ordinal);
-
-    private static string CodexProviderText(CodexProbeResult codex, CodexBalanceResult balance)
-    {
-        // 状态已经因身份不一致 fail-closed 成灰,文案必须跟着说明原因。
-        // 否则会出现"灰点 + 却显示着上一个 provider 的余额"这种自相矛盾的一行。
-        if (EvidenceDisagrees(codex, balance))
-        {
-            return "配置已切换";
-        }
-
-        // Unreachable 也在此列:可用性探测挂了的时候,这一行该说的是"服务端异常",
-        // 而不是把余额数字端出来 —— 那会让琥珀灯看起来像一切正常。
-        if (codex.Readiness is CodexReadiness.Auth or CodexReadiness.NoCli or CodexReadiness.Limited
-            or CodexReadiness.Unreachable)
-        {
-            return ShortLabel(codex.Reason, codex.Summary);
-        }
-
-        // 本轮最小推理真成功时,灯是绿的。此时余额路由"这次没问出来"(限流/CDN 拦截)
-        // 不能当成这一行的结论 —— 绿灯配「余额限流」是颜色和文字各说各话,
-        // 与"红色状态却显示限流"是同一类缺陷。402 不在此列:那是真的余额不足。
-        if (codex.Readiness == CodexReadiness.Ok && codex.DeepChecked &&
-            balance.Reason is "http-429" or "cdn-blocked")
-        {
-            return ShortLabel(codex.Reason, codex.Summary);
-        }
-
-        if (balance.Reason == "invalid")
-        {
-            return "账户不可用";
-        }
-
-        if (balance.Readiness == ProviderReadiness.Auth)
-        {
-            return "凭据被拒";
-        }
-
-        return CodexBalanceText(balance) ?? ShortLabel(codex.Reason, codex.Summary);
-    }
-
-    private static string CodexDetail(CodexProbeResult codex, CodexBalanceResult balance)
-    {
-        if (EvidenceDisagrees(codex, balance))
-        {
-            return "刷新期间 provider 已切换,本次可用性与余额分属不同配置,均不作数;请重新刷新额度";
-        }
-
-        string availability = codex.Summary ?? "未探测";
-        if (balance.Readiness == ProviderReadiness.Ok && balance.Summary is { Length: > 0 })
-        {
-            return availability + "；" + balance.Summary;
-        }
-
-        if (balance.Reason is "not-supported" or "no-balance" or "no-config")
-        {
-            return availability;
-        }
-
-        if (!string.IsNullOrWhiteSpace(balance.Summary))
-        {
-            return availability + "；" + balance.Summary;
-        }
-
-        return availability;
-    }
-    /// <summary>
-    /// 把探测结论压成 2–5 个字。
-    ///
-    /// 不是为了好看:侧栏一行放不下整句,截断之后剩的是前半句,
-    /// 而结论在后半句 —— 截断等于把最有用的部分丢掉。短标签 + title 里的全文,
-    /// 一眼能看懂,想细看也拿得到。
-    /// </summary>
-    internal static string ShortLabel(string? reason, string? summary) => reason switch
-    {
-        "authorized" => (summary ?? string.Empty).Contains("未核实", StringComparison.Ordinal)
-            ? "未验推理"      // 凭据过了,但推理那一步没验到 —— 不能说成"已验证"
-            : "已验证",
-        "no-inference" => "不能推理",
-        "auth-rejected" or "auth" => "凭据被拒",
-        "credential-required" => "需要凭据",
-        "http-402" => "余额不足",
-        "http-429" or "limited" => "被限流",
-        "server-error" => "服务端异常",
-        "unverified" => "未验证",
-        "inference-unverified" => "未验推理",
-        "no-cli" => "未安装",
-        "config-error" => "配置错误",
-        "timeout" => "探测超时",
-        "unreachable" => "网络不可达",
-        "Ok" => "可用",
-        "Auth" => "凭据被拒",
-        "Insufficient" => "余额不足",
-        "Unreachable" => "网络不可达",
-        _ => string.IsNullOrWhiteSpace(summary) ? "未探测" : "未探测",
-    };
-
-    public static string CodexProviderState(
-        CodexProbeResult result,
-        CodexBalanceResult? balance = null)
-    {
-        // CLI、推理与鉴权的明确失败优先，不能被余额数字掩盖。
-        if (result.Readiness == CodexReadiness.Limited)
-        {
-            return result.Reason == "http-402" ? "bad" : "wait";
-        }
-
-        if (result.Readiness is CodexReadiness.Auth or CodexReadiness.NoCli)
-        {
-            return "bad";
-        }
-
-        // 不同 provider 的证据绝不能合并。生产路径共用同一快照；这里仍做最后一道
-        // fail-closed，防止未来调用方或竞态重新引入 A 的 /models + B 的 /usage。
-        if (EvidenceDisagrees(result, balance))
-        {
-            return "idle";
-        }
-
-        // 余额为零、账户失效、鉴权失败和 402/429 是当前更具体的 provider 证据，
-        // 必须先于上一枪的 deep 成功。瞬时失败若命中最近成功缓存则显示琥珀，
-        // 不把旧余额冒充为实时绿色。
-        if (balance is not null)
-        {
-            if (balance.IsStale)
-            {
-                return "wait";
-            }
-
-            if (balance.Readiness == ProviderReadiness.Insufficient)
-            {
-                return balance.Reason == "http-429" ? "wait" : "bad";
-            }
-
-            // 只有"凭据被这个路由拒了"是需要动手修的。**网络不可达/超时不是。**
-            // 原来把 Unreachable 也归红,会出现"本轮最小推理刚跑通、只因余额路由
-            // 一次 DNS 失败就红着说凭据坏了",而同模块的 IsTransient 明明把它当
-            // 瞬时失败 —— 两处语义必须一致。
-            if (balance.Readiness == ProviderReadiness.Auth)
-            {
-                return "bad";
-            }
-        }
-
-        if (result.Readiness == CodexReadiness.Ok && result.DeepChecked)
-        {
-            return "ok";
-        }
-
-        // 可用性探测本身失败时,正余额只能证明"计费系统还认识这把 key",
-        // 证明不了"现在跑得动活儿" —— 最多琥珀,绝不点绿。
-        // 否则会出现绿灯配 detail「服务端异常(HTTP 502)」这种自我证伪的一行。
-        if (result.Readiness == CodexReadiness.Unreachable)
-        {
-            return balance is { Readiness: ProviderReadiness.Ok, Remaining: > 0 } ? "wait" : "bad";
-        }
-
-        // 与 CC Switch 的 Sub2API usage_script 语义保持一致：余额请求成功、
-        // 账户未显式失效且 remaining > 0，就是当前凭据可用的真实零 token 证据。
-        if (balance is { Readiness: ProviderReadiness.Ok, Remaining: > 0 })
-        {
-            return "ok";
-        }
-
-        // 限流、CDN 拦截、网络不可达与超时都是"这次没问出来",既不是故障也不是没验过
-        // —— 归琥珀(在等)。放在 deep 绿之后:本轮最小推理真成功了,余额路由这一次
-        // 没问出来不该把它压成琥珀。
-        if (balance is not null &&
-            (balance.Reason is "http-429" or "cdn-blocked" ||
-             balance.Readiness is ProviderReadiness.Unreachable or ProviderReadiness.Timeout))
-        {
-            return "wait";
-        }
-
-        return "idle";
     }
 
     /// <summary>

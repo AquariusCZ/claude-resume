@@ -11,20 +11,27 @@ public sealed record ProviderObservation(
     ProviderModelCatalog Catalog, decimal? Balance, string? Currency,
     bool QuotaKnown, bool Limited, string? Problem, UsageSnapshot? Usage = null)
 {
+    /// <summary>凭据来源标签(不含实值),如 claude-oauth:ai-resume-token / auth.json:chatgpt。</summary>
+    public string? CredentialSource { get; init; }
+
     public object ToPayload() => new
     {
         id = Id, name = Name, agent = Agent, kind = Kind, identity = Identity,
+        credentialSource = CredentialSource,
         models = Catalog.Models.Select(m => new { id = m.Id, name = m.Name }),
         modelsVerified = Catalog.Verified, source = Catalog.Source,
         observedAtUtc = Catalog.ObservedAtUtc, balance = Balance, currency = Currency,
         quotaKnown = QuotaKnown, limited = Limited, problem = Problem ?? Catalog.Problem,
-        windows = Usage?.Buckets.SelectMany(b => b.Windows).Select(w => new
-        {
-            name = w.Name, usedPercent = w.UsedPercent, resetAtUnix = w.ResetAtUnix,
-            windowSeconds = w.WindowSeconds, carriedForward = w.CarriedForward, status = w.Status,
-        }),
+        // 模型可用性窗口只在「不可用」时露出:列出全部模型只会把侧栏填满无意义的绿行。
+        windows = Usage?.Buckets.SelectMany(b => b.Windows)
+            .Where(w => !w.Name.StartsWith(ChatGptUsage.ModelWindowPrefix, StringComparison.Ordinal) || w.Status == "blocked")
+            .Select(w => new
+            {
+                name = w.Name, usedPercent = w.UsedPercent, resetAtUnix = w.ResetAtUnix,
+                windowSeconds = w.WindowSeconds, carriedForward = w.CarriedForward, status = w.Status,
+            }),
         resumeNote = Kind == "chatgpt"
-            ? "账号窗口可显示；当前接口缺少模型与额度的对应关系，自动续跑等待核实"
+            ? "账号窗口与模型可用性来自 ChatGPT 官方接口；账号未限额且目标模型可用时自动续跑"
             : Kind == "deepseek"
                 ? "本周期固定调用 ID；供应商可能更新同一 ID 的后端版本"
                 : "布防时固定供应商与调用 ID，下次布防重新选择",
@@ -73,7 +80,7 @@ public sealed class ProviderCatalogService
             ProviderConnection? current = _registry.Find(connection.Id);
             if (current?.Identity != connection.Identity)
                 return Unavailable(connection, "查询期间供应商或账号已改变，请刷新");
-            return observation;
+            return observation with { CredentialSource = connection.Credentials.CredentialSource };
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception) { return Unavailable(connection, "供应商数据暂时无法读取"); }
@@ -107,7 +114,13 @@ public sealed class ProviderCatalogService
         {
             return _quotaProbe.Evaluate(snapshot, target.ModelId, _quota.StorageWarning);
         }
-        if (!observation.QuotaKnown || connection.Kind == "chatgpt") return new ClaudeProbeResult();
+        if (connection.Kind == "chatgpt")
+        {
+            return observation.Usage is { } chatGpt
+                ? EvaluateChatGpt(chatGpt, target.ModelId)
+                : new ClaudeProbeResult();
+        }
+        if (!observation.QuotaKnown) return new ClaudeProbeResult();
         return new ClaudeProbeResult
         {
             Ready = !observation.Limited && observation.Balance > 0,
@@ -115,11 +128,45 @@ public sealed class ProviderCatalogService
         };
     }
 
+    /// <summary>
+    /// Codex 官方(ChatGPT 登录)的续跑放行规则,保守优先:
+    /// <list type="bullet">
+    /// <item>账号任一窗口/附加限额打满、spend 限制触发、或目标模型 <c>model_usage.available=false</c> → limited;</item>
+    /// <item>账号窗口全部 allowed 且百分比 &lt; 100、无未归因限流、目标模型未被列为不可用 → ok;</item>
+    /// <item>没有数据、格式未核实或任一窗口缺百分比 → unknown(等待,不猜)。</item>
+    /// </list>
+    /// 服务端没有在 model_usage 里列出目标模型时不视为不可用:列表只枚举有过记录的模型。
+    /// </summary>
+    public static ClaudeProbeResult EvaluateChatGpt(UsageSnapshot usage, string modelId)
+    {
+        if (!usage.HasData || usage.UnavailableReason is not null) return new ClaudeProbeResult();
+        UsageBucket? account = usage.Buckets.FirstOrDefault(b => b.Name == ChatGptUsage.AccountBucket);
+        if (account is null || account.Windows.Count == 0) return new ClaudeProbeResult();
+        UsageWindow? model = ChatGptUsage.FindModelWindow(usage, modelId);
+        UsageWindow? primary = account.Windows.FirstOrDefault(w => w.Name.StartsWith("primary", StringComparison.Ordinal));
+        UsageWindow? secondary = account.Windows.FirstOrDefault(w => w.Name.StartsWith("secondary", StringComparison.Ordinal));
+        bool limited = usage.Buckets.Any(b => b.LimitReached || b.UnattributedLimitReached) ||
+                       account.Windows.Any(w => w.Status == "blocked") ||
+                       model?.Status == "blocked";
+        bool ready = !limited && account.Allowed &&
+                     account.Windows.All(w => w.Status == "allowed" && w.UsedPercent is >= 0 and < 100) &&
+                     (model is null || model.Status == "allowed");
+        return new ClaudeProbeResult
+        {
+            Ready = ready,
+            Reason = limited ? "limited" : ready ? "ok" : "unknown",
+            FiveHourResetUtc = primary?.ResetAtUnix is { } p ? DateTimeOffset.FromUnixTimeSeconds(p) : null,
+            SevenDayResetUtc = secondary?.ResetAtUnix is { } s ? DateTimeOffset.FromUnixTimeSeconds(s) : null,
+            FiveHourUtil = primary?.UsedPercent is { } pu ? pu / 100d : null,
+            SevenDayUtil = secondary?.UsedPercent is { } su ? su / 100d : null,
+        };
+    }
+
     private async Task<ProviderObservation> ObserveCoreAsync(ProviderConnection connection, CancellationToken ct)
     {
         CodexProviderCredentials credentials = connection.Credentials;
         if (credentials.Problem is not null || (connection.Agent != "codex" && string.IsNullOrEmpty(credentials.BearerToken)))
-            return Unavailable(connection, "凭据未就绪，请先在对应客户端配置供应商");
+            return Unavailable(connection, credentials.Problem ?? "凭据未就绪，请先在对应客户端配置供应商");
 
         ProviderModelCatalog catalog;
         try
@@ -146,7 +193,7 @@ public sealed class ProviderCatalogService
 
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        catch (Exception) { catalog = ProviderModelCatalog.Unavailable("模型目录暂时无法读取"); }
+        catch (Exception ex) { catalog = ProviderModelCatalog.Unavailable(DescribeMetadataFailure(ex, "模型目录")); }
 
         if (connection.Kind == "claude-oauth")
         {
@@ -177,10 +224,13 @@ public sealed class ProviderCatalogService
             UsageSnapshot snapshot;
             try { snapshot = ChatGptUsage.Parse(await GetAsync("https://chatgpt.com/backend-api/wham/usage", connection, ct).ConfigureAwait(false)); }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-            catch (Exception) { snapshot = UsageSnapshot.Unavailable("ChatGPT", DateTimeOffset.UtcNow, "订阅窗口暂时无法读取"); }
+            catch (Exception ex) { snapshot = UsageSnapshot.Unavailable("ChatGPT", DateTimeOffset.UtcNow, DescribeMetadataFailure(ex, "订阅窗口")); }
+            // 行级 limited 只看账号级证据;某个没在用的模型不可用不该把整行标成限额,
+            // 目标模型的可用性由 EvaluateChatGpt 在布防目标上单独判断。
             return new(connection.Id, connection.Name, connection.Agent, connection.Kind, connection.Identity,
-                catalog, null, null, snapshot.HasData, snapshot.Buckets.Any(b => b.LimitReached),
-                snapshot.UnavailableReason ?? "订阅窗口仅代表账号；目标模型恢复状态未核实", snapshot);
+                catalog, null, null, snapshot.HasData,
+                snapshot.Buckets.Any(b => b.LimitReached || b.UnattributedLimitReached),
+                snapshot.UnavailableReason, snapshot);
         }
 
         CodexBalanceResult usage = await new CodexBalanceProbe(handler: _handler).ProbeAsync(credentials, ct).ConfigureAwait(false);
@@ -243,7 +293,25 @@ public sealed class ProviderCatalogService
         return await ProviderModels.ReadBodyAsync(response.Content, timeout.Token).ConfigureAwait(false);
     }
 
-    private static ProviderModelCatalog ParseChatGptModels(string body)
+    /// <summary>
+    /// 元数据请求失败的可行动文案。登录失效、限流、版本未核实、超时与网络分别说清,
+    /// 不合并成一句「暂时无法读取」——那句话用户没法据此做任何事。
+    /// </summary>
+    public static string DescribeMetadataFailure(Exception ex, string what) => ex switch
+    {
+        HttpRequestException { StatusCode: HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden } rejected =>
+            what + "被拒(HTTP " + (int)rejected.StatusCode.GetValueOrDefault() + "):登录已失效或无权限,请在对应客户端重新登录",
+        HttpRequestException { StatusCode: HttpStatusCode.TooManyRequests } => what + "被限流(HTTP 429),稍后自动重试",
+        HttpRequestException { StatusCode: { } code } => what + "请求失败(HTTP " + (int)code + ")",
+        HttpRequestException => what + "网络请求失败",
+        OperationCanceledException => what + "请求超时",
+        InvalidOperationException version when version.Message.Contains("版本", StringComparison.Ordinal) => what + "未读取:" + version.Message,
+        JsonException => what + "格式未核实",
+        _ => what + "暂时无法读取",
+    };
+
+    /// <summary>ChatGPT <c>/backend-api/codex/models</c>:只收 <c>visibility=list</c> 的 slug;形状以 2026-10-12 本机录制为准。</summary>
+    public static ProviderModelCatalog ParseChatGptModels(string body)
     {
         using JsonDocument doc = JsonDocument.Parse(body);
         if (!doc.RootElement.TryGetProperty("models", out JsonElement models) || models.ValueKind != JsonValueKind.Array)
@@ -256,5 +324,8 @@ public sealed class ProviderCatalogService
     }
 
     private static ProviderObservation Unavailable(ProviderConnection p, string problem) =>
-        new(p.Id, p.Name, p.Agent, p.Kind, p.Identity, ProviderModelCatalog.Unavailable(problem), null, null, false, false, problem);
+        new(p.Id, p.Name, p.Agent, p.Kind, p.Identity, ProviderModelCatalog.Unavailable(problem), null, null, false, false, problem)
+        {
+            CredentialSource = p.Credentials.CredentialSource,
+        };
 }

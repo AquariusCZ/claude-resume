@@ -81,8 +81,10 @@ public sealed class GuiQuotaContractTests
         Assert.Contains("warn: false,", html, StringComparison.Ordinal);
         Assert.Contains("同一重置周期的最近一次服务端读数", html, StringComparison.Ordinal);
         Assert.Contains("if (p.storageWarning) lastQuotaDetail", html, StringComparison.Ordinal);
-        Assert.Contains("$('refreshBtn').addEventListener('click', () => refreshQuota(true, true));", html,
+        // 现役刷新只读元数据,不再有“用户主动刷新才允许最小推理”这一档。
+        Assert.Contains("$('refreshBtn').addEventListener('click', () => refreshQuota(true, false));", html,
             StringComparison.Ordinal);
+        Assert.DoesNotContain("refreshQuota(true, true)", html, StringComparison.Ordinal);
         Assert.Contains("refreshQuota(false, false);", html, StringComparison.Ordinal);
         Assert.Contains("setInterval(() => refreshQuota(true, false)", html, StringComparison.Ordinal);
         Assert.DoesNotContain("deep 会跑 `codex exec`", html, StringComparison.Ordinal);

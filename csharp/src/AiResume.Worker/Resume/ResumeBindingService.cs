@@ -17,8 +17,9 @@ public sealed class ResumeBindingService(ProviderCatalogService providers, Resum
         config.ResumeTarget = target;
         config.ResumeModel = target.ModelId;
         var execution = new ProviderExecutionPlan(providers.Registry, _sessions);
-        if (providers.Registry.Find(target.ProviderId)?.Kind != "chatgpt")
-            foreach (ProjectRef project in projects) { using ResumeExecutionPlan plan = execution.Create(project, config); }
+        // 布防时就把每个项目的执行计划完整走一遍(不 spawn):官方 ChatGPT 也不例外,
+        // 不能等到额度恢复那一刻才发现 Codex 未登录或管理配置锁不住。
+        foreach (ProjectRef project in projects) { using ResumeExecutionPlan plan = execution.Create(project, config); }
         if (!execution.IsCurrent(target)) throw new InvalidOperationException("布防期间供应商已改变，请重新布防");
         return new(target, projects);
     }

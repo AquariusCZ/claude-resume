@@ -1,8 +1,8 @@
 # Claude 额度获取协议与验证手册
 
-> 现役详细真身。最后一次代码、真机响应、安装产物与界面交叉验证:2026-08-09。
+> 现役详细真身。最后一次代码、真机响应、安装产物与界面交叉验证:2026-08-09;2026-10-12 v2.1 改版凭据来源(§4.1、§15),自持令牌的真机验证待用户粘贴后完成。
 > 仓库协作与安全规则仍以 [`CLAUDE.md`](../CLAUDE.md) 为准;本文件定义 Claude 额度链路的现役行为、故障边界与回归方法。
-> [`design/s7i-oauth-usage-spec.md`](design/s7i-oauth-usage-spec.md) 与 [`design/s7c-quota-probe-spec.md`](design/s7c-quota-probe-spec.md) 是初始设计记录,不得再当现役契约。
+> [`history/design/s7i-oauth-usage-spec.md`](history/design/s7i-oauth-usage-spec.md) 与 [`history/design/s7c-quota-probe-spec.md`](history/design/s7c-quota-probe-spec.md) 是初始设计记录,不得再当现役契约。
 
 ## 1. 第一性目标
 
@@ -22,7 +22,7 @@
 - **任一限额打满都算限流。** 总窗口未满但 `weekly_scoped` 已满时,任务仍可能被拒绝。
 - **显示证据不等于执行许可。** CLI 降级和未到期的历史承接可用于诊断/连续显示,但都不能授权自动续跑;5H reset 也只表示可以重新取证。
 - **额度许可按项目消费。** 首项目可复用刚触发恢复的实时证据;前一个项目执行后,下一个项目 spawn 前必须再次强刷并过闸。
-- **凭据只读且不外泄。** AI Resume 不刷新、不写回 Claude Code token,不把 token、响应正文或凭据路径写进日志与 UI。
+- **凭据只读且不外泄。** AI Resume 不刷新、不写回任何 Claude token——无论是自持的 `claude setup-token` 长期令牌还是 Claude Code 登录文件;不把 token、响应正文或凭据路径写进日志、UI、RPC 回包与聊天。
 - **首帧不依赖 I/O。** 凭据读取、Claude 版本探测、SQLite 迁移和网络请求都发生在后台额度请求路径,不得进入 WPF 构造函数。
 
 ## 2. 上游盘点与自取依据
@@ -54,9 +54,12 @@ QuotaService.GetAsync(forceRefresh)
        +-- single-flight,同进程并发只执行一轮探测
        |
        v
+ClaudeCredentialSource(自持 setup-token 令牌 → Claude Code 登录文件)
+       |
+       v
 ClaudeOAuthUsageProbe
        |
-       +-- 有可用 OAuth 窗口
+       +-- 2xx 且有窗口
        |      |
        |      v
        |  SQLite IMMEDIATE 事务内:读取 -> 稀疏合并 -> 写回
@@ -64,16 +67,15 @@ ClaudeOAuthUsageProbe
        |      v
        |  UsageSnapshot
        |
-       +-- OAuth 不可用或无窗口
+       +-- 自持令牌被 401/403 拒绝
+       |      |
+       |      v
+       |  写 rejected 标记,改用 CLI 凭据重试一次
+       |
+       +-- 其它失败 / 无凭据
               |
               v
-        ClaudeCodeProbe 读取 rate_limit_event
-              |
-              v
-        与同账号最近权威快照稀疏合并
-              |
-              v
-        UsageSnapshot / Unavailable
+        Unavailable(仅承接同账号未过期的历史读数)
        |
        v
 ControlPlaneBridge 转成 JSON RPC
@@ -97,10 +99,20 @@ anthropic-version: 2023-06-01
 User-Agent: claude-code/<本机版本>
 ```
 
-- Windows 默认凭据文件:`%USERPROFILE%\.claude\.credentials.json`。
-- 只读取 `claudeAiOauth.accessToken`、`claudeAiOauth.expiresAt` 与顶层 `organizationUuid`。
-- token 剩余寿命小于 60 秒时返回 `token_expired`,不发网络请求。
-- 绝不读取后刷新、写回或替换 refresh token。Claude Code 是凭据生命周期的唯一 writer。
+- 凭据来源按顺序由 `ClaudeCredentialSource.Read` 决定:
+  1. **AI Resume 自持长期令牌**:用户在终端运行 `claude setup-token`(需先 `claude` → `/login`),把令牌粘到控制面「Claude · 凭据」。
+     `SaveToken` 校验长度 20–8192 且仅含可打印 ASCII,然后以 DPAPI **LocalMachine** 范围存
+     `%LOCALAPPDATA%\AI Resume\state\secrets\claude-oauth-token.bin`——S4U session 0 的 Worker 必须能解密。
+     机器范围意味着同机其它用户也能解密,所以它只用于可在 Anthropic 侧撤销的 Claude 令牌,不用于飞书 app_secret。
+  2. **Claude Code 登录文件** `%USERPROFILE%\.claude\.credentials.json`:只读取 `claudeAiOauth.accessToken`、`claudeAiOauth.expiresAt`
+     与顶层 `organizationUuid`;剩余寿命小于 60 秒返回 `token_expired`,不发网络请求。
+- usage 端点明确拒绝自持令牌(401,或带 Anthropic 结构化错误体的 403)时,探针写 `claude-oauth-token.bin.rejected.json` 标记并用 CLI 凭据重试一次,结果附注「已改用 Claude CLI 登录」;
+  标记绑定被拒令牌读取时的文件签名(请求在途时换了令牌就不标),1 小时后自动失效允许再试一次,重新保存令牌也会删除它;标记有效期间 `Read()` 跳过自持令牌。
+  CDN/网关的裸 403(非 Anthropic 错误体)不持久标记,只影响本轮。令牌文件存在但解密失败时 `claude.token.status` 返回 `storedProblem`,侧栏显红。
+  机器范围密文保存后文件 ACL 收紧到当前用户 + SYSTEM + Administrators 并读回核验。
+- 两个来源都绝不刷新、写回或替换 refresh token。Claude Code 是其登录文件的唯一 writer;自持令牌由 Anthropic 签发、约一年有效,AI Resume 只保管与使用。
+- GUI RPC:`claude.token.status`(hasStoredToken / storedTokenSavedAtUnix / cliLoggedIn / cliExpiresAtUnix / cliProblem / activeSource / problem / storedRejectedReason)、
+  `claude.token.save`、`claude.token.clear`;页面永远读不回令牌。
 - 产品不读取 v2rayN 订阅、不修改系统代理或 Windows 网络设置;请求使用 .NET/Windows 当前网络栈。开发阶段查公开上游时按全局规则先直连,网络链路失败后才试 `127.0.0.1:10808` / `10809`。
 
 ### 4.2 User-Agent 解析
@@ -123,7 +135,7 @@ User-Agent: claude-code/<本机版本>
 回退:SHA-256("token:" + accessToken)
 ```
 
-结果是 64 位十六进制不可逆指纹。数据库和返回值只保存指纹,不保存 identity material。账号指纹不同,历史窗口绝不互相承接。
+结果是 64 位十六进制不可逆指纹。数据库和返回值只保存指纹,不保存 identity material。账号指纹不同,历史窗口绝不互相承接。自持令牌文件没有 `organizationUuid`,其指纹固定走 `token:` 分支;因此从 CLI 登录切到自持令牌(或反向)等于换了指纹,历史窗口**不跨来源承接**,已布防周期也会因「供应商或账号已改变」而等待重新布防——这是有意的保守选择,推荐先保存令牌再布防。
 
 ## 5. 响应解析契约
 
@@ -180,9 +192,11 @@ OAuth 探测不把 token、响应正文或异常正文回传。失败分类如�
 
 | 场景 | `FailureReason` | 后续动作 |
 | --- | --- | --- |
-| 凭据不存在、不可读、JSON 损坏或无 access token | `no_credentials` | 显示未核实 |
+| 两个来源都没有可用凭据(未保存令牌且 CLI 未登录/文件损坏) | `no_credentials` | 显示未核实,提示 `/login` 或保存 setup-token |
+| 自持令牌文件存在但解密/读取失败 | `stored_token_unreadable` | 显示未核实,提示重新粘贴 |
+| 自持令牌文件为空 | `stored_token_empty` | 显示未核实 |
 | token 剩余寿命小于 60 秒 | `token_expired` | 显示未核实,不发 OAuth 请求 |
-| HTTP 401 / 403 | `token_rejected_401/403` | 显示未核实 |
+| HTTP 401 / 403 | `token_rejected_401/403` | 自持令牌被拒时写标记并回退 CLI 重试;CLI 也被拒才显示未核实 |
 | HTTP 408 / 504 | `gateway_timeout` | 显示未核实 |
 | HTTP 429 或其它非 2xx | `http_<status>` | 显示未核实 |
 | DNS/TCP/TLS/reset/HttpClient 自身超时 | `failed_local` | 显示未核实 |
@@ -345,11 +359,13 @@ runner 在最终门禁后先把精确 `RunId` 预登记到 `product_state`,再�
 - provider 绿色状态只来自本次探测成功、有数据、未限流且未承接的真实证据;失败探测中的部分窗口不得点绿。
 - carried 主窗口使用静态琥珀光柱,不播放表示实时活动的绿色扫光;5H/7D 来源标签每个绘制分支都显式重置,不得泄漏上一轮来源。
 - `hasData=false` 的成功 RPC 也不是健康额度。
+- 侧栏「Claude · 凭据」两行分别表示自持令牌(已保存时间 / 被拒原因)与 CLI 登录(到期时间 / 问题);绿色只给当前实际在用且未被拒的来源,`problem` 非空时额度区一并显示原因,不回退成「空闲」。
 
 ## 10. 回归测试矩阵
 
 | 层 | 必须覆盖的行为 | 现役测试 |
 | --- | --- | --- |
+| 凭据来源 | 自持优先、rejected 标记回退、DPAPI 往返、形状校验、到期、指纹分离、401 回退请求路由 | `ClaudeCredentialSourceTests` |
 | OAuth 请求 | 五个协议头、token 只读、到期短路、错误分类、取消传播 | `ClaudeOAuthUsageProbeTests` |
 | 响应解析 | modern-only、modern 逐字段优先 legacy、空对象、多条/同名重排 scoped、缺 percent、ISO/epoch reset、100% 限流 | `ClaudeOAuthUsageProbeTests` |
 | CLI 映射 | `rate_limit_event`、无窗口、部分失败不 Allowed、状态/错误分类、未报告不当 0 | `ClaudeProbeTests`,`UsageSnapshotMapperTests` |
@@ -381,7 +397,7 @@ dotnet test csharp\AiResume.sln -c Release --no-build
 ### 11.1 前置检查
 
 1. `claude --version` 能返回本机版本。
-2. Claude Code 已登录,但不要读取或打印 `.credentials.json` 内容。
+2. Claude Code 已登录,或已在控制面保存 `claude setup-token` 令牌;两者都不要读取或打印内容。
 3. 先完成 Release build 与全量测试。
 4. 安装 Release 产物,关闭旧 GUI 后再打开;已打开窗口不会热更新。
 
@@ -493,7 +509,8 @@ Get-FileHash "$env:LOCALAPPDATA\AI Resume\AiResume.Gui.dll"
 
 ## 14. 代码索引
 
-- OAuth 请求、凭据、UA、modern/legacy/Fable 解析:[`ClaudeOAuthUsageProbe.cs`](../csharp/src/AiResume.Worker/Quota/ClaudeOAuthUsageProbe.cs)
+- 凭据来源、自持令牌存取与 rejected 标记:[`ClaudeCredentialSource.cs`](../csharp/src/AiResume.Worker/Quota/ClaudeCredentialSource.cs)
+- OAuth 请求、UA、modern/legacy/Fable 解析与 401/403 回退:[`ClaudeOAuthUsageProbe.cs`](../csharp/src/AiResume.Worker/Quota/ClaudeOAuthUsageProbe.cs)
 - 数据源优先级、缓存、single-flight、稀疏合并:[`QuotaService.cs`](../csharp/src/AiResume.Worker/Quota/QuotaService.cs)
 - SQLite 账号快照与原子更新:[`QuotaSnapshotStore.cs`](../csharp/src/AiResume.Worker/Quota/QuotaSnapshotStore.cs)
 - SQLite schema v4/v5 迁移:[`StorageDatabase.cs`](../csharp/src/AiResume.Storage/StorageDatabase.cs)
@@ -507,4 +524,10 @@ Get-FileHash "$env:LOCALAPPDATA\AI Resume\AiResume.Gui.dll"
 
 ## 2026-09-07 动态供应商界面
 
-现役界面改用 `providers.catalog`，不再从名称猜最新模型，也不在刷新时发最小推理。选择供应商后顶部卡片随其余额/订阅窗口变化；Claude 的原有本地诊断与 OAuth 卡片在选择 Claude 订阅时保留。侧栏显示各供应商和服务端返回窗口，source/更新时间保留在提示中。订阅、余额和模型目录互不冒充；ChatGPT 的账号窗口不授权具体模型恢复。完整上游盘点、兼容限制和实际目录录制见 ADR-0004。
+现役界面改用 `providers.catalog`，不再从名称猜最新模型，也不在刷新时发最小推理。选择供应商后顶部卡片随其余额/订阅窗口变化；Claude 的原有本地诊断与 OAuth 卡片在选择 Claude 订阅时保留。侧栏显示各供应商和服务端返回窗口，source/更新时间保留在提示中。订阅、余额和模型目录互不冒充。完整上游盘点、兼容限制和实际目录录制见 ADR-0004;Codex 官方账号的放行规则(2026-10-12 起)见 ADR-0005 B1。
+
+## 15. 2026-10-12 v2.1 凭据来源改版
+
+故障证据(只读检查,未打印凭据):`~/.claude/.credentials.json` 的 `claudeAiOauth.expiresAt=0`,refresh token 已于 2026-09-30 过期,`claude auth status` 报 `loggedIn=false`;生产 `quota_snapshots` 最后更新停在 2026-09-09。额度链路寄生在 Claude Code CLI 的登录态上,CLI 一登出产品就失明,而界面只显示「未核实」,没有任何主动提醒。
+
+修复见 [ADR-0005](adr/0005-owned-credentials-official-codex-and-hooks.md) A1:自持 `claude setup-token` 令牌优先、CLI 回退、401/403 标记回退;`QuotaService.DescribeOAuthFailure` 把 `no_credentials` / `token_expired` / `stored_token_*` 统一译成「请在终端运行 claude 并 /login,或在控制面保存 claude setup-token 长期令牌」。本轮离线回归 1264/1264,Release 构建 0 警告。usage 端点是否接受 setup-token 签发的令牌只能在真机证实:用户粘贴后,额度区应变为实时读数,`quota_snapshots` 应出现新的一行(指纹与 CLI 时期不同)。

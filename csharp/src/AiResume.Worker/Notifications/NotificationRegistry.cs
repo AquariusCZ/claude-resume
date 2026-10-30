@@ -72,7 +72,7 @@ public sealed class NotificationRegistry
         var adapterList = adapters?.ToList() ?? new List<INotificationAdapter>
         {
             new ClaudeCodeNotificationAdapter(),
-            new CodexNotificationAdapter(),
+            new CodexHooksNotificationAdapter(),
             new ClineNotificationAdapter(),
             new QoderNotificationAdapter(),
             new OpenCodeNotificationAdapter(),

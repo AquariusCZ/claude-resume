@@ -126,51 +126,6 @@ public sealed class HookHealthTests
         Assert.Null(OpenCodeNotificationAdapter.ParseHookCommand("export default () => {};"));
     }
 
-    [Fact]
-    public void codex条目被别人包住时要剥到里层()
-    {
-        // 2026-08-08 本机实测:Codex 自己的 codex-computer-use.exe 占了 notify 的第 0 位,
-        // 把我们整个塞进它的 --previous-notify 里。于是含标记的那一项是一段 JSON 数组文本。
-        // 直接当路径用会得到 ["C:\…\AiResume.Hook.exe 这种带方括号的残缺路径,
-        // 面板红着说"钩子断链"而钩子其实好好的 —— 误判比漏判更糟。
-        const string nested =
-            """["C:\\Users\\me\\AppData\\Local\\AI Resume\\AiResume.Hook.exe","codex","--previous-notify","[]"]""";
-
-        Assert.Equal(
-            @"C:\Users\me\AppData\Local\AI Resume\AiResume.Hook.exe",
-            CodexNotificationAdapter.ResolveOwnCommand(nested));
-    }
-
-    [Fact]
-    public void codex条目在最外层时原样返回()
-    {
-        Assert.Equal(
-            @"C:\x\AiResume.Hook.exe",
-            CodexNotificationAdapter.ResolveOwnCommand(@"C:\x\AiResume.Hook.exe"));
-    }
-
-    [Theory]
-    [InlineData(null)]
-    [InlineData("")]
-    [InlineData(@"C:\other\some-notify.exe")]        // 不含标记 = 不是我们的
-    [InlineData("[不是合法 JSON")]                     // 形状认不出
-    public void codex剥不动时返回null不冒充结论(string? element)
-    {
-        Assert.Null(CodexNotificationAdapter.ResolveOwnCommand(element));
-    }
-
-    [Fact]
-    public void codex嵌套过深时停下而不是无限递归()
-    {
-        string s = @"C:\x\AiResume.Hook.exe";
-        for (int i = 0; i < 12; i++)
-        {
-            s = System.Text.Json.JsonSerializer.Serialize(new[] { s, "codex" });
-        }
-
-        Assert.Null(CodexNotificationAdapter.ResolveOwnCommand(s));
-    }
-
     private sealed class StubAdapter : INotificationAdapter
     {
         private readonly bool _enabled;

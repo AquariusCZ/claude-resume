@@ -1,22 +1,34 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 
 namespace AiResume.Secrets;
 
+/// <summary>DPAPI 加密范围。解密不需要指定:密文自带范围信息。</summary>
+public enum DpapiScope
+{
+    /// <summary>仅当前 Windows 用户可解(默认)。</summary>
+    CurrentUser,
+
+    /// <summary>本机任何账号可解;只用于必须在 S4U 会话里解密的材料,见 SaveAsync 重载说明。</summary>
+    LocalMachine,
+}
+
 /// <summary>
-/// DPAPI(CurrentUser)机密存储(S2-F 实质实现)。
+/// DPAPI 机密存储(S2-F 实质实现)。默认 CurrentUser 范围;LocalMachine 范围只给 S4U 会话必须解密的材料,
+/// 且保存时把文件 ACL 收紧到当前用户 + SYSTEM + Administrators。
 ///
 /// 契约(规格 §3.7):credential_ref → &lt;root&gt;\secrets\&lt;ref&gt;.bin,密文由
-/// CryptProtectData(CurrentUser)保护,仅当前 Windows 用户可解密;
-/// 日志/事件/异常绝不含明文。
+/// CryptProtectData 保护;日志/事件/异常绝不含明文。
 ///
 /// 实现要点:
 /// 1. 不新增 NuGet 依赖:DPAPI 直接 P/Invoke crypt32.dll(CryptProtectData/
 ///    CryptUnprotectData/LocalFree),与 ProcessSupervisor 的 Job Object P/Invoke 同风格。
 /// 2. credentialRef 白名单校验([A-Za-z0-9._-]),杜绝路径穿越与目录注入。
 /// 3. 原子写:先写 .tmp 再替换(崩溃不产生半截密文文件);替换前 fsync 落盘。
-/// 4. Load 解密失败(非本用户/密文损坏)抛 CryptographicException,不落任何明文。
+/// 4. Load 解密失败(非本用户/密文损坏)抛 Win32Exception,不落任何明文。
 /// 5. 明文仅存在于本次调用栈内,不做任何日志/异常参数传递。
 /// </summary>
 public sealed class DpapiSecretStore
@@ -33,16 +45,28 @@ public sealed class DpapiSecretStore
     }
 
     public Task SaveAsync(string credentialRef, byte[] plaintext, CancellationToken cancellationToken)
+        => SaveAsync(credentialRef, plaintext, DpapiScope.CurrentUser, cancellationToken);
+
+    /// <summary>
+    /// 按指定范围加密保存。
+    ///
+    /// <see cref="DpapiScope.LocalMachine"/> 只给**必须在 S4U 计划任务里解密**的材料用:
+    /// 2026-09/10 真机日志证明,会话 0 的 S4U Worker 解 CurrentUser 密文会间歇失败
+    /// (<c>CryptUnprotectData</c> 0x8009000B,一次持续数小时),而机器范围不依赖用户主密钥。
+    /// 代价是本机任何能读到该文件的账号都能解,所以保存后显式把文件 ACL 收紧到
+    /// 当前用户 + SYSTEM + Administrators(断开继承)并读回核验;收不紧就删掉文件并抛错,不留一份谁都能解的密文。
+    /// </summary>
+    public Task SaveAsync(string credentialRef, byte[] plaintext, DpapiScope scope, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(plaintext);
         cancellationToken.ThrowIfCancellationRequested();
         string path = SecretPath(credentialRef);
         Directory.CreateDirectory(_secretsDirectory);
 
-        byte[] cipher = Protect(plaintext);
+        byte[] cipher = Protect(plaintext, scope);
+        string tmpPath = path + ".tmp";
         try
         {
-            string tmpPath = path + ".tmp";
             using (var stream = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
             {
                 stream.Write(cipher, 0, cipher.Length);
@@ -50,6 +74,15 @@ public sealed class DpapiSecretStore
             }
 
             File.Move(tmpPath, path, overwrite: true);
+            if (scope == DpapiScope.LocalMachine)
+            {
+                HardenLocalMachineFileAcl(path);
+            }
+        }
+        catch
+        {
+            TryDelete(tmpPath);
+            throw;
         }
         finally
         {
@@ -119,15 +152,79 @@ public sealed class DpapiSecretStore
         return Path.Combine(_secretsDirectory, credentialRef + ".bin");
     }
 
-    private static byte[] Protect(byte[] plaintext)
+    /// <summary>
+    /// 机器范围密文的文件 ACL:断开继承,只留当前用户、SYSTEM、Administrators 的完全控制。
+    /// 设置后读回核验;任何其它 SID 仍有 Allow 规则就删文件并抛错——宁可保存失败,也不留一份全机可解的密文。
+    /// </summary>
+    private static void HardenLocalMachineFileAcl(string path)
+    {
+        try
+        {
+            var file = new FileInfo(path);
+            SecurityIdentifier user = WindowsIdentity.GetCurrent().User
+                ?? throw new InvalidOperationException("无法取得当前用户 SID");
+            var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+
+            FileSecurity security = file.GetAccessControl(AccessControlSections.Access);
+            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+            foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+            {
+                security.RemoveAccessRuleAll(rule);
+            }
+
+            foreach (SecurityIdentifier sid in new[] { user, system, admins })
+            {
+                security.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl, AccessControlType.Allow));
+            }
+
+            file.SetAccessControl(security);
+
+            FileSecurity applied = new FileInfo(path).GetAccessControl(AccessControlSections.Access);
+            foreach (FileSystemAccessRule rule in applied.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+            {
+                if (rule.AccessControlType == AccessControlType.Allow &&
+                    rule.IdentityReference is SecurityIdentifier sid && sid != user && sid != system && sid != admins)
+                {
+                    throw new InvalidOperationException("令牌文件 ACL 收紧后仍有其它账号可读");
+                }
+            }
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            TryDelete(path);
+            throw new InvalidOperationException("无法收紧机器范围密文的文件权限,已放弃保存:" + ex.Message, ex);
+        }
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    /// <summary>CRYPTPROTECT_LOCAL_MACHINE:密文不绑定用户主密钥,本机任何账号可解。</summary>
+    private const uint CryptProtectLocalMachine = 0x4;
+
+    private static byte[] Protect(byte[] plaintext, DpapiScope scope = DpapiScope.CurrentUser)
     {
         var input = new DataBlob(plaintext);
         try
         {
             // ref 不能指向属性,先取局部副本(ref struct 语义:仅本次调用有效)。
             NativeBlob blob = input.Blob;
+            uint flags = CryptProtectUiForbidden |
+                         (scope == DpapiScope.LocalMachine ? CryptProtectLocalMachine : 0);
             if (!CryptProtectData(ref blob, null, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero,
-                    CryptProtectUiForbidden, out NativeBlob output))
+                    flags, out NativeBlob output))
             {
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "CryptProtectData 失败。");
             }

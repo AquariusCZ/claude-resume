@@ -19,7 +19,7 @@ public static class FeishuCheckCommand
     {
         if (!new FeishuCredentialStore().TryLoad(out string appId, out string appSecret, out string allowFrom))
         {
-            Console.Error.WriteLine("DPAPI 里没有飞书凭据。先运行 import-feishu。");
+            Console.Error.WriteLine("DPAPI 里没有飞书凭据。请先打开控制面,在「飞书接入」填写并保存。");
             return 1;
         }
 

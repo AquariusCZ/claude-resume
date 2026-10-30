@@ -4,7 +4,7 @@
 - 日期:2026-08-01
 - 决策者:用户(架构权威);OpenAI Codex 架构监督
 - 取代范围:ADR-0001 中关于目标运行时「无总时限」的简略描述;`EVENT-CONTRACTS` v1 中 `deadline_ms`、通用 `task.failed`、超时取消和 transient 网络 fallback 语义
-- 关联:`docs/RUN-CONTRACT.md`、`docs/EVENT-CONTRACTS.md`、`docs/STATE-OWNERSHIP.md`、`docs/adr/0001-target-architecture.md`
+- 关联:`docs/RUN-CONTRACT.md`、`docs/EVENT-CONTRACTS.md`、`docs/history/STATE-OWNERSHIP.md`、`docs/adr/0001-target-architecture.md`
 
 ## 背景
 

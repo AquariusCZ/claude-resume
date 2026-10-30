@@ -124,7 +124,7 @@ public sealed class QuotaService
                 else
                 {
                     UsageSnapshot unavailable = UsageSnapshot.Unavailable(UsageSnapshotMapper.ProviderName, now,
-                        "Claude 订阅额度未核实，请检查登录或稍后刷新");
+                        DescribeOAuthFailure(oauth));
                     snapshot = MergeSparseObservation(unavailable, ResolveAuthoritative(oauth.CredentialFingerprint), now);
                 }
             }
@@ -147,6 +147,33 @@ public sealed class QuotaService
         {
             _gate.Release();
         }
+    }
+
+    /// <summary>
+    /// 把 OAuth 失败分类翻成用户看得懂、也能据以行动的一句话。
+    /// 不含 token、响应正文或凭据路径;Note 由探针生成,同样不含实值。
+    /// </summary>
+    public static string DescribeOAuthFailure(OAuthUsageResult oauth)
+    {
+        if (!string.IsNullOrWhiteSpace(oauth.Note))
+        {
+            return oauth.Note;
+        }
+
+        return oauth.FailureReason switch
+        {
+            "no_credentials" or "token_expired" or "stored_token_unreadable" or "stored_token_empty" =>
+                "Claude 凭据不可用:请在终端运行 claude 并 /login,或在控制面保存 claude setup-token 长期令牌",
+            "token_rejected_401" or "token_rejected_403" => oauth.CredentialSource == ClaudeCredentialSource.SourceStored
+                ? "AI Resume 长期令牌被服务端拒绝,请重新运行 claude setup-token 并在控制面更换令牌"
+                : "Claude CLI 登录被服务端拒绝,请在终端运行 claude 并 /login",
+            "http_429" => "Claude 额度接口限流(HTTP 429),稍后自动重试",
+            "gateway_timeout" => "Claude 额度接口网关超时,稍后自动重试",
+            "failed_local" => "Claude 额度请求网络失败,稍后自动重试",
+            "malformed_response" => "Claude 额度接口返回了无法解析的内容",
+            "oauth_disabled" => "Claude 订阅额度未启用实时读取",
+            _ => "Claude 订阅额度未核实，请检查登录或稍后刷新",
+        };
     }
 
     private bool TryGetFresh(out UsageSnapshot? snapshot)

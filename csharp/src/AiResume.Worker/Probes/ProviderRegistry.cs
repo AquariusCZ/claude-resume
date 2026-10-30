@@ -22,23 +22,43 @@ public sealed class ProviderRegistry
     private readonly Func<string, string?> _env;
     private readonly string _userProfile;
     private readonly Func<CodexProviderCredentials> _codex;
+    private readonly Func<CodexProviderCredentials> _codexOfficial;
     private readonly ClaudeOAuthUsageProbe _oauth;
 
+    /// <param name="secretsRoot">
+    /// AI Resume 自持长期令牌的 DPAPI 根目录。null 时:注入了 <paramref name="userProfile"/>(测试)
+    /// 就落在它下面的隔离目录,否则用生产状态目录。测试因此永远碰不到真机令牌。
+    /// </param>
+    /// <param name="codex">当前 <c>model_provider</c> 指向的连接(第三方静态 provider 才单独成行)。</param>
+    /// <param name="codexOfficial">
+    /// Codex 官方连接(auth.json 登录)。null 时读真机;测试若只注入 <paramref name="codex"/>,
+    /// 官方连接默认视为未登录,不会碰真机 auth.json。
+    /// </param>
     public ProviderRegistry(Func<string, string?>? environment = null, string? userProfile = null,
-        Func<CodexProviderCredentials>? codex = null, ClaudeOAuthUsageProbe? oauth = null)
+        Func<CodexProviderCredentials>? codex = null, ClaudeOAuthUsageProbe? oauth = null,
+        string? secretsRoot = null, Func<CodexProviderCredentials>? codexOfficial = null)
     {
         _env = environment ?? Environment.GetEnvironmentVariable;
         _userProfile = userProfile ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         _codex = codex ?? (() => CodexAuthProbe.ReadActiveProviderCredentials());
-        _oauth = oauth ?? new ClaudeOAuthUsageProbe(credentialsPath: Path.Combine(_env("CLAUDE_CONFIG_DIR") ?? Path.Combine(_userProfile, ".claude"), ".credentials.json"));
+        _codexOfficial = codexOfficial ?? (codex is null
+            ? () => CodexAuthProbe.ReadOfficialCredentials()
+            : () => SimpleCredentials(null, null, "none", "Codex 未登录:请运行 codex login"));
+        _oauth = oauth ?? new ClaudeOAuthUsageProbe(
+            credentialsPath: Path.Combine(_env("CLAUDE_CONFIG_DIR") ?? Path.Combine(_userProfile, ".claude"), ".credentials.json"),
+            secretsRoot: secretsRoot ?? (userProfile is null ? ShadowPaths.SecretsRoot : Path.Combine(userProfile, ".ai-resume-secrets")));
     }
+
+    /// <summary>Claude 凭据解析器(不含实值),供控制面显示与保存长期令牌。</summary>
+    public ClaudeCredentialSource ClaudeCredentials => _oauth.Credentials;
 
     public IReadOnlyList<ProviderConnection> Read()
     {
         var result = new List<ProviderConnection>();
-        var token = _oauth.ReadAccessToken();
+        ClaudeCredential token = _oauth.ReadAccessToken();
         result.Add(Create("claude-subscription", "Claude · Anthropic 订阅", "claudecode", "claude-oauth",
-            SimpleCredentials("https://api.anthropic.com", token.AccessToken, "claude-oauth", token.FailureReason),
+            SimpleCredentials("https://api.anthropic.com", token.AccessToken, "claude-oauth:" + token.Source,
+                token.Ok ? null : token.Detail ?? token.FailureReason),
             token.CredentialFingerprint));
 
         Dictionary<string, string> settingsEnv;
@@ -64,20 +84,36 @@ public sealed class ProviderRegistry
                 SimpleCredentials(baseUrl, apiKey, source, apiKey is null ? "缺少 API 凭据" : null)));
         }
 
+        // Codex 官方行只看 auth.json 的登录,不跟随 config.toml 的 model_provider:
+        // 本机桥接(如 codex-chatgpt-web)借用的就是同一份 ChatGPT 登录,额度也是同一份。
         try
         {
-            CodexProviderCredentials codex = _codex();
-            bool chatGpt = codex.CredentialSource == "auth.json:chatgpt" && codex.IsBuiltInOpenAi &&
-                Uri.TryCreate(codex.BaseUrl, UriKind.Absolute, out Uri? codexUri) &&
-                codexUri.Scheme == "https" && codexUri.Host == "chatgpt.com" && codexUri.IsDefaultPort;
-            string name = chatGpt ? "Codex · ChatGPT" : "Codex · " + (codex.ProviderId ?? SafeHost(codex.BaseUrl));
-            result.Add(Create("codex-active", name, "codex", chatGpt ? "chatgpt" : "openai-api", codex,
-                chatGpt && codex.AccountId is { Length: > 0 } ? codex.AccountId : null));
+            CodexProviderCredentials official = _codexOfficial();
+            bool chatGpt = official.CredentialSource == "auth.json:chatgpt";
+            bool officialApiKey = official.CredentialSource == "auth.json:apikey";
+            string name = chatGpt ? "Codex · ChatGPT 官方" : officialApiKey ? "Codex · OpenAI API 官方" : "Codex · 官方(未登录)";
+            result.Add(Create("codex-official", name, "codex", chatGpt ? "chatgpt" : "openai-api", official,
+                chatGpt && official.AccountId is { Length: > 0 } ? official.AccountId : null));
         }
         catch (Exception)
         {
-            result.Add(Create("codex-active", "Codex · 未配置", "codex", "openai-api",
-                SimpleCredentials(null, null, "none", "供应商配置无法读取")));
+            result.Add(Create("codex-official", "Codex · 官方(未核实)", "codex", "chatgpt",
+                SimpleCredentials(null, null, "none", "Codex 登录状态无法读取")));
+        }
+
+        // 第三方静态 provider 只有在自带凭据、且不是借用 ChatGPT 登录的本机桥接时才单独成行。
+        try
+        {
+            CodexProviderCredentials codex = _codex();
+            if (!codex.IsBuiltInOpenAi && !codex.RequiresOpenAiAuth && !IsLoopback(codex.BaseUrl) &&
+                codex.ProviderId is { Length: > 0 })
+            {
+                result.Add(Create("codex-active", "Codex · " + codex.ProviderId, "codex", "openai-api", codex));
+            }
+        }
+        catch (Exception)
+        {
+            // 第三方配置读不到不影响官方行;官方行已经如实说明登录状态。
         }
 
         string? deepSeekKey = _env(DeepSeekProbe.ApiKeyEnvName);
@@ -125,4 +161,7 @@ public sealed class ProviderRegistry
         uri.AbsolutePath.TrimEnd('/') is "" or "/v1" or "/anthropic" && uri.Host.Equals("api.deepseek.com", StringComparison.OrdinalIgnoreCase);
 
     private static string SafeHost(string? url) => Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) ? uri.Host : "端点未核实";
+
+    internal static bool IsLoopback(string? url) => !Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) || uri.IsLoopback ||
+        uri.Host.EndsWith(".localhost", StringComparison.OrdinalIgnoreCase);
 }

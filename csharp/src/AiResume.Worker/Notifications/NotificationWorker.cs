@@ -146,19 +146,30 @@ public sealed class NotificationWorker : BackgroundService
     }
 
     /// <summary>
-    /// 收件人取授权名单的第一个 open_id。
+    /// 收件人 = 授权名单的第一个 open_id。
     ///
-    /// 用 allow_from 而不是另设一个配置项:能给机器人发消息的人和该收到通知的人
-    /// 本来就是同一个;另设一份只会漂开,还多一处要维护的安全边界。
+    /// 先读明文产品配置 <see cref="AiResume.Core.ProductConfig.NotifyRecipientOpenId"/>:
+    /// Worker 以 S4U 跑在会话 0,用户范围 DPAPI 在那里会间歇失败数小时(2026-09/10 日志里
+    /// <c>CryptUnprotectData</c> 一天失败七百多次),而发送本身走 lark-cli 的 bot 身份,根本不需要 app_secret。
+    /// 只有配置里还没有(GUI 尚未迁移)时才退回 DPAPI 名单,保证升级后第一次开窗前也能发。
     /// </summary>
     private static string? ResolveOwnerOpenId()
     {
-        if (!new FeishuCredentialStore().TryLoad(out _, out _, out string allowFrom))
+        string? configured = FirstOpenId(new Products.ProductConfigStore(ShadowPaths.Root).Load().NotifyRecipientOpenId);
+        if (configured is not null)
         {
-            return null;
+            return configured;
         }
 
-        foreach (string part in allowFrom.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        return new FeishuCredentialStore().TryLoad(out _, out _, out string allowFrom)
+            ? FirstOpenId(allowFrom)
+            : null;
+    }
+
+    /// <summary>逗号分隔名单里第一个 <c>ou_</c> 开头的 open_id;没有则 null。</summary>
+    public static string? FirstOpenId(string? allowFrom)
+    {
+        foreach (string part in (allowFrom ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             if (part.StartsWith("ou_", StringComparison.Ordinal))
             {

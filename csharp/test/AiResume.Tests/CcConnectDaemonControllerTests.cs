@@ -247,6 +247,43 @@ public sealed class CcConnectDaemonControllerTests : IDisposable
         Assert.Equal("preflight", result.Phase);
     }
 
+    /// <summary>
+    /// 2026-10-12 真机复现:PT5M 重复触发让任务 LastRunTime 每 5 分钟推进,稳态下再也对不上 2026-09 启动的 watchdog,
+    /// 归属判成 Unknown、激活被整体拒绝。任务计划程序给出的 EnginePID 才是任务实际启动的进程。
+    /// </summary>
+    [Fact]
+    public void 任务引擎PID为锁PID祖先即判归属_LastRunTime启发式只作回退()
+    {
+        DateTime t0 = new(2026, 9, 22, 11, 12, 33, DateTimeKind.Utc);
+        var processes = new List<RunningProcessInfo>
+        {
+            new(3328, "svchost.exe", null, 1600, t0.AddDays(-30)),
+            new(11432, "powershell.exe", null, 3328, t0.AddSeconds(-2)),
+            new(17304, "cc-connect.exe", null, 11432, t0),
+            new(999, "cc-connect.exe", null, 1, t0.AddHours(1)),
+        };
+        var staleLastRun = new DateTimeOffset(t0.AddHours(12));
+
+        Assert.Equal(CcConnectTaskOwnership.Owned,
+            CcConnectDaemonController.ResolveTaskOwnership(17304, processes, new[] { 11432 }, staleLastRun));
+        Assert.Equal(CcConnectTaskOwnership.NotOwned,
+            CcConnectDaemonController.ResolveTaskOwnership(999, processes, new[] { 11432 }, staleLastRun));
+        // 没有运行实例、LastRunTime 又对不上任何 powershell:仍是未知,不得猜。
+        Assert.Equal(CcConnectTaskOwnership.Unknown,
+            CcConnectDaemonController.ResolveTaskOwnership(17304, processes, Array.Empty<int>(), staleLastRun));
+        // 旧启发式仍可用:LastRunTime 与 watchdog 创建时间相符(刚启动的实例)。
+        Assert.Equal(CcConnectTaskOwnership.Owned,
+            CcConnectDaemonController.ResolveTaskOwnership(17304, processes, Array.Empty<int>(), new DateTimeOffset(t0.AddSeconds(-2))));
+        // PID 复用:「父进程」比子进程晚启动,不是祖先。
+        var reused = new List<RunningProcessInfo>
+        {
+            new(11432, "powershell.exe", null, 3328, t0.AddMinutes(30)),
+            new(17304, "cc-connect.exe", null, 11432, t0),
+        };
+        Assert.Equal(CcConnectTaskOwnership.NotOwned,
+            CcConnectDaemonController.ResolveTaskOwnership(17304, reused, new[] { 11432 }, staleLastRun));
+    }
+
     [Fact]
     public void 计划任务进程归属无法核验时提交前失败关闭()
     {

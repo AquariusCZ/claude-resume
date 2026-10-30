@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.Management;
+using System.Reflection;
+using System.Runtime.Versioning;
 using System.Net.Http.Headers;
 using System.Security.Principal;
 using System.Text;
@@ -1076,69 +1078,164 @@ public sealed class CcConnectDaemonController
             ? parsed
             : 0;
 
+    /// <summary>计划任务名;生产约定为根路径下唯一同名任务。</summary>
+    private const string ScheduledTaskName = "cc-connect";
+
+    /// <summary>
+    /// 锁 PID 是否属于 cc-connect 计划任务。
+    ///
+    /// 首选证据是任务计划程序 COM 的 <c>IRunningTask.EnginePID</c>——任务实际启动的那个进程(守护脚本的 powershell),
+    /// 任务所有者在交互会话里对 S4U 实例同样可读;锁 PID 的父进程链里有它就是归属。
+    /// 以前只用「LastRunTime ±5 秒内创建的 powershell.exe」:任务带 PT5M 无限重复触发时,即使 IgnoreNew 忽略了新实例,
+    /// LastRunTime 也每 5 分钟推进一次,稳态下永远匹配不到 2026-09 启动的 watchdog,激活因此被整体拒绝(2026-10-12 真机复现)。
+    /// 该启发式只在取不到运行实例时作回退。
+    /// </summary>
     private static CcConnectTaskOwnership GetTaskOwnershipDefault(int pid, DateTimeOffset? taskLastRunTime)
     {
-        if (!OperatingSystem.IsWindows() || taskLastRunTime is null)
+        if (!OperatingSystem.IsWindows())
         {
             return CcConnectTaskOwnership.Unknown;
         }
 
         try
         {
-            var parents = new Dictionary<int, int>();
-            var taskRoots = new HashSet<int>();
-            using var searcher = new ManagementObjectSearcher(
-                "SELECT ProcessId, ParentProcessId, Name, CreationDate FROM Win32_Process");
-            using ManagementObjectCollection processes = searcher.Get();
-            foreach (ManagementBaseObject item in processes)
-            {
-                using (item)
-                {
-                    int processId = Convert.ToInt32(item["ProcessId"]);
-                    parents[processId] = Convert.ToInt32(item["ParentProcessId"]);
-                    string name = item["Name"] as string ?? string.Empty;
-                    if (!name.Equals("powershell.exe", StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
-                    string? creation = item["CreationDate"] as string;
-                    if (creation is null)
-                    {
-                        continue;
-                    }
-
-                    DateTime createdLocal = ManagementDateTimeConverter.ToDateTime(creation);
-                    var created = new DateTimeOffset(createdLocal).ToUniversalTime();
-                    if (Math.Abs((created - taskLastRunTime.Value.ToUniversalTime()).TotalSeconds) <= 5)
-                    {
-                        taskRoots.Add(processId);
-                    }
-                }
-            }
-
-            int current = pid;
-            var visited = new HashSet<int>();
-            while (current > 0 && visited.Add(current))
-            {
-                if (taskRoots.Contains(current))
-                {
-                    return CcConnectTaskOwnership.Owned;
-                }
-                if (!parents.TryGetValue(current, out current))
-                {
-                    break;
-                }
-            }
-
-            return taskRoots.Count > 0
-                ? CcConnectTaskOwnership.NotOwned
-                : CcConnectTaskOwnership.Unknown;
+            IReadOnlyList<RunningProcessInfo> processes = new CimRunningProcessLister().List();
+            IReadOnlyCollection<int> enginePids = QueryRunningTaskEnginePids(ScheduledTaskName);
+            return ResolveTaskOwnership(pid, processes, enginePids, taskLastRunTime);
         }
         catch (Exception)
         {
             return CcConnectTaskOwnership.Unknown;
         }
+    }
+
+    /// <summary>
+    /// 纯函数:<paramref name="enginePids"/> 非空时以其为任务根;否则退回 LastRunTime ±5 秒内创建的 powershell.exe。
+    /// 锁 PID 自身或任一祖先是任务根 → Owned;有任务根但都不在父链上 → NotOwned;没有任何任务根 → Unknown。
+    /// 父进程比子进程晚启动视为 PID 复用,不再向上追。
+    /// </summary>
+    public static CcConnectTaskOwnership ResolveTaskOwnership(
+        int pid,
+        IReadOnlyList<RunningProcessInfo> processes,
+        IReadOnlyCollection<int> enginePids,
+        DateTimeOffset? taskLastRunTime)
+    {
+        var parents = new Dictionary<int, int>();
+        var created = new Dictionary<int, DateTime>();
+        var taskRoots = new HashSet<int>(enginePids.Where(p => p > 0));
+        foreach (RunningProcessInfo process in processes)
+        {
+            if (process.ParentPid is { } parent)
+            {
+                parents[process.Pid] = parent;
+            }
+
+            if (process.CreatedAt is { } createdAt)
+            {
+                created[process.Pid] = createdAt.Kind == DateTimeKind.Utc ? createdAt : createdAt.ToUniversalTime();
+            }
+        }
+
+        if (taskRoots.Count == 0 && taskLastRunTime is { } lastRun)
+        {
+            foreach (RunningProcessInfo process in processes)
+            {
+                if (process.Name.Equals("powershell.exe", StringComparison.OrdinalIgnoreCase) &&
+                    created.TryGetValue(process.Pid, out DateTime startedAt) &&
+                    Math.Abs((startedAt - lastRun.UtcDateTime).TotalSeconds) <= 5)
+                {
+                    taskRoots.Add(process.Pid);
+                }
+            }
+        }
+
+        if (taskRoots.Count == 0)
+        {
+            return CcConnectTaskOwnership.Unknown;
+        }
+
+        int current = pid;
+        var visited = new HashSet<int>();
+        while (current > 0 && visited.Add(current))
+        {
+            if (taskRoots.Contains(current))
+            {
+                return CcConnectTaskOwnership.Owned;
+            }
+
+            if (!parents.TryGetValue(current, out int parent))
+            {
+                break;
+            }
+
+            if (created.TryGetValue(parent, out DateTime parentStarted) &&
+                created.TryGetValue(current, out DateTime childStarted) &&
+                parentStarted > childStarted.AddSeconds(2))
+            {
+                break;
+            }
+
+            current = parent;
+        }
+
+        return CcConnectTaskOwnership.NotOwned;
+    }
+
+    /// <summary>任务计划程序 COM:根路径下名为 <paramref name="taskName"/> 的任务当前所有运行实例的 EnginePID。</summary>
+    [SupportedOSPlatform("windows")]
+    private static IReadOnlyCollection<int> QueryRunningTaskEnginePids(string taskName)
+    {
+        var pids = new HashSet<int>();
+        Type? serviceType = Type.GetTypeFromProgID("Schedule.Service");
+        if (serviceType is null)
+        {
+            return pids;
+        }
+
+        object service = Activator.CreateInstance(serviceType) ?? throw new InvalidOperationException("无法创建任务计划程序 COM 对象");
+        try
+        {
+            serviceType.InvokeMember("Connect", BindingFlags.InvokeMethod, null, service, null);
+            object? running = serviceType.InvokeMember("GetRunningTasks", BindingFlags.InvokeMethod, null, service, new object[] { 0 });
+            if (running is null)
+            {
+                return pids;
+            }
+
+            Type runningType = running.GetType();
+            int count = Convert.ToInt32(runningType.InvokeMember("Count", BindingFlags.GetProperty, null, running, null));
+            string expectedPath = "\\" + taskName;
+            for (int index = 1; index <= count; index++)
+            {
+                object? task = runningType.InvokeMember("Item", BindingFlags.GetProperty, null, running, new object[] { index });
+                if (task is null)
+                {
+                    continue;
+                }
+
+                Type taskType = task.GetType();
+                string path = taskType.InvokeMember("Path", BindingFlags.GetProperty, null, task, null) as string ?? string.Empty;
+                if (!path.Equals(expectedPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                object? enginePid = taskType.InvokeMember("EnginePID", BindingFlags.GetProperty, null, task, null);
+                if (enginePid is not null)
+                {
+                    pids.Add(Convert.ToInt32(enginePid));
+                }
+            }
+        }
+        finally
+        {
+            if (System.Runtime.InteropServices.Marshal.IsComObject(service))
+            {
+                System.Runtime.InteropServices.Marshal.FinalReleaseComObject(service);
+            }
+        }
+
+        return pids;
     }
 
     private static CcConnectCommandResult RunDefault(IReadOnlyList<string> arguments, TimeSpan timeout)

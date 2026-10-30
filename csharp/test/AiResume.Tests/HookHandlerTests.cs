@@ -438,6 +438,58 @@ public class HookHandlerTests : IDisposable
     }
 
     [Fact]
+    public void TryWriteEvent_CodexHooksStopPayload_UsesTranscriptPathAndIsAccepted()
+    {
+        const string threadId = "019fe5b6-f28b-7e60-a01a-79c6ce5e1bdd";
+        string codexHome = CreateCodexRollout(threadId, subagent: false);
+        string rollout = Directory.GetFiles(codexHome, "*" + threadId + ".jsonl", SearchOption.AllDirectories).Single();
+        string cwd = Path.Combine(_tempDir, "real-project");
+        Directory.CreateDirectory(cwd);
+        // hooks Stop 的 stdin 形状(固定上游 0.148.0):没有 type,有 hook_event_name/session_id/turn_id/transcript_path。
+        string payload = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["session_id"] = threadId,
+            ["turn_id"] = "turn-hooks-1",
+            ["cwd"] = cwd,
+            ["transcript_path"] = rollout,
+            ["hook_event_name"] = "Stop",
+            ["model"] = "gpt-5.6-sol",
+            ["stop_hook_active"] = false,
+            ["last_assistant_message"] = "done",
+        });
+        var env = new Dictionary<string, string?>
+        {
+            // 不给 AI_RESUME_CODEX_HOME:transcript_path 已经指向 rollout,不应再依赖目录扫描。
+            ["AI_RESUME_CODEX_DOCUMENTS_ROOT"] = Path.Combine(_tempDir, "Codex"),
+        };
+
+        bool written = Program.TryWriteEvent(_tempDir, "codex", payload, env, out string eventId, out string reason);
+
+        Assert.True(written, reason);
+        Assert.Equal("written", reason);
+        string stored = File.ReadAllText(Path.Combine(_tempDir, eventId + ".json"));
+        Assert.Contains("\"turn-hooks-1\"", stored, StringComparison.Ordinal);
+
+        // 其它 hooks 事件不是 turn 结束,必须拒绝。
+        string sessionEnd = payload.Replace("\"Stop\"", "\"SessionEnd\"");
+        Assert.False(Program.TryWriteEvent(_tempDir, "codex", sessionEnd, env, out _, out string rejected));
+        Assert.Equal("codex_event_not_complete", rejected);
+
+        // transcript_path 文件名与线程 id 不符时退回按 id 扫描;扫描根不存在则拒绝。
+        string forged = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["session_id"] = threadId,
+            ["turn_id"] = "turn-hooks-2",
+            ["cwd"] = cwd,
+            ["transcript_path"] = rollout.Replace(threadId, "f" + threadId[1..]),
+            ["hook_event_name"] = "Stop",
+        });
+        var noHome = new Dictionary<string, string?> { ["AI_RESUME_CODEX_HOME"] = Path.Combine(_tempDir, "missing-home") };
+        Assert.False(Program.TryWriteEvent(_tempDir, "codex", forged, noHome, out _, out string missing));
+        Assert.Equal("rollout_missing", missing);
+    }
+
+    [Fact]
     public void TryWriteEvent_CodexSubagentThread_IsRejected()
     {
         const string threadId = "019fe5ed-ce08-7b93-8a41-f342eeee9aff";
@@ -553,6 +605,39 @@ public class HookHandlerTests : IDisposable
         Assert.True(File.Exists(pidPath), "旧通知进程没有启动到可观测阶段");
         int pid = int.Parse(File.ReadAllText(pidPath));
         Assert.Throws<ArgumentException>(() => Process.GetProcessById(pid));
+    }
+
+[Fact]
+    public void TryWriteEvent_CodexLegacyNotifyAndHooksStop_SameTurnShareEventId()
+    {
+        const string threadId = "019fe5b6-f28b-7e60-a01a-79c6ce5e1bee";
+        string codexHome = CreateCodexRollout(threadId, subagent: false);
+        string rollout = Directory.GetFiles(codexHome, "*" + threadId + ".jsonl", SearchOption.AllDirectories).Single();
+        string cwd = Path.Combine(_tempDir, "real-project-dual");
+        Directory.CreateDirectory(cwd);
+        var env = new Dictionary<string, string?>
+        {
+            ["AI_RESUME_CODEX_HOME"] = codexHome,
+            ["AI_RESUME_CODEX_DOCUMENTS_ROOT"] = Path.Combine(_tempDir, "Codex"),
+        };
+        // 升级期:config.toml 旧 notify 链与 hooks.json 的 Stop 钩子同时存在,同一回合送来两个形状不同的负载。
+        string legacy = JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["type"] = "agent-turn-complete", ["thread-id"] = threadId, ["turn-id"] = "turn-dual", ["cwd"] = cwd,
+            ["last-assistant-message"] = "done",
+        });
+        string hooks = JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["session_id"] = threadId, ["turn_id"] = "turn-dual", ["cwd"] = cwd, ["transcript_path"] = rollout,
+            ["hook_event_name"] = "Stop", ["stop_hook_active"] = false, ["last_assistant_message"] = "done",
+        });
+
+        Assert.True(Program.TryWriteEvent(_tempDir, "codex", legacy, env, out string first, out string reason1), reason1);
+        bool second = Program.TryWriteEvent(_tempDir, "codex", hooks, env, out string secondId, out string reason2);
+
+        Assert.Equal(first, secondId);
+        Assert.False(second, reason2);
+        Assert.Single(Directory.GetFiles(_tempDir, "*.json"));
     }
 
     private string CreateCodexRollout(

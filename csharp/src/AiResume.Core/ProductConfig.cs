@@ -92,6 +92,16 @@ public sealed class ProductConfig
     /// </summary>
     public List<string> NotifySources { get; set; } = new();
 
+    /// <summary>
+    /// 完成通知的收件人 open_id(明文)。
+    ///
+    /// 它不是机密:同一个值本来就以明文写在 <c>~/.cc-connect/config.toml</c> 的 <c>allow_from</c> 里。
+    /// 原来 Worker 为了拿它去解整份 DPAPI 密文(含 app_secret),而 Worker 以 S4U 计划任务跑在会话 0,
+    /// 用户范围 DPAPI 在那里会间歇失败数小时(2026-09/10 日志实证)——通知就跟着静默丢失。
+    /// 把收件人放进明文配置后,Worker 的通知路径不再碰 DPAPI;app_secret 仍只由 GUI 使用。
+    /// </summary>
+    public string NotifyRecipientOpenId { get; set; } = string.Empty;
+
     public string DirtyGuard { get; set; } = "stash";
 
     public static ProductConfig CreateDefault() => new();

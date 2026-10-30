@@ -6,7 +6,7 @@
 - 日期:2026-08-01
 - 决策者:用户(架构权威);OpenAI Codex 架构监督;DeepSeek V4-flash 为主要开发执行器(开发流程分工,不是产品运行时依赖或密钥写入仓库)
 - 补充决策:AI 运行生命周期由 `docs/adr/0002-run-lifecycle-contract.md` 细化;冲突处以 ADR-0002 为准
-- 关联:`docs/MIGRATION-BASELINE.md`、`docs/STATE-OWNERSHIP.md`、`docs/EVENT-CONTRACTS.md`、`docs/RUN-CONTRACT.md`、`docs/UPSTREAM-ARCHITECTURE-RESEARCH.md`
+- 关联:`docs/history/MIGRATION-BASELINE.md`、`docs/history/STATE-OWNERSHIP.md`、`docs/EVENT-CONTRACTS.md`、`docs/RUN-CONTRACT.md`、`docs/UPSTREAM-ARCHITECTURE-RESEARCH.md`
 
 ## 背景
 
@@ -26,9 +26,9 @@
 
 - 现役生产链路(Node `feishu-agent.js`)在迁移完成前仍是唯一消费者;禁止与 cc-connect 双消费同一生产应用、禁止双写同一会话/任务状态。
 - cc-connect 只能先用独立测试应用 + 测试项目做兼容性验证。
-- 任意时刻每类状态只有一个 writer(见 `docs/STATE-OWNERSHIP.md`)。
+- 任意时刻每类状态只有一个 writer(见 `docs/history/STATE-OWNERSHIP.md`)。
 - 机器当前无 .NET SDK(仅 8.0.25 runtime);按基线**阶段 2** 才安装固定 SDK(winget 官方源 `Microsoft.DotNet.SDK.10` `10.0.302`)。
-- 版本/事实以 2026-08-01 `docs/MIGRATION-BASELINE.md` 为准;不得夸大已实现范围。
+- 版本/事实以 2026-08-01 `docs/history/MIGRATION-BASELINE.md` 为准;不得夸大已实现范围。
 - DeepSeek V4-flash 开发分工不改变「密钥不写入仓库」红线。
 
 ## 决策
@@ -45,7 +45,7 @@
 5. **cc-connect 配置由 C# ProjectCatalogBridge 确定性生成**;Management/Bridge 默认禁用;GUI 不直连 Management API;版本只以 `cc-connect --version` 确认,未知子命令不得在真实 config 目录试探。
 6. **lark-cli 适配器契约**:parserKind=`envelope|catalog|ndjson|binary`;argv + shell:false;固定原生 exe,每次显式 profile 与 `--as bot|user`。后台自动化固定 bot profile 且 strict/risk control 开启;user 身份只用于用户明确授权且策略允许的操作。高风险 exit 10 不自动 `--yes`;send/reply 只有稳定 idempotency key 才重试;raw API 固定 allowlist;`event consume` 仅测试/诊断,不是生产入口。
 7. **完成边界**:只维护 Codex、Claude Code、Cline 三个可靠边界;`DeepSeek V4 for Copilot Chat` 的 provider 回调不冒充整个 Copilot Agent 任务完成。
-8. **状态真身**:SQLite+WAL 为产品状态真身,迁移方式与回滚真身见 `docs/STATE-OWNERSHIP.md`。
+8. **状态真身**:SQLite+WAL 为产品状态真身,迁移方式与回滚真身见 `docs/history/STATE-OWNERSHIP.md`。
 
 ## 替代方案(评估)
 
@@ -80,7 +80,7 @@
 - 事件/命令统一信封 + 幂等键(EVENT-CONTRACTS);outbox 提供投递记录与重试可观测。
 - 结构化日志(本地时间)替代现役混合文本日志;进程登记/回收全程可审计。
 - ProviderHealthChanged 携带快照 TTL 与配置指纹,线路决策可审计。
-- 门禁指标:完整离线矩阵、GUI 四模式、provider-live 两次、query/chat security canary,均以 `docs/MIGRATION-BASELINE.md` 记录为准。
+- 门禁指标:完整离线矩阵、GUI 四模式、provider-live 两次、query/chat security canary,均以 `docs/history/MIGRATION-BASELINE.md` 记录为准。
 
 ## 回滚
 

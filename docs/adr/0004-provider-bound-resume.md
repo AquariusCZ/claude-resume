@@ -51,7 +51,7 @@ Claude Code 2.1.251 原生二进制（GIT_SHA `37534ac596d80cefb02d272f036adba4b
 Codex 使用固定上游 0.148.0 commit `3ba0f711642a888aec92a611a3f3b2211157ff89` 核查：
 
 - ChatGPT HTTP 目录是 `/backend-api/codex/models?client_version=<所选CLI版本>`，响应 `models[].slug/display_name/visibility`，仅 `visibility=list` 进入选择器；HTTP 接口无分页。
-- 账号额度是 `/backend-api/wham/usage`，字段 `rate_limit.primary_window/secondary_window`、`additional_rate_limits`、`spend_control` 等。此版本没有模型到额度桶的 join key，不能授权某个目标模型恢复；目录和账号窗口可展示，布防后保持明确的等待原因。
+- 账号额度是 `/backend-api/wham/usage`，字段 `rate_limit.primary_window/secondary_window`、`additional_rate_limits`、`spend_control` 等。此版本没有模型到额度桶的 join key，不能授权某个目标模型恢复；目录和账号窗口可展示，布防后保持明确的等待原因。（2026-10-12 更新：本机录制显示服务端已在 `model_usage` 返回逐模型 `available`，ADR-0005 B1 据此定义了官方账号的放行规则；本段保留当时结论。）
 - `exec resume UUID PROMPT --model ID --json` 支持 Windows，使用所选 CLI 的同一入口；npm 包读取自身版本，不混用其它 PATH 中的 CLI。
 - JSONL 的 error 只有 message，没有结构化限流码。任何 error、未知项、损坏行或缺少完整 `turn.completed` 都锁住周期，不按错误文案授权自动重放。命令、文件和 MCP 项从 started 即视为可能有副作用。
 - 静态第三方 provider 保留原 ID，通过官方 `-c` 固定 endpoint/wire/env_key，密钥与自定义头值只存在子进程环境。内置 openai 的同名 provider 表覆盖被上游忽略，所以不能套用该方法。复杂认证、查询参数、冲突项目/managed 配置不冒充可固定。

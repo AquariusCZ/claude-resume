@@ -5,7 +5,7 @@ using System.Text.Json;
 
 namespace AiResume.Worker.Probes;
 
-/// <summary>探测判定分类。与 <see cref="CodexProbe"/> 的语义对齐。</summary>
+/// <summary>探测判定分类。与 Codex 余额/认证探针的语义对齐。</summary>
 public enum ProviderReadiness
 {
     Ok,

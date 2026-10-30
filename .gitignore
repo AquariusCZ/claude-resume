@@ -10,3 +10,6 @@ state.json
 .repomix.md
 out.txt
 stderr.txt
+
+# cc-connect 聊天附件(work_dir 指向本仓库时会落在这里)
+.cc-connect/

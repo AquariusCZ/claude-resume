@@ -295,6 +295,62 @@ namespace AiResume.Tests
             Assert.Equal(0, lister.ListCallCount);
         }
 
+        /// <summary>
+        /// 生产 cc-connect 以 S4U 计划任务运行:powershell.exe 宿主对交互会话不暴露命令行。
+        /// 它是 cc-connect 自己的祖先,不是第二个消费者;豁免后守卫应只报告 cc-connect 冲突本身。
+        /// </summary>
+        [Fact]
+        public void cc_connect祖先中的不可读脚本宿主不算无法核验()
+        {
+            var lister = new FakeProcessLister(new List<RunningProcessInfo>
+            {
+                new RunningProcessInfo(100, "svchost.exe", null, 4),
+                new RunningProcessInfo(200, "powershell.exe", null, 100),
+                new RunningProcessInfo(300, "cc-connect.exe", "cc-connect.exe", 200),
+                new RunningProcessInfo(400, "conhost.exe", null, 200),
+            });
+
+            var withAllowed = CreateGuard(lister).Check(true, new HashSet<int> { 300 });
+            Assert.Equal(ConsumerGuardVerdict.Clear, withAllowed.Verdict);
+
+            var withoutAllowed = CreateGuard(lister).Check(true);
+            Assert.Equal(ConsumerGuardVerdict.Conflict, withoutAllowed.Verdict);
+            Assert.Single(withoutAllowed.Conflicts);
+            Assert.Equal("cc-connect", withoutAllowed.Conflicts[0].Kind);
+        }
+
+        /// <summary>不在 cc-connect 祖先链上的不可读脚本宿主仍然 fail-closed。</summary>
+        [Fact]
+        public void 非cc_connect祖先的不可读脚本宿主仍判无法核验()
+        {
+            var lister = new FakeProcessLister(new List<RunningProcessInfo>
+            {
+                new RunningProcessInfo(200, "powershell.exe", null, 100),
+                new RunningProcessInfo(300, "cc-connect.exe", "cc-connect.exe", 100),
+                new RunningProcessInfo(500, "node.exe", null, 1),
+            });
+
+            var result = CreateGuard(lister).Check(true, new HashSet<int> { 300 });
+
+            Assert.Equal(ConsumerGuardVerdict.Unverifiable, result.Verdict);
+        }
+
+        /// <summary>PID 复用:ParentProcessId 指向的「父进程」比 cc-connect 自己还晚启动,不是真祖先,不豁免。</summary>
+        [Fact]
+        public void 比子进程晚启动的父PID不算祖先不豁免()
+        {
+            DateTime t0 = new(2026, 10, 12, 8, 0, 0, DateTimeKind.Utc);
+            var lister = new FakeProcessLister(new List<RunningProcessInfo>
+            {
+                new RunningProcessInfo(200, "node.exe", null, 100, t0.AddMinutes(30)),
+                new RunningProcessInfo(300, "cc-connect.exe", "cc-connect.exe", 200, t0),
+            });
+
+            var result = CreateGuard(lister).Check(true, new HashSet<int> { 300 });
+
+            Assert.Equal(ConsumerGuardVerdict.Unverifiable, result.Verdict);
+        }
+
         /// <summary>默认枚举器如实声明看不到命令行(不得谎报能力)。</summary>
         [Fact]
         public void 默认枚举器如实声明看不到命令行()

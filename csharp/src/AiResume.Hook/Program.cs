@@ -380,12 +380,18 @@ public static class Program
         string? eventName = GetString(root, "hook_event_name") ?? GetString(root, "hookEventName");
         if (source == "codex")
         {
-            eventName = GetString(root, "type");
-            if (!string.Equals(eventName, "agent-turn-complete", StringComparison.Ordinal))
+            // 两种官方协议并存:旧 notify 把 {"type":"agent-turn-complete",…} 放在最后一个 argv;
+            // 0.148.0 起的 hooks Stop 把 {"hook_event_name":"Stop","session_id":…,"turn_id":…} 写进 stdin。
+            // 两者都代表一整个 turn 结束;其它事件(SessionEnd、SubagentStop 等)一律拒绝。
+            string? legacyType = GetString(root, "type");
+            bool legacyComplete = string.Equals(legacyType, "agent-turn-complete", StringComparison.Ordinal);
+            bool hookStop = legacyType is null && string.Equals(eventName, "Stop", StringComparison.Ordinal);
+            if (!legacyComplete && !hookStop)
             {
                 reason = "codex_event_not_complete";
                 return false;
             }
+            eventName = legacyComplete ? "agent-turn-complete" : "Stop";
         }
         else if (source == "claudecode" && kind == DecisionKind)
         {
@@ -484,7 +490,7 @@ public static class Program
             NullIfBlank(transcriptPath),
             GetFirstString(root, "event_id", "eventId"),
             GetFirstString(root, "timestamp", "created_at", "createdAt"),
-            GetFirstString(root, "last_assistant_message", "lastAssistantMessage"),
+            GetFirstString(root, "last_assistant_message", "lastAssistantMessage", "last-assistant-message"),
             smoke,
             kind,
             GetFirstString(root, "notification_type", "notificationType"));
@@ -509,7 +515,16 @@ public static class Program
             return false;
         }
 
-        if (!TryFindCodexRollout(item.SessionId!, env, out string? rollout, out reason))
+        // hooks Stop 直接给了 transcript_path:文件名以 -<thread id>.jsonl 结尾才采信,
+        // 否则仍按线程 id 扫描 sessions/,不让一条可伪造的路径替代归属核验。
+        string? rollout = null;
+        if (!string.IsNullOrWhiteSpace(item.TranscriptPath) &&
+            item.TranscriptPath.EndsWith("-" + item.SessionId + ".jsonl", StringComparison.OrdinalIgnoreCase) &&
+            Path.IsPathFullyQualified(item.TranscriptPath) && File.Exists(item.TranscriptPath))
+        {
+            rollout = item.TranscriptPath;
+        }
+        else if (!TryFindCodexRollout(item.SessionId!, env, out rollout, out reason))
         {
             return false;
         }
@@ -800,6 +815,14 @@ public static class Program
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
             }
+        }
+
+        // Codex 的 turn_id 是全局唯一的回合身份。旧 notify 负载与 hooks Stop 负载描述同一回合时字段集合不同
+        // (有无 transcript_path / last_assistant_message),把这些拼进哈希就会让升级期用户每回合收到两条。
+        if (source == "codex" && !string.IsNullOrWhiteSpace(sessionId) && !string.IsNullOrWhiteSpace(turnId))
+        {
+            string turnRaw = string.Join("|", source, sessionId, turnId, cwd, kind);
+            return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(turnRaw)).AsSpan(0, 8)).ToLowerInvariant();
         }
 
         string raw = string.Join("|", source, sessionId, turnId, taskId, cwd, transcriptTime,

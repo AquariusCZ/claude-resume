@@ -21,12 +21,12 @@ public sealed class AllowFromNormalizationTests
     [Fact]
     public void 中间夹空格的open_id被修好()
     {
-        string bad = "ou_160a7866f6c507d6c 508896eadda3c34";
+        string bad = "ou_0123456789abcdef0 123456789abcdef";
         Assert.Equal(36, bad.Length);
 
         string fixedUp = FeishuCredentialStore.NormalizeAllowFrom(bad);
 
-        Assert.Equal("ou_160a7866f6c507d6c508896eadda3c34", fixedUp);
+        Assert.Equal("ou_0123456789abcdef0123456789abcdef", fixedUp);
         Assert.Equal(35, fixedUp.Length);   // open_id 的标准长度
     }
 
@@ -66,7 +66,7 @@ public sealed class AllowFromNormalizationTests
     [Fact]
     public void 正常值原样返回()
     {
-        const string good = "ou_160a7866f6c507d6c508896eadda3c34";
+        const string good = "ou_0123456789abcdef0123456789abcdef";
 
         Assert.Equal(good, FeishuCredentialStore.NormalizeAllowFrom(good));
     }
