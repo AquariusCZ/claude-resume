@@ -163,7 +163,7 @@ ADR-0002(RunContract)、ADR-0004 的其余约束、ADR-0005 的 B1(Codex 官方�
 
 ## 6. 验证边界
 
-- 离线:`dotnet build -c Release -warnaserror` 0 警告;`dotnet test` 全绿(数量以当次输出为准;2026-10-30 首轮 1156,10-31 交叉审查后 1195,11-02 修复轮复审后 1215)。逐项目续跑、送达分级、控制面、OpenCode 插件
+- 离线:`dotnet build -c Release -warnaserror` 0 警告;`dotnet test` 全绿(数量以当次输出为准;2026-10-30 首轮 1156,10-31 交叉审查后 1195,11-02 修复轮复审后 1215,同日限额通知规则与用语修正后 1250)。逐项目续跑、送达分级、控制面、OpenCode 插件
   (内嵌 Node harness 21 个事件场景)、GUI 视图模型(Node 驱动)均有对真实录制形状断言的测试。
 - 截图:`AiResume.Gui.exe --screenshot`(合成数据)与无头 Edge 渲染,在 1120×760 与 900×600、150% 缩放下核对布局。
 - 真机(本轮 install 后):`notify list`、`notify check`、`notify test`,OpenCode 日志中的插件加载记录。

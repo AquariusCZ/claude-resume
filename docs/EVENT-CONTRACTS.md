@@ -76,7 +76,7 @@ RunContract payload 额外携带 `contract_version="1"`。
 
 ## 5. 入站事件
 
-> 历史:ADR-0006 之后 AI Resume 不再有任何飞书入站——cc-connect 已退役,lark-cli 只用于发送完成通知(`im +messages-send`)、通道体检(`doctor`)与识别收件人(`auth list`),不调用 `event consume`。本节只作历史记录。
+> 历史:ADR-0006 之后 AI Resume 不再有任何飞书入站——cc-connect 已退役,lark-cli 只用于发送完成通知(`im +messages-send`)、诊断通道(`doctor`)与识别收件人(`auth list`),不调用 `event consume`。本节只作历史记录。
 
 `inbound.*` payload:
 
@@ -309,8 +309,10 @@ AI run terminal 与消息投递分离。结果/进度发送失败不把 `succeed
 - 根节点不是对象、字段类型不对、缺 `eventId`(或非 `ai-resume` 来源缺 `cwd`)的文件移入 `completion-events\malformed\`;
 - 按 `atUtc` 从旧到新处理(缺时间排最后,同刻按文件名);七天已发送表 `completion-notify-seen.json` 命中则直接删除文件;
 - 来源不在通知意图 `ProductConfig.NotifySources` 里的直接删除不发(`ai-resume` 总是放行;`NotifyIntentRecorded=false` 的旧空配置不过滤,记录过的空意图全部丢弃);`atUtc` 早于 24 小时前的不再补发,移入 `dead\`(`stale`);
+- Claude Code 事件(非冒烟)带 `transcriptPath` 而该转录文件在稳定期(20 秒)后仍不存在 → 会话没落盘,删除不发(`session_not_persisted`;路径形状陌生、目录读不了或没带路径时照发);
+- 用量上限中断(`kind=failure` 且 `error=rate_limit`,或 `kind=decision` 且 `notificationType=quota_auto_resume_disabled`)满稳定期后按转录尾部 `quotaLimits.rateLimitType + resetsAt` 加配置根定限额周期(事件晚于重置时间时不采信;读不到按会话):`completion-notify-limits.json` 记着这个会话这一周期已提醒过 → 删除不发(`same_limit_cycle`);同周期同时待发的中断合成一条,以最早一条的 `eventId` 作幂等键发送,送达后整组记已送达;
 - Claude Code 完成类事件(`source=claudecode`,`kind` 为空或 `completion`,非冒烟且有 `sessionId`)入队未满 20 秒不发;同一会话 2 分钟内出现更新的完成时旧条目被替代;`backgroundBusy=true` 时最多暂缓 30 分钟,同会话任何更晚的完成(队列中,或 `completion-notify-sessions.json` 记录的已送出)都让它作废;
 - 未设收件人(`ProductConfig.NotifyRecipientOpenId`)时保留文件不发;
 - 发送:`lark-cli im +messages-send --as bot --user-id <收件人> --text <文案> --idempotency-key <eventId> --format json`,成功后记入已发送表并删除文件;机器人凭据优先取 AI Resume 的机器范围副本、经环境变量交给 lark-cli,没有副本时退回 lark-cli 自己的钥匙串(S4U Worker 经该副本的真实投递待真机验证);
 - 失败:条目级只推迟该条(30 秒起指数退避,上限 15 分钟);通道级故障(凭据、网络、频控等)熔断整个通道,凭据文件、收件人或 lark-cli 位置一变即解除;参数类永久错误、首次尝试后超过 24 小时仍未送达、或首次结果不明后超过 55 分钟(飞书 uuid 只去重一小时)的条目移入 `completion-events\dead\`,并写同名 `.error.txt`;退出码 0 而输出不是信封按已送达;
-- 状态文件与队列同在状态根:`completion-notify-seen.json`(已送达,保留七天)、`completion-notify-state.json`(条目退避)、`completion-notify-sessions.json`(每个 Claude Code 会话最近已送出的完成,保留两天)、`completion-notify-health.json`(通道健康,Worker 单写、GUI 只读)。
+- 状态文件与队列同在状态根:`completion-notify-seen.json`(已送达,保留七天)、`completion-notify-state.json`(条目退避)、`completion-notify-sessions.json`(每个 Claude Code 会话最近已送出的完成,保留两天)、`completion-notify-limits.json`(已提醒过的限额周期,重置后 1 小时或 5 小时失效)、`completion-notify-health.json`(通道健康,Worker 单写、GUI 只读)。

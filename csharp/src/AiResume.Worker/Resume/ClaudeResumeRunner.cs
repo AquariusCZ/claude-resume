@@ -149,7 +149,7 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
 
         if (Path.IsPathRooted(_claudeCommand) && !File.Exists(_claudeCommand))
         {
-            return result with { Status = "no-claude", NotStarted = true, NotStartedDetail = "执行器不存在" };
+            return result with { Status = "no-claude", NotStarted = true, NotStartedDetail = "找不到 Claude Code 程序" };
         }
 
         if (!Directory.Exists(projectPath))

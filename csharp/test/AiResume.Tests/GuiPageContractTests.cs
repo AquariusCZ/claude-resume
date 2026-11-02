@@ -166,7 +166,7 @@ public sealed class GuiPageContractTests
             assert.equal(t[3].big, '未核实'); assert.match(t[3].foot, /读取失败/); assert.match(t[4].foot, /读取失败/);
             // 服务端报告已达上限却没指明窗口:磁贴要说出来,不能只显示几个未满的窗口。
             t = AR.quotaTiles({ hasData: true, unattributedLimitReached: true, windows: [{ name: 'five_hour', usedPercent: 40, status: 'allowed' }] }, [], null, {}, now);
-            assert.equal(t[2].state, 'limit'); assert.equal(t[2].unit, '未归因');
+            assert.equal(t[2].state, 'limit'); assert.equal(t[2].unit, '窗口不明');
             """);
 
     [Fact]
@@ -204,12 +204,18 @@ public sealed class GuiPageContractTests
             ] };
             let m = AR.notifyModel(list, null, {}, now);
             assert.deepEqual(m.rows.map(r => r.kind), ['ClaudeCode', 'OpenCode']);
-            assert.equal(m.rows[0].led, 'ok'); assert.equal(m.rows[1].text, '待核实');
+            assert.equal(m.rows[0].led, 'ok'); assert.equal(m.rows[0].text, 'hook 正常'); assert.equal(m.rows[1].text, '待核实');
             assert.match(m.extraHint, /Codex/); assert.match(m.extraHint, /仍开启/);
             m = AR.notifyModel(list, null, { showExtraNotify: true }, now);
             assert.equal(m.extraHint, ''); assert.equal(m.rows.length, 4);
             const broken = { items: [{ kind: 'Qoder', displayName: 'Qoder', isInstalled: true, isEnabled: true, hookBroken: true }] };
-            assert.match(AR.notifyModel(broken, null, {}, now).extraHint, /断链/);
+            assert.match(AR.notifyModel(broken, null, {}, now).extraHint, /Qoder 的通知 hook 失效/);
+            // OpenCode 是插件:「已加载」只来自它自己的日志(detail 不含「核实」);失效同样按插件说。
+            const plugin = (extra) => AR.notifyModel({ items: [{ kind: 'OpenCode', displayName: 'OpenCode', isInstalled: true, isEnabled: true, hookBroken: false, detail: '已安装,OpenCode 已加载(日志 11-02 10:00)', ...extra }] }, null, {}, now).rows[0];
+            assert.equal(plugin().text, '插件已加载'); assert.equal(plugin().led, 'ok');
+            assert.equal(plugin({ hookBroken: true, detail: 'OpenCode 拒绝加载 AI Resume 通知插件' }).text, '插件失效');
+            const claudeBroken = AR.notifyModel({ items: [{ kind: 'ClaudeCode', displayName: 'Claude Code', isInstalled: true, isEnabled: true, hookBroken: true, detail: 'x' }] }, null, {}, now).rows[0];
+            assert.equal(claudeBroken.text, 'hook 失效'); assert.equal(claudeBroken.led, 'bad');
             // 探测本身失败(配置正被改写、被占用):不能说「已关闭」或「未检测到」,开关保持可点。
             const unreadable = { items: [{ kind: 'ClaudeCode', displayName: 'Claude Code', isInstalled: true, isEnabled: false, hookBroken: false, unverified: true, detail: '配置读取失败: busy' }] };
             const u = AR.notifyModel(unreadable, null, {}, now).rows[0];
@@ -244,7 +250,8 @@ public sealed class GuiPageContractTests
             const blocked = AR.notifyModel(list, { ...base, health: { state: 'blocked', reason: 'keychain_unavailable', lastErrorCode: 1 } }, {}, now).robot;
             assert.equal(blocked.led, 'bad'); assert.equal(blocked.text, AR.DELIVERY_REASON.keychain_unavailable);
             assert.equal(AR.notifyModel(list, { ...base, health: null }, {}, now, true).robot.text, '待核实');
-            assert.equal(AR.notifyModel(list, { ...base, credentialSource: 'keychain', health: null }, {}, now, true).robot.led, 'wait');
+            const keychainOnly = AR.notifyModel(list, { ...base, credentialSource: 'keychain', health: null }, {}, now, true).robot;
+            assert.equal(keychainOnly.led, 'wait'); assert.equal(keychainOnly.text, '未存凭据副本'); assert.match(keychainOnly.title, /后台服务/);
             assert.equal(AR.notifyModel(list, { ...base, health: null }, {}, now).robot.text, '核验中…');
             assert.equal(AR.notifyModel(list, { ...base, recipientSet: false }, {}, now).robot.led, 'bad');
             assert.equal(AR.notifyModel(list, { ...base, larkCliFound: false }, {}, now).robot.led, 'bad');
@@ -291,7 +298,7 @@ public sealed class GuiPageContractTests
 
             r = AR.rowModel(item, { ...base, armed: true, armProject: { modelId: 'claude-fable-5-1', modelName: 'Claude Fable 5.1', modelSource: 'session',
               category: 'waiting', reasonText: '等额度', hint: 'Fable 周额度已用尽', resetAtUnix: now + 3600 } });
-            assert.equal(r.mode, 'fixed'); assert.equal(r.modelLabel, 'Fable 5.1'); assert.match(r.modelTitle, /本周期固定/);
+            assert.equal(r.mode, 'fixed'); assert.equal(r.modelLabel, 'Fable 5.1'); assert.match(r.modelTitle, /^模型 ID claude-fable-5-1 · 跟随会话 · 本轮固定$/);
             assert.match(r.status.text, /^等额度 · \d/); assert.equal(r.status.cls, 'wait');
             assert.match(r.status.title, /Fable 周额度已用尽;预计 .* 起续跑/);
             r = AR.rowModel(item, { ...base, armed: true, armProject: { modelId: 'claude-fable-5-1', category: 'waiting', reasonText: '等额度', resetAtUnix: now - 60 } });
@@ -301,10 +308,10 @@ public sealed class GuiPageContractTests
             assert.ok(r.needsChoice); assert.equal(r.value, '__gone'); assert.equal(r.options[0].value, '__gone'); assert.match(r.status.text, /已下线/);
             assert.ok(!r.armable, '手选的模型下线了必须重选,不能悄悄改用会话模型布防'); assert.equal(r.effectiveModel, '');
             assert.equal(AR.rowModel(item, { ...base, armed: true, armProject: null }).mode, 'none');
-            // 在布防队列里却没有逐项目数据(状态库读不出):不能肯定地说「未在本周期」。
+            // 在布防队列里却没有逐项目数据(状态库读不出):不能肯定地说「不在本轮布防」。
             r = AR.rowModel(item, { ...base, armed: true, armProject: null, inCycle: true });
             assert.equal(r.status.text, '状态未核实'); assert.equal(r.status.cls, 'wait');
-            assert.equal(AR.rowModel(item, { ...base, armed: true, armProject: null, inCycle: false }).status.text, '未在本周期');
+            assert.equal(AR.rowModel(item, { ...base, armed: true, armProject: null, inCycle: false }).status.text, '不在本轮布防');
 
             const req = AR.armRequest([
               { path: 'C:\\a', chosen: '', effectiveModel: 'claude-opus-5-5' },
@@ -365,17 +372,21 @@ public sealed class GuiPageContractTests
             assert.equal(b.cls, 'bad'); assert.match(b.head, /未确认完成/);
             b = AR.beaconModel(armed({ engine: 'Healthy', projects: [{ name: 'a', status: '', category: 'idle' }] }), null, now);
             assert.equal(b.head, '监视中');
-            // 未启动(执行器暂时不可用,下一轮自动重试)不是「不会自动重放」的执行后失败。
-            b = AR.beaconModel(armed({ engine: 'Alive', projects: [{ name: 'a', status: 'limited', category: 'failure', reason: 'not-started:no-claude', reasonText: '执行器不可用' }] }), null, now);
-            assert.equal(b.cls, 'wait'); assert.match(b.sub, /执行器不可用/);
+            // 未启动(找不到程序或目录,下一轮自动重试)不是「不会再自动续跑」的执行后失败。
+            b = AR.beaconModel(armed({ engine: 'Alive', projects: [{ name: 'a', status: 'limited', category: 'failure', reason: 'not-started:no-claude', reasonText: '找不到程序或目录' }] }), null, now);
+            assert.equal(b.cls, 'wait'); assert.match(b.sub, /找不到程序或目录/);
             b = AR.beaconModel(armed({ engine: 'Alive', projects: [{ name: 'a', status: 'limited', category: 'failure', reason: 'quota:provider-changed', reasonText: '账号已变化 · 重新布防' }] }), null, now);
             assert.equal(b.cls, 'bad'); assert.equal(b.head, '需要重新布防');
-            // 还在取证 / 会话记录未核实:引擎不会放行,不得说「尚未被限额打断」。
+            // 还在核对 / 会话记录未核实:后台服务不会放行,不得说「尚未被限额打断」。
             b = AR.beaconModel(armed({ engine: 'Alive', projects: [{ name: 'a', status: null, category: 'waiting', reason: 'evidence-unverified', reasonText: '会话记录未核实' }] }), null, now);
-            assert.equal(b.cls, 'wait'); assert.equal(b.head, '等待取证');
-            // 引擎还没接手新周期:不能说「监视中」。
+            assert.equal(b.cls, 'wait'); assert.equal(b.head, '等待核对');
+            // 后台服务还没接手新一轮:不能说「监视中」。
             b = AR.beaconModel(armed({ engine: 'Alive', phase: '', projects: [{ name: 'a', category: 'idle' }] }), null, now);
-            assert.equal(b.head, '待初始化');
+            assert.equal(b.head, '待初始化'); assert.match(b.sub, /后台服务还没接手这一轮/);
+            b = AR.beaconModel(armed({ engine: 'Alive', phase: 'blocked', projects: [] }), null, now);
+            assert.equal(b.head, '本轮已停止'); assert.match(b.sub, /不会再自动续跑/);
+            b = AR.beaconModel(armed({ engine: 'Stalled', probeAgeSeconds: 1800 }), null, now);
+            assert.equal(b.head, '续跑监视卡住', '后台服务进程还在(页脚绿),卡住的是续跑监视'); assert.equal(b.sub, '已 30 分钟未核验额度');
             // 有同名进程但常驻 Worker 不应答:不说监视中，也不报红。
             b = AR.beaconModel(armed({ engine: 'WorkerUnverified', projects: [{ name: 'a', category: 'idle' }] }), null, now);
             assert.equal(b.cls, 'wait'); assert.equal(b.head, '监视状态未核实');

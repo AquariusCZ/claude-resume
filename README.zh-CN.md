@@ -69,11 +69,11 @@ v2.1 的 `claude setup-token` 长期令牌已删除：usage 接口不接受它�
 
 1. 安装 lark-cli：`npm i -g @larksuite/cli`。AI Resume 直接启动 npm 包里的 `lark-cli.exe`，绝不经 `cmd.exe`——那条路会把多行消息截在第一个换行处。
 2. 在飞书开放平台准备一个自建应用：开启机器人能力，并有发消息的权限。收件人（也就是你）要在应用的可用范围内。
-3. **工具 › 飞书通知设置…**（或**完成通知 → 飞书**下的**设置…**）：填 App ID（`cli_…`）和 App Secret，点**保存并验证**。AI Resume 先用这组凭据在线跑一次 `lark-cli doctor`，飞书确实换得到机器人令牌才保存。凭据以机器范围 DPAPI 副本存在 `state\secrets\feishu-bot.bin`（只有你、SYSTEM 和 Administrators 可读），投递时经 lark-cli 官方的 `LARKSUITE_CLI_*` 环境变量交给它——后台 Worker 可能跑在会话 0，那里 lark-cli 自己的钥匙串时常读不出来。没有这份副本时退回钥匙串，真实投递成功之前界面显示**凭据在钥匙串**。从 v2.1 升级？**导入旧版凭据**会把旧版「飞书接入」区保存的凭据经同样的核验后导入。
+3. **工具 › 飞书通知设置…**（或**完成通知 → 飞书**下的**设置…**）：填 App ID（`cli_…`）和 App Secret，点**保存并验证**。AI Resume 先用这组凭据在线跑一次 `lark-cli doctor`，飞书确实换得到机器人令牌才保存。凭据以机器范围 DPAPI 副本存在 `state\secrets\feishu-bot.bin`（只有你、SYSTEM 和 Administrators 可读），投递时经 lark-cli 官方的 `LARKSUITE_CLI_*` 环境变量交给它——后台 Worker 可能跑在会话 0，那里 lark-cli 自己的钥匙串时常读不出来。没有这份副本时退回钥匙串，真实投递成功之前界面显示**未存凭据副本**。从 v2.1 升级？**导入旧版凭据**会把旧版「飞书接入」区保存的凭据经同样的核验后导入。
 4. 收件人：粘贴你的 `ou_…` open_id 后点**保存**，或点**识别**从已登录 lark-cli 的用户里挑（`lark-cli auth list`）。open_id 按应用隔离，必须取自机器人所在的那个应用；保存过机器人凭据后，**识别**只列出同一应用的用户。
-5. **通道体检**用投递实际会用的凭据跑 `lark-cli doctor`；**发送测试**（也在**工具 › 发送测试通知**）往队列放一条测试消息，走完整条链路。
+5. **诊断通道**用投递实际会用的凭据跑 `lark-cli doctor`；**发送测试**（也在**工具 › 发送测试通知**）往队列放一条测试消息，走完整条链路。
 
-**飞书机器人**这一行只有最近一次真实投递成功、且之后没改过设置时才显示**可送达**；后台 Worker 不在时显示**后台服务未运行**；投递受阻时直接写出原因——凭据、权限或收件人、限流、网络；最近一次尝试失败时显示**最近投递失败**；成功之后改过凭据或收件人时显示**设置已变更**（点**发送测试**重新核实）。一条消息失败只按它自己的退避重试，不拖慢别的。通道级故障会让整条通道暂停一段退避时间，你一改凭据或收件人就立即解除。永远发不出去的、发生超过 24 小时还没送出的、或者结果不明已过 55 分钟的消息（飞书只在一小时内去重，再发可能重复）移进 `state\completion-events\dead\`，旁边附一份 `.error.txt`。
+**飞书机器人**这一行只有最近一次真实投递成功、且之后没改过设置时才显示**可送达**；后台服务不在时显示**后台服务未运行**；投递受阻时直接写出原因——凭据、权限或收件人、限流、网络；最近一次尝试失败时显示**最近投递失败**；成功之后改过凭据或收件人时显示**设置已变更**（点**发送测试**重新核实）。一条消息失败只按它自己的退避重试，不拖慢别的。通道级故障会让整条通道暂停一段退避时间，你一改凭据或收件人就立即解除。永远发不出去的、发生超过 24 小时还没送出的、或者结果不明已过 55 分钟的消息（飞书只在一小时内去重，再发可能重复）移进 `state\completion-events\dead\`，旁边附一份 `.error.txt`。
 
 ## 通知
 
@@ -81,20 +81,20 @@ v2.1 的 `claude setup-token` 长期令牌已删除：usage 接口不接受它�
 
 | 来源 | 跑完了 | 因错误中断 | 在等你 |
 |---|---|---|---|
-| Claude Code | `Stop` 钩子 | `StopFailure`——用量上限、登录失效、账单问题等 | `Notification`——等你授权、MCP 确认框（elicitation）、需要你输入、额度恢复后没能自动继续或自动继续未开启 |
+| Claude Code | `Stop` hook | `StopFailure`——用量上限（每个会话每个限额周期只提醒一次）、登录失效、账单问题等 | `Notification`——等你授权、MCP 确认框（elicitation）、需要你输入、额度恢复后没能自动接上 |
 | OpenCode 2.x | 顶层会话的 `session.execution.succeeded`，且没有仍在运行的子会话 | 顶层会话的 `session.execution.failed`，宽限期内没被自动续跑 | `permission.asked`、`form.created`（AI 提问） |
 
 Claude Code 的钩子以官方 exec form 写进 `%USERPROFILE%\.claude\settings.json`——`command` 是 `AiResume.Hook.exe` 的绝对路径，`args` 放开关——需要 Claude Code 2.1.139 以上。Claude Code 会自己重新加载这个文件，不用新开会话。OpenCode 插件是官方 v2 目录形态，位于 `%USERPROFILE%\.config\opencode\plugins\airesume-notify\index.ts`；旧的单文件插件会被迁移并留一份 `.bak`。直到 OpenCode 自己的日志（`%USERPROFILE%\.local\share\opencode\log\opencode.log`）显示插件已加载，OpenCode 这一行都显示**待核实**；OpenCode 拒绝加载时标红（以日志里最后一条结论为准，之后成功加载会覆盖先前的失败）。一直待核实就重启一次 OpenCode。两处路径都跟随客户端自己的设置：Claude Code 跟随 `CLAUDE_CONFIG_DIR`，OpenCode 跟随 `XDG_CONFIG_HOME` / `XDG_DATA_HOME`。
 
-适配器合并进你已有的配置，且只移除能证明属于自己的条目。AI Resume 自己的续跑运行带内部标记，它们的钩子不会通知你；取而代之的是 AI Resume 自己发的提醒：开始续跑，续跑完成或未确认完成；额度已恢复但会话仍开着；Claude 登录令牌过期；账号已变化；登录即将到期或已过期。经手机远程连接的 Claude Code 会话，通知里会带「· 远程已连接」。
+适配器合并进你已有的配置，且只移除能证明属于自己的条目。AI Resume 自己的续跑运行带内部标记，它们的钩子不会通知你；取而代之的是 AI Resume 自己发的提醒：开始续跑，续跑完成或未确认完成；额度已恢复但会话仍开着；Claude 登录令牌过期；账号已变化；登录即将到期或已过期。经手机远程连接的 Claude Code 会话，通知里会带「· 远程已连接」；Claude Code 的通知还会写上会话名（桌面端侧栏标题或 `/rename`）。用量上限每个会话每个限额周期只提醒一次：同时被打断的会话合成一条，写明哪个额度用完、预计何时重置，并按发出那一刻的布防状态说清 AI Resume 会不会续跑它们。没有落盘的会话（例如第三方工具以 `claude --no-session-persistence` 拉起的进程）不发通知。
 
-Codex（`hooks.json` 里的 `Stop` 钩子）、Cline（`TaskComplete`）和 Qoder（`hooks.Stop`）仍可用，只发"跑完了"，默认隐藏：**视图 › 显示其他通知源**，或 `notify enable <源>`。隐藏的源若仍开着或钩子断链，主界面会留一句提示。安装前已经打开的 Codex 会话不会重载 `hooks.json`，请新开会话；若 Codex 里 `/hooks` 显示 AI Resume 的钩子未信任，在那里信任一次即可。协议与冒烟步骤见[完成通知](docs/COMPLETION-NOTIFICATIONS.md)。
+Codex（`hooks.json` 里的 `Stop` hook）、Cline（`TaskComplete`）和 Qoder（`hooks.Stop`）仍可用，只发"跑完了"，默认隐藏：**视图 › 显示其他通知源**，或 `notify enable <源>`。隐藏的源若仍开着或 hook 失效，主界面会留一句提示。安装前已经打开的 Codex 会话不会重载 `hooks.json`，请新开会话；若 Codex 里 `/hooks` 显示 AI Resume 的 hook 未信任，在那里信任一次即可。协议与测试步骤见[完成通知](docs/COMPLETION-NOTIFICATIONS.md)。
 
 ## 额度与续跑
 
 额度取自 Anthropic 的 OAuth usage 接口，复用 Claude Code 的真实请求形状和 Claude Code 自己的登录。响应是稀疏的，所以缺字段不等于被删除。承接下来的旧值显示为琥珀色的*最近服务端读数*，绝不点绿；只有重置时间没有百分比时用不确定态扫描，而不是编一个数字出来。额度屏含义固定：Claude 5 小时、Claude 7 天、Claude 按模型（已用最高或已满的那条按模型周额度；有布防项目卡在它上面时带「N 项在等」角标）、DeepSeek 余额。余额用 OpenCode 的 DeepSeek 密钥查询（先看 OpenCode 配置，再看 OpenCode 2.x 自己的凭据库 `opencode.db`，然后是旧的 `auth.json`，都没有才用 `DEEPSEEK_API_KEY`），只展示：AI Resume 不保存任何 DeepSeek 密钥，也不用它续跑。OpenCode 合并后的配置把 DeepSeek 指到自定义端点时，不发余额请求。刷新失败而沿用旧读数时，页头写**部分更新**，磁贴悬停说明写出失败原因。
 
-勾选要守护的项目。勾选的行会出现模型下拉：默认的「沿用会话:<模型>」跟随该会话最近实际用的模型（布防后显示为 ↺），也可以逐个改选——多个项目可以共用一个模型，共用的项目共享同一份额度读数。**预演…**只显示每个项目当前的判定，什么都不执行。**布防**会固定本周期的供应商和账号、每个项目从供应商实时目录里选定的模型 ID，以及精确的原生会话；模型目录更新在下次布防采用。会话正开着只给警告；会话模型不在目录里时需要手动选一个。
+勾选要守护的项目。勾选的行会出现模型下拉：默认的「沿用会话:<模型>」跟随该会话最近实际用的模型（布防后显示为 ↺），也可以逐个改选——多个项目可以共用一个模型，共用的项目共享同一份额度读数。**预览…**只显示每个项目当前的判定，什么都不执行。**布防**会固定本轮的供应商和账号、每个项目从供应商实时目录里选定的模型 ID，以及精确的原生会话；模型目录更新在下次布防采用。会话正开着只给警告；会话模型不在目录里时需要手动选一个。
 
 布防后每个项目各自判定，任何一项核实不了都只等待，绝不放行：
 
@@ -102,9 +102,9 @@ Codex（`hooks.json` 里的 `Stop` 钩子）、Cline（`TaskComplete`）和 Qode
 - **它的模型额度恢复了吗？** 必须有实时读数显示 5 小时和 7 天窗口都低于 100%，且没有约束该模型的额度被打满。按模型的周额度只约束同一模型族（任何版本都算；认不出模型族的按"有约束"处理），所以 Fable 周额度用尽不再挡住 Opus 项目。
 - **会话空着吗？** 会话开在某个客户端里——终端、桌面端、VS Code 或手机远程——或者同目录另一个会话正在跑，这个项目就等。开着的交互会话交给 Claude Code 自己的自动继续；额度恢复 10 分钟后会话仍开着且没有继续，飞书提醒你一次。
 
-项目按队列顺序一次一个续跑，在各自目录里执行 `claude --resume <会话 ID> -p continue --model <模型> …`，每个启动前都重新核验一遍。没能启动的项目——会话刚被打开、访问令牌不足 45 分钟、配置刚变化——本轮跳过、下一轮重试，不再锁死整个周期。进程启动后的失败绝不自动重放：本周期停住，等你解除后重新布防。一次性模式（默认）在所有项目都完成后自动解除；**工具 › 连续模式**每次被打断都续跑，下次布防时生效。把鼠标停在某行状态上，可以看到完整原因和预计起续时间。
+项目按队列顺序一次一个续跑，在各自目录里执行 `claude --resume <会话 ID> -p continue --model <模型> …`，每个启动前都重新核验一遍。没能启动的项目——会话刚被打开、访问令牌不足 45 分钟、配置刚变化——本轮跳过、下一轮重试，不再锁死整轮。进程启动后的失败绝不自动重放：本轮停住，等你解除后重新布防。一次性模式（默认）在所有项目都完成后自动解除；**工具 › 连续模式**每次被打断都续跑，下次布防时生效。把鼠标停在某行状态上，可以看到完整原因和预计起续时间。
 
-Codex 默认隐藏，**视图 › 显示 Codex** 之后才出现它的额度屏，并可选为续跑供应商。它使用 `~/.codex/auth.json` 里的官方 ChatGPT/OpenAI 登录——Codex 里配置的本机中转不会被使用。Codex 没有会话记录核对：观测到项目的模型受限时排进队列，账号各窗口都低于 100%、没有附加限额或消费上限命中、目标模型未被标为不可用时才续跑。其它已配置的供应商（非本机的第三方 Codex provider，或指向 API 端点的 Claude Code）需要已核实的正余额。没有额度数据就显示“未核实”；不会自动换供应商；固定调用 ID 不等于冻结供应商同名 ID 的后端版本。详见[供应商与固定目标续跑](docs/adr/0004-provider-bound-resume.md)和 [ADR-0006](docs/adr/0006-retire-cc-connect-per-project-resume.md)。
+Codex 默认隐藏，**视图 › 显示 Codex** 之后才出现它的额度屏，并可选为续跑供应商。它使用 `~/.codex/auth.json` 里的官方 ChatGPT/OpenAI 登录——Codex 里配置的本机中转不会被使用。Codex 没有会话记录核对：观测到项目的模型受限时排进队列，账号各窗口都低于 100%、没有附加限额或消费上限命中、目标模型未被标为不可用时才续跑。其它已配置的供应商（非本机的第三方 Codex provider，或指向 API 端点的 Claude Code）需要已核实的正余额。没有额度数据就显示“未核实”；不会自动换供应商；固定模型 ID 不等于冻结供应商同名 ID 的后端版本。详见[供应商与固定目标续跑](docs/adr/0004-provider-bound-resume.md)和 [ADR-0006](docs/adr/0006-retire-cc-connect-per-project-resume.md)。
 
 ## 用手机远程
 
@@ -164,7 +164,7 @@ $w = "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe"
 | `install` | 部署、重建入口、按意图对齐通知源 | 0 成功 · 1 出错 · 2 通知源未对齐 · 3 Worker 未起来 · 4 回滚不完整 |
 | `uninstall` | 移除安装副本、快捷方式和自己的钩子条目；保留 `state\` | |
 | `shortcuts` | 重建桌面、开始菜单和开机自启入口（`shortcuts uninstall` 移除）；`install` 会替你做 | |
-| `notify` · `notify list` | 每个通知源：已安装、已启用、可送达 | 有已启用的钩子断链时为 2 |
+| `notify` · `notify list` | 每个通知源：已安装、已启用、可送达 | 有已启用的源 hook 失效时为 2 |
 | `notify enable <源>` · `notify disable <源>` | 开关 `ClaudeCode`、`OpenCode`、`Codex`、`Cline`、`Qoder`，并记住意图供下次安装恢复 | 失败为 1 |
 | `notify check` | lark-cli、凭据来源、收件人、最近一次真实投递，再跑 `lark-cli doctor` | 0 就绪 · 2 未就绪 |
 | `notify test` | 往队列放一条测试消息，最多等 90 秒看 Worker 是否送达 | 0 已送达 · 2 未送达 |
@@ -177,7 +177,7 @@ $w = "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe"
 
 1. `& $w notify list`——每个已启用的源「可送达」都是 True，退出码 0。OpenCode 那一行的说明应是 `OpenCode 已加载(日志 …)`，而不是 `等 OpenCode 下次加载后核实`。
 2. `& $w notify check`——最后一行是 `结论: 飞书通知通道就绪`，退出码 0。
-3. `& $w notify test`——90 秒内退出码 0，手机上收到「AI Resume 通知冒烟通过」。退出码 2 时会说明原因：通道受阻的原因及其错误码和 `log_id`，或 90 秒内没有送达——这时确认后台 Worker 在运行，再跑 `notify check`。
+3. `& $w notify test`——90 秒内退出码 0，手机上收到「🧪 AI Resume 测试通知」。退出码 2 时会说明原因：飞书投递暂停的原因及其错误码和 `log_id`，或 90 秒内没有送达——这时确认后台服务（Worker）在运行，再跑 `notify check`。
 4. 控制面页脚显示「后台服务运行中」，**Claude 登录**显示**有效**，**飞书机器人**显示**可送达**。
 5. 每次续跑判定都逐项目记进 `state\logs\worker-yyyyMMdd.log` 的 `resume.probe.evaluated`（`name=model|quota|session|evidence|reason`）。
 

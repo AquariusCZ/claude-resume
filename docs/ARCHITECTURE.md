@@ -100,6 +100,7 @@ AI Resume 自己的持久状态放在单独的子目录,卸载时可以保留:
   completion-notify-seen.json       已送达的 eventId → 送达时间(7 天去重窗)
   completion-notify-state.json      逐条退避状态(次数、首次/下次尝试时间、首次结果不明时间、最近错误类别/错误码/log_id)
   completion-notify-sessions.json   每个 Claude Code 会话最近一次已送达的完成时间(2 天),让更早的 backgroundBusy 完成作废
+  completion-notify-limits.json     已提醒过的「限额周期#会话」(周期为 rate_limit|<配置根指纹>|<窗口>|<重置时间> 或 session|<会话>)→ 失效时间;同一会话同周期之后的用量上限中断据此丢弃
   completion-notify-health.json     投递通道健康(Worker 单写;GUI 与 notify check/test 只读)
   secrets\feishu-bot.bin            飞书机器人 app_id / app_secret(DPAPI LocalMachine,ACL 收紧;GUI 写,Worker 读)
   secrets\feishu-platform.bin       仅 v2.1 遗留:「飞书接入」保存的 CurrentUser 密文,只供「导入旧版凭据」读取一次,原样保留
@@ -155,7 +156,7 @@ AI Resume 读取(少数场合写入)的外部文件,所有权都在各自的客�
 
 `ProjectRef` 字段:`name`、`path`、`sessionId`(布防时固定的原生会话 UUID),以及 v2.2 新增的逐项目模型:
 
-- `modelId` / `modelName`:本项目续跑用的模型调用 ID,布防时冻结;多个项目可以指向同一个模型,共用同一份额度证据。
+- `modelId` / `modelName`:本项目续跑用的模型 ID,布防时冻结;多个项目可以指向同一个模型,共用同一份额度证据。
 - `modelSource`:`session` = 未手选,跟随该会话最近一次真实应答的模型(在本次实时目录里);`user` = 手选(必须在本次实时目录里,否则整次布防被拒);`default` = 未手选,且会话模型读不到或不在目录里,退回布防目标的默认模型(会话模型不在目录时附提示,不阻止布防;Codex 项目没有会话模型证据,未手选时总是 `default`);空 = v2.2 之前的旧配置,`modelId` 也为空,沿用 `resumeTarget.modelId`(GUI 把空来源显示为 `default`)。
 - 有效模型由 `ResumeTarget.EffectiveModel(project, target)` 给出:项目级优先,为空时退回 `resumeTarget.modelId`。`ResumeTarget.Identity(config)` 把供应商/账号/agent/默认模型、`resumeModel`、`resumePrompt`、`skipPermissions` 与每个项目的(路径, 会话 UUID, 有效模型)一起哈希,只在进程内比较:任何一项在异步边界前后变化,在途的额度证据立即作废。
 
@@ -194,10 +195,10 @@ v2.2 的界面只回答四个问题,其余收进菜单栏:
 - **菜单栏**:视图(显示 Codex〔额度栏与续跑供应商〕/ 显示其他通知源〔Codex / Cline / Qoder〕/ 供应商与额度详情… / 不再扫描的目录…)、工具(刷新额度与状态 F5 / 重新扫描项目 / 连续模式 / 飞书通知设置… / 发送测试通知)、帮助(使用说明 / 关于)。快捷键 Alt+V / Alt+T / Alt+H 打开菜单,F10 聚焦菜单栏。偏好(`showCodex`、`showExtraNotify`)只存在本机 WebView2 的 `localStorage`(键 `airesume.prefs`)。连续模式不是界面偏好而是布防配置(`config.json` 的 `continuous`):菜单里的勾选只是内存里的待定选择,没动过时跟随 `arm.get` 返回的当前配置,下一次布防随 `arm.set` 生效。
 - **铭牌 + 状态灯**(一灯两行):它现在在不在干活。「监视中」要布防、引擎进程在、探测新鲜,且本用户常驻 Worker 应答 Named Pipe(有同名进程却不应答为琥珀「监视状态未核实」);Claude 登录的红/琥珀只套在 Claude 订阅周期上(`resumeTarget.providerId === 'claude-subscription'`),Codex 与走 API 凭据的 Claude Code 周期不受订阅登录影响;认不出模型族(`quota:unknown` + `model-invalid`)与账号变化一样提示「需要重新布防」。
 - **额度表**:四块含义固定的 CRT——Claude 5 小时、Claude 7 天、Claude 按模型(已用最高或已满的一条 scoped 窗口,卡在该窗口上的布防项目显示角标「N 项在等」)、DeepSeek 余额;打开「显示 Codex」时追加 Codex 第五块。窄磁贴用容器查询换短标题。
-- **续跑队列**:每行是勾选 + 序号 + 项目名/路径 + 「续跑模型 / 状态」列。未布防时勾选的行出现模型下拉(默认「沿用会话:最近模型」,可逐项目手选);已布防时显示固定模型(↺ 表示跟随会话)与本周期等待原因短句,悬停看完整说明与预计续跑时间。供应商下拉只在未布防且有两个以上可续跑供应商时出现在队列标题栏。布防栏给出摘要、「预演…」(只读,不执行)与布防/解除布防。
+- **续跑队列**:每行是勾选 + 序号 + 项目名/路径 + 「续跑模型 / 状态」列。未布防时勾选的行出现模型下拉(默认「沿用会话:最近模型」,可逐项目手选);已布防时显示固定模型(↺ 表示跟随会话)与本周期等待原因短句,悬停看完整说明与预计续跑时间。供应商下拉只在未布防且有两个以上可续跑供应商时出现在队列标题栏。布防栏给出摘要、「预览…」(只读,不执行)与布防/解除布防。
 - **右栏**两块:「Claude 登录」(有效 / 即将到期 / 令牌待续期 / 已过期 / 未登录 / 凭据位置变化 / 未核实,来自 `claude.login.status`)与「完成通知 → 飞书」(Claude Code、OpenCode 两行开关 + 飞书机器人行 + 收件人/积压/未送达)。
 - **页脚**:左侧操作反馈,右侧「后台服务运行中 / 未运行 / 未核实」(`arm.get` 的 `workerRunning`)。
-- **对话框**(原生 `<dialog>`):飞书通知设置(机器人凭据 / 收件人 / 通道体检)、续跑预演、供应商与额度详情、不再扫描的目录、关于、使用说明。
+- **对话框**(原生 `<dialog>`):飞书通知设置(机器人凭据 / 收件人 / 诊断通道)、续跑预览、供应商与额度详情、不再扫描的目录、关于、使用说明。
 
 收进菜单的东西若处于启用、故障或未核实状态,主界面必须留一句提示,隐藏不得掩盖启用态、断链或读不出配置。页面每 30 秒重读 `arm.get` 与 `notify.channel`,每 `quotaRefreshMinutes` 分钟整体刷新一次,F5 立即刷新。一轮刷新里每块数据到了就各自绘制(额度磁贴不等最慢的供应商目录):`providers.catalog` 在 `quota.get` 返回之后才发,宿主让 Claude 行复用这一轮 1 分钟内的额度读数(`QuotaService.GetRecentAsync`),一轮只请求一次 usage 端点;`claude.login.status` 在额度请求结束后再读一次(只采用最后发出的那次),`serverRejected` 反映的是这一轮的结果。
 
@@ -245,7 +246,7 @@ Worker 是 Generic Host。托管服务强制串行启动(`ServicesStartConcurren
 | `notify.recipient.detect` | — | `lark-cli auth list --json` 列出的已登录用户 `items[]`(`openId` / `userName` / `tokenStatus`)与 `filteredByApp`(保存过机器人凭据副本时只留同一应用的用户)。 |
 | `notify.test` | — | 冒烟事件入队,返回 `eventId`、`enqueuedAtUnix` 与最新 `channel`。界面先查 lark-cli、收件人与后台 Worker,缺一样就不入队。 |
 | `notify.test.status` | `eventId`、`sinceUnix` | 这一条测试事件的结局 `outcome`:`delivered`(进了已送达表)/ `dead` / `failed`(这一条真实尝试过、得到确定的条目级失败,`failure` 给出类别、错误码与 log_id;结果不明的不算,Worker 会在飞书去重窗口内重试)/ `blocked`(入队之后 Worker 看过、通道此刻仍在熔断:到期了或改过设置都不算)/ `pending`,外加最新 `channel`。与 `notify test` 同一判据(`NotifyControlPlane.TestOutcome`);界面每 5 秒问一次,最多 90 秒。 |
-| `notify.test.withdraw` | `eventId` | 撤回还没送出的测试事件(失败、熔断或 90 秒没送达时),免得通道恢复后补发一条过时的「冒烟通过」;返回 `withdrawn`。Worker 发送前复查事件文件并在发送期间占住它,撤回与发送互斥:撤不回(正在发这一条)时界面再看一眼结局,如实说「已送达」或「撤回未确认,稍后仍可能收到」。事件 ID 只接受 16 位十六进制。 |
+| `notify.test.withdraw` | `eventId` | 撤回还没送出的测试事件(失败、熔断或 90 秒没送达时),免得通道恢复后补发一条过时的测试通知;返回 `withdrawn`。Worker 发送前复查事件文件并在发送期间占住它,撤回与发送互斥:撤不回(正在发这一条)时界面再看一眼结局,如实说「已送达」或「撤回未确认,稍后仍可能收到」。事件 ID 只接受 16 位十六进制。 |
 
 `--screenshot` 截图模式下,页面渲染所需的读请求改由进程内合成数据(`DemoPayload`)回答,其它请求一律报错,请求处理不读真实配置与状态(WebView2 用户数据与 GUI 日志仍落在状态根下,见「构建、安装与验证」)。历史:`feishu.*`、`cutover.*`、`agent.*`、`claude.token.*`、`quota.local` 已于 2026-10-30 删除,`providers.probe` 已于 v2.1 删除。
 
@@ -257,10 +258,10 @@ Worker 是 Generic Host。托管服务强制串行启动(`ServicesStartConcurren
 | `install [--target <目录>] [--from <构建根>]` | 安装或升级(见「构建、安装与验证」)。 | 0 成功;1 失败;2 通知源未能对齐;3 新 Worker 未就绪(已回滚);4 回滚不完整;快捷方式失败时返回其退出码。 |
 | `uninstall [--target <目录>]` | 卸载,保留 `state\` 与未知文件。 | 0 成功;异常 1;移除快捷方式失败时返回其退出码;从安装目录执行而临时卸载 Worker 60 秒内未返回时 4。失败时 stderr 给出恢复材料的绝对路径。 |
 | `shortcuts [install\|uninstall] [--gui …] [--worker …] [--icon …]` | 创建或移除开始菜单、桌面与登录自启入口(`install` / `uninstall` 内部调用)。 | 0 成功,失败非 0。 |
-| `notify` / `notify list` | 列出 5 个通知源及「已安装 / 已启用 / 可送达」。 | 任一源已启用但钩子断链时 2,否则 0。 |
+| `notify` / `notify list` | 列出 5 个通知源及「已安装 / 已启用 / 可送达」。 | 任一源已启用但 hook 失效(可送达列 `False(hook 失效)`,OpenCode 为 `False(插件失效)`)时 2,否则 0。 |
 | `notify enable <源>` / `notify disable <源>` | 源名大小写不敏感:`ClaudeCode` / `Codex` / `Cline` / `Qoder` / `OpenCode`;先写意图、再改客户端配置(`NotifyIntent.Apply`,改客户端失败时按实际状态记意图,证明没生效才恢复原样)。 | 成功 0;找不到源、找不到 Hook、意图或客户端配置写入失败 1。 |
-| `notify check` | 飞书通道体检:lark-cli 位置、凭据来源、收件人、最近一次真实投递结论,再跑 `lark-cli doctor`(在线、只读)。 | lark-cli 在、收件人已设、机器人身份就绪、通道未熔断且最近一次真实投递尝试不是失败时 0,否则 2(doctor 只证明机器人身份,证明不了收件人可达)。 |
-| `notify test` | 放一条冒烟事件进队列,等后台 Worker 真实投递,最多 90 秒;只认这一条事件自己的结局(`NotifyControlPlane.TestOutcome`)。 | 送达 0(包括撤回时 Worker 恰好正在发送、随后确认送达);进了死信、这一条确定失败、通道此刻熔断或超时 2(失败、熔断与超时时撤回这条事件,撤不回如实提示可能仍会送达)。 |
+| `notify check` | 诊断飞书通道:lark-cli 位置、凭据来源、收件人、最近一次真实投递结论,再跑 `lark-cli doctor`(在线、只读)。 | lark-cli 在、收件人已设、机器人身份就绪、通道未熔断且最近一次真实投递尝试不是失败时 0,否则 2(doctor 只证明机器人身份,证明不了收件人可达)。 |
+| `notify test` | 放一条测试通知进队列,等后台服务(Worker)真实投递,最多 90 秒;只认这一条事件自己的结局(`NotifyControlPlane.TestOutcome`)。 | 送达 0(包括撤回时 Worker 恰好正在发送、随后确认送达);进了死信、这一条确定失败、通道此刻熔断或超时 2(失败、熔断与超时时撤回这条事件,撤不回如实提示可能仍会送达)。 |
 | `internal-agent-run <规格>` | 内部:续跑子进程的受监督包装(见「执行计划」)。 | 环境没有 `AI_RESUME_INTERNAL_RUN=1` 或规格无效时 2;执行异常 3;否则为子进程退出码。 |
 
 `notify` 未知子命令返回 1。历史:`feishu-check`、`cc-connect-apply`、`preflight` 已于 2026-10-30 删除;v1 迁移命令 `migrate` / `import-feishu` / `sync-dirs` / `cutover-config` 已于 2026-10-12 删除。
@@ -484,7 +485,7 @@ RunContract 的启动驱动同时是每个 RunId 的启动/取消串行化边界
 |---|---|---|
 | agent | 本地执行器、工具与原生会话实现 | 可续跑:`claudecode`、`codex`;`opencode` 只出现在只展示余额的 DeepSeek 行 |
 | 供应商 | 远端端点、凭据来源与协议映射 | `ProviderRegistry` 的行:`claude-subscription`、`claude-api`、`codex-official`、`codex-active`、`deepseek` |
-| 模型 | 发给供应商的调用 ID | 布防时从该供应商的**实时目录**逐项目确定,冻结在 `ProjectRef.modelId` |
+| 模型 | 发给供应商的模型 ID | 布防时从该供应商的**实时目录**逐项目确定,冻结在 `ProjectRef.modelId` |
 
 布防固定的是供应商、账号身份与 agent(`ResumeTarget`),外加每个项目的原生会话 UUID 与模型;供应商、账号或端点改变都必须重新布防,不自动换供应商重放。共用同一模型的项目共享同一份额度观测、排队串行,每个启动前都重新核验——「项目 A、B 共用模型 A」就是两个项目各自把有效模型设为 A。
 
@@ -551,10 +552,10 @@ Claude Code 事件额外记录结构化短值:`hookEvent`、`promptId`、`error`
 - **直接启动 `lark-cli.exe`,绝不经 `cmd.exe`**:先找 `%APPDATA%\npm`(npm 全局包的官方位置),再按 PATH 逐个目录找;每个目录先认包内的 `node_modules\@larksuite\cli\bin\lark-cli.exe`,再认独立的 `lark-cli.exe`;PATH 里的相对路径条目一律跳过(会按 Worker 当前目录解析,而子进程环境里有机器人 App Secret);找不到即通道级 `launch_failed`。经 `cmd.exe /c` 调 npm 垫片会在换行处截断多行 `--text`,`--idempotency-key` 因此从未送达(2026-10-30 实证)。命令为 `lark-cli im +messages-send --as bot --user-id <open_id> --text <正文> --idempotency-key <eventId> --format json`;eventId 是 16 位十六进制,直接作为飞书幂等键(服务端一小时内去重)。子进程设 `LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1` 与 `LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1`,stdout/stderr 只剩信封。
 - **凭据**:Worker 以 S4U 计划任务跑在会话 0,lark-cli 每次 `--as bot` 都要用 CurrentUser DPAPI 解自己钥匙串里的 appSecret,在会话 0 间歇失败(2026-10-14 以来占投递失败的 96%)。所以 GUI 在交互会话里把机器人凭据另存一份 **LocalMachine** DPAPI 副本 `state\secrets\feishu-bot.bin`,Worker 读出后只经官方环境变量凭据提供者交给 lark-cli:`LARKSUITE_CLI_APP_ID`、`LARKSUITE_CLI_APP_SECRET`、`LARKSUITE_CLI_BRAND=feishu`、`LARKSUITE_CLI_STRICT_MODE=bot`(它优先于钥匙串,本机 dry-run 证实)。没有副本时退回 lark-cli 自己的钥匙串,日志与界面如实标出 `credentialSource`(`env` / `keychain`)。
 - **结果解析**:同时解析 stdout 与 stderr 两种信封(`code`、`log_id`、`retryable`、`retry_after`、`message_id`),由 `NotifyClassifier` 按 lark-cli 1.0.81 的错误契约分类:`confirmation_required`(exit 10,绝不自动 `--yes`)、`keychain_unavailable`、`rate_limit`、`network` / `network_timeout`、`auth_config`、`permission_or_recipient`,以及找不到或启动不了 lark-cli 的 `launch_failed`,属于通道级故障;`invalid_message`(参数/策略类)是条目级永久失败;其余未知错误(`unknown`)与投递异常是条目级可重试失败。退出码 0 但 stdout 不是单个信封时按已送达处理(`sent_unverified`):lark-cli 用 0 表示发送成功,当失败重试会在幂等窗口之外真的重复送达。超时与传输中断结果不明,重试沿用同一个幂等键,首次不明 55 分钟后不再重发(`outcome_unknown` 进死信)。
-- **调度**:按事件 `atUtc` 从旧到新处理;7 天内已送达的直接删除;来源不在通知意图里的直接丢弃(`Suppressed`;意图三态:`notifyIntentRecorded=false` 的旧空配置不过滤,记录过的意图哪怕为空也只放行列表里的来源,`ai-resume` 总是放行);发生超过 24 小时仍未送出的不再补发、进死信(`stale`);同一 Claude Code 会话 2 分钟内更新的完成替代旧的(连续 Stop 只报最后一次),`backgroundBusy` 的完成被同会话任何更晚的完成作废(队列里的,或 `completion-notify-sessions.json` 记着已送出的);Claude 完成类事件有 20 秒稳定期,后台任务未完时最多暂缓 30 分钟;没设收件人时整轮记 `recipient_missing`、保留文件。两次发送之间留 300 毫秒间隔(飞书对同一用户 5 QPS)。
+- **调度**:按事件 `atUtc` 从旧到新处理;7 天内已送达的直接删除;来源不在通知意图里的直接丢弃(`Suppressed`;意图三态:`notifyIntentRecorded=false` 的旧空配置不过滤,记录过的意图哪怕为空也只放行列表里的来源,`ai-resume` 总是放行);发生超过 24 小时仍未送出的不再补发、进死信(`stale`);同一 Claude Code 会话 2 分钟内更新的完成替代旧的(连续 Stop 只报最后一次),`backgroundBusy` 的完成被同会话任何更晚的完成作废(队列里的,或 `completion-notify-sessions.json` 记着已送出的);Claude 完成类事件有 20 秒稳定期,后台任务未完时最多暂缓 30 分钟;没设收件人时整轮记 `recipient_missing`、保留文件。两次发送之间留 300 毫秒间隔(飞书对同一用户 5 QPS)。会话没落盘的 Claude Code 事件(稳定期后转录文件仍不存在,如第三方工具以 `--no-session-persistence` 拉起的 claude)不发(`session_not_persisted`,判断不了照发);用量上限中断(`StopFailure` rate_limit 与 `quota_auto_resume_disabled`)按转录里服务端给的 `rateLimitType + resetsAt`(加配置根指纹)定限额周期(读不到按会话、5 小时),每个会话每个周期只提醒一次(`same_limit_cycle`),同一周期同时待发的会话合成一条;入队不满 20 秒先不判,事件晚于转录里的重置时间时那份证据作废;外部事实经 `INotifyFacts`(生产 `NotifyFacts`)只读获取,读不出一律按「不知道」。详见 [COMPLETION-NOTIFICATIONS.md](COMPLETION-NOTIFICATIONS.md) §5.3。
 - **退避与熔断**:条目级失败只推迟这一条,间隔 30 秒 × 2^(n-1)、上限 15 分钟、±20% 抖动;首次尝试超过 24 小时仍未送达的移入 `completion-events\dead\`。通道级故障熔断整个通道:`keychain_unavailable` 60 秒起翻倍、上限 10 分钟,`rate_limit` 按 `retry_after`(缺省 2^n 秒、上限 60 秒),网络类 30 秒起翻倍、上限 5 分钟,凭据/权限/确认/启动/契约类 30 分钟;机器人凭据文件的写入时间、收件人或 lark-cli 位置一变(熔断指纹 `NotifyFingerprint` 变化)立即解除。条目级永久失败直接移入 `dead\`;30 分钟内另一条不同事件命中同类永久失败(跨轮记账,存在健康文件里),升级为通道级 `cli_contract`,防止 CLI 升级把全部通知送进死信。
-- **状态文件**:`completion-notify-seen.json`(7 天去重)、`completion-notify-state.json`(逐条退避,跨重启保留)、`completion-notify-sessions.json`(每个 Claude Code 会话最近一次已送达的完成时间,保留 2 天)、`completion-notify-health.json`(`state`(healthy / blocked / unknown)、`reason`、`blockedSinceUtc` / `blockedUntilUtc`、`consecutiveChannelFailures`、`blockFingerprint`、`lastSuccessUtc`、`lastAttemptUtc`、`lastAttemptOk`(最近一次真实尝试成没成,条目级失败也置 false)、`successFingerprint`(最近一次成功时的设置指纹)、`permanentClass` / `permanentSinceUtc` / `permanentEventId`(跨轮永久失败记账)、`lastErrorClass` / `lastErrorCode` / `lastLogId`、`backlog`、`dead`、`credentialSource`、`updatedAtUtc`)。熔断到期但这轮没有可尝试的条目时保持 blocked,直到下一次真实尝试给出结论。一轮开头就把事件读进内存,发送每一条之前再确认事件文件还在,并在发送期间以允许读、不允许删的方式占住它:撤回(测试通知)与发送由此互斥,文件已不在的记 `Suppressed`(`withdrawn`)不再发。送达一条就落盘一次已送达表,积压冲刷持续几分钟时 `notify test` / 「发送测试」也能及时看到这一条已送达。日志只记类别、错误码、log_id、退出码、耗时与凭据来源,不记正文、收件人或凭据。
-- **文案**(`CompletionNotifier.BuildText`):第一行说发生了什么,第二行「来源 · 模型短名 · 时间」(Remote Control 已连接时加「· 远程已连接」;模型短名如 `claude-opus-5-5` → `Opus 5.5`),需要人动手时第三行写怎么做。完成、等你、中断、续跑/登录提醒与冒烟各有固定的首行符号与说法:等你写明在等什么(含 `quota_auto_resume_stale` / `quota_auto_resume_disabled`),认不出类型就说「等你决定」,绝不编造更具体的说法;中断按 `StopFailure` 的 `error` 区分用量上限、登录失效(提示 `/login`)、账单、账号受限与服务端错误。
+- **状态文件**:`completion-notify-seen.json`(7 天去重)、`completion-notify-state.json`(逐条退避,跨重启保留)、`completion-notify-sessions.json`(每个 Claude Code 会话最近一次已送达的完成时间,保留 2 天)、`completion-notify-limits.json`(已提醒过的限额周期)、`completion-notify-health.json`(`state`(healthy / blocked / unknown)、`reason`、`blockedSinceUtc` / `blockedUntilUtc`、`consecutiveChannelFailures`、`blockFingerprint`、`lastSuccessUtc`、`lastAttemptUtc`、`lastAttemptOk`(最近一次真实尝试成没成,条目级失败也置 false)、`successFingerprint`(最近一次成功时的设置指纹)、`permanentClass` / `permanentSinceUtc` / `permanentEventId`(跨轮永久失败记账)、`lastErrorClass` / `lastErrorCode` / `lastLogId`、`backlog`、`dead`、`credentialSource`、`updatedAtUtc`)。熔断到期但这轮没有可尝试的条目时保持 blocked,直到下一次真实尝试给出结论。一轮开头就把事件读进内存,发送每一条之前再确认事件文件还在,并在发送期间以允许读、不允许删的方式占住它:撤回(测试通知)与发送由此互斥,文件已不在的记 `Suppressed`(`withdrawn`)不再发。送达一条就落盘一次已送达表,积压冲刷持续几分钟时 `notify test` / 「发送测试」也能及时看到这一条已送达。日志只记类别、错误码、log_id、退出码、耗时与凭据来源,不记正文、收件人或凭据。
+- **文案**(`CompletionNotifier.BuildText` / `BuildLimitText`):第一行说发生了什么,第二行「来源 · 模型短名 · 时间 · 「会话名」」(会话名只对 Claude Code 取、只进消息不进日志;Remote Control 已连接时加「· 远程已连接」;模型短名如 `claude-opus-5-5` → `Opus 5.5`),需要人动手时第三行写怎么做;桌面端临时工作区用会话名代替目录名。完成、等你、中断、续跑/登录提醒与测试通知各有固定的首行符号与说法:等你写明在等什么(`quota_auto_resume_stale` 为「额度已恢复,按回车即可继续」),认不出类型就说「等你决定」,绝不编造更具体的说法;中断按 `StopFailure` 的 `error` 区分登录失效(提示 `/login`)、账单、账号受限与服务端错误。用量上限中断四行:谁被打断、来源行、哪个额度用完与预计重置时间(读不到写未核实)、续跑句——只按投递那一刻的布防快照说(未布防 / 本轮布防已停止 / 要重新布防 / 读不到 Claude 登录 / 会续跑它 / 一次性布防这一轮已处理过 / 布防的是同项目另一个会话 / 不在布防范围 / 未核实),`quota_auto_resume_disabled` 补「Claude Code 也不会自己继续」;没有服务端额度窗口时只说「被限额打断」。
 
 收件人 `open_id` 只读明文 `ProductConfig.notifyRecipientOpenId`:它不是机密,而是 lark-cli 所登录应用下的用户标识(按应用隔离),由「飞书通知设置」识别或填写。v2.1 对旧配置回退解 DPAPI 授权名单的路径已删除;收件人也不再从 `allow_from` 同步(该名单已随 cc-connect 退役)。
 
@@ -566,14 +567,14 @@ Claude Code 事件额外记录结构化短值:`hookEvent`、`promptId`、`error`
 - `CheckAsync`:用投递实际会用的凭据来源跑 `lark-cli doctor`(在线,Risk: read),核对机器人身份能否换到 token、端点是否可达。
 - `SetCredentialAsync`:先用这组凭据跑 doctor,飞书确实换得到 bot token 才保存;`ImportLegacyAsync`:读 v2.1「飞书接入」的 CurrentUser 密文 `feishu-platform.bin`(只能在交互会话里解开),同样先核验再写机器范围副本,旧文件原样保留由用户决定是否清除;`ClearCredential`:删除副本。
 - `SetRecipient`:去掉全部空白(含不换行空格与零宽字符)后必须是 `ou_` 开头的字母数字;`DetectRecipientsAsync`:`lark-cli auth list --json` 列出已登录的用户;保存过机器人凭据副本时只保留与它同一应用的用户(比对在进程内做,不回传 app_id 实值),避免跨应用错配。
-- `EnqueueTest`:往队列放一条冒烟事件,走完「队列 → Worker → lark-cli → 飞书」全链路,而不是在界面进程里直接发。GUI「发送测试」与 `notify test` 共用 `TestOutcome`,只看**这一条**事件自己的结局(`delivered` / `dead` / `failed` / `blocked` / `pending`,`failed` 的原因由 `TestFailure` 给出);失败、熔断或 90 秒超时会 `WithdrawTest` 撤回这一条,撤不回时再看一眼结局如实说明。
+- `EnqueueTest`:往队列放一条测试通知,走完「队列 → Worker → lark-cli → 飞书」全链路,而不是在界面进程里直接发。GUI「发送测试」与 `notify test` 共用 `TestOutcome`,只看**这一条**事件自己的结局(`delivered` / `dead` / `failed` / `blocked` / `pending`,`failed` 的原因由 `TestFailure` 给出);失败、熔断或 90 秒超时会 `WithdrawTest` 撤回这一条,撤不回时再看一眼结局如实说明。
 
 凭据实值只出现在用户输入那一刻、`FeishuBotCredentials` 的调用栈内与 lark-cli 子进程的环境变量里,绝不进日志、RPC 应答或 argv。
 
 ### 界面语义
 
 - 通知源行:钩子命令指向的可执行文件不存在时标 `hookBroken` 显红(`HookHealth`);OpenCode 的「已加载」以它自己的日志为准,没有记录就是「待核实」。
-- 飞书机器人行只认真实投递:按顺序判定——lark-cli 未安装 / 未设收件人 / 后台 Worker 未运行(红)→ 通道熔断(红,短句说明原因,悬停给错误码与 log_id)→ Worker 在不在还没读到(「核验中…」)或核验不出(「未核实」)→ 最近一次尝试失败(琥珀「最近投递失败」)→ 成功之后改过设置(琥珀「设置已变更」)或比不出来(琥珀「待核实」)→ 健康文件有成功记录且 `settingsVerified === true`(「可送达」)→ 凭据只在钥匙串(琥珀,建议保存机器范围副本)→ 还没有真实投递记录(「待核实」)。
+- 飞书机器人行只认真实投递:按顺序判定——lark-cli 未安装 / 未设收件人 / 后台服务未运行(红)→ 通道熔断(红,短句说明原因,悬停给错误码与 log_id)→ 后台服务在不在还没读到(「核验中…」)或核验不出(「未核实」)→ 最近一次尝试失败(琥珀「最近投递失败」)→ 成功之后改过设置(琥珀「设置已变更」)或比不出来(琥珀「待核实」)→ 健康文件有成功记录且 `settingsVerified === true`(「可送达」)→ 没存机器范围副本、只能用 lark-cli 钥匙串(琥珀「未存凭据副本」,建议保存一份)→ 还没有真实投递记录(「待核实」)。
 - `notify list` 的「可送达」列只说明钩子命令跑得起来;通道是否真的送达看 `notify check` 与健康文件。
 
 完整的来源契约、准入规则、安装生命周期、队列语义与冒烟流程见 [COMPLETION-NOTIFICATIONS.md](COMPLETION-NOTIFICATIONS.md)。待真机验证:OpenCode 2.2.3 里真实加载新插件并在任务完成时发出通知;用户在「飞书通知设置」保存或导入一次机器人凭据后,S4U Worker 经机器范围副本真实送达;登录到期提醒在真实到期窗口内发出。
@@ -617,7 +618,7 @@ S4U 有两个承重的后果。第一,任务里的 Worker 跑在会话 0,而 `in
 
 S4U 下的 DPAPI 是一部演变史。2026-08-14 实测会话 0 的 Worker 解开 CurrentUser 范围的飞书凭据并送达(`outcome=Sent`),但这个单一样本没有站住:2026-10 同一路径在会话 0 间歇失败数小时(`CryptUnprotectData`)。v2.1 因此把收件人改为明文、让 Worker 不再解 AI Resume 自己的 CurrentUser 密文。2026-10-30 的体检又发现,故障点只是移到了 lark-cli:它每次 `--as bot` 都在会话 0 解自己钥匙串里的 CurrentUser 密文,占投递失败的 96%。v2.2 由此改为 GUI 保存机器范围副本 `feishu-bot.bin`、Worker 经环境变量交给 lark-cli(见「完成通知」)。S4U Worker 经该副本的真实送达仍**待真机验证**(需要用户在「飞书通知设置」保存或导入一次机器人凭据)。
 
-C# 测试套件当前共 1215 项 xUnit 用例(2026-11-02,以当次 `dotnet test` 输出为准)。它们使用隔离的临时状态(只经 `TestTemp` 申请)、合成会话与注入的进程/API 运行器;不会对真实项目启动 AI 修改运行,不发付费 API 请求,不碰 `~/.claude`、`~/.codex`、`~/.qoder`、`~/.config/opencode` 与真实状态目录;mock 照抄录制下来的真实返回结构。`GuiPageContractTests` 与 `OpenCodeNotificationAdapterTests` 会启动 PATH 上的 `node` 驱动页面视图模型与插件脚本,运行环境需要装有 Node.js。
+C# 测试套件当前共 1250 项 xUnit 用例(2026-11-02,以当次 `dotnet test` 输出为准)。它们使用隔离的临时状态(只经 `TestTemp` 申请)、合成会话与注入的进程/API 运行器;不会对真实项目启动 AI 修改运行,不发付费 API 请求,不碰 `~/.claude`、`~/.codex`、`~/.qoder`、`~/.config/opencode` 与真实状态目录;mock 照抄录制下来的真实返回结构。`GuiPageContractTests` 与 `OpenCodeNotificationAdapterTests` 会启动 PATH 上的 `node` 驱动页面视图模型与插件脚本,运行环境需要装有 Node.js。
 
 相关的重点测试:
 
@@ -628,7 +629,7 @@ C# 测试套件当前共 1215 项 xUnit 用例(2026-11-02,以当次 `dotnet test
 - `ResumeEngineTests`、`CheckerCycleTests`、`ClaudeResumeRunnerTests`、`ProviderBoundResumeTests`、`ProviderExecutionTests`:状态机、门禁与执行计划;
 - `PowerLossRecoveryTests`、`ProcessVerifierTests`、`ReconcilerTests`:失败关闭的进程恢复;
 - `CodexAuthProbeTests`、`CodexOfficialProviderTests`、`CodexBalanceProbeTests`、`DeepSeekProbeTests`、`OpenCodeCredentialsTests`、`ControlPlaneBridgeProviderTests`:官方/第三方 Codex 路由、录制的 ChatGPT usage 解析与准入、第三方余额解析、DeepSeek 只读 OpenCode 密钥、GUI 证据分离;
-- `NotificationDeliveryTests`、`CompletionNotifierTests`、`NotificationWorkerTests`、`LarkCliInvokerTests`、`NotifyControlPlaneTests`、`NotifyRecipientTests`:错误分类、通道熔断、单条退避与死信、稳定期与同会话合并、机器范围凭据、lark-cli doctor 与收件人识别的录制形状;
+- `NotificationDeliveryTests`、`CompletionNotifierTests`、`NotificationWorkerTests`、`LarkCliInvokerTests`、`NotifyControlPlaneTests`、`NotifyRecipientTests`:错误分类、通道熔断、单条退避与死信、稳定期与同会话合并、机器范围凭据、lark-cli doctor 与收件人识别的录制形状;`LimitNotificationTests` / `NotifyFactsTests`:没落盘的会话不发、限额周期合并与记账、续跑句按布防快照的各分支、会话名与临时工作区、`NotifyFacts` 按 2.1.309 录制形状读转录与进程登记;
 - `ClaudeCodeNotificationAdapterTests`、`OpenCodeNotificationAdapterTests`、`CodexHooksNotificationAdapterTests`、`HookHandlerTests`、`NotificationHookProcessTests`、`HookHealthTests`、`NotifyIntentTests`:钩子合并、所有权与迁移、事件准入、断链报告;
 - `GuiPageContractTests`、`ControlPlaneBridgeArmTests`、`ControlPlaneBridgeDemoTests`:页面静态纪律、视图模型语义与布防/演示应答;
 - `InstallUninstallTests`、`InstallTargetSafetyTests`、`InstallWorkerLauncherTests`、`WorkerAutostartTests`、`WorkerStartupContractTests`:安装事务、目标安全、自启与宿主启动契约。

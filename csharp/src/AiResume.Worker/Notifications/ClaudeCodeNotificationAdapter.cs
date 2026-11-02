@@ -98,7 +98,7 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
             if (own.Length == 0)
             {
                 return new NotificationProviderStatus(
-                    Kind, DisplayName, true, false, _settingsPath, "未安装 AI Resume 通知钩子");
+                    Kind, DisplayName, true, false, _settingsPath, "未安装 AI Resume 通知 hook");
             }
 
             // 「已启用」必须三组都在且形状正确:只剩 Stop 时，中断与「等你」两类通知永远不会到。
@@ -109,9 +109,9 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
             string hookCommand = own[0].Command;
             return drift.Length == 0
                 ? new NotificationProviderStatus(Kind, DisplayName, true, true, _settingsPath,
-                    "已安装 AI Resume 通知钩子(完成 / 中断 / 等你)", HookCommand: hookCommand)
+                    "已安装 AI Resume 通知 hook(完成 / 中断 / 等你)", HookCommand: hookCommand)
                 : new NotificationProviderStatus(Kind, DisplayName, true, true, _settingsPath,
-                    $"钩子不完整或为旧格式(缺:{string.Join("、", drift)});关掉再打开本开关或重新安装即可修复",
+                    $"hook 不完整或为旧格式(缺:{string.Join("、", drift)});关掉再打开本开关或重新安装即可修复",
                     HookCommand: hookCommand, HookBroken: true);
         }
         catch (Exception ex)

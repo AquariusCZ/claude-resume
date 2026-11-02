@@ -549,7 +549,7 @@ public class ControlPlaneBridgeArmTests : IDisposable
         Assert.Equal("success", Find(@"C:\proj\alpha").GetProperty("category").GetString());
         Assert.Equal("已完成", Find(@"C:\proj\alpha").GetProperty("text").GetString());
         Assert.Equal("failure", Find(@"C:\proj\gamma").GetProperty("category").GetString());
-        Assert.Equal("Claude 或项目不可用", Find(@"C:\proj\gamma").GetProperty("text").GetString());
+        Assert.Equal("找不到程序或目录", Find(@"C:\proj\gamma").GetProperty("text").GetString());
         Assert.Equal("waiting", Find(@"C:\proj\delta").GetProperty("category").GetString());
         Assert.Equal("已停止", Find(@"C:\proj\delta").GetProperty("text").GetString());
         Assert.Equal("failure", Find(@"C:\proj\epsilon").GetProperty("category").GetString());

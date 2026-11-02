@@ -55,7 +55,7 @@ public sealed class ClineNotificationAdapter : INotificationAdapter
                 IsEnabled: enabled,
                 ConfigPath: enabled ? hookPath : null,
                 Detail: installed
-                    ? (enabled ? "已安装 AI Resume 通知钩子" : "Cline hooks 目录存在,但未安装 AI Resume 通知钩子")
+                    ? (enabled ? "已安装 AI Resume 通知 hook" : "Cline hooks 目录存在,但未安装 AI Resume 通知 hook")
                     : "未检测到 Cline hooks 目录",
                 HookCommand: enabled ? FindHookCommand(hookPath) : null);
         }

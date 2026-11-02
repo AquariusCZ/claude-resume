@@ -88,7 +88,7 @@ public sealed class NotifyControlPlaneTests
     }
 
     [Fact]
-    public async Task 测试通知写进真实队列_投递端按冒烟文案发送()
+    public async Task 测试通知写进真实队列_投递端按测试通知文案发送()
     {
         string root = TestTemp.NewDir("notify-test");
         var control = new NotifyControlPlane(new ProductConfigStore(root), root, new FeishuBotCredentials(root), () => null);
@@ -104,7 +104,7 @@ public sealed class NotifyControlPlaneTests
         NotifySweepResult result = await notifier.SweepAsync("ou_test");
 
         Assert.Equal(1, result.Sent);
-        Assert.Contains("通知冒烟通过", text);
+        Assert.StartsWith("🧪 AI Resume 测试通知\n", text);
         DeliveryHealth health = control.Describe().Health!;
         Assert.Equal("healthy", health.State);
         Assert.False(control.Describe().LarkCliFound);

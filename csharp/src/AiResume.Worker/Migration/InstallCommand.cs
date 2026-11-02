@@ -138,7 +138,7 @@ public static class InstallCommand
                 () => ReconcileHooks(hookExe));
             if (!activation.WorkerReady)
             {
-                Console.Error.WriteLine("注意:后台 Worker 未通过 Named Pipe 就绪核验;正在恢复旧运行版本。");
+                Console.Error.WriteLine("注意:后台服务(Worker)未通过 Named Pipe 就绪核验;正在恢复旧运行版本。");
                 if (!RollbackRuntime(stage, backup, fullTarget, hadWorker, obsoletePayload))
                 {
                     preserveRecoveryArtifacts = true;
@@ -494,12 +494,12 @@ public static class InstallCommand
         try
         {
             bool ok = startAndProbe?.Invoke(psi) ?? StartAndProbe(psi);
-            Console.WriteLine(ok ? "后台 Worker 已立即启动" : "后台 Worker 启动后立即退出");
+            Console.WriteLine(ok ? "后台服务(Worker)已立即启动" : "后台服务(Worker)启动后立即退出");
             return ok;
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"警告:启动后台 Worker 失败({ex.Message})");
+            Console.Error.WriteLine($"警告:启动后台服务(Worker)失败({ex.Message})");
             return false;
         }
     }
@@ -1324,7 +1324,7 @@ public static class InstallCommand
         int shortcutResult = removeShortcuts();
         if (shortcutResult != 0)
         {
-            Console.Error.WriteLine("快捷方式未能完整移除，已停止卸载；程序文件与 Worker 保持不变。");
+            Console.Error.WriteLine("快捷方式未能完整移除，已停止卸载；程序文件与后台服务(Worker)保持不变。");
             return shortcutResult;
         }
 
@@ -1347,7 +1347,7 @@ public static class InstallCommand
     {
         if (!File.Exists(hookExe))
         {
-            Console.Error.WriteLine($"警告:安装目录里没有 {HookExecutable.FileName},通知钩子未对账。");
+            Console.Error.WriteLine($"警告:安装目录里没有 {HookExecutable.FileName},通知 hook 未对账。");
             return false;
         }
 
@@ -1387,7 +1387,7 @@ public static class InstallCommand
         }
         else if (done.Contains(NotificationProviderKind.Codex))
         {
-            Console.WriteLine("Codex Stop 钩子已写入 hooks.json 并登记信任;已打开的 Codex 会话不会重载,新开会话即生效;若 codex /hooks 显示未信任,在那里信任一次。");
+            Console.WriteLine("Codex Stop hook 已写入 hooks.json 并登记信任;已打开的 Codex 会话不会重载,新开会话即生效;若 codex /hooks 显示未信任,在那里信任一次。");
         }
 
         // 意图代表用户想要的目标,不是本轮偶然成功的子集。失败项必须保留,
@@ -1790,7 +1790,7 @@ public static class InstallCommand
             string oldWorker = Path.Combine(target, "AiResume.Worker.exe");
             if (restartWorker && File.Exists(oldWorker) && !StartInstalledWorker(oldWorker, target))
             {
-                Console.Error.WriteLine("警告:旧 Worker 文件已恢复,但未能重新通过就绪核验。");
+                Console.Error.WriteLine("警告:旧版后台服务(Worker)文件已恢复,但未能重新通过就绪核验。");
                 return false;
             }
 

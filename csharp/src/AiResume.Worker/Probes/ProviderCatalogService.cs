@@ -38,7 +38,7 @@ public sealed record ProviderObservation(
             ? "账号窗口与模型可用性来自 ChatGPT 官方接口；账号未限额且目标模型可用时自动续跑"
             : Agent == "opencode"
                 ? "OpenCode 使用的 DeepSeek 账户余额，只展示，不参与续跑"
-                : "布防时按项目固定模型调用 ID，下次布防重新选择",
+                : "布防时按项目固定模型 ID，下次布防重新选择",
     };
 }
 

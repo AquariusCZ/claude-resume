@@ -54,6 +54,6 @@ public static class HookHealth
 
     /// <summary>断链时给用户看的说明。必须写清后果,否则"路径不存在"读起来像个无关紧要的警告。</summary>
     public static string BrokenDetail(string? hookCommand)
-        => $"钩子指向的程序不存在:{ExtractExe(hookCommand) ?? hookCommand}" +
+        => $"hook 指向的程序不存在:{ExtractExe(hookCommand) ?? hookCommand}" +
            " —— 配置还在,但任务结束时这条命令执行不了,通知永远不会到。重新安装或关掉再打开本开关可修复。";
 }

@@ -71,7 +71,7 @@ public sealed class QoderNotificationAdapter : INotificationAdapter
             var isEnabled = own is not null;
             return new NotificationProviderStatus(
                 Kind, DisplayName, true, isEnabled, _settingsPath,
-                isEnabled ? "已安装 AI Resume 通知钩子" : "未安装 AI Resume 通知钩子",
+                isEnabled ? "已安装 AI Resume 通知 hook" : "未安装 AI Resume 通知 hook",
                 HookCommand: own);
         }
         catch (Exception ex)

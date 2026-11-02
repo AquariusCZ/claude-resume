@@ -230,7 +230,7 @@ public sealed class ControlPlaneBridge
                 },
             },
             "providers.catalog" => new { items = new object[] {
-                new { id = "claude-subscription", name = "Claude · Anthropic 订阅", agent = "claudecode", kind = "claude-oauth", credentialSource = "claude-oauth:claude-cli", resumable = true, models = new[] { new { id = "claude-fable-5-1", name = "Claude Fable 5.1" }, new { id = "claude-opus-5-5", name = "Claude Opus 5.5" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = true, resumeNote = "布防时按项目固定模型调用 ID，下次布防重新选择", windows = new object[] { new { name = "five_hour", usedPercent = 41, resetAtUnix = now + 9_000, windowSeconds = 18_000, carriedForward = false, status = "allowed" }, new { name = "seven_day", usedPercent = 88, resetAtUnix = now + 180_000, windowSeconds = 604_800, carriedForward = false, status = "allowed" }, new { name = "weekly_scoped:Fable", usedPercent = 100, resetAtUnix = now + 180_000, windowSeconds = 604_800, carriedForward = false, status = "blocked" } } },
+                new { id = "claude-subscription", name = "Claude · Anthropic 订阅", agent = "claudecode", kind = "claude-oauth", credentialSource = "claude-oauth:claude-cli", resumable = true, models = new[] { new { id = "claude-fable-5-1", name = "Claude Fable 5.1" }, new { id = "claude-opus-5-5", name = "Claude Opus 5.5" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = true, resumeNote = "布防时按项目固定模型 ID，下次布防重新选择", windows = new object[] { new { name = "five_hour", usedPercent = 41, resetAtUnix = now + 9_000, windowSeconds = 18_000, carriedForward = false, status = "allowed" }, new { name = "seven_day", usedPercent = 88, resetAtUnix = now + 180_000, windowSeconds = 604_800, carriedForward = false, status = "allowed" }, new { name = "weekly_scoped:Fable", usedPercent = 100, resetAtUnix = now + 180_000, windowSeconds = 604_800, carriedForward = false, status = "blocked" } } },
                 new { id = "deepseek", name = "DeepSeek · OpenCode", agent = "opencode", kind = "deepseek", credentialSource = "opencode-auth", resumable = false, models = new[] { new { id = "deepseek-v4-flash", name = "deepseek-v4-flash" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = false, balance = 47.77, currency = "CNY", resumeNote = "OpenCode 使用的 DeepSeek 账户余额，只展示，不参与续跑" },
                 new { id = "codex-official", name = "Codex · ChatGPT 官方", agent = "codex", kind = "chatgpt", credentialSource = "auth.json:chatgpt", resumable = true, models = new[] { new { id = "gpt-5.6-sol", name = "GPT-5.6 Sol" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = false, resumeNote = "账号窗口与模型可用性来自 ChatGPT 官方接口", windows = new object[] { new { name = "primary · 7D", usedPercent = 12, resetAtUnix = now + 500_000, windowSeconds = 604_800, carriedForward = false, status = "allowed" } } }
             } },
@@ -263,7 +263,7 @@ public sealed class ControlPlaneBridge
                     new { path = selected[2], name = "pixel-sprites", sessionId = "00000000-0000-4000-8000-000000000003", modelId = "claude-opus-5-5", modelName = "Claude Opus 5.5", modelSource = "user", category = "idle", reason = "not-interrupted", reasonText = "监视中 · 未被打断", hint = "会话没有被用量上限打断，不需要续跑" },
                 },
                 engine = "Alive",
-                engineText = "引擎在跑",
+                engineText = "后台服务在运行",
                 workerRunning = true,
                 probeAgeSeconds = 12,
                 probeReason = "quota:limited",
@@ -582,7 +582,7 @@ public sealed class ControlPlaneBridge
             hookExe = _hookExecutableResolver()
                 ?? throw new FileNotFoundException(
                     $"未找到 {HookExecutable.FileName}。请先构建 AiResume.Hook 项目;" +
-                    "钩子必须写绝对路径,写不存在的路径会表现为「已启用但永远收不到通知」。");
+                    "hook 必须写绝对路径,写不存在的路径会表现为「已启用但永远收不到通知」。");
         }
 
         // 意图先落盘、再改客户端配置。它既是重装后恢复通知源的**唯一依据**(卸载会把现状清空,审计 B3),
@@ -889,7 +889,7 @@ public sealed class ControlPlaneBridge
                     ? DescribeNote(note, project.Path, agent, providerId)
                     : status is not null
                         ? (status.Category, status.Text, string.Empty)
-                        : state is not null ? ("waiting", "等待取证", string.Empty) : ("idle", string.Empty, string.Empty);
+                        : state is not null ? ("waiting", "待核对", string.Empty) : ("idle", string.Empty, string.Empty);
             return new ArmProjectItem(
                 project.Path,
                 project.Name,
@@ -920,7 +920,7 @@ public sealed class ControlPlaneBridge
         if (reason.StartsWith("blocked:", StringComparison.Ordinal))
         {
             ProjectStatusItem blocked = DescribeProjectStatus(path, reason["blocked:".Length..]);
-            return (blocked.Category, blocked.Text, "本周期已停止，不会自动重放;检查后解除并重新布防");
+            return (blocked.Category, blocked.Text, "本轮已停止，不会再自动续跑;检查后解除并重新布防");
         }
 
         // Codex 周期的账号与登录问题不能给出 Claude 的修复办法(/login、打开 Claude Code)。
@@ -952,7 +952,7 @@ public sealed class ControlPlaneBridge
             "running" => ("running", "续跑中", string.Empty),
             "done" => ("success", "已完成", string.Empty),
             "continued-elsewhere" => ("success", "已在客户端继续", "被打断之后会话里又有了新的对话，视为你已经自己续上"),
-            "unevaluated" => ("waiting", "等待取证", string.Empty),
+            "unevaluated" => ("waiting", "待核对", string.Empty),
             "session-in-use" => ("waiting", "会话开着 · 关闭后续跑",
                 "会话开在" + ClientText(note.Client) + ":客户端开着时由它自己继续，关闭后自动续跑"),
             "cwd-busy" => ("waiting", "同目录有会话在跑", "同一目录下另一个会话正在运行，它结束后再续跑"),
@@ -981,7 +981,7 @@ public sealed class ControlPlaneBridge
             "not-started:evidence-unverified" => ("waiting", "会话记录未核实", "启动前读不出会话记录的结尾，下一轮重试"),
             "not-started:execution-unverified" => ("waiting", "执行条件未核实", note.Detail is { Length: > 0 } d ? d : "下一轮重试"),
             "not-started:configuration-changed" => ("waiting", "配置刚变化 · 下次重试", "启动前发现布防配置被改过，这次不启动"),
-            "not-started:no-claude" => ("failure", "执行器不可用", "找不到 Claude Code 可执行文件或项目目录"),
+            "not-started:no-claude" => ("failure", "找不到程序或目录", "找不到 Claude Code 可执行文件或项目目录"),
             _ when reason.StartsWith("not-started:", StringComparison.Ordinal) => ("waiting", "本次未启动 · 下次重试", string.Empty),
             _ when reason.StartsWith("quota:", StringComparison.Ordinal) => ("waiting", "额度未核实", string.Empty),
             _ => ("waiting", "状态未核实", string.Empty),
@@ -1029,14 +1029,14 @@ public sealed class ControlPlaneBridge
             "cancel-pending" => ("waiting", "终止待确认"),
             "stopped" => ("waiting", "已停止"),
             "error" => ("failure", "失败"),
-            "no-claude" => ("failure", "Claude 或项目不可用"),
+            "no-claude" => ("failure", "找不到程序或目录"),
             "prompt-multiline" => ("failure", "续跑提示词无效"),
             "launch-error" => ("failure", "启动失败"),
             "configuration-changed" => ("waiting", "配置已改变，请重新布防"),
             "execution-unverified" => ("waiting", "执行条件未核实，请重新布防"),
             "registry-error" => ("failure", "进程登记失败"),
             "monitor-error" => ("failure", "进程监控失败"),
-            "limited-side-effects" => ("failure", "限流前已执行操作"),
+            "limited-side-effects" => ("failure", "撞限前已有操作"),
             "exit-null" => ("failure", "未确认完成"),
             "run-unverified" => ("waiting", "状态未核实"),
             _ when normalizedStatus.StartsWith("exit-", StringComparison.Ordinal) => ("failure", "进程异常退出"),

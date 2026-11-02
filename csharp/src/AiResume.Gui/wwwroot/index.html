@@ -418,7 +418,7 @@ dialog::backdrop{background:rgba(38,35,29,.28)}
     <div class="rows" id="rows" role="list"><div class="sk"></div><div class="sk"></div><div class="sk"></div></div>
     <div class="armbar">
       <span class="sum" id="armSum">勾选项目并确认模型后布防</span>
-      <button class="btn" type="button" id="dryBtn" disabled>预演…</button>
+      <button class="btn" type="button" id="dryBtn" disabled>预览…</button>
       <button class="btn primary" type="button" id="armBtn" disabled><span id="armLabel">布防</span><span class="spin" aria-hidden="true"></span></button>
     </div>
   </section>
@@ -468,7 +468,7 @@ dialog::backdrop{background:rgba(38,35,29,.28)}
     <div class="list" id="fsCandidates" hidden></div>
 
     <div class="brow split">
-      <button class="btn" type="button" id="fsCheck"><span>通道体检</span><span class="spin" aria-hidden="true"></span></button>
+      <button class="btn" type="button" id="fsCheck"><span>诊断通道</span><span class="spin" aria-hidden="true"></span></button>
       <!-- 不做 submit 按钮:否则在输入框里按 Enter 会隐式提交成「关闭」,刚填的凭据被清空且什么也没保存 -->
       <button class="btn" type="button" id="fsClose">关闭</button>
     </div>
@@ -478,7 +478,7 @@ dialog::backdrop{background:rgba(38,35,29,.28)}
 
 <dialog id="dlgPreview" aria-labelledby="pvTitle">
   <form class="dlg" method="dialog">
-    <h3 id="pvTitle">续跑预演(不执行)</h3>
+    <h3 id="pvTitle">续跑预览(不执行)</h3>
     <table class="tbl"><thead><tr><th>#</th><th>项目</th><th>模型</th><th>当前判定</th></tr></thead><tbody id="pvBody"></tbody></table>
     <p class="hint">按队列顺序串行续跑;每个项目启动前都会重新核验额度、会话是否在客户端打开、会话是否已被你续上。</p>
     <div class="brow"><button class="btn" value="close">关闭</button></div>
@@ -614,7 +614,7 @@ const AR = (() => {
       const scoped = windows.filter(w => String(w.name).startsWith('weekly_scoped'));
       if (quota.unattributedLimitReached) {
         // 服务端说已达上限,却没指明哪个窗口:续跑据此全体等待,磁贴必须把它说出来,而不是只显示几个未满的窗口。
-        tiles.push({ title: 'Claude · 限额', state: 'limit', big: '受限', unit: '未归因', percent: null,
+        tiles.push({ title: 'Claude · 限额', state: 'limit', big: '受限', unit: '窗口不明', percent: null,
           foot: '服务端报告已达上限,但没有指明窗口', badge: '' });
       } else if (scoped.length) {
         const rank = w => (w.status === 'blocked' || num(w.usedPercent) >= 100 ? 1000 : 0) + (num(w.usedPercent) ?? -1);
@@ -718,18 +718,18 @@ const AR = (() => {
     network: '网络不通',
     network_timeout: '网络超时',
     launch_failed: 'lark-cli 无法启动',
-    cli_contract: 'lark-cli 契约变化',
+    cli_contract: 'lark-cli 疑似不兼容',
     confirmation_required: 'lark-cli 要求确认',
   };
   const DELIVERY_DETAIL = {
-    keychain_unavailable: '后台 Worker 读不到 lark-cli 钥匙串里的机器人凭据;在「设置…」里保存一份机器范围副本',
+    keychain_unavailable: '后台服务读不到 lark-cli 钥匙串里的机器人凭据;在「设置…」里保存一份机器范围副本',
     auth_config: '飞书拒绝了机器人凭据或应用配置;在「设置…」里重新保存并验证',
     permission_or_recipient: '机器人没有发消息的权限，或收件人不在应用可见范围内',
     rate_limit: '飞书限流，稍后自动重试',
     network: '连不上飞书开放平台，网络恢复后自动重试',
     network_timeout: '请求飞书超时，稍后自动重试',
     launch_failed: '找不到或无法启动 lark-cli;npm i -g @larksuite/cli',
-    cli_contract: 'lark-cli 的参数或输出格式变了，需要升级 AI Resume',
+    cli_contract: '30 分钟内两条消息因同一类参数错误被拒,多半是 lark-cli 的参数或输出格式变了，需要升级 AI Resume',
     confirmation_required: 'lark-cli 要求人工确认高风险操作，后台无法代为确认',
   };
 
@@ -754,13 +754,16 @@ const AR = (() => {
           title: '读不出这个通知源的配置:' + (it.detail || '') + '(点开关重新读取,也会自动重试)' };
       }
       const pendingCheck = it.isEnabled && !it.hookBroken && /核实/.test(it.detail || '');
+      // OpenCode 走插件,「已加载」只以 OpenCode 自己的日志为证;其余客户端走官方 hook,「正常」= 命令指向的程序在。
+      const plugin = it.kind === 'OpenCode';
       return {
         kind: it.kind,
         name: it.displayName,
         on: !!it.isEnabled,
         installed: !!it.isInstalled,
         led: !it.isInstalled ? '' : it.hookBroken ? 'bad' : it.isEnabled ? (pendingCheck ? 'wait' : 'ok') : '',
-        text: !it.isInstalled ? '未检测到' : it.hookBroken ? '钩子断链' : it.isEnabled ? (pendingCheck ? '待核实' : '钩子正常') : '已关闭',
+        text: !it.isInstalled ? '未检测到' : it.hookBroken ? (plugin ? '插件失效' : 'hook 失效')
+          : it.isEnabled ? (pendingCheck ? '待核实' : plugin ? '插件已加载' : 'hook 正常') : '已关闭',
         cls: !it.isInstalled ? '' : it.hookBroken ? 'bad' : it.isEnabled ? (pendingCheck ? 'wait' : 'ok') : '',
         title: it.hookBroken ? (it.detail || '') + '(关掉再打开可修复)' : (it.detail || it.configPath || ''),
       };
@@ -773,7 +776,7 @@ const AR = (() => {
     // 分隔符前用不换行空格:窄栏折行时「·」跟在上一段末尾，菜单路径不被拆开。
     const where = ' · 视图 › 其他通知源';
     const extraHint = brokenHidden.length
-      ? `${brokenHidden.join('、')} 通知钩子断链${where}`
+      ? `${brokenHidden.join('、')} 的通知 hook 失效${where}`
       : unverifiedHidden.length ? `${unverifiedHidden.join('、')} 通知源状态未核实${where}`
       : onHidden.length ? `另有 ${onHidden.join('、')} 通知仍开启${where}` : '';
 
@@ -783,7 +786,7 @@ const AR = (() => {
     else if (channel.error) robot = { led: '', text: '未核实', cls: '', title: channel.error };
     else if (!channel.larkCliFound) robot = { led: 'bad', text: '未安装 lark-cli', cls: 'bad', title: 'npm i -g @larksuite/cli,再运行 lark-cli config init' };
     else if (!channel.recipientSet) robot = { led: 'bad', text: '未设置收件人', cls: 'bad', title: '在「设置…」里识别或填写 open_id' };
-    else if (worker === false) robot = { led: 'bad', text: '后台服务未运行', cls: 'bad', title: '完成通知由后台 Worker 投递;它不在时通知只会排队。重新安装或重新登录 Windows 会拉起它' };
+    else if (worker === false) robot = { led: 'bad', text: '后台服务未运行', cls: 'bad', title: '完成通知由后台服务投递;它不在时通知只会排队。重新安装或重新登录 Windows 会拉起它' };
     else if (channel.health && channel.health.state === 'blocked') {
       const h = channel.health;
       robot = {
@@ -791,10 +794,10 @@ const AR = (() => {
         title: [DELIVERY_DETAIL[h.reason] || '', h.lastErrorCode ? '错误码 ' + h.lastErrorCode : '', h.lastLogId ? 'log_id ' + h.lastLogId : ''].filter(Boolean).join(' · '),
       };
     } else if (worker !== true) {
-      // 只有确认后台 Worker 在跑才谈得上「可送达」:还没读到(undefined)与核验不出(null)都不能凭历史成功点绿。
+      // 只有确认后台服务在跑才谈得上「可送达」:还没读到(undefined)与核验不出(null)都不能凭历史成功点绿。
       robot = worker === undefined
-        ? { led: '', text: '核验中…', cls: '', title: '正在核验后台 Worker 是否在跑;完成通知由它投递' }
-        : { led: '', text: '未核实', cls: '', title: '暂时无法核验后台 Worker 是否在跑;完成通知由它投递' };
+        ? { led: '', text: '核验中…', cls: '', title: '正在核验后台服务是否在运行;完成通知由它投递' }
+        : { led: '', text: '未核实', cls: '', title: '暂时无法核验后台服务是否在运行;完成通知由它投递' };
     } else if (channel.health && channel.health.lastAttemptOk === false) {
       // 最近一次投递失败(条目级:收件人、权限、未知错误码…):历史成功不能再让这一行显示绿色。
       const h = channel.health;
@@ -811,7 +814,7 @@ const AR = (() => {
     } else if (channel.health && channel.health.state === 'healthy' && num(channel.health.lastSuccessAtUnix)) {
       robot = { led: 'ok', text: '可送达', cls: 'ok', title: `最近一次送达 ${fmtWhen(channel.health.lastSuccessAtUnix, now)}` };
     } else if (channel.credentialSource === 'keychain') {
-      robot = { led: 'wait', text: '凭据在钥匙串', cls: 'wait', title: '后台计划任务下 lark-cli 钥匙串可能读不到;建议在「设置…」里保存机器人凭据' };
+      robot = { led: 'wait', text: '未存凭据副本', cls: 'wait', title: 'AI Resume 没有保存机器范围的机器人凭据副本,投递只能用 lark-cli 自己的钥匙串,后台服务(计划任务)可能读不到;建议在「设置…」里保存一份' };
     } else {
       robot = { led: 'wait', text: '待核实', cls: 'wait', title: '还没有真实投递记录,可点「发送测试」' };
     }
@@ -827,12 +830,12 @@ const AR = (() => {
     return { rows, extraHint, robot, app, note: notes.join(' · '), loading: items == null };
   }
 
-  /** 页脚右侧:后台 Worker 在不在。续跑和完成通知都由它执行;核验不出就说未核实。 */
+  /** 页脚右侧:后台服务(AiResume.Worker)在不在。续跑和完成通知都由它执行;核验不出就说未核实。 */
   function workerModel(arm) {
     if (!arm || arm.workerRunning === undefined) return { cls: '', text: '' };
-    if (arm.workerRunning === true) return { cls: 'ok', text: '后台服务运行中', title: '续跑引擎与完成通知投递都在这个进程里' };
+    if (arm.workerRunning === true) return { cls: 'ok', text: '后台服务运行中', title: '自动续跑和完成通知都由它执行' };
     if (arm.workerRunning === false) return { cls: 'bad', text: '后台服务未运行', title: '续跑和完成通知都不会进行;重新安装或重新登录 Windows 会拉起它' };
-    return { cls: '', text: '后台服务未核实', title: '有 AiResume.Worker 进程但常驻服务没有应答,或暂时无法枚举进程' };
+    return { cls: '', text: '后台服务未核实', title: '有 AiResume.Worker 进程但后台服务没有应答(管道无回应),或暂时无法枚举进程' };
   }
 
   /** 可续跑供应商下拉的选项:Codex 跟随「显示 Codex」偏好;已布防时固定为布防目标。 */
@@ -852,7 +855,7 @@ const AR = (() => {
   };
 
   /**
-   * 队列一行:已布防时是固定模型 + 本周期等待原因(短句 + 悬停说明);未布防时勾选的行出现模型下拉 + 会话事实,
+   * 队列一行:已布防时是固定模型 + 本轮等待原因(短句 + 悬停说明);未布防时勾选的行出现模型下拉 + 会话事实,
    * 没勾选的行只显示最近会话时间。状态短句要放得进窄列:时间只补「HH:mm」,解释放进 title。
    */
   function rowModel(item, ctx) {
@@ -865,9 +868,9 @@ const AR = (() => {
     const lastUsed = { text: item.lastUsed ? `最近会话 ${used}` : '手动添加', cls: '', title: item.lastUsed ? `最近一次会话活动 ${item.lastUsed}` : '' };
     if (ctx.armed) {
       const ap = ctx.armProject;
-      // 在布防队列里、却没有逐项目数据(状态库读不出、arm.get 失败):不知道它在等什么，不能说「未在本周期」。
-      if (!ap && ctx.inCycle) return { mode: 'none', status: { text: '状态未核实', cls: 'wait', title: '暂时读不出这个项目在本周期的状态' }, armable: false };
-      if (!ap) return { mode: 'none', status: { text: '未在本周期', cls: '' }, armable: false };
+      // 在布防队列里、却没有逐项目数据(状态库读不出、arm.get 失败):不知道它在等什么，不能说「不在本轮布防」。
+      if (!ap && ctx.inCycle) return { mode: 'none', status: { text: '状态未核实', cls: 'wait', title: '暂时读不出这个项目在本轮的状态' }, armable: false };
+      if (!ap) return { mode: 'none', status: { text: '不在本轮布防', cls: '' }, armable: false };
       const reset = num(ap.resetAtUnix);
       const waitingReset = reset && ap.category === 'waiting' && reset > now;
       const text = (ap.reasonText || '') + (waitingReset ? ` · ${fmtWhen(reset, now)}` : '');
@@ -878,8 +881,8 @@ const AR = (() => {
         mode: 'fixed',
         modelLabel: modelShort(ap.modelId, ap.modelName),
         modelHint: ap.modelSource === 'session' ? '↺' : '',
-        modelTitle: `调用 ID ${ap.modelId} · ${source} · 本周期固定`,
-        status: { text: text || '等待取证', cls, title: title || ap.reasonText || '' },
+        modelTitle: `模型 ID ${ap.modelId} · ${source} · 本轮固定`,
+        status: { text: text || '待核对', cls, title: title || ap.reasonText || '' },
         armable: false,
       };
     }
@@ -930,7 +933,7 @@ const AR = (() => {
     };
   }
 
-  /** 布防请求:逐项目模型。跟随会话传空串，由后端按同一会话事实解析;手选传调用 ID。 */
+  /** 布防请求:逐项目模型。跟随会话传空串，由后端按同一会话事实解析;手选传模型 ID。 */
   function armRequest(rows, providerId, continuous) {
     const projectModels = {};
     rows.forEach(r => { projectModels[r.path] = r.chosen || ''; });
@@ -955,7 +958,7 @@ const AR = (() => {
     return `已选 ${rows.length} 个 · ` + [...counts].map(([k, v]) => `${k} ×${v}`).join(' · ');
   }
 
-  /** 状态灯:它在不在干活。引擎与进程门禁压过一切阶段文案;登录过期且已布防时标红。 */
+  /** 状态灯:它在不在干活。后台服务与进程门禁压过一切阶段文案;登录过期且已布防时标红。 */
   function beaconModel(arm, login, now) {
     if (!arm) return { cls: '', head: '正在读取状态', sub: '等待布防状态核验' };
     const on = !!arm.armed;
@@ -964,11 +967,11 @@ const AR = (() => {
     if (on && arm.engine === 'WorkerUnverified') return { cls: 'wait', head: '监视状态未核实', sub: arm.engineText || '后台服务没有应答,无法确认它在监视' };
     if (on && arm.engine === 'Stalled') {
       const mins = num(arm.probeAgeSeconds) != null ? Math.floor(arm.probeAgeSeconds / 60) : null;
-      return { cls: 'wait', head: '引擎无响应', sub: mins != null ? `已 ${mins} 分钟未核验额度` : '久未核验额度' };
+      return { cls: 'wait', head: '续跑监视卡住', sub: mins != null ? `已 ${mins} 分钟未核验额度` : '久未核验额度' };
     }
     if (arm.engine === 'CancelPending') return { cls: 'bad', head: '续跑终止待确认', sub: '已请求终止,对应进程仍在运行;确认进程退出前不会启动新的续跑' };
-    if (arm.engine === 'RunActive') return { cls: 'wait', head: '续跑仍在进行', sub: on ? '已有项目进程仍在运行,新周期会等待它结束' : '已解除布防,但已启动的项目进程仍在运行' };
-    if (arm.engine === 'StateUnverified') return { cls: 'bad', head: '布防状态未核实', sub: arm.engineText || '状态数据库或续跑引擎暂时无法核实' };
+    if (arm.engine === 'RunActive') return { cls: 'wait', head: '续跑仍在进行', sub: on ? '已有项目进程仍在运行,新一轮会等它结束' : '已解除布防,但已启动的项目进程仍在运行' };
+    if (arm.engine === 'StateUnverified') return { cls: 'bad', head: '布防状态未核实', sub: arm.engineText || '状态数据库或后台服务暂时无法核实' };
     if (arm.engine === 'RunMissing') return { cls: 'bad', head: '续跑已中断', sub: '项目仍标记进行中,但对应进程已不存在' };
     if (arm.engine === 'RunUnverified') return { cls: 'wait', head: '续跑状态未确认', sub: '暂时无法核验对应进程' };
     if (!on) return { cls: '', head: '未布防', sub: '勾选项目并确认模型后布防' };
@@ -979,11 +982,11 @@ const AR = (() => {
     if (claudeCycle && login && login.badBeacon) return { cls: 'bad', head: 'Claude 登录' + login.head, sub: '额度无法核实 · ' + login.note };
 
     const projects = arm.projects || [];
-    // 只有「进程启动后」的失败(状态行是 exit-* / error / launch-error…)或周期已锁存才说「不会自动重放」;
-    // 待续项目上的失败类原因(执行器暂时不可用 = 未启动,下一轮自动重试)走下面的等待分支。
+    // 只有「进程启动后」的失败(状态行是 exit-* / error / launch-error…)或本轮已锁存才说「不会再自动续跑」;
+    // 待续项目上的失败类原因(找不到程序或目录 = 未启动,下一轮自动重试)走下面的等待分支。
     const failed = projects.filter(p => p.category === 'failure' && p.status && p.status !== 'limited');
     if (failed.length || arm.phase === 'blocked') {
-      return { cls: 'bad', head: failed.length ? `${failed.length} 个续跑未确认完成` : '本周期已停止', sub: '不会自动重放,检查后解除并重新布防' };
+      return { cls: 'bad', head: failed.length ? `${failed.length} 个续跑未确认完成` : '本轮已停止', sub: '不会再自动续跑,检查后解除并重新布防' };
     }
     // 不会自己好的原因:账号变了、旧布防没有目标、模型认不出模型族(额度永远无法核实)。
     const rearm = projects.filter(p => /^quota:(provider-changed|target-unbound)$/.test(String(p.reason || '')) ||
@@ -991,8 +994,8 @@ const AR = (() => {
     if (rearm.length) {
       return { cls: 'bad', head: '需要重新布防', sub: `${rearm[0].name} ${rearm[0].reasonText || ''}`.trim() };
     }
-    // 引擎还没接手这个布防周期(刚布防、Worker 刚重启):还没有任何逐项目证据,不能说「监视中」。
-    if (!arm.phase) return { cls: 'wait', head: '待初始化', sub: `已布防 ${n} 个 · 后台引擎尚未接手本周期` };
+    // 后台服务还没接手这一轮布防(刚布防、Worker 刚重启):还没有任何逐项目证据,不能说「监视中」。
+    if (!arm.phase) return { cls: 'wait', head: '待初始化', sub: `已布防 ${n} 个 · 后台服务还没接手这一轮` };
     const running = projects.find(p => p.status === 'running');
     if (arm.phase === 'resuming' || running) {
       return { cls: 'on', head: '正在续跑', sub: running ? `${running.name} · ${modelShort(running.modelId, running.modelName)}` : `共 ${n} 个项目` };
@@ -1007,13 +1010,13 @@ const AR = (() => {
       }
       // 不全是在等额度:点名第一个卡在别处的项目(会话开着、未核实…),其余计数。
       const first = pending.find(p => !String(p.reason || '').startsWith('quota:limited')) || pending[0];
-      return { cls: 'wait', head: '等待续跑', sub: `${first.name} ${first.reasonText || '等待取证'}${pending.length > 1 ? ` · 共 ${pending.length} 个在等` : ''}` };
+      return { cls: 'wait', head: '等待续跑', sub: `${first.name} ${first.reasonText || '待核对'}${pending.length > 1 ? ` · 共 ${pending.length} 个在等` : ''}` };
     }
-    // 还在取证、会话记录或占用读不出的项目:引擎不会放行它们,绿色「尚未被限额打断」在这里没有证据。
+    // 还在核对、会话记录或占用读不出的项目:后台服务不会放行它们,绿色「尚未被限额打断」在这里没有证据。
     const unsettled = projects.filter(p => !p.status && p.category === 'waiting');
     if (unsettled.length) {
       const first = unsettled[0];
-      return { cls: 'wait', head: '等待取证', sub: `${first.name} ${first.reasonText || '等待取证'}${unsettled.length > 1 ? ` · 共 ${unsettled.length} 个` : ''}` };
+      return { cls: 'wait', head: '等待核对', sub: `${first.name} ${first.reasonText || '待核对'}${unsettled.length > 1 ? ` · 共 ${unsettled.length} 个` : ''}` };
     }
     if (claudeCycle && login && login.warnBeacon) return { cls: 'wait', head: '监视中 · 登录即将到期', sub: login.value ? `Claude 登录 ${login.value.replace('至 ', '')} 到期` : login.note };
     const done = projects.filter(p => p.category === 'success').length;
@@ -1264,7 +1267,7 @@ const AR = (() => {
         model = '<span class="fixed"></span>';
       } else {
         model = `<select class="model${m.inherit ? ' inherit' : ''}${on && m.needsChoice ? ' need' : ''}" data-key="${esc(key)}"
-          aria-label="${esc(it.name)} 的续跑模型" title="${m.inherit ? '沿用该会话最近一次实际使用的模型' : '布防后本周期固定'}"${armBusy || queueBusy ? ' disabled' : ''}>
+          aria-label="${esc(it.name)} 的续跑模型" title="${m.inherit ? '沿用该会话最近一次实际使用的模型' : '布防后本轮固定'}"${armBusy || queueBusy ? ' disabled' : ''}>
           ${m.options.map(o => `<option value="${esc(o.value)}"${o.value === m.value ? ' selected' : ''}>${esc(o.label)}</option>`).join('')}
         </select>`;
       }
@@ -1609,14 +1612,14 @@ const AR = (() => {
     try {
       notifyList = await call('notifications.setEnabled', { kind, enabled: enabling });
       renderNotify();
-      if (kind === 'Codex' && enabling) say('Codex 钩子已写入 hooks.json 并登记信任;新开的 Codex 会话生效,若 codex /hooks 显示未信任请在那里信任一次');
+      if (kind === 'Codex' && enabling) say('Codex hook 已写入 hooks.json 并登记信任;新开的 Codex 会话生效,若 codex /hooks 显示未信任请在那里信任一次');
       else if (kind === 'OpenCode' && enabling) say('OpenCode 插件已写入,OpenCode 会自动重新加载;加载结果以它的日志为准');
     } catch (e) { el.classList.remove('busy'); say(`通知源切换失败:${e.message}`, true); }
     finally { notifyBusy = false; }
   });
 
   // 「发送测试」只认这一条测试通知自己的结局(与 notify test 同一判据),送不出去就撤回,
-  // 免得通道恢复后补发一条过时的「冒烟通过」。
+  // 免得通道恢复后补发一条过时的测试通知。
   let testBusy = false;
   async function sendTest() {
     if (testBusy) return;
@@ -1628,9 +1631,9 @@ const AR = (() => {
     try {
       r = await call('notify.test');
       channel = r.channel; renderNotify();
-      say('测试通知已入队 · 等后台 Worker 经 lark-cli 发出…');
+      say('测试通知已排队 · 等后台服务经 lark-cli 发出…');
       const status = () => call('notify.test.status', { eventId: r.eventId, sinceUnix: r.enqueuedAtUnix });
-      // 撤回只在成功时才说「已撤回」;撤不回(Worker 正在发这一条)或调用失败时再看一眼结局，如实说明。
+      // 撤回只在成功时才说「已撤回」;撤不回(后台服务正在发这一条)或调用失败时再看一眼结局，如实说明。
       const withdraw = async () => {
         let w = null;
         try { w = await call('notify.test.withdraw', { eventId: r.eventId }); } catch { }
@@ -1638,8 +1641,8 @@ const AR = (() => {
         await new Promise(res => setTimeout(res, 3000));
         let s = null;
         try { s = await status(); } catch { }
-        if (s && s.outcome === 'delivered') return '已送达(撤回时 Worker 正在发送这一条)';
-        if (s && s.outcome === 'dead') return '测试通知已移入死信';
+        if (s && s.outcome === 'delivered') return '已送达(撤回时后台服务正在发送这一条)';
+        if (s && s.outcome === 'dead') return '测试通知没能送达,已停止重试';
         return '撤回未确认,稍后仍可能收到这条测试通知';
       };
       for (let i = 0; i < 18; i++) {
@@ -1647,14 +1650,14 @@ const AR = (() => {
         let s;
         try { s = await status(); } catch { continue; }
         if (s.channel) { channel = s.channel; renderNotify(); }
-        if (s.outcome === 'delivered') { say('测试通知已送达飞书 · 请在手机上确认收到「AI Resume 通知冒烟通过」'); return; }
-        if (s.outcome === 'dead') { say('测试通知没能送达,已移入死信;悬停飞书机器人一行看原因', true); return; }
+        if (s.outcome === 'delivered') { say('测试通知已送达飞书 · 请在手机上确认收到「AI Resume 测试通知」'); return; }
+        if (s.outcome === 'dead') { say('测试通知没能送达,已停止重试;悬停飞书机器人一行看原因', true); return; }
         if (s.outcome === 'failed') { say(`测试通知投递失败(${s.failure || '原因未知'}),${await withdraw()};悬停飞书机器人一行看原因`, true); return; }
-        if (s.outcome === 'blocked') { say(`投递通道熔断,${await withdraw()};悬停飞书机器人一行看原因`, true); return; }
+        if (s.outcome === 'blocked') { say(`飞书投递已暂停,${await withdraw()};悬停飞书机器人一行看原因`, true); return; }
       }
       const last = await withdraw();
-      if (last.startsWith('已送达')) { say('测试通知已送达飞书 · 请在手机上确认收到「AI Resume 通知冒烟通过」'); return; }
-      say(`90 秒内没有确认送达,${last};确认后台服务在运行,再看「设置…」里的通道体检`, true);
+      if (last.startsWith('已送达')) { say('测试通知已送达飞书 · 请在手机上确认收到「AI Resume 测试通知」'); return; }
+      say(`90 秒内没有确认送达,${last};确认后台服务在运行,再在「设置…」里点「诊断通道」`, true);
     } catch (e) { say('发送测试失败:' + e.message, true); }
     finally { testBusy = false; }
   }
@@ -1697,7 +1700,7 @@ const AR = (() => {
     finally { renderNotify(); renderFeishuDialog(); }
   }));
   $('fsClear').addEventListener('click', () => busyButton($('fsClear'), async () => {
-    if (!window.confirm('清除 AI Resume 保存的机器人凭据?之后改用 lark-cli 自己的钥匙串(后台计划任务下可能读不到)。')) return;
+    if (!window.confirm('清除 AI Resume 保存的机器人凭据?之后改用 lark-cli 自己的钥匙串(后台服务(计划任务)可能读不到)。')) return;
     try { channel = await call('notify.credential.clear'); $('fsOut').textContent = '已清除'; }
     catch (e) { $('fsOut').innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
     finally { renderNotify(); renderFeishuDialog(); }
@@ -1796,7 +1799,7 @@ const AR = (() => {
       if (b.dataset.pref === 'continuous') {
         continuousChoice = !continuousNext();
         say(arm && arm.armed
-          ? `连续模式${continuousChoice ? '开启' : '关闭'}:下次布防时生效(本周期仍是${arm.continuous ? '连续模式' : '一次性'})`
+          ? `连续模式${continuousChoice ? '开启' : '关闭'}:下次布防时生效(本轮仍是${arm.continuous ? '连续模式' : '一次性'})`
           : `连续模式${continuousChoice ? '开启' : '关闭'}:布防时生效`);
         syncArm();
         return;

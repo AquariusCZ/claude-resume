@@ -185,7 +185,7 @@ public sealed class CodexHooksNotificationAdapter : INotificationAdapter
             {
                 string legacy = HasLegacyNotify() ? ";检测到旧版 notify 链残留,可手动清理 config.toml 的 notify" : string.Empty;
                 return new NotificationProviderStatus(Kind, DisplayName, true, false, _hooksPath,
-                    "未安装 AI Resume 通知钩子" + legacy);
+                    "未安装 AI Resume 通知 hook" + legacy);
             }
 
             string expectedHash = ComputeTrustHash(own.Command, own.Timeout);
@@ -193,7 +193,7 @@ public sealed class CodexHooksNotificationAdapter : INotificationAdapter
             if (HooksDisabledInConfig())
             {
                 return new NotificationProviderStatus(Kind, DisplayName, true, true, _hooksPath,
-                    "config.toml 的 [features] hooks = false:Codex 已禁用 hooks,钩子不会执行;删除该项或改为 true 后新开会话",
+                    "config.toml 的 [features] hooks = false:Codex 已禁用 hooks,hook 不会执行;删除该项或改为 true 后新开会话",
                     HookCommand: own.Command, HookBroken: true);
             }
 
@@ -204,9 +204,9 @@ public sealed class CodexHooksNotificationAdapter : INotificationAdapter
                 : string.Empty;
             return trusted
                 ? new NotificationProviderStatus(Kind, DisplayName, true, true, _hooksPath,
-                    "已安装 AI Resume Stop 钩子,信任哈希已登记(" + key + ");新开的 Codex 会话即生效" + legacyNote, HookCommand: own.Command)
+                    "已安装 AI Resume Stop hook,信任哈希已登记(" + key + ");新开的 Codex 会话即生效" + legacyNote, HookCommand: own.Command)
                 : new NotificationProviderStatus(Kind, DisplayName, true, true, _hooksPath,
-                    "钩子已写入 hooks.json 但 Codex 尚未信任它(" + why + ";键 " + key + "):在 codex 里运行 /hooks 信任,或关掉再打开本开关重写信任记录" + legacyNote,
+                    "hook 已写入 hooks.json 但 Codex 尚未信任它(" + why + ";键 " + key + "):在 codex 里运行 /hooks 信任,或关掉再打开本开关重写信任记录" + legacyNote,
                     HookCommand: own.Command, HookBroken: true);
         }
         catch (Exception ex)
@@ -525,7 +525,7 @@ public sealed class CodexHooksNotificationAdapter : INotificationAdapter
             !hooks.TryGetValue("state", out object? stateRaw) || stateRaw is not TomlTable state ||
             !state.TryGetValue(key, out object? entryRaw) || entryRaw is not TomlTable entry)
         {
-            return (false, "hooks.state 里没有本钩子的信任记录");
+            return (false, "hooks.state 里没有这个 hook 的信任记录");
         }
 
         if (entry.TryGetValue("enabled", out object? enabled) && enabled is false)
@@ -536,7 +536,7 @@ public sealed class CodexHooksNotificationAdapter : INotificationAdapter
         return entry.TryGetValue("trusted_hash", out object? hashRaw) && hashRaw is string hash &&
                string.Equals(hash, expectedHash, StringComparison.Ordinal)
             ? (true, string.Empty)
-            : (false, "trusted_hash 与当前钩子定义不一致");
+            : (false, "trusted_hash 与当前 hook 定义不一致");
     }
 
     private static readonly Regex StateHeaderRegex = new(
@@ -608,7 +608,7 @@ public sealed class CodexHooksNotificationAdapter : INotificationAdapter
             {
                 output.Add(string.Empty);
             }
-            output.Add("# AI Resume: Codex Stop 钩子的信任记录(与 hooks.json 同步维护,勿手改)");
+            output.Add("# AI Resume: Codex Stop hook 的信任记录(与 hooks.json 同步维护,勿手改)");
             output.Add("[hooks.state." + TomlBasicString(key) + "]");
             output.Add("trusted_hash = " + TomlBasicString(hash));
         }

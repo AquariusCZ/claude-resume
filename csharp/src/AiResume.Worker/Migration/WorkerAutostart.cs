@@ -230,7 +230,7 @@ public static class WorkerAutostart
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             logError?.Invoke(
-                $"警告:开机快捷方式删除失败,它与计划任务并存会在登录时各拉起一个 Worker:{link}({ex.Message})");
+                $"警告:开机快捷方式删除失败,它与计划任务并存会在登录时各拉起一个后台服务(Worker):{link}({ex.Message})");
             return false;
         }
     }

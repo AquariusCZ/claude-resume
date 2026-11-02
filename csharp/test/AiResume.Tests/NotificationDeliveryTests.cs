@@ -309,10 +309,10 @@ public sealed class NotificationDeliveryTests
     }
 
     [Theory]
-    [InlineData("failure", null, "rate_limit", "因用量上限中断")]
+    [InlineData("failure", null, "rate_limit", "被限额打断")]
     [InlineData("failure", null, "authentication_failed", "/login")]
     [InlineData("decision", "execution_failed", null, "运行失败")]
-    [InlineData("decision", "quota_auto_resume_stale", null, "没能自动继续")]
+    [InlineData("decision", "quota_auto_resume_stale", null, "按回车即可继续")]
     [InlineData("resume", "session-open", null, "额度已恢复")]
     [InlineData("resume", "resume-succeeded", null, "自动续跑完成")]
     public async Task 通知文案按类型说清发生了什么(string kind, string? type, string? error, string expected)

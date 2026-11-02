@@ -56,7 +56,9 @@ public sealed class NotificationWorker : BackgroundService
                 {
                     AiResume.Core.ProductConfig config = configStore.Load();
                     return CompletionNotifier.IsSourceEnabled(source, config.NotifySources, config.NotifyIntentRecorded);
-                });
+                },
+                // Claude Code 事件定稿前核对:会话落没落盘、限额周期、会话名、布防快照(只读)。
+                facts: new NotifyFacts());
             _logger.LogInformation(
                 "worker.notify.channel_init larkCli={LarkCli} credentialSource={CredentialSource}",
                 LarkCliNotificationChannel.ResolveExecutable(Environment.GetEnvironmentVariable("PATH"),
@@ -93,9 +95,10 @@ public sealed class NotificationWorker : BackgroundService
                     NotifySendResult? attempt = item.Attempt;
                     if (item.Outcome is NotifyOutcome.Sent or NotifyOutcome.Duplicate or NotifyOutcome.Superseded or NotifyOutcome.Suppressed)
                     {
+                        // detail 是稳定原因码(session_not_persisted / same_limit_cycle / merged / source_disabled …),不含正文。
                         _logger.LogInformation(
-                            "worker.notify.item eventId={EventId} source={Source} outcome={Outcome} durationMs={DurationMs} credentialSource={CredentialSource}",
-                            item.EventId, item.Source ?? "unknown", item.Outcome, attempt?.DurationMs, attempt?.CredentialSource);
+                            "worker.notify.item eventId={EventId} source={Source} outcome={Outcome} detail={Detail} durationMs={DurationMs} credentialSource={CredentialSource}",
+                            item.EventId, item.Source ?? "unknown", item.Outcome, item.Detail, attempt?.DurationMs, attempt?.CredentialSource);
                     }
                     else
                     {

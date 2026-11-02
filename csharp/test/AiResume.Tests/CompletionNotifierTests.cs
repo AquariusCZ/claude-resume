@@ -156,7 +156,8 @@ public sealed class CompletionNotifierTests
 
             await notifier.SweepAsync("ou_test");
 
-            Assert.Contains("通知冒烟通过", received);
+            Assert.Contains("repo 测试通知", received);
+            Assert.Contains("说明飞书投递这一段是通的", received);
             Assert.Contains("OpenCode", received);
         }
         finally

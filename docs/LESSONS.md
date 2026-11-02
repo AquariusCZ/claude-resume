@@ -519,6 +519,12 @@ cc-connect 给 codex agent 配 provider 时会 `ensureCodexAuth` 改写 `~/.code
    - 规则:① 解析上游行式文件按行读,单行不设上限,只给总量设预算,上限要按本机真实分布量过再定;② 安全门禁类判定一律三态(是 / 否 / 判断不了),判断不了只导致等待;③ 「没有」与「读不了」必须用不同的返回值表达,读不了显示未核实,绝不退回另一个可能过时的来源。
    - 位置:`ProjectCatalog.ReadHeadString` / `ReadHeadLines`、`ResumeSessionCatalog.ContinuedInAnotherSession`(`bool?`,另以文件创建时间识别分叉续写)、`CheckerCycle`(superseded 记入 `ConsumedInterruptions`)、`OpenCodeCredentials.ReadDatabaseKey`、`ClaudeCredentialSource`(`unreadable` / `ClaudeLoginVerdict.Unverified`)。
 
+13. **★★ 全局 hook 不只服务人:第三方工具拉起的一次性 claude 也会触发;通知文案不看状态,说了一句没发生的事(2026-11-02)**
+   - 现象:周额度用完的两天里,飞书每 8 小时收到一条「⏸️ Default Project 因用量上限中断 / 额度恢复后 AI Resume 会按布防自动续跑」,额度恢复后又是「✅ Default Project 已完成」。当时根本没布防,本机也没有叫 Default Project 的项目。来源是常驻的第三方用量监视器(CodeZeno ClaudeCodeUsageMonitor,工作目录 `Documents\Default Project`):访问令牌过期时它以 `--no-session-persistence` 拉起 `claude` 刷新令牌,这个进程读同一份 `~/.claude/settings.json`,我们的 `StopFailure` / `Stop` hook 照常触发。另一个同源重复:同一次中断,Claude Code 原生自动继续放弃时还会发 `quota_auto_resume_disabled`,飞书收到两条。
+   - 根因:① 把「hook 触发了」等同于「用户的一个会话结束了」——全局 settings 里的 hook 对本机任何 claude 进程都生效,包括没有转录、谁都打不开也续不了的程序化调用;② 去重只按事件:每次程序化调用都是新会话、新 eventId,而用量上限是账号级的,同一周期里每一次撞墙都被当成新消息;③ 文案是写死的套话,不读布防状态、不看这个会话在不在布防范围,也不给重置时间。
+   - 规则:① 通知的准入要有「这是用户能接着干的会话吗」的外部证据(转录落盘);判断不了照发,确认没有才丢;② 去重的粒度要对准「新信息」:同一会话同一限额周期(服务端给的 `rateLimitType + resetsAt`,加配置根)只提醒一次,同时发生的合成一条;程序化调用靠第 ① 条拦,别指望靠会话去重——它每次都是新会话;判周期前先等转录写完,事件晚于证据里的重置时间时证据作废;③ 文案里每一句关于「接下来会发生什么」的话,都要在投递那一刻按真实状态(布防快照,连同引擎已知会一直等的原因:要重新布防、登录失效、监视卡住)生成,读不出就写「未核实」——与界面「肯定句可证伪」同一条规则;只说自己会做什么,不替上游承诺;④ 排查「谁发的通知」先看进程的工作目录与命令行,而不是只看事件内容。
+   - 位置:`CompletionNotifier`(§5.3 第 6、7 步:`session_not_persisted`、`same_limit_cycle`、`completion-notify-limits.json`,`BuildLimitText` / `OutlookFor`)、`NotifyFacts`(转录、进程登记、`custom-title`、布防快照)。
+
 ---
 
 _维护提示:再遇到新坑,按上面的分类追加一条(现象 → 根因 → 规则 → 代码位置)。现役回归是 `dotnet test csharp\AiResume.sln`(`GuiPageContractTests` 与 `OpenCodeNotificationAdapterTests` 需要本机 node);v1 的 `node test/*.js` 回归已随 v1 运行时删除,只在 git 历史里。_

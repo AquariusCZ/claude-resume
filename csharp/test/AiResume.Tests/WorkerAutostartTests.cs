@@ -196,6 +196,6 @@ public sealed class WorkerAutostartTests
             deleteFile: _ => throw new UnauthorizedAccessException("locked"));
 
         Assert.False(ok);
-        Assert.Contains(errors, e => e.Contains("各拉起一个 Worker", StringComparison.Ordinal));
+        Assert.Contains(errors, e => e.Contains("各拉起一个后台服务(Worker)", StringComparison.Ordinal));
     }
 }

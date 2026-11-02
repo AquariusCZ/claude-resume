@@ -163,9 +163,9 @@ public static class EngineLiveness
     public static string Describe(EngineVerdict verdict) => verdict switch
     {
         EngineVerdict.NotArmed => "未布防",
-        EngineVerdict.Alive => "引擎在跑",
-        EngineVerdict.Stalled => "引擎进程在,但久未探测额度",
-        EngineVerdict.NotRunning => "已布防,但续跑引擎没在运行",
+        EngineVerdict.Alive => "后台服务在运行",
+        EngineVerdict.Stalled => "后台服务进程在,但久未探测额度",
+        EngineVerdict.NotRunning => "已布防,但后台服务没在运行",
         EngineVerdict.RunMissing => "续跑状态仍在,但对应进程已不存在",
         EngineVerdict.RunUnverified => "续跑进程状态暂时无法核验",
         EngineVerdict.RunActive => "已登记的续跑进程仍在运行",

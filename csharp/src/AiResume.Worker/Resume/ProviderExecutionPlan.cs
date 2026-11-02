@@ -89,7 +89,7 @@ public sealed class ProviderExecutionPlan : IProviderExecutionPlan
         string model = ResumeTarget.EffectiveModel(project, target);
         if (!ProviderModels.IsSafeId(model)) throw new InvalidOperationException("项目的续跑模型无效，请重新布防");
         if (!_sessions.Matches(target.Agent, project)) throw new InvalidOperationException("原生会话归属无法核实");
-        AgentCommand command = _command(target.Agent) ?? throw new InvalidOperationException("执行器未安装");
+        AgentCommand command = _command(target.Agent) ?? throw new InvalidOperationException(target.Agent == "codex" ? "找不到 Codex 程序" : "找不到 Claude Code 程序");
         var arguments = new List<string>(command.Prefix);
         var environment = new Dictionary<string, string?> { ["AI_RESUME_INTERNAL_RUN"] = "1" };
         if (target.Agent == "claudecode")

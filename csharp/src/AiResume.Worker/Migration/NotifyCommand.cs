@@ -63,7 +63,8 @@ public static class NotifyCommand
         // 审计里把 hook 可执行文件挪走后,这一行照旧打印"已启用=True"(2026-08-08 A1)。
         foreach (var status in statuses.OrderBy(s => s.Kind))
         {
-            string deliverable = status.IsEnabled ? (status.HookBroken ? "False(钩子断链)" : "True") : "-";
+            string broken = status.Kind == NotificationProviderKind.OpenCode ? "False(插件失效)" : "False(hook 失效)";
+            string deliverable = status.IsEnabled ? (status.HookBroken ? broken : "True") : "-";
             Console.WriteLine(
                 $"{status.Kind}  {status.DisplayName}  " +
                 $"已安装={status.IsInstalled}  已启用={status.IsEnabled}  " +
@@ -101,7 +102,7 @@ public static class NotifyCommand
             if (resolved is null)
             {
                 Console.Error.WriteLine(
-                    $"找不到 {HookExecutable.FileName},拒绝启用——写进配置的钩子会指向不存在的程序,");
+                    $"找不到 {HookExecutable.FileName},拒绝启用——写进配置的 hook 会指向不存在的程序,");
                 Console.Error.WriteLine("表现为「已启用但永远收不到通知」。请先构建 AiResume.Hook 项目。");
                 return 1;
             }
@@ -129,20 +130,20 @@ public static class NotifyCommand
     }
 
     /// <summary>
-    /// <c>notify check</c>:飞书通知通道体检。lark-cli 是否找得到、凭据来源(机器范围副本 env / lark-cli 钥匙串)、
-    /// 收件人、Worker 最近的真实投递结论，再跑一次 <c>lark-cli doctor</c>(在线，只读)。全部就绪返回 0,否则 2。
+    /// <c>notify check</c>:诊断飞书通知通道。lark-cli 是否找得到、凭据来源(机器范围副本 env / lark-cli 钥匙串)、
+    /// 收件人、后台服务最近的真实投递结论，再跑一次 <c>lark-cli doctor</c>(在线，只读)。全部就绪返回 0,否则 2。
     /// </summary>
     private static int Check()
     {
         var control = new NotifyControlPlane();
         NotifyChannelStatus status = control.Describe();
         Console.WriteLine($"lark-cli: {(status.LarkCliFound ? "找到" : "未找到(npm i -g @larksuite/cli)")}");
-        Console.WriteLine($"机器人凭据: {(status.CredentialSource == "env" ? "AI Resume 机器范围副本 " + status.AppIdMasked : "lark-cli 钥匙串(后台计划任务下不可靠)")}");
+        Console.WriteLine($"机器人凭据: {(status.CredentialSource == "env" ? "AI Resume 机器范围副本 " + status.AppIdMasked : "lark-cli 钥匙串(AI Resume 未存机器范围副本,后台服务可能读不到)")}");
         Console.WriteLine($"收件人: {(status.RecipientSet ? status.RecipientMasked : "未设置")}");
         if (status.Health is { } health)
         {
             string lastAttempt = health.LastAttemptOk switch { true => "成功", false => "失败(" + (health.LastErrorClass ?? "?") + ")", null => "-" };
-            Console.WriteLine($"最近投递: 状态={health.State} 原因={health.Reason ?? "-"} 最近一次尝试={lastAttempt} 最近成功={health.LastSuccessUtc?.ToLocalTime():MM-dd HH:mm} 积压={health.Backlog} 死信={health.Dead}");
+            Console.WriteLine($"最近投递: 状态={health.State} 原因={health.Reason ?? "-"} 最近一次尝试={lastAttempt} 最近成功={health.LastSuccessUtc?.ToLocalTime():MM-dd HH:mm} 待发={health.Backlog} 未送达={health.Dead}");
             if (status.SettingsVerified == false)
             {
                 Console.WriteLine("  注意:最近一次成功之后改过机器人凭据、收件人或 lark-cli,那次成功不再作数;运行 notify test 重新核实。");
@@ -150,7 +151,7 @@ public static class NotifyCommand
         }
         else
         {
-            Console.WriteLine("最近投递: 未核实(Worker 还没有写出投递健康记录)");
+            Console.WriteLine("最近投递: 未核实(后台服务还没有写出投递记录)");
         }
 
         LarkDoctorReport report = control.CheckAsync(CancellationToken.None).GetAwaiter().GetResult();
@@ -172,7 +173,7 @@ public static class NotifyCommand
     }
 
     /// <summary>
-    /// <c>notify test</c>:往队列放一条冒烟事件，等后台 Worker 经 lark-cli 真实投递(最多 90 秒)。
+    /// <c>notify test</c>:往队列放一条测试通知，等后台服务经 lark-cli 真实投递(最多 90 秒)。
     /// 走的是与任务完成通知完全相同的链路，送达返回 0,否则 2。
     /// </summary>
     private static int Test()
@@ -180,7 +181,7 @@ public static class NotifyCommand
         var control = new NotifyControlPlane();
         DateTimeOffset started = DateTimeOffset.UtcNow;
         string eventId = control.EnqueueTest();
-        Console.WriteLine($"已入队测试通知 {eventId},等待后台 Worker 投递…");
+        Console.WriteLine($"已排队测试通知 {eventId},等待后台服务投递…");
         for (int i = 0; i < 90; i++)
         {
             Thread.Sleep(TimeSpan.FromSeconds(1));
@@ -188,14 +189,14 @@ public static class NotifyCommand
             string outcome = control.TestOutcome(eventId, started);
             if (outcome == "delivered")
             {
-                Console.WriteLine("已送达飞书(请在手机上确认收到「AI Resume 通知冒烟通过」)。");
+                Console.WriteLine("已送达飞书(请在手机上确认收到「AI Resume 测试通知」)。");
                 return 0;
             }
 
             DeliveryHealth? health = DeliveryHealth.TryLoad(control.HealthPath);
             if (outcome == "dead")
             {
-                Console.Error.WriteLine($"测试通知没能送达,已移入死信:{health?.LastErrorClass ?? "-"}(错误码 {health?.LastErrorCode?.ToString() ?? "-"},log_id {health?.LastLogId ?? "-"})。运行 notify check 查看原因。");
+                Console.Error.WriteLine($"测试通知没能送达,已停止重试:{health?.LastErrorClass ?? "-"}(错误码 {health?.LastErrorCode?.ToString() ?? "-"},log_id {health?.LastLogId ?? "-"})。运行 notify check 查看原因。");
                 return 2;
             }
 
@@ -208,25 +209,25 @@ public static class NotifyCommand
 
             if (outcome == "blocked")
             {
-                Console.Error.WriteLine($"投递通道熔断:{health?.Reason}(错误码 {health?.LastErrorCode?.ToString() ?? "-"},log_id {health?.LastLogId ?? "-"})。{WithdrawText(control, eventId, started)}运行 notify check 查看原因。");
+                Console.Error.WriteLine($"飞书投递已暂停:{health?.Reason}(错误码 {health?.LastErrorCode?.ToString() ?? "-"},log_id {health?.LastLogId ?? "-"})。{WithdrawText(control, eventId, started)}运行 notify check 查看原因。");
                 return 2;
             }
         }
 
-        // 没送出去的冒烟事件撤回,免得通道恢复后补发一条过时的「冒烟通过」。
+        // 没送出去的测试通知撤回,免得通道恢复后补发一条过时的测试通知。
         string withdrawn = WithdrawText(control, eventId, started);
         if (withdrawn.StartsWith("已送达", StringComparison.Ordinal))
         {
-            Console.WriteLine("已送达飞书(请在手机上确认收到「AI Resume 通知冒烟通过」)。");
+            Console.WriteLine("已送达飞书(请在手机上确认收到「AI Resume 测试通知」)。");
             return 0;
         }
 
-        Console.Error.WriteLine($"90 秒内没有确认送达。{withdrawn}确认后台 Worker 在运行(开机自启计划任务),并运行 notify check。");
+        Console.Error.WriteLine($"90 秒内没有确认送达。{withdrawn}确认后台服务(计划任务「AI Resume 续跑引擎」)在运行,并运行 notify check。");
         return 2;
     }
 
     /// <summary>
-    /// 撤回测试通知并如实说明结果:撤回成功才说已撤回;撤不回(Worker 正在发它)时再看一眼结局——
+    /// 撤回测试通知并如实说明结果:撤回成功才说已撤回;撤不回(后台服务正在发它)时再看一眼结局——
     /// 已送达就说已送达，否则提示可能仍会送达。
     /// </summary>
     private static string WithdrawText(NotifyControlPlane control, string eventId, DateTimeOffset started)
@@ -239,9 +240,9 @@ public static class NotifyCommand
         Thread.Sleep(TimeSpan.FromSeconds(3));
         return control.TestOutcome(eventId, started) switch
         {
-            "delivered" => "已送达(撤回时 Worker 正在发送这一条)。",
-            "dead" => "测试通知已移入死信。",
-            _ => "撤回未确认:Worker 可能正在发送这一条,稍后仍可能收到。",
+            "delivered" => "已送达(撤回时后台服务正在发送这一条)。",
+            "dead" => "测试通知没能送达,已停止重试。",
+            _ => "撤回未确认:后台服务可能正在发送这一条,稍后仍可能收到。",
         };
     }
 
