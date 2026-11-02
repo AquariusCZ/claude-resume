@@ -179,7 +179,7 @@ Set-ScheduledTask -TaskName 'cc-connect' -Trigger $trg -Settings $s
 进程因此跑在 **session 0** —— 那里没有桌面,窗口不可能存在。
 复核证据:`SessionId = 0`、`MainWindowHandle = 0`。
 
-改法见 [`tools/cc-connect-hide-window.ps1`](../tools/cc-connect-hide-window.ps1),
+改法见 [`tools/cc-connect-hide-window.ps1`](tools/cc-connect-hide-window.ps1),
 **必须以管理员身份运行**(账户在 Administrators 组不够,进程本身要提权)。
 该脚本同时重申 §4.1 的全部加固项。
 

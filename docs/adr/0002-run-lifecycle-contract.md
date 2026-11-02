@@ -6,6 +6,14 @@
 - 取代范围:ADR-0001 中关于目标运行时「无总时限」的简略描述;`EVENT-CONTRACTS` v1 中 `deadline_ms`、通用 `task.failed`、超时取消和 transient 网络 fallback 语义
 - 关联:`docs/RUN-CONTRACT.md`、`docs/EVENT-CONTRACTS.md`、`docs/history/STATE-OWNERSHIP.md`、`docs/adr/0001-target-architecture.md`
 
+> **2026-10-30 修订说明(v2.2)**:本 ADR 的运行语义——Start/Status/Cancel、不设客户端总时长、`failed_provider` / `failed_local` / `cancelled` 三分类、启动后失败与副作用后禁止自动 fallback/重放、durable 登记与恢复——继续有效,ADR-0006(`docs/adr/0006-retire-cc-connect-per-project-resume.md`)没有改变它们。正文保留为历史决策记录,不再改写;变化的是适用面与正文里的部分角色:
+>
+> - **飞书层与 cc-connect 适配层已不存在。** 背景、§1、§7、「C# 责任边界」中 `Transport` 一行,以及「后果」「验收」里把飞书/cc-connect 列为状态消费者、命令来源或投递目标的说法只作历史:自 ADR-0003 起 cc-connect 自己运行 agent、从不经过本契约,ADR-0006 让它整体退役;AI Resume 没有飞书入站与聊天任务,飞书只剩 Worker 经 lark-cli 发出的完成通知。
+> - **适用面只剩 AI Resume 自己启动的进程。** §2 列出的 chat、query、modify 原为飞书会话任务,现无调用方(`TaskKind` 枚举保留);生产中也没有推理型 provider 探测(GUI 供应商刷新使用零 token 的 `providers.catalog`)。现役受本契约约束的只有后台续跑:`ResumeEngine` → `ClaudeResumeRunner` → `IProcessSupervisor`,子进程为 `AiResume.Worker.exe internal-agent-run`,运行身份是 `product_state` 的 `ActiveRunId` / `PendingCancellationRunId` 加 `process_registry`;落点细节见 `docs/RUN-CONTRACT.md` 文首。
+> - **§7 单次请求超时。** 飞书卡片更新、图片上传下载已无对应操作;飞书侧只剩完成通知的单次 lark-cli 调用,超时按结果不明处理,重试沿用同一幂等键。通知投递失败只在完成通知队列内重试,不回写续跑结果。
+> - **ADR-0006 的「未启动不锁周期」与 §5 一致。** spawn 前被门禁拦下的尝试(会话正开着、Claude 登录令牌剩余不足 45 分钟、执行条件未核实、配置刚变化等)既没有进程也没有副作用,只记 `not-started:<原因>`,下一拍重新评估;一旦 spawn,失败仍按 §5 禁止自动重放(周期级 `ReplayBlocked`)。ADR-0006 也没有引入换供应商自动重放。
+> - 背景与「代价」中「现役 Node 查询/闲聊 30 分钟 deadline」是 2026-08-01 的历史语境,v1 运行时已于 2026-08-08 删除。
+
 ## 背景
 
 现役 Node/PowerShell 链路把 AI 调用建模为一次等待 Promise/子进程结束的同步操作。部分任务没有总时限,查询/闲聊仍有 30 分钟 deadline,provider 健康探测还有客户端墙钟预算。该模型会把「长时间静默」「监控读取失败」「网络连接故障」「服务端主动超时」混成 timeout,并诱发错误取消、线路切换或 provider fallback。

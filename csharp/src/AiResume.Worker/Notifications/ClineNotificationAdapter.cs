@@ -67,7 +67,8 @@ public sealed class ClineNotificationAdapter : INotificationAdapter
                 IsInstalled: false,
                 IsEnabled: false,
                 ConfigPath: null,
-                Detail: $"探测异常: {ex.Message}");
+                Detail: $"探测异常: {ex.Message}",
+                Unverified: true);
         }
     }
 

@@ -45,16 +45,16 @@ public sealed class ProviderBoundResumeTests
     public async Task 布防后目录升级不改写目标且新布防采用新ID()
     {
         string root = TestTemp.NewDir("provider-binding");
-        string model = "deepseek-v4-flash";
+        string model = "relay-model-1";
         string token = "test-only-token";
         ProviderRegistry registry = Registry(root, () => token);
         var service = new ProviderCatalogService(registry, observe: (p, _) => Task.FromResult(Observation(p, model, 10)));
-        ResumeTarget bound = await service.BindAsync("deepseek", model, default);
-        model = "deepseek-v5";
-        Assert.Equal("deepseek-v4-flash", bound.ModelId);
+        ResumeTarget bound = await service.BindAsync("codex-active", model, default);
+        model = "relay-model-2";
+        Assert.Equal("relay-model-1", bound.ModelId);
         Assert.False((await service.CheckAsync(bound, default)).Ready);
-        ResumeTarget next = await service.BindAsync("deepseek", model, default);
-        Assert.Equal("deepseek-v5", next.ModelId);
+        ResumeTarget next = await service.BindAsync("codex-active", model, default);
+        Assert.Equal("relay-model-2", next.ModelId);
         Assert.True((await service.CheckAsync(next, default)).Ready);
         token = "different-test-token";
         Assert.Equal("provider-changed", (await service.CheckAsync(next, default)).Reason);
@@ -66,13 +66,26 @@ public sealed class ProviderBoundResumeTests
         string root = TestTemp.NewDir("provider-balance");
         decimal? balance = 0;
         var service = new ProviderCatalogService(Registry(root, () => "test-key"),
-            observe: (p, _) => Task.FromResult(Observation(p, "deepseek-v4-flash", balance)));
-        ResumeTarget target = await service.BindAsync("deepseek", "deepseek-v4-flash", default);
+            observe: (p, _) => Task.FromResult(Observation(p, "relay-model", balance)));
+        ResumeTarget target = await service.BindAsync("codex-active", "relay-model", default);
         Assert.True((await service.CheckAsync(target, default)).IsLimited);
         balance = null;
         Assert.False((await service.CheckAsync(target, default)).Ready);
         balance = 1;
         Assert.True((await service.CheckAsync(target, default)).Ready);
+    }
+
+    [Fact]
+    public async Task DeepSeek余额行只展示不能作为续跑目标()
+    {
+        var service = new ProviderCatalogService(Registry(TestTemp.NewDir("provider-deepseek"), () => "test-key"),
+            observe: (p, _) => Task.FromResult(Observation(p, "deepseek-v4-flash", 5)));
+        ProviderConnection deepseek = service.Registry.Find("deepseek")!;
+        Assert.Equal("opencode", deepseek.Agent);
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => service.BindAsync("deepseek", "deepseek-v4-flash", default));
+        Assert.Contains("只显示余额", error.Message, StringComparison.Ordinal);
+        ProviderObservation row = (await service.ReadAsync(default)).Single(p => p.Id == "deepseek");
+        Assert.False(JsonDocument.Parse(JsonSerializer.Serialize(row.ToPayload())).RootElement.GetProperty("resumable").GetBoolean());
     }
 
     [Fact]
@@ -216,7 +229,7 @@ public sealed class ProviderBoundResumeTests
 
     private static ProviderRegistry Registry(string root, Func<string> key) => new(
         environment: name => name == "DEEPSEEK_API_KEY" ? key() : null, userProfile: root,
-        codex: () => new("https://test.invalid/v1", "fake", "model", "responses", new Dictionary<string, string>(),
+        codex: () => new("https://test.invalid/v1", key(), "model", "responses", new Dictionary<string, string>(),
             new Dictionary<string, string>(), "test", null, null, "test", false, false));
 
     private static ProviderObservation Observation(ProviderConnection p, string model, decimal? balance) =>

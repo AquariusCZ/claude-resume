@@ -6,6 +6,12 @@
 - 关系:**修订 ADR-0001 的「C# 与 cc-connect 边界」一节**;不改变 ADR-0002(RunContract)的运行语义,但大幅缩小其适用面(见 §4.3)
 - 关联:`docs/UPSTREAM-ARCHITECTURE-RESEARCH.md`、`docs/history/MIGRATION-DEBT.md`(D-014)、`docs/history/STAGE-4-SPEC.md` §7、`docs/history/STAGE-6-SPEC.md` §7.4
 
+> **2026-10-30 修订说明(ADR-0006)**:cc-connect 已整体退役。本 ADR 中「cc-connect 直接运行并承担飞书/多平台协议、会话、cron、停止」
+> 「AI Resume 生成/校验/激活 cc-connect 配置」「单消费者预检」「飞书接入凭据与 `allow_from`」等现役描述全部作废,只作历史记录;
+> 手机远程改由 Claude Code 官方 Remote Control 承担,飞书只保留完成通知(经官方 lark-cli)。仍然有效的是:AI Resume 收敛为
+> 「续跑编排 + 项目发现 + 完成通知 + 控制面 GUI」、§2.3「额度数据自行获取」的证据结论、§5 的 WPF + WebView2 选型与首帧不依赖 I/O 的约束。
+> 文中的 RPC 清单(如 `feishu.*`、`cutover.*`、`agent.*`、`quota.local`)已删除,现役清单以 `docs/ARCHITECTURE.md` 为准。
+
 ## 1. 背景:为什么在 Stage 6 中途翻案
 
 ADR-0001 确定「cc-connect 作为目标编排内核,C# wrapper 承接 AI Resume 自有语义」。Stage 4 试点与 Stage 6 前三个工作包实施后,四条实证推翻了该边界的成本假设:

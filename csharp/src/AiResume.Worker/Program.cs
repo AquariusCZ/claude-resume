@@ -23,12 +23,6 @@ if (args.Length > 0 && args[0] == "internal-agent-run")
     return await AgentExecCommand.RunAsync(args);
 }
 
-// S10 生产切换预检:确认本机没有第二个飞书事件消费者。只读、不停任何进程。
-if (args.Length > 0 && string.Equals(args[0], "preflight", StringComparison.OrdinalIgnoreCase))
-{
-    return PreflightCommand.Run();
-}
-
 // 开始菜单 + 开机自启快捷方式。Worker 自启是产品功能的一部分:
 // 续跑编排跑在本进程里,没有启动入口就等于装了不会跑。
 if (args.Length > 0 && string.Equals(args[0], "shortcuts", StringComparison.OrdinalIgnoreCase))
@@ -45,20 +39,7 @@ if (args.Length > 0 &&
     return InstallCommand.Run(args);
 }
 
-// 凭据健康检查:用 DPAPI 里的凭据独立换一次 tenant_access_token,
-// 区分「凭据失效」与「客户端坏了」。只打状态码与飞书错误码,不碰 secret 实值。
-if (args.Length > 0 && string.Equals(args[0], "feishu-check", StringComparison.OrdinalIgnoreCase))
-{
-    return FeishuCheckCommand.Run();
-}
-
-// 生成、验证、提交 cc-connect 配置并经管理 API 自重启(与 GUI「生成并重启」同一条路径)。
-if (args.Length > 0 && string.Equals(args[0], "cc-connect-apply", StringComparison.OrdinalIgnoreCase))
-{
-    return CcConnectApplyCommand.Run(args);
-}
-
-// 本地完成通知源的启用/禁用(B5 需要;GUI 那个开关无法自动化)。
+// 本地完成通知源的列出/启用/停用，以及飞书通知通道体检(notify check)与测试(notify test)。
 if (args.Length > 0 && string.Equals(args[0], "notify", StringComparison.OrdinalIgnoreCase))
 {
     return NotifyCommand.Run(args);
@@ -75,7 +56,7 @@ if (args.Length > 0 && string.Equals(args[0], "notify", StringComparison.Ordinal
 // (如 `--Observation:IntervalSeconds=00:00:15`,PowerLossRecoveryTests 真在用)
 // 一定带。所以只拦下**不带横线的未知首参**,再单独认掉 help 家族。
 {
-    const string Usage = "可用命令:install / uninstall / preflight / shortcuts / feishu-check / cc-connect-apply / notify\n"
+    const string Usage = "可用命令:install / uninstall / shortcuts / notify [list|check|test|enable <源>|disable <源>]\n"
         + "不带任何子命令运行才会以常驻服务启动(此时可传 --Section:Key=Value 形式的宿主配置)。";
 
     if (args.Length > 0 && (args[0] is "--help" or "-h" or "-?" or "/?"))
@@ -146,6 +127,10 @@ builder.Services.AddSingleton<ProviderExecutionPlan>();
 builder.Services.AddSingleton<CheckerCycle>(sp => new CheckerCycle(sp.GetRequiredService<ProductStateStore>()));
 builder.Services.AddSingleton<IClaudeResumeRunner>(sp =>
     new ClaudeResumeRunner(sp.GetRequiredService<IProcessSupervisor>(), execution: sp.GetRequiredService<ProviderExecutionPlan>()));
+// 续跑提醒(会话仍开着、已开始/完成续跑、登录失效)与钩子事件走同一个完成通知队列。
+builder.Services.AddSingleton<IResumeNotices>(_ => new ResumeNoticeWriter(Path.Combine(ShadowPaths.Root, "completion-events")));
+// Claude Code 登录(refresh token)到期前提醒:额度只靠它读取，过期后无法自动续跑。
+builder.Services.AddHostedService<ClaudeLoginReminder>();
 builder.Services.AddSingleton<ResumeEngine>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ResumeEngine>());
 builder.Services.Configure<ObservationOptions>(

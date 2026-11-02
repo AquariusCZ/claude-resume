@@ -31,7 +31,21 @@ public static class Program
         string? LastAssistantMessage,
         bool Smoke,
         string Kind = CompletionKind,
-        string? NotificationType = null);
+        string? NotificationType = null,
+        ClaudeDetails? Claude = null);
+
+    /// <summary>
+    /// Claude Code 官方 hook 负载里与通知有关的字段(2026-10-30 按官方 hooks 文档核对)。
+    /// 只留结构化短值：错误类别、通知类型、是否仍有后台任务;不留消息正文与错误详情。
+    /// </summary>
+    private sealed record ClaudeDetails(
+        string? HookEvent,
+        string? PromptId,
+        string? Error,
+        string? MessageKey,
+        bool StopHookActive,
+        bool BackgroundBusy,
+        bool Bridged);
 
     /// <summary>任务跑完。原有行为,文案是「✅ 已完成」。</summary>
     public const string CompletionKind = "completion";
@@ -39,8 +53,22 @@ public static class Program
     /// <summary>AI 停下来等人:需要输入或弹出了确认框。卡住的这一刻才是要把人拉回来的时刻。</summary>
     public const string DecisionKind = "decision";
 
+    /// <summary>
+    /// 回合因 API 错误中断(Claude Code 的 StopFailure:用量上限、登录失效、账单等)。
+    /// 官方说明这时 Stop 不触发——此前这类中断完全没有通知。
+    /// </summary>
+    public const string FailureKind = "failure";
+
     /// <summary>内部任务、递归 Stop、空负载或非法 JSON 一律不入队。</summary>
     public static bool ShouldSuppress(string? payloadJson, IDictionary<string, string?> env)
+        => ShouldSuppress(payloadJson, env, source: null);
+
+    /// <summary>
+    /// 同上，按来源区分 <c>stop_hook_active</c>:Claude Code 的 <c>stop_hook_active=true</c> 只表示
+    /// “Claude 正因某个 Stop hook 而继续”,我方 hook 从不阻断，没有递归风险;直接丢弃会吞掉
+    /// /goal 等场景下真正的结束通知。Claude Code 改为记录该标志，由投递端按会话合并。
+    /// </summary>
+    public static bool ShouldSuppress(string? payloadJson, IDictionary<string, string?> env, string? source)
     {
         if (env.TryGetValue("AI_RESUME_INTERNAL_RUN", out string? internalRun) &&
             string.Equals(internalRun, "1", StringComparison.Ordinal))
@@ -57,7 +85,8 @@ public static class Program
         {
             using JsonDocument doc = JsonDocument.Parse(payloadJson);
             return doc.RootElement.ValueKind != JsonValueKind.Object ||
-                   (doc.RootElement.TryGetProperty("stop_hook_active", out JsonElement active) &&
+                   (!string.Equals(source, "claudecode", StringComparison.Ordinal) &&
+                    doc.RootElement.TryGetProperty("stop_hook_active", out JsonElement active) &&
                     active.ValueKind == JsonValueKind.True);
         }
         catch (JsonException)
@@ -98,9 +127,9 @@ public static class Program
         foreach (string arg in args)
         {
             if (arg.StartsWith("--kind=", StringComparison.Ordinal) &&
-                string.Equals(arg["--kind=".Length..], DecisionKind, StringComparison.Ordinal))
+                arg["--kind=".Length..] is DecisionKind or FailureKind)
             {
-                return DecisionKind;
+                return arg["--kind=".Length..];
             }
         }
 
@@ -134,7 +163,7 @@ public static class Program
         reason = "suppressed";
         string normalizedSource = NormalizeSource(source);
 
-        if (ShouldSuppress(payloadJson, env))
+        if (ShouldSuppress(payloadJson, env, normalizedSource))
         {
             return false;
         }
@@ -155,7 +184,7 @@ public static class Program
         eventId = ComputeEventId(
             item.Source, item.SessionId, item.TurnId, item.TaskId, item.Cwd,
             item.TranscriptPath, item.ExplicitEventId, item.Timestamp, item.LastAssistantMessage,
-            item.Kind);
+            item.Kind, item.NotificationType, item.Claude);
         string targetPath = Path.Combine(eventsDirectory, eventId + ".json");
         if (File.Exists(targetPath))
         {
@@ -178,6 +207,15 @@ public static class Program
             ["notificationType"] = item.NotificationType,
             ["atUtc"] = DateTimeOffset.UtcNow.ToString("o", CultureInfo.InvariantCulture),
         };
+        if (item.Claude is { } claude)
+        {
+            eventPayload["hookEvent"] = claude.HookEvent;
+            eventPayload["promptId"] = claude.PromptId;
+            eventPayload["error"] = claude.Error;
+            eventPayload["stopHookActive"] = claude.StopHookActive;
+            eventPayload["backgroundBusy"] = claude.BackgroundBusy;
+            eventPayload["bridged"] = claude.Bridged;
+        }
 
         try
         {
@@ -395,12 +433,19 @@ public static class Program
         }
         else if (source == "claudecode" && kind == DecisionKind)
         {
-            // 决策类只认 Notification。种类由 settings.json 的 matcher 选定并经命令行传入,
-            // 所以这里不依赖 payload 里是否真有 notification_type —— 那个字段官方文档
-            // 只给了"与其它事件一致"的推断,没有逐字写明,不能拿它当准入条件。
+            // 决策类只认 Notification。种类由 settings.json 的 matcher 选定并经命令行传入;
+            // 官方文档列出了 notification_type / message / title 字段，但准入仍以事件名为准。
             if (!string.Equals(eventName, "Notification", StringComparison.Ordinal))
             {
                 reason = "notification_event_mismatch";
+                return false;
+            }
+        }
+        else if (source == "claudecode" && kind == FailureKind)
+        {
+            if (!string.Equals(eventName, "StopFailure", StringComparison.Ordinal))
+            {
+                reason = "stop_failure_event_mismatch";
                 return false;
             }
         }
@@ -418,18 +463,19 @@ public static class Program
         }
         else if (source == "opencode" && kind == DecisionKind)
         {
-            // OpenCode 的等待信号是 permission.asked(官方文档:opencode 向用户请求授权时触发)。
-            // 与 Claude Code 不同,这里**不做顶层 session 过滤** —— 子 agent 的授权请求
-            // 同样会把整个会话卡住,过滤掉等于漏掉真正需要你的那一刻。
-            if (!string.Equals(eventName, "permission.asked", StringComparison.Ordinal))
+            // OpenCode 2.x 只在三种「停下来等人」时带 --kind=decision:permission.asked(授权,含子 agent ——
+            // 子 agent 的授权请求同样会卡住整件事)、form.created(AI 提问)、session.execution.failed
+            // (顶层运行失败且宽限期内未被自动续跑)。
+            if (eventName is not ("permission.asked" or "form.created" or "session.execution.failed"))
             {
                 reason = "opencode_decision_event_mismatch";
                 return false;
             }
         }
         else if (source == "opencode" &&
-                 !string.Equals(eventName, "session.idle", StringComparison.Ordinal))
+                 eventName is not ("session.execution.succeeded" or "session.idle"))
         {
+            // session.execution.succeeded 是 2.x 的完成边界;session.idle 只为 1.x 旧插件保留兼容。
             reason = "opencode_event_mismatch";
             return false;
         }
@@ -481,6 +527,7 @@ public static class Program
 
         bool smoke = root.TryGetProperty("smoke", out JsonElement smokeElement) &&
                      smokeElement.ValueKind == JsonValueKind.True;
+        ClaudeDetails? claude = source == "claudecode" ? ReadClaudeDetails(root, eventName, env) : null;
         item = new NormalizedEvent(
             source,
             NullIfBlank(sessionId),
@@ -493,9 +540,58 @@ public static class Program
             GetFirstString(root, "last_assistant_message", "lastAssistantMessage", "last-assistant-message"),
             smoke,
             kind,
-            GetFirstString(root, "notification_type", "notificationType"));
+            GetFirstString(root, "notification_type", "notificationType"),
+            claude);
         reason = "normalized";
         return true;
+    }
+
+    /// <summary>
+    /// Claude Code 官方 hook 负载的通知相关字段。<c>error</c> 是官方枚举(rate_limit / authentication_failed …),
+    /// 只收短的字母数字值;Notification 的 <c>message</c> 只取哈希参与事件 ID,正文不落盘。
+    /// <c>background_tasks</c>(2.1.145+)里仍有非 shell 类任务在跑，说明这次 Stop 只是暂停等后台唤醒。
+    /// <c>CLAUDE_CODE_BRIDGE_SESSION_ID</c> 有值表示该会话正连着 Remote Control(手机可直接处理)。
+    /// </summary>
+    private static ClaudeDetails ReadClaudeDetails(JsonElement root, string? eventName, IDictionary<string, string?> env)
+    {
+        string? error = GetString(root, "error");
+        if (error is not null && (error.Length > 64 || !error.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-')))
+        {
+            error = "unknown";
+        }
+
+        string? message = GetString(root, "message");
+        string? messageKey = string.IsNullOrEmpty(message)
+            ? null
+            : Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(message)).AsSpan(0, 8)).ToLowerInvariant();
+
+        // background_tasks 是「在途」的后台工作(官方 schema:running/pending + backgrounded)。只有结束后会唤醒会话
+        // 继续干活的类型才说明这次 Stop 只是暂停:子代理、workflow、云端会话。shell(含开发服务器)、monitor、
+        // teammate、dream、auto-mode scan、memory import 这类常驻或内务任务一直在,算进来会让每次完成都推迟 30 分钟。
+        // 类型名取自本机 Claude Code 的映射表(local_agent→subagent、local_workflow→workflow、remote_agent→cloud session)。
+        bool backgroundBusy = false;
+        if (root.TryGetProperty("background_tasks", out JsonElement tasks) && tasks.ValueKind == JsonValueKind.Array)
+        {
+            foreach (JsonElement task in tasks.EnumerateArray())
+            {
+                if (task.ValueKind == JsonValueKind.Object &&
+                    GetString(task, "status")?.ToLowerInvariant() is "running" or "pending" &&
+                    GetString(task, "type")?.ToLowerInvariant() is "subagent" or "workflow" or "cloud session")
+                {
+                    backgroundBusy = true;
+                    break;
+                }
+            }
+        }
+
+        return new ClaudeDetails(
+            eventName,
+            GetFirstString(root, "prompt_id", "promptId"),
+            error,
+            messageKey,
+            root.TryGetProperty("stop_hook_active", out JsonElement active) && active.ValueKind == JsonValueKind.True,
+            backgroundBusy,
+            GetEnv(env, "CLAUDE_CODE_BRIDGE_SESSION_ID") is not null);
     }
 
     private static bool AdmitCodex(
@@ -803,7 +899,9 @@ public static class Program
         string? explicitEventId,
         string? timestamp,
         string? lastAssistantMessage,
-        string kind = CompletionKind)
+        string kind = CompletionKind,
+        string? notificationType = null,
+        ClaudeDetails? claude = null)
     {
         string transcriptTime = string.Empty;
         if (!string.IsNullOrWhiteSpace(transcriptPath) && File.Exists(transcriptPath))
@@ -825,8 +923,23 @@ public static class Program
             return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(turnRaw)).AsSpan(0, 8)).ToLowerInvariant();
         }
 
-        string raw = string.Join("|", source, sessionId, turnId, taskId, cwd, transcriptTime,
-            explicitEventId, timestamp, lastAssistantMessage, kind);
+        // OpenCode 2.x 的 event_id 由上游全局唯一生成(evt_… / permission:per_… / form:…),同一事件可能经
+        // 多个位置实例或重复投递到达,cwd 与时间戳不得参与去重。
+        if (source == "opencode" && !string.IsNullOrWhiteSpace(explicitEventId))
+        {
+            string openCodeRaw = string.Join("|", source, explicitEventId, kind);
+            return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(openCodeRaw)).AsSpan(0, 8)).ToLowerInvariant();
+        }
+
+        // Claude Code:同一提示里可能有多次 Stop(/goal 继续)与多次 Notification(不同工具的授权),
+        // 只靠 transcript 修改时间(官方说明异步写入、可能滞后)会撞 ID。把官方的 prompt_id、事件名、
+        // 通知类型、错误类别和消息哈希都纳入，让不同的等待/中断各有自己的 ID,“谁是最终结束”交给投递端合并。
+        string raw = claude is null
+            ? string.Join("|", source, sessionId, turnId, taskId, cwd, transcriptTime,
+                explicitEventId, timestamp, lastAssistantMessage, kind)
+            : string.Join("|", source, sessionId, turnId, taskId, cwd, transcriptTime,
+                explicitEventId, timestamp, lastAssistantMessage, kind,
+                claude.HookEvent, claude.PromptId, notificationType, claude.Error, claude.MessageKey);
         byte[] hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(raw));
         return Convert.ToHexString(hashBytes.AsSpan(0, 8)).ToLowerInvariant();
     }

@@ -35,6 +35,30 @@ public sealed class QuotaServiceTests
     }
 
     [Fact]
+    public async Task 控制面同一轮刷新复用刚拿到的读数_过期才重新请求()
+    {
+        DateTimeOffset now = DateTimeOffset.Parse("2026-08-09T12:00:00Z");
+        int oauthCalls = 0;
+        var service = new QuotaService(
+            probe: _ => Task.FromResult(FallbackProbe(now)),
+            clock: () => now,
+            oauthProbe: _ =>
+            {
+                oauthCalls++;
+                return Task.FromResult(new OAuthUsageResult(true, Authoritative(now, includeScoped: true), null, AccountA));
+            });
+
+        await service.GetAsync(forceRefresh: true, CancellationToken.None);
+        now = now.AddSeconds(20);
+        await service.GetRecentAsync(TimeSpan.FromMinutes(1), CancellationToken.None);
+        Assert.Equal(1, oauthCalls);
+
+        now = now.AddMinutes(2);
+        await service.GetRecentAsync(TimeSpan.FromMinutes(1), CancellationToken.None);
+        Assert.Equal(2, oauthCalls);
+    }
+
+    [Fact]
     public async Task 已过重置时间的模型额度不会继续承接()
     {
         DateTimeOffset now = DateTimeOffset.Parse("2026-08-09T12:00:00Z");
@@ -233,6 +257,66 @@ public sealed class QuotaServiceTests
         Assert.Equal("blocked", window.Status);
         Assert.True(window.CarriedForward);
         Assert.Equal(newerTime, merged.CapturedAt);
+    }
+
+    [Fact]
+    public async Task 服务端拒绝本机令牌时记下来_之后任何一次成功清掉()
+    {
+        DateTimeOffset now = DateTimeOffset.Parse("2026-10-30T08:00:00Z");
+        var results = new Queue<OAuthUsageResult>(new[]
+        {
+            new OAuthUsageResult(false, null, "token_rejected_401", AccountA),
+            new OAuthUsageResult(false, null, "failed_local", AccountA),
+            new OAuthUsageResult(true, Authoritative(now, includeScoped: false), null, AccountA),
+        });
+        var service = new QuotaService(
+            probe: _ => Task.FromResult(new ClaudeProbeResult()),
+            clock: () => now,
+            oauthProbe: _ => Task.FromResult(results.Dequeue()),
+            allowCliFallback: false);
+
+        await service.GetAsync(forceRefresh: true, CancellationToken.None);
+        Assert.Equal("token_rejected_401", service.LastRejection?.Reason);
+
+        // 网络类失败不是「服务端拒绝」,不改写也不清掉已有的拒绝记录。
+        await service.GetAsync(forceRefresh: true, CancellationToken.None);
+        Assert.Equal("token_rejected_401", service.LastRejection?.Reason);
+
+        await service.GetAsync(forceRefresh: true, CancellationToken.None);
+        Assert.Null(service.LastRejection);
+    }
+
+    [Fact]
+    public void 较新的实时OAuth低读数以本次为准_升级套餐后不会卡在旧的满额()
+    {
+        // 撞到周上限后中途升级套餐:同一 resetAt 里 utilization 从 100 降到 20。按稳定账号指纹保存的旧 100%
+        // 若一直取大,会让项目一直等到周窗口重置。
+        DateTimeOffset olderTime = DateTimeOffset.Parse("2026-08-09T12:00:00Z");
+        DateTimeOffset newerTime = olderTime.AddMinutes(5);
+        long resetAt = newerTime.AddDays(5).ToUnixTimeSeconds();
+        UsageSnapshot previous = MainWindow(olderTime, resetAt, 100);
+        UsageSnapshot live = MainWindow(newerTime, resetAt, 20) with { EvidenceSource = UsageEvidenceSource.OAuth };
+
+        UsageWindow window = Assert.Single(Assert.Single(QuotaService.MergeSparseObservation(live, previous, newerTime).Buckets).Windows);
+        Assert.Equal(20, window.UsedPercent);
+        Assert.NotEqual("blocked", window.Status);
+        Assert.False(window.CarriedForward);
+
+        // 0% 且没给 resetAt(新窗口还没开始):不借旧的重置时间,也不算承接。
+        UsageSnapshot fresh = MainWindow(newerTime, resetAt, 0) with { EvidenceSource = UsageEvidenceSource.OAuth };
+        fresh = fresh with
+        {
+            Buckets = new[] { fresh.Buckets[0] with { Windows = new[] { fresh.Buckets[0].Windows[0] with { ResetAtUnix = null } } } },
+        };
+        UsageWindow reset = Assert.Single(Assert.Single(QuotaService.MergeSparseObservation(fresh, previous, newerTime).Buckets).Windows);
+        Assert.Equal(0, reset.UsedPercent);
+        Assert.Null(reset.ResetAtUnix);
+        Assert.False(reset.CarriedForward);
+
+        // 非 OAuth(CLI 兜底)的较新低读数仍按同代取大:它不是权威证据。
+        UsageWindow cli = Assert.Single(Assert.Single(QuotaService.MergeSparseObservation(
+            MainWindow(newerTime, resetAt, 20) with { EvidenceSource = UsageEvidenceSource.Cli }, previous, newerTime).Buckets).Windows);
+        Assert.Equal(100, cli.UsedPercent);
     }
 
     [Fact]

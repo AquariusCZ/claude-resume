@@ -12,7 +12,6 @@ using AiResume.Worker.Probes;
 using AiResume.Worker.Products;
 using AiResume.Worker.Quota;
 using AiResume.Worker.Resume;
-using AiResume.Wrapper;
 
 namespace AiResume.Gui;
 
@@ -39,21 +38,18 @@ public sealed class ControlPlaneBridge
     private readonly ProductConfigStore _configStore;
     private readonly ProductStateStore _stateStore;
     private readonly Func<CancellationToken, Task<string?>>? _folderPicker;
-    private readonly Func<CcConnectDaemonController> _daemonControllerFactory;
-    private readonly Func<string, CutoverConfigCommand.GenerateResult> _cutoverGenerate;
     private readonly Func<string?> _hookExecutableResolver;
     private readonly ClaudeCredentialSource _claudeCredentials;
     private readonly Action<string, string> _probeFailureReporter;
     private readonly Action<string, string> _requestFailureReporter;
     private readonly Func<bool?> _engineProcessDetector;
+    private readonly Func<bool> _workerPing;
     private readonly Func<string, bool?> _activeResumeDetector;
-    private readonly string _cutoverConfigPath;
     private readonly bool _demoMode;
     private readonly Func<CancellationToken, Task<IReadOnlyList<ProviderObservation>>> _providerCatalog;
-    private readonly Func<string, string, IReadOnlyList<string>, ProductConfig, CancellationToken, Task<BoundResumeSelection>> _resumeBinding;
-    private int _cutoverInProgress;
-
-    public bool IsCutoverInProgress => Volatile.Read(ref _cutoverInProgress) != 0;
+    private readonly Func<string, string, IReadOnlyList<string>, IReadOnlyDictionary<string, string>, ProductConfig, CancellationToken, Task<BoundResumeSelection>> _resumeBinding;
+    private readonly Func<string, IReadOnlyList<string>, IReadOnlyList<ProjectPreview>> _resumePreview;
+    private readonly NotifyControlPlane _notify;
 
     public ControlPlaneBridge(
         ProjectCatalog? catalog = null,
@@ -63,9 +59,6 @@ public sealed class ControlPlaneBridge
         ProductConfigStore? configStore = null,
         ProductStateStore? stateStore = null,
         Func<CancellationToken, Task<string?>>? folderPicker = null,
-        Func<CcConnectDaemonController>? daemonControllerFactory = null,
-        Func<string, CutoverConfigCommand.GenerateResult>? cutoverGenerate = null,
-        string? cutoverConfigPath = null,
         Func<string?>? hookExecutableResolver = null,
         ClaudeCredentialSource? claudeCredentials = null,
         Action<string, string>? probeFailureReporter = null,
@@ -74,29 +67,35 @@ public sealed class ControlPlaneBridge
         Func<string, bool?>? activeResumeDetector = null,
         bool demoMode = false,
         Func<CancellationToken, Task<IReadOnlyList<ProviderObservation>>>? providerCatalog = null,
-        Func<string, string, IReadOnlyList<string>, ProductConfig, CancellationToken, Task<BoundResumeSelection>>? resumeBinding = null)
+        Func<string, string, IReadOnlyList<string>, IReadOnlyDictionary<string, string>, ProductConfig, CancellationToken, Task<BoundResumeSelection>>? resumeBinding = null,
+        Func<string, IReadOnlyList<string>, IReadOnlyList<ProjectPreview>>? resumePreview = null,
+        NotifyControlPlane? notifyControl = null,
+        Func<bool>? workerPing = null)
     {
         _demoMode = demoMode;
         // 选目录必须回到 UI 线程弹原生对话框,由宿主窗口注入;测试注入替身,不弹窗。
         _folderPicker = folderPicker;
-        _daemonControllerFactory = daemonControllerFactory ?? (() => new CcConnectDaemonController());
-        _cutoverGenerate = cutoverGenerate ?? (path => CutoverConfigCommand.Generate(
-            path, appId: null, appSecret: null, requireLoadable: true));
         _hookExecutableResolver = hookExecutableResolver ?? HookExecutable.TryResolve;
         _probeFailureReporter = probeFailureReporter ?? ((_, _) => { });
         _requestFailureReporter = requestFailureReporter ?? ((_, _) => { });
         _engineProcessDetector = engineProcessDetector ?? (() => EngineLiveness.TryDetectEngineProcess());
+        // 「后台服务运行中」还要常驻 Worker 的 Named Pipe 应答;测试注入了进程判定时不去碰本机真实的管道。
+        _workerPing = workerPing ?? (engineProcessDetector is null
+            ? () => InstallCommand.CanPingWorker(TimeSpan.FromMilliseconds(300))
+            : () => true);
         // 测试注入自有 stateStore 时默认不碰生产 process_registry;生产窗口才读现役数据库。
         _activeResumeDetector = activeResumeDetector ?? (stateStore is null
             ? runId => EngineLiveness.TryDetectActiveOwnedProcess(ShadowPaths.RunDatabasePath, runId)
             : _ => false);
-        _cutoverConfigPath = cutoverConfigPath ?? CutoverConfigCommand.DefaultConfigPath;
         _quota = quotaService ?? new QuotaService();
         var providers = new ProviderCatalogService(quota: _quota);
-        _providerCatalog = providerCatalog ?? providers.ReadAsync;
+        // 页面在 quota.get 返回之后才读供应商目录:Claude 行复用这一轮刚拿到的额度读数，一轮刷新只请求一次 usage 端点。
+        _providerCatalog = providerCatalog ?? (ct => providers.ReadAsync(ct, TimeSpan.FromMinutes(1)));
         // 长期令牌的保存/清除与供应商注册表共用同一个凭据解析器,面板上「现在靠哪份凭据」才和续跑一致。
         _claudeCredentials = claudeCredentials ?? providers.Registry.ClaudeCredentials;
-        _resumeBinding = resumeBinding ?? new ResumeBindingService(providers).BindAsync;
+        var binding = new ResumeBindingService(providers);
+        _resumeBinding = resumeBinding ?? binding.BindAsync;
+        _resumePreview = resumePreview ?? binding.Preview;
         // 与 Worker 的续跑引擎读写同一份 shadow 配置/状态:GUI 布防 → 引擎消费。
         _configStore = configStore ?? new ProductConfigStore(ShadowPaths.Root);
         _stateStore = stateStore ?? new ProductStateStore(ShadowPaths.RunDatabasePath);
@@ -107,6 +106,8 @@ public sealed class ControlPlaneBridge
         // customProjects / hiddenProjects 里,读默认值等于每次开窗都把用户的增删丢掉。
         _configFactory = configFactory ?? (() => _configStore.Load());
         _notificationRegistry = notificationRegistry ?? new NotificationRegistry();
+        // 飞书通知通道与 Worker 共用同一 shadow 根(凭据副本、投递健康文件、事件队列)。
+        _notify = notifyControl ?? new NotifyControlPlane(_configStore);
     }
 
     /// <summary>
@@ -130,25 +131,44 @@ public sealed class ControlPlaneBridge
                 "projects.remove" => await Task.Run(() => RemoveProject(root), cancellationToken).ConfigureAwait(false),
                 "projects.restore" => await Task.Run(() => RestoreProjects(root), cancellationToken).ConfigureAwait(false),
                 "dialog.pickFolder" => await PickFolderAsync(cancellationToken).ConfigureAwait(false),
-                "feishu.status" => await Task.Run(() => FeishuStatus(), cancellationToken).ConfigureAwait(false),
-                "feishu.save" => await Task.Run(() => SaveFeishu(root), cancellationToken).ConfigureAwait(false),
-                "feishu.clear" => await Task.Run(() => ClearFeishu(), cancellationToken).ConfigureAwait(false),
-                "feishu.verify" => await VerifyFeishuAsync(cancellationToken).ConfigureAwait(false),
-                "cutover.generate" => await Task.Run(() => GenerateAndRestartCutover(), cancellationToken).ConfigureAwait(false),
-                "cutover.preflight" => await Task.Run(() => Preflight(), cancellationToken).ConfigureAwait(false),
-                "app.info" => AppInfo(),
+                "app.info" => await Task.Run(() => AppInfo(), cancellationToken).ConfigureAwait(false),
                 "notifications.list" => await Task.Run(() => ListNotifications(), cancellationToken).ConfigureAwait(false),
                 "notifications.setEnabled" => await Task.Run(() => SetNotificationEnabled(root), cancellationToken).ConfigureAwait(false),
-                "quota.get" => await GetQuotaAsync(root, cancellationToken).ConfigureAwait(false),
-                "quota.local" => await Task.Run(() => GetLocalBlock(), cancellationToken).ConfigureAwait(false),
+                // 额度与供应商目录的同步部分要读 ~/.claude.json(可达数 MB)等多份配置:同样放到线程池,不卡窗口消息泵。
+                "quota.get" => await Task.Run(() => GetQuotaAsync(root, cancellationToken), cancellationToken).ConfigureAwait(false),
                 "arm.get" => await Task.Run(() => GetArm(), cancellationToken).ConfigureAwait(false),
                 "arm.set" => await Task.Run(() => SetArmAsync(root, cancellationToken), cancellationToken).ConfigureAwait(false),
-                "providers.catalog" => new { items = (await _providerCatalog(cancellationToken).ConfigureAwait(false)).Select(p => p.ToPayload()) },
-                "claude.token.status" => await Task.Run(() => ClaudeTokenStatus(), cancellationToken).ConfigureAwait(false),
-                "claude.token.save" => await Task.Run(() => SaveClaudeToken(root), cancellationToken).ConfigureAwait(false),
-                "claude.token.clear" => await Task.Run(() => ClearClaudeToken(), cancellationToken).ConfigureAwait(false),
-                "agent.get" => await Task.Run(() => GetAgent(), cancellationToken).ConfigureAwait(false),
-                "agent.set" => await Task.Run(() => SetAgent(root), cancellationToken).ConfigureAwait(false),
+                "arm.preview" => await Task.Run(() => PreviewArm(root), cancellationToken).ConfigureAwait(false),
+                "providers.catalog" => new { items = (await Task.Run(() => _providerCatalog(cancellationToken), cancellationToken).ConfigureAwait(false)).Select(p => p.ToPayload()) },
+                "claude.login.status" => await Task.Run(() => ClaudeLoginStatus(), cancellationToken).ConfigureAwait(false),
+                // notify.* 会扫 PATH、解 DPAPI、拉起 lark-cli:与其它请求一样整个放到线程池,绝不在 UI 线程上做 I/O。
+                "notify.channel" => await Task.Run(() => ChannelPayload(_notify.Describe()), cancellationToken).ConfigureAwait(false),
+                "notify.check" => CheckPayload(await Task.Run(() => _notify.CheckAsync(cancellationToken), cancellationToken).ConfigureAwait(false)),
+                "notify.credential.set" => ChannelPayload(await Task.Run(() => _notify.SetCredentialAsync(
+                    ReadString(root, "appId"), ReadString(root, "appSecret"), cancellationToken), cancellationToken).ConfigureAwait(false)),
+                "notify.credential.import" => ChannelPayload(await Task.Run(() => _notify.ImportLegacyAsync(cancellationToken), cancellationToken).ConfigureAwait(false)),
+                "notify.credential.clear" => await Task.Run(() => ChannelPayload(_notify.ClearCredential()), cancellationToken).ConfigureAwait(false),
+                "notify.recipient.set" => await Task.Run(() => ChannelPayload(_notify.SetRecipient(ReadString(root, "openId"))), cancellationToken).ConfigureAwait(false),
+                "notify.recipient.detect" => await Task.Run(() => DetectPayloadAsync(cancellationToken), cancellationToken).ConfigureAwait(false),
+                "notify.test" => await Task.Run(() => new
+                {
+                    enqueuedAtUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    eventId = _notify.EnqueueTest(),
+                    channel = ChannelPayload(_notify.Describe()),
+                }, cancellationToken).ConfigureAwait(false),
+                "notify.test.status" => await Task.Run(() =>
+                {
+                    string eventId = ReadString(root, "eventId");
+                    string outcome = _notify.TestOutcome(eventId,
+                        DateTimeOffset.FromUnixTimeSeconds(root.TryGetProperty("sinceUnix", out JsonElement since) && since.TryGetInt64(out long unix) ? unix : 0));
+                    return new
+                    {
+                        outcome,
+                        failure = outcome == "failed" ? _notify.TestFailure(eventId) : null,
+                        channel = ChannelPayload(_notify.Describe()),
+                    };
+                }, cancellationToken).ConfigureAwait(false),
+                "notify.test.withdraw" => await Task.Run(() => new { withdrawn = _notify.WithdrawTest(ReadString(root, "eventId")) }, cancellationToken).ConfigureAwait(false),
                 _ => throw new NotSupportedException($"未知请求类型:{type}"),
             };
 
@@ -179,8 +199,8 @@ public sealed class ControlPlaneBridge
             {
                 items = new object[]
                 {
-                    new { name = "orbit-planner", path = @"D:\Demo\orbit-planner", lastUsed = "已完成", isGit = true, isCustom = false },
-                    new { name = "ledger-api", path = @"D:\Demo\ledger-api", lastUsed = "等额度", isGit = true, isCustom = false },
+                    new { name = "orbit-planner", path = @"D:\Demo\orbit-planner", lastUsed = "2026/8/8 09:12", isGit = true, isCustom = false },
+                    new { name = "ledger-api", path = @"D:\Demo\ledger-api", lastUsed = "2026/8/8 01:40", isGit = true, isCustom = false },
                     new { name = "atlas-docs", path = @"D:\Demo\atlas-docs", lastUsed = "2026/8/7 23:05", isGit = true, isCustom = false },
                     new { name = "pixel-sprites", path = @"D:\Demo\pixel-sprites", lastUsed = "2026/8/7 18:31", isGit = false, isCustom = true },
                     new { name = "kettle-firmware", path = @"D:\Demo\kettle-firmware", lastUsed = "2026/8/7 11:02", isGit = true, isCustom = false },
@@ -188,15 +208,6 @@ public sealed class ControlPlaneBridge
                 },
                 elapsedMs = 37,
                 hidden = Array.Empty<object>(),
-            },
-            "quota.local" => new
-            {
-                active = true,
-                startUnix = now - 9_000,
-                endUnix = now + 9_000,
-                totalTokens = 18_420,
-                messageCount = 6,
-                elapsedMs = 21,
             },
             "quota.get" => new
             {
@@ -215,30 +226,27 @@ public sealed class ControlPlaneBridge
                 {
                     new { name = "five_hour", label = "5 小时", status = "available", usedPercent = 41, windowSeconds = 18_000, resetAtUnix = now + 9_000, resetAfterSeconds = 9_000, windowStartUnix = now - 9_000, carriedForward = false },
                     new { name = "seven_day", label = "7 天", status = "available", usedPercent = 88, windowSeconds = 604_800, resetAtUnix = now + 180_000, resetAfterSeconds = 180_000, windowStartUnix = now - 424_800, carriedForward = false },
-                    new { name = "weekly_scoped:fable", label = "Fable", status = "blocked", usedPercent = 100, windowSeconds = 604_800, resetAtUnix = now + 180_000, resetAfterSeconds = 180_000, windowStartUnix = now - 424_800, carriedForward = false },
+                    new { name = "weekly_scoped:Fable", label = "weekly_scoped:Fable", status = "blocked", usedPercent = 100, windowSeconds = 604_800, resetAtUnix = now + 180_000, resetAfterSeconds = 180_000, windowStartUnix = now - 424_800, carriedForward = false },
                 },
             },
             "providers.catalog" => new { items = new object[] {
-                new { id = "claude-subscription", name = "Claude · Anthropic 订阅", agent = "claudecode", kind = "claude-oauth", models = new[] { new { id = "claude-fable-5-1", name = "Claude Fable 5.1" }, new { id = "claude-opus-5", name = "Claude Opus 5" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = true, resumeNote = "布防后固定调用 ID", windows = new[] { new { name = "Fable", usedPercent = 100, carriedForward = false } } },
-                new { id = "deepseek", name = "DeepSeek · 官方 API", agent = "claudecode", kind = "deepseek", models = new[] { new { id = "deepseek-v4-flash", name = "deepseek-v4-flash" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = false, balance = 47.77, currency = "CNY", resumeNote = "固定调用 ID；同一 ID 的后端可能更新" },
-                new { id = "codex-official", name = "Codex · ChatGPT 官方", agent = "codex", kind = "chatgpt", credentialSource = "auth.json:chatgpt", models = new[] { new { id = "gpt-5.6-sol", name = "GPT-5.6 Sol" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = false, resumeNote = "账号窗口与模型可用性来自 ChatGPT 官方接口", windows = new object[] { new { name = "primary · 7D", usedPercent = 12, resetAtUnix = now + 500_000, windowSeconds = 604_800, carriedForward = false, status = "allowed" } } }
+                new { id = "claude-subscription", name = "Claude · Anthropic 订阅", agent = "claudecode", kind = "claude-oauth", credentialSource = "claude-oauth:claude-cli", resumable = true, models = new[] { new { id = "claude-fable-5-1", name = "Claude Fable 5.1" }, new { id = "claude-opus-5-5", name = "Claude Opus 5.5" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = true, resumeNote = "布防时按项目固定模型调用 ID，下次布防重新选择", windows = new object[] { new { name = "five_hour", usedPercent = 41, resetAtUnix = now + 9_000, windowSeconds = 18_000, carriedForward = false, status = "allowed" }, new { name = "seven_day", usedPercent = 88, resetAtUnix = now + 180_000, windowSeconds = 604_800, carriedForward = false, status = "allowed" }, new { name = "weekly_scoped:Fable", usedPercent = 100, resetAtUnix = now + 180_000, windowSeconds = 604_800, carriedForward = false, status = "blocked" } } },
+                new { id = "deepseek", name = "DeepSeek · OpenCode", agent = "opencode", kind = "deepseek", credentialSource = "opencode-auth", resumable = false, models = new[] { new { id = "deepseek-v4-flash", name = "deepseek-v4-flash" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = false, balance = 47.77, currency = "CNY", resumeNote = "OpenCode 使用的 DeepSeek 账户余额，只展示，不参与续跑" },
+                new { id = "codex-official", name = "Codex · ChatGPT 官方", agent = "codex", kind = "chatgpt", credentialSource = "auth.json:chatgpt", resumable = true, models = new[] { new { id = "gpt-5.6-sol", name = "GPT-5.6 Sol" } }, modelsVerified = true, source = "供应商实时返回", observedAtUtc = DateTimeOffset.UtcNow, quotaKnown = true, limited = false, resumeNote = "账号窗口与模型可用性来自 ChatGPT 官方接口", windows = new object[] { new { name = "primary · 7D", usedPercent = 12, resetAtUnix = now + 500_000, windowSeconds = 604_800, carriedForward = false, status = "allowed" } } }
             } },
-            "claude.token.status" => new
+            "claude.login.status" => new
             {
-                hasStoredToken = true,
-                storedTokenSavedAtUnix = now - 86_400,
-                cliLoggedIn = false,
-                cliExpiresAtUnix = (long?)null,
-                cliProblem = "Claude CLI 未登录",
-                activeSource = "ai-resume-token",
-                problem = (string?)null,
-                storedRejectedReason = (string?)null,
-                storedProblem = (string?)null,
+                verdict = nameof(ClaudeLoginVerdict.LoginExpiring),
+                accessTokenExpiresAtUnix = now + 6 * 3600,
+                loginExpiresAtUnix = now + 2 * 86_400,
+                subscriptionType = "max",
+                accountVerified = true,
+                problem = "Claude Code 登录将于 11-2 21:55 到期，届时需运行 claude 并 /login",
             },
             "arm.get" => new
             {
-                armed = !Environment.GetCommandLineArgs().Contains("--screenshot-provider"),
-                continuous = true,
+                armed = !Environment.GetCommandLineArgs().Contains("--screenshot-unarmed"),
+                continuous = false,
                 resumeModel = "claude-fable-5-1",
                 resumeTarget = new ResumeTarget { ProviderId = "claude-subscription", ProviderName = "Claude · Anthropic 订阅", ProviderIdentity = "demo", Agent = "claudecode", ModelId = "claude-fable-5-1", ModelName = "Claude Fable 5.1", BoundAtUtc = DateTimeOffset.UtcNow },
                 cycleId = "demo-cycle",
@@ -248,57 +256,81 @@ public sealed class ControlPlaneBridge
                 projectStatus = selected
                     .Select(path => DescribeProjectStatus(path, "limited"))
                     .ToArray(),
-                engine = "Healthy",
-                engineText = "运行中",
+                projects = new object[]
+                {
+                    new { path = selected[0], name = "ledger-api", sessionId = "00000000-0000-4000-8000-000000000001", modelId = "claude-fable-5-1", modelName = "Claude Fable 5.1", modelSource = "session", status = "limited", category = "waiting", reason = "quota:limited", reasonText = "等额度", hint = "Fable 周额度已用尽", detail = "weekly_scoped:Fable:blocked", resetAtUnix = now + 180_000, interruptedAtUnix = now - 5_400 },
+                    new { path = selected[1], name = "atlas-docs", sessionId = "00000000-0000-4000-8000-000000000002", modelId = "claude-opus-5-5", modelName = "Claude Opus 5.5", modelSource = "session", status = "limited", category = "waiting", reason = "session-in-use", reasonText = "会话开着 · 关闭后续跑", hint = "会话开在 Claude 桌面端:客户端开着时由它自己继续，关闭后自动续跑", interruptedAtUnix = now - 3_600, client = "claude-desktop" },
+                    new { path = selected[2], name = "pixel-sprites", sessionId = "00000000-0000-4000-8000-000000000003", modelId = "claude-opus-5-5", modelName = "Claude Opus 5.5", modelSource = "user", category = "idle", reason = "not-interrupted", reasonText = "监视中 · 未被打断", hint = "会话没有被用量上限打断，不需要续跑" },
+                },
+                engine = "Alive",
+                engineText = "引擎在跑",
+                workerRunning = true,
                 probeAgeSeconds = 12,
+                probeReason = "quota:limited",
             },
-            "feishu.status" => new
+            "arm.preview" => new
             {
-                hasCredentials = false,
-                appIdMasked = (string?)null,
-                allowFrom = (string?)null,
-                configPath = @"D:\Demo\.cc-connect\config.toml",
-                configExists = true,
-                configState = "ok",
-                configSummary = "配置可加载",
-                configProblems = Array.Empty<string>(),
-                configWarnings = Array.Empty<string>(),
+                items = new object[]
+                {
+                    new { path = selected[0], name = "ledger-api", sessionId = "00000000-0000-4000-8000-000000000001", sessionModel = "claude-fable-5-1", evidence = "interrupted", limitType = "seven_day", limitResetsAtUnix = now + 180_000, interruptedAtUnix = now - 5_400, session = "idle" },
+                    new { path = selected[1], name = "atlas-docs", sessionId = "00000000-0000-4000-8000-000000000002", sessionModel = "claude-opus-5-5", evidence = "interrupted", limitType = "five_hour", limitResetsAtUnix = now + 9_000, interruptedAtUnix = now - 3_600, session = "in-use", client = "claude-desktop" },
+                    new { path = selected[2], name = "pixel-sprites", sessionId = "00000000-0000-4000-8000-000000000003", sessionModel = "claude-opus-5-5", evidence = "clear", session = "idle" },
+                },
             },
             "notifications.list" => new
             {
                 items = new object[]
                 {
                     DemoNotification("ClaudeCode", "Claude Code"),
-                    DemoNotification("Codex", "Codex"),
-                    DemoNotification("Cline", "Cline"),
-                    DemoNotification("Qoder", "Qoder"),
+                    DemoNotification("Codex", "Codex", enabled: false),
+                    DemoNotification("Cline", "Cline", enabled: false),
+                    DemoNotification("Qoder", "Qoder", enabled: false),
                     DemoNotification("OpenCode", "OpenCode"),
                 },
             },
-            "app.info" => new { version = "2.0.0", shadowRoot = @"D:\Demo\AI Resume\state", quotaRefreshMinutes = 15 },
-            "agent.get" => new
+            "notify.channel" => new
             {
-                current = "claudecode",
-                options = new object[]
+                larkCliFound = true,
+                credentialSource = "env",
+                appIdMasked = "cli_a1…7f",
+                legacyCredentialAvailable = false,
+                recipientSet = true,
+                recipientMasked = "ou_0123…cdef",
+                health = new
                 {
-                    new { id = "claudecode", display = "Claude Code", installed = true },
-                    new { id = "codex", display = "Codex", installed = true },
-                    new { id = "qoder", display = "Qoder", installed = true },
-                    new { id = "opencode", display = "OpenCode", installed = true },
+                    state = "healthy", lastSuccessAtUnix = now - 1_260, lastAttemptAtUnix = now - 1_260, backlog = 0, dead = 0,
+                    credentialSource = "env", updatedAtUnix = now - 8,
                 },
             },
+            "notify.check" => new
+            {
+                ok = true,
+                botReady = true,
+                credentialSource = "env",
+                checks = new object[]
+                {
+                    new { name = "app_resolved", status = "pass", message = "app: cli_a1…7f (feishu)" },
+                    new { name = "bot_identity", status = "pass", message = "Bot identity: ready" },
+                    new { name = "endpoint_open", status = "pass", message = "https://open.feishu.cn reachable" },
+                },
+            },
+            "notify.recipient.detect" => new
+            {
+                items = new object[] { new { openId = "ou_0123456789abcdef0123456789abcdef", userName = "演示用户", tokenStatus = "valid" } },
+            },
+            "app.info" => new { version = typeof(ControlPlaneBridge).Assembly.GetName().Version?.ToString(3) ?? "dev", shadowRoot = @"D:\Demo\AI Resume\state", quotaRefreshMinutes = 15 },
             _ => throw new NotSupportedException($"截图合成模式不支持请求:{type}"),
         };
     }
 
-    private static object DemoNotification(string kind, string displayName) => new
+    private static object DemoNotification(string kind, string displayName, bool enabled = true) => new
     {
         kind,
         displayName,
         isInstalled = true,
-        isEnabled = true,
+        isEnabled = enabled,
         configPath = @"D:\Demo\notifications",
-        detail = "已安装 AI Resume 通知钩子",
+        detail = enabled ? "已安装,最近一次加载正常" : "未启用",
         hookBroken = false,
     };
 
@@ -520,7 +552,9 @@ public sealed class ControlPlaneBridge
             s.Detail,
             // 「已启用但送不到」必须能被界面单独表达。只回 isEnabled 的话,
             // 钩子程序被删之后开关照旧是绿的(2026-08-08 审计 A1)。
-            s.HookBroken)).ToList();
+            s.HookBroken,
+            // 探测失败:开没开不知道,界面显示「未核实」而不是「已关闭」「未检测到」。
+            s.Unverified)).ToList();
         return new NotificationsPayload(items);
     }
 
@@ -551,18 +585,10 @@ public sealed class ControlPlaneBridge
                     "钩子必须写绝对路径,写不存在的路径会表现为「已启用但永远收不到通知」。");
         }
 
-        _notificationRegistry.SetEnabled(kind, enabled, hookExe);
-
-        // 把开关记进配置。这条记录是重装后恢复通知源的**唯一依据**——
-        // 卸载会把 ~/.claude 之类里的现状清空,清空之后就再没有东西能说出
-        // "本来开着哪几个"(2026-08-08 审计 B3)。记不下来不影响本次开关生效,所以不抛。
-        try
-        {
-            _configStore.Update(c => c.NotifySources = NotifyIntent.Toggle(c.NotifySources, kind, enabled));
-        }
-        catch (Exception)
-        {
-        }
+        // 意图先落盘、再改客户端配置。它既是重装后恢复通知源的**唯一依据**(卸载会把现状清空,审计 B3),
+        // 也是投递端的来源过滤:记不下来就不能改开关,否则界面显示开着、事件却被投递端按旧意图丢弃。
+        NotifyIntent.Apply(_configStore, kind, enabled, () => _notificationRegistry.SetEnabled(kind, enabled, hookExe),
+            () => _notificationRegistry.ProbeEnabled(kind));
 
         // 返回与 notifications.list 相同形状的最新列表。
         return ListNotifications();
@@ -661,7 +687,8 @@ public sealed class ControlPlaneBridge
         {
             ReportRequestFailure("arm.get", readError ?? new InvalidDataException("布防状态快照为空。"));
             var unreadableSelected = config.Selected.Select(p => p.Path).ToList();
-            EngineVerdict unreadableVerdict = config.Armed && _engineProcessDetector() == false
+            bool? workerRunning = _engineProcessDetector();
+            EngineVerdict unreadableVerdict = config.Armed && workerRunning == false
                 ? EngineVerdict.NotRunning
                 : EngineVerdict.StateUnverified;
             return new ArmPayload(
@@ -675,7 +702,10 @@ public sealed class ControlPlaneBridge
                 Array.Empty<ProjectStatusItem>(),
                 unreadableVerdict.ToString(),
                 EngineLiveness.Describe(unreadableVerdict),
-                null, config.ResumeTarget);
+                null, config.ResumeTarget)
+            {
+                WorkerRunning = EngineLiveness.ResidentWorker(workerRunning, _workerPing),
+            };
         }
 
         CheckerState state = snapshot.State;
@@ -805,6 +835,14 @@ public sealed class ControlPlaneBridge
         {
             ReplaceClaimedRunningStatuses(statuses, "exit-null");
         }
+
+        // 引擎判定只看同名进程;「监视中」还要本用户的常驻 Worker 应答管道。有进程却不应答:核验不出，不说监视中。
+        bool? residentWorker = EngineLiveness.ResidentWorker(engineRunning, _workerPing);
+        if (verdict == EngineVerdict.Alive && residentWorker is null)
+        {
+            verdict = EngineVerdict.WorkerUnverified;
+        }
+
         long? probeAge = currentCycle && state.LastProbeUtc is { } lp
             ? (long)Math.Max(0, (now - lp).TotalSeconds)
             : null;
@@ -820,7 +858,163 @@ public sealed class ControlPlaneBridge
             statuses,
             verdict.ToString(),
             EngineLiveness.Describe(verdict),
-            probeAge, config.ResumeTarget, currentCycle ? state.LastProbeReason : string.Empty);
+            probeAge, config.ResumeTarget, currentCycle ? state.LastProbeReason : string.Empty)
+        {
+            Projects = DescribeProjects(config, currentCycle ? state : null, statuses),
+            WorkerRunning = residentWorker,
+        };
+    }
+
+    /// <summary>
+    /// 逐项目：绑定的会话与模型、当前状态，以及「为什么在等、在等什么」的一句话。
+    /// 状态行已被引擎存活判定改写(如未核实)时以改写后的为准;只有 limited(待续跑)才展开等待原因。
+    /// </summary>
+    private static IReadOnlyList<ArmProjectItem> DescribeProjects(
+        ProductConfig config, CheckerState? state, IReadOnlyList<ProjectStatusItem> statuses)
+    {
+        return config.Selected.Select(project =>
+        {
+            ProjectStatusItem? status = statuses.FirstOrDefault(item => PathEquals(item.Path, project.Path));
+            ProjectNote? note = state is null ? null : ProjectPaths.Find(state.ProjectNotes, project.Path);
+            string modelId = ResumeTarget.EffectiveModel(project, config.ResumeTarget);
+            string modelName = project.ModelName is { Length: > 0 } name ? name
+                : modelId == config.ResumeTarget?.ModelId ? config.ResumeTarget.ModelName : modelId;
+            string? agent = config.ResumeTarget?.Agent;
+            string? providerId = config.ResumeTarget?.ProviderId;
+            (string category, string text, string hint) = status is { Status: "continued-elsewhere" } && note is { Reason: "continued-elsewhere" }
+                ? DescribeNote(note, project.Path, agent, providerId)
+                : status is { Status: not "limited" }
+                ? (status.Category, status.Text, string.Empty)
+                : note is not null
+                    ? DescribeNote(note, project.Path, agent, providerId)
+                    : status is not null
+                        ? (status.Category, status.Text, string.Empty)
+                        : state is not null ? ("waiting", "等待取证", string.Empty) : ("idle", string.Empty, string.Empty);
+            return new ArmProjectItem(
+                project.Path,
+                project.Name,
+                project.SessionId,
+                modelId,
+                modelName,
+                project.ModelSource is { Length: > 0 } source ? source : "default",
+                status?.Status,
+                category,
+                note?.Reason,
+                text,
+                hint,
+                note?.Detail,
+                note?.ResetAtUnix,
+                note?.InterruptedAtUnix,
+                note?.Client);
+        }).ToArray();
+    }
+
+    /// <summary>
+    /// 原因码 → 队列行的短句(窄列放得下)+ 悬停时的完整说明。
+    /// 重置时间由前端按本地时区补在短句后面，说明里的「预计 HH:mm 起续跑」也由前端补。
+    /// </summary>
+    private static (string Category, string Text, string Hint) DescribeNote(ProjectNote note, string path, string? agent = null,
+        string? providerId = null)
+    {
+        string reason = note.Reason;
+        if (reason.StartsWith("blocked:", StringComparison.Ordinal))
+        {
+            ProjectStatusItem blocked = DescribeProjectStatus(path, reason["blocked:".Length..]);
+            return (blocked.Category, blocked.Text, "本周期已停止，不会自动重放;检查后解除并重新布防");
+        }
+
+        // Codex 周期的账号与登录问题不能给出 Claude 的修复办法(/login、打开 Claude Code)。
+        if (agent == "codex")
+        {
+            switch (reason)
+            {
+                case "quota:credentials-unavailable" or "quota:identity-unverified":
+                    return ("waiting", "Codex 登录未核实", "读不出 Codex 官方账号:运行 codex login,或检查 ~/.codex/auth.json");
+                case "quota:provider-changed":
+                    return ("failure", "账号已变化 · 重新布防", "Codex 账号与布防时不同:不会用当前账号自动续跑,确认后解除并重新布防");
+            }
+        }
+
+        // Claude Code 走 API 凭据(ANTHROPIC_* 指向的端点)的周期与订阅登录无关，不能给出 /login 的办法。
+        if (agent == "claudecode" && providerId is { Length: > 0 } and not "claude-subscription" &&
+            reason is "quota:credentials-unavailable" or "quota:identity-unverified")
+        {
+            return ("waiting", "API 凭据未核实", "读不出 Claude Code 设置里的 API 凭据(ANTHROPIC_* 环境变量或 settings.json 的 env)");
+        }
+
+        return reason switch
+        {
+            "continued-elsewhere" when note.Detail == "other-session" => ("success", "已在别的会话继续",
+                "中断之后,你在同一目录新开的会话里接着干了:旧会话的上下文已经过时,为免它改动变化了的工作树,不再自动续跑"),
+            "not-interrupted" => ("idle", "监视中 · 未被打断", "会话没有被用量上限打断，不需要续跑"),
+            "watching" => ("idle", "监视中", string.Empty),
+            "ready" => ("waiting", "额度已恢复 · 即将续跑", string.Empty),
+            "running" => ("running", "续跑中", string.Empty),
+            "done" => ("success", "已完成", string.Empty),
+            "continued-elsewhere" => ("success", "已在客户端继续", "被打断之后会话里又有了新的对话，视为你已经自己续上"),
+            "unevaluated" => ("waiting", "等待取证", string.Empty),
+            "session-in-use" => ("waiting", "会话开着 · 关闭后续跑",
+                "会话开在" + ClientText(note.Client) + ":客户端开着时由它自己继续，关闭后自动续跑"),
+            "cwd-busy" => ("waiting", "同目录有会话在跑", "同一目录下另一个会话正在运行，它结束后再续跑"),
+            "session-unverified" => ("waiting", "会话占用未核实", "读不出会话是否开在客户端，暂不续跑"),
+            "evidence-unverified" => ("waiting", "会话记录未核实", "读不出会话记录的结尾，暂不续跑"),
+            "quota:limited" => ("waiting", "等额度", WindowText(note.Detail) is { Length: > 0 } windows ? windows + "已用尽" : "额度已用尽"),
+            // 读不到额度的原因不同,该做的事也不同(note.Detail = 凭据失败原因码)。
+            "quota:credentials-unavailable" or "quota:identity-unverified" => note.Detail switch
+            {
+                "token_expired" => ("waiting", "等登录令牌续期", "Claude 访问令牌已过期:打开一次 Claude Code(或保持手机远程连接)即可自动续期"),
+                "login_expired" or "no_credentials" => ("waiting", "Claude 登录失效 · 需 /login", "在终端运行 claude 后执行 /login;恢复前读不到额度"),
+                "credential_store_moved" => ("waiting", "凭据位置变化", "Claude Code 把登录挪进了 Windows 凭据管理器,AI Resume 读不到它"),
+                "unreadable" => ("waiting", "登录状态未核实", "读不出 Claude Code 的登录文件(可能正被改写),稍后自动重试"),
+                _ => ("waiting", "账号身份未核实", "Claude Code 全局配置里没有一致的账号信息,打开一次 Claude Code 通常即可恢复"),
+            },
+            "quota:provider-changed" => ("failure", "账号已变化 · 重新布防",
+                "Claude 账号身份与布防时不同(换了账号,或刚从 v2.1 升级):不会用当前账号自动续跑,确认后解除并重新布防"),
+            "quota:model-unverified" when note.Detail == "absent" => ("waiting", "模型不在当前目录", "供应商当前的模型目录里找不到布防时固定的模型"),
+            "quota:model-unverified" => ("waiting", "模型目录未核实", "这次没读出供应商的模型目录(限流、网络或凭据问题),下一轮重试"),
+            "quota:unknown" when note.Detail == "model-invalid" => ("failure", "模型额度无法核实 · 重新布防",
+                "认不出这个模型属于哪个模型族,无法按它的按模型额度判断何时续跑;解除布防后换一个模型重新布防"),
+            "quota:target-unbound" => ("failure", "需要重新布防", "旧布防没有固定续跑目标"),
+            "not-started:token-expiring" => ("waiting", "等登录令牌续期", "访问令牌剩余不足 45 分钟，等 Claude Code 续期后再启动"),
+            "not-started:session-in-use" or "not-started:cwd-busy" => ("waiting", "会话刚被打开 · 已跳过", "启动前复核时会话正开在客户端，这次跳过，下一轮再评估"),
+            "not-started:evidence-changed" => ("waiting", "会话有新记录", "启动前复核时会话结尾变了，下一轮重新评估"),
+            "not-started:evidence-unverified" => ("waiting", "会话记录未核实", "启动前读不出会话记录的结尾，下一轮重试"),
+            "not-started:execution-unverified" => ("waiting", "执行条件未核实", note.Detail is { Length: > 0 } d ? d : "下一轮重试"),
+            "not-started:configuration-changed" => ("waiting", "配置刚变化 · 下次重试", "启动前发现布防配置被改过，这次不启动"),
+            "not-started:no-claude" => ("failure", "执行器不可用", "找不到 Claude Code 可执行文件或项目目录"),
+            _ when reason.StartsWith("not-started:", StringComparison.Ordinal) => ("waiting", "本次未启动 · 下次重试", string.Empty),
+            _ when reason.StartsWith("quota:", StringComparison.Ordinal) => ("waiting", "额度未核实", string.Empty),
+            _ => ("waiting", "状态未核实", string.Empty),
+        };
+    }
+
+    private static string ClientText(string? client) => client switch
+    {
+        "claude-desktop" or "claude-desktop-3p" => " Claude 桌面端",
+        "cli" => "终端",
+        "claude-vscode" => " VS Code",
+        _ => "客户端",
+    };
+
+    /// <summary><c>weekly_scoped:Fable:blocked,five_hour:blocked</c> → 「Fable 周额度、5 小时额度」。</summary>
+    private static string WindowText(string? detail)
+    {
+        if (string.IsNullOrWhiteSpace(detail) || detail == "unattributed")
+        {
+            return string.Empty;
+        }
+
+        IEnumerable<string> names = detail.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(item => item.EndsWith(":blocked", StringComparison.Ordinal) ? item[..^":blocked".Length] : item)
+            .Select(name => name switch
+            {
+                "five_hour" => "5 小时额度",
+                "seven_day" => "7 天额度",
+                _ when name.StartsWith("weekly_scoped:", StringComparison.OrdinalIgnoreCase) => name["weekly_scoped:".Length..] + " 周额度",
+                _ => name,
+            })
+            .Distinct();
+        return string.Join("、", names);
     }
 
     private static ProjectStatusItem DescribeProjectStatus(string path, string? status)
@@ -829,6 +1023,7 @@ public sealed class ControlPlaneBridge
         (string category, string text) = normalizedStatus switch
         {
             "success" => ("success", "已完成"),
+            "continued-elsewhere" => ("success", "已在客户端继续"),
             "limited" => ("waiting", "等额度"),
             "running" => ("running", "进行中"),
             "cancel-pending" => ("waiting", "终止待确认"),
@@ -897,6 +1092,16 @@ public sealed class ControlPlaneBridge
         BoundResumeSelection? binding = null;
         ProductConfig original = _configStore.Load();
         string originalIntent = JsonSerializer.Serialize(original, ProductConfig.JsonOptions);
+        // 前置条件:调用方看到的周期必须仍是现在的周期。两个控制面窗口时,另一个窗口刚布防过,
+        // 这里拒绝而不是静默替换掉别人的周期(连同它已消费的中断与逐项目进度)。
+        string? expectCycleId = root.TryGetProperty("expectCycleId", out JsonElement expectEl) && expectEl.ValueKind == JsonValueKind.String
+            ? expectEl.GetString() ?? string.Empty
+            : null;
+        if (armed && expectCycleId is not null && !string.Equals(expectCycleId, original.Armed ? original.ArmCycleId : string.Empty, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("布防状态已在别处改变(可能另一个控制面窗口刚操作过),请刷新后再试。");
+        }
+
         if (armed)
         {
             string? requestedModel = root.TryGetProperty("resumeModel", out JsonElement modelEl) &&
@@ -921,7 +1126,23 @@ public sealed class ControlPlaneBridge
             }
             string providerId = root.TryGetProperty("providerId", out JsonElement providerEl) && providerEl.ValueKind == JsonValueKind.String
                 ? providerEl.GetString()! : "claude-subscription";
-            binding = await _resumeBinding(providerId, requestedModel, paths, original, ct).ConfigureAwait(false);
+            // 逐项目模型:{路径: 模型调用 ID};空串或缺省 = 跟随该会话最近使用的模型。
+            var projectModels = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (root.TryGetProperty("projectModels", out JsonElement modelsEl) && modelsEl.ValueKind == JsonValueKind.Object)
+            {
+                foreach (JsonProperty entry in modelsEl.EnumerateObject())
+                {
+                    string chosen = entry.Value.ValueKind == JsonValueKind.String ? entry.Value.GetString() ?? string.Empty : string.Empty;
+                    if (chosen.Length > 0 && !ProviderModels.IsSafeId(chosen))
+                    {
+                        throw new ArgumentException("项目模型无效,请从供应商目录中选择。");
+                    }
+
+                    projectModels[entry.Name] = chosen;
+                }
+            }
+
+            binding = await _resumeBinding(providerId, requestedModel, paths, projectModels, original, ct).ConfigureAwait(false);
             resumeModel = binding.Target.ModelId;
         }
 
@@ -952,244 +1173,128 @@ public sealed class ControlPlaneBridge
             }
         });
 
-        return GetArm();
+        ArmPayload payload = GetArm();
+        return binding is { Warnings.Count: > 0 } ? payload with { Warnings = binding.Warnings } : payload;
     }
 
     /// <summary>
-    /// 本地 5 小时块:直接读会话 jsonl 计算,**不起进程、毫秒级**,所以开窗即可渲染。
-    /// 服务端的 rate_limit_event 是偶发下发的(实测常常只给 seven_day),
-    /// 只等它会让 5 小时窗口时有时无——社区监视器(ccusage / Claude-Code-Usage-Monitor)
-    /// 同样是本地算这个块。token 总量是本地事实,**不是**占限额的百分比(账户档位未知,不臆测)。
+    /// 布防前预演：逐项目只读本地会话事实(绑定的会话、会话最近用的模型、是否被限额打断、是否开在客户端)。
+    /// 不发网络请求、不做推理、不写任何状态。
     /// </summary>
-    private LocalBlockPayload GetLocalBlock()
+    private object PreviewArm(JsonElement root)
     {
-        string root = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects");
-
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        UsageBlock? block = ClaudeUsageBlocks.FindActiveBlock(root, DateTimeOffset.UtcNow);
-        sw.Stop();
-
-        if (block is null)
-        {
-            return new LocalBlockPayload(false, null, null, 0, 0, sw.ElapsedMilliseconds);
-        }
-
-        return new LocalBlockPayload(
-            true,
-            block.StartUtc.ToUnixTimeSeconds(),
-            block.EndUtc.ToUnixTimeSeconds(),
-            block.TotalTokens,
-            block.MessageCount,
-            sw.ElapsedMilliseconds);
-    }
-
-    // ── 飞书接入(S10-D)──
-    // **实值单向流动**:前端 → 桥 → DPAPI → cc-connect 配置文件。
-    // 任何一个应答都只回"有没有"与遮蔽后的 app_id,app_secret 永不回传前端。
-
-    private FeishuPayload FeishuStatus()
-    {
-        FeishuCredentialStatus status = new FeishuCredentialStore().Describe();
-        if (status.HasCredentials)
-        {
-            SyncNotifyRecipient(status.AllowFrom);
-        }
-
-        // **文件在 ≠ cc-connect 加载得了。** 原来这里只回 File.Exists,
-        // 于是配置被改坏之后界面照旧说"配置已生成"(2026-08-08 审计 A3)。
-        // 校验走 cc-connect 自己的解析器,且只校验副本(见 CcConnectConfigValidator)。
-        CcConnectConfigCheck check;
-        try
-        {
-            check = CcConnectConfigValidator.CheckFile(CutoverConfigCommand.DefaultConfigPath);
-        }
-        catch (Exception ex)
-        {
-            ReportRequestFailure("feishu.status", ex);
-            check = new CcConnectConfigCheck(
-                CcConnectConfigState.Unknown,
-                $"配置未能复核:{SecretRedactor.RedactText(ex.Message)}",
-                Array.Empty<string>(), Array.Empty<string>());
-        }
-
-        return new FeishuPayload(
-            status.HasCredentials,
-            status.AppIdMasked,
-            // 授权 open_id 不是口令,展示它才能让用户确认"锁的是我"。
-            status.AllowFrom,
-            CutoverConfigCommand.DefaultConfigPath,
-            File.Exists(CutoverConfigCommand.DefaultConfigPath),
-            check.State.ToString().ToLowerInvariant(),
-            check.Summary,
-            check.Problems.ToList(),
-            check.Warnings.ToList());
-    }
-
-    /// <summary>
-    /// 真实校验飞书凭据:拿它去换一次 tenant_access_token。
-    ///
-    /// 「DPAPI 里有值」只证明用户填过。secret 在开放平台被重置之后本机这份就永久失效,
-    /// 而失效的表现是**机器人不理你** —— 和进程没起来、open_id 夹空格、钩子断链
-    /// 长得一模一样。不真发一次请求,界面就没有能力把它们分开(审计 A2)。
-    /// </summary>
-    private async Task<object> VerifyFeishuAsync(CancellationToken cancellationToken)
-    {
-        FeishuVerifyResult r = await FeishuCredentialVerifier
-            .VerifyAsync(cancellationToken).ConfigureAwait(false);
-
-        // 只回结论与飞书原文的 code/msg(不是机密);app_secret 从不离开 DPAPI。
+        string providerId = root.TryGetProperty("providerId", out JsonElement providerEl) && providerEl.ValueKind == JsonValueKind.String
+            ? providerEl.GetString()! : "claude-subscription";
+        var paths = root.TryGetProperty("paths", out JsonElement pathsEl) && pathsEl.ValueKind == JsonValueKind.Array
+            ? pathsEl.EnumerateArray().Select(e => e.GetString()).Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s!).ToList()
+            : new List<string>();
         return new
         {
-            ok = r.Ok,
-            verdict = r.Verdict.ToString(),
-            code = r.Code,
-            summary = r.Summary,
+            items = _resumePreview(providerId, paths).Select(p => new
+            {
+                path = p.Path,
+                name = p.Name,
+                sessionId = p.SessionId,
+                sessionModel = p.SessionModel,
+                evidence = p.Evidence,
+                limitType = p.LimitType,
+                limitResetsAtUnix = p.LimitResetsAtUtc?.ToUnixTimeSeconds(),
+                interruptedAtUnix = p.InterruptedAtUtc?.ToUnixTimeSeconds(),
+                session = p.Session,
+                client = p.Client,
+                problem = p.Problem,
+            }),
         };
     }
 
-    private FeishuPayload SaveFeishu(JsonElement root)
+    // ── 完成通知 → 飞书 ──
+    // 只回结论、来源与遮蔽后的标识;凭据实值从不出现在应答里。
+
+    private static object ChannelPayload(NotifyChannelStatus status) => new
     {
-        string appId = root.TryGetProperty("appId", out JsonElement idEl) ? idEl.GetString() ?? "" : "";
-        string appSecret = root.TryGetProperty("appSecret", out JsonElement secEl) ? secEl.GetString() ?? "" : "";
-        string allowFrom = root.TryGetProperty("allowFrom", out JsonElement allowEl) ? allowEl.GetString() ?? "" : "";
-
-        // 校验信息里绝不回显用户输入的内容(哪怕是错的那一份也可能是真凭据的手误)。
-        if (string.IsNullOrWhiteSpace(appId) || string.IsNullOrWhiteSpace(appSecret))
-        {
-            throw new ArgumentException("App ID 与 App Secret 都必须填写。");
-        }
-
-        // fail-closed:allow_from 为空时 cc-connect 会放行所有飞书用户。
-        if (string.IsNullOrWhiteSpace(allowFrom))
-        {
-            throw new ArgumentException("必须填写授权用户 open_id,否则任何人都能驱动本机 AI 改你的项目。");
-        }
-
-        new FeishuCredentialStore().Save(appId, appSecret, allowFrom);
-        SyncNotifyRecipient(allowFrom);
-        return FeishuStatus();
-    }
-
-    private FeishuPayload ClearFeishu()
-    {
-        new FeishuCredentialStore().Clear();
-        try
-        {
-            _configStore.Update(c => c.NotifyRecipientOpenId = string.Empty);
-        }
-        catch (Exception ex)
-        {
-            ReportRequestFailure("feishu.recipient", ex);
-        }
-        return FeishuStatus();
-    }
-
-
-    /// <summary>
-    /// 生成、验证并重启 cc-connect。凭据由 <see cref="CutoverConfigCommand"/> 从 DPAPI 取,
-    /// 全流程在 <see cref="CcConnectApplyCommand"/>(与 CLI 共用)里完成;本类只做窗口内互斥与应答映射。
-    /// </summary>
-    private CutoverPayload GenerateAndRestartCutover()
-    {
-        if (Interlocked.CompareExchange(ref _cutoverInProgress, 1, 0) != 0)
-        {
-            return new CutoverPayload(
-                false, "已有一次 cc-connect 配置切换正在进行,请等待其完成。", 0, null,
-                _cutoverConfigPath, ConfigWritten: false, RestartVerified: false,
-                Agent: null, Pid: null, Phase: "busy");
-        }
-
-        try
-        {
-            CcConnectApplyResult r = CcConnectApplyCommand.Apply(_cutoverConfigPath, _cutoverGenerate, _daemonControllerFactory);
-            if (r.Phase == "exception")
+        larkCliFound = status.LarkCliFound,
+        credentialSource = status.CredentialSource,
+        appIdMasked = status.AppIdMasked,
+        legacyCredentialAvailable = status.LegacyCredentialAvailable,
+        recipientSet = status.RecipientSet,
+        recipientMasked = status.RecipientMasked,
+        // 最近一次成功送达时的凭据/收件人指纹与现在是否一致;null = 还没有成功记录或无法比较。
+        settingsVerified = status.SettingsVerified,
+        health = status.Health is { } health
+            ? new
             {
-                ReportRequestFailure("cutover.generate", new InvalidOperationException(r.Message));
+                state = health.State,
+                reason = health.Reason,
+                lastAttemptOk = health.LastAttemptOk,
+                lastSuccessAtUnix = health.LastSuccessUtc?.ToUnixTimeSeconds(),
+                lastAttemptAtUnix = health.LastAttemptUtc?.ToUnixTimeSeconds(),
+                blockedUntilUnix = health.BlockedUntilUtc?.ToUnixTimeSeconds(),
+                lastErrorClass = health.LastErrorClass,
+                lastErrorCode = health.LastErrorCode,
+                lastLogId = health.LastLogId,
+                backlog = health.Backlog,
+                dead = health.Dead,
+                credentialSource = health.CredentialSource,
+                updatedAtUnix = health.UpdatedAtUtc.ToUnixTimeSeconds(),
             }
+            : null,
+    };
 
-            return new CutoverPayload(r.Ok, r.Message, r.ProjectCount, r.SanitizedToml, r.OutPath,
-                r.ConfigWritten, r.RestartVerified, r.Agent, r.Pid, r.Phase);
-        }
-        finally
-        {
-            Volatile.Write(ref _cutoverInProgress, 0);
-        }
-    }
-
-    /// <summary>单消费者预检。只读,不停任何进程。</summary>
-    private PreflightPayload Preflight()
+    private async Task<object> DetectPayloadAsync(CancellationToken cancellationToken)
     {
-        ConsumerGuardResult result = SingleConsumerGuard.CreateDefault()
-            .Check(feishuPlatformConfigured: true);
-
-        // Detail 只有进程名与固定文案(SingleConsumerGuard 保证),不含原始命令行。
-        var conflicts = result.Conflicts
-            .Select(c => new PreflightConflict(c.Pid, c.Kind, c.Detail))
-            .ToList();
-
-        return new PreflightPayload(result.Verdict.ToString(), result.CanStart, result.Reason, conflicts);
+        RecipientCandidates found = await _notify.DetectRecipientsAsync(cancellationToken).ConfigureAwait(false);
+        return new
+        {
+            filteredByApp = found.FilteredByApp,
+            items = found.Users.Select(user => new { openId = user.UserOpenId, userName = user.UserName, tokenStatus = user.TokenStatus }),
+        };
     }
 
-    // ── Claude 凭据(长期令牌)──
-    // 实值单向流动:输入框 → 桥 → DPAPI(机器范围)。应答只回「有没有、何时存的、现在靠哪份」。
+    private static object CheckPayload(LarkDoctorReport report) => new
+    {
+        ok = report.Ok,
+        botReady = report.BotReady,
+        credentialSource = report.CredentialSource,
+        problem = report.Problem,
+        checks = report.Checks.Select(check => new { name = check.Name, status = check.Status, message = check.Message }),
+    };
 
-    private object ClaudeTokenStatus()
+    private static string ReadString(JsonElement root, string name) =>
+        root.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? string.Empty : string.Empty;
+
+    // ── Claude Code 登录 ──
+    // 只回结论与到期时间，不回任何令牌、邮箱或账号 UUID。
+
+    private object ClaudeLoginStatus()
     {
         ClaudeCredentialStatus status = _claudeCredentials.Describe();
+        // 本地文件时间戳说「有效」不等于服务端认:usage 端点刚以 401/403 拒绝过本机令牌、且之后登录文件没再换过时,
+        // 登录卡片必须说出来(改密码、被移出组织、在别处登出,本地文件都还是新的)。
+        QuotaService.OAuthRejection? rejection = _quota.LastRejection;
+        bool serverRejected = rejection is not null && !CredentialsRewrittenSince(rejection.AtUtc);
         return new
         {
-            hasStoredToken = status.HasStoredToken,
-            storedTokenSavedAtUnix = status.StoredTokenSavedAtUtc?.ToUnixTimeSeconds(),
-            cliLoggedIn = status.CliLoggedIn,
-            cliExpiresAtUnix = status.CliExpiresAtUtc?.ToUnixTimeSeconds(),
-            cliProblem = status.CliProblem,
-            activeSource = status.ActiveSource,
+            verdict = status.Verdict.ToString(),
+            serverRejected,
+            accessTokenExpiresAtUnix = status.AccessTokenExpiresAtUtc?.ToUnixTimeSeconds(),
+            loginExpiresAtUnix = status.LoginExpiresAtUtc?.ToUnixTimeSeconds(),
+            subscriptionType = status.SubscriptionType,
+            accountVerified = status.AccountVerified,
             problem = status.Problem,
-            storedRejectedReason = status.StoredRejectedReason,
-            storedProblem = status.StoredProblem,
         };
     }
 
-    private object SaveClaudeToken(JsonElement root)
+    /// <summary>登录文件在这之后被改写过(多半是 /login 或令牌续期):那次拒绝说的是旧令牌,不再作数。</summary>
+    private bool CredentialsRewrittenSince(DateTimeOffset atUtc)
     {
-        string token = root.TryGetProperty("token", out JsonElement tokenEl) && tokenEl.ValueKind == JsonValueKind.String
-            ? tokenEl.GetString() ?? string.Empty
-            : string.Empty;
-        if (string.IsNullOrWhiteSpace(token))
-        {
-            throw new ArgumentException("请粘贴 claude setup-token 输出的令牌。");
-        }
-
-        // 形状校验失败的异常文案不含输入内容;保存后由下一次额度请求真实验证。
-        _claudeCredentials.SaveToken(token);
-        return ClaudeTokenStatus();
-    }
-
-    private object ClearClaudeToken()
-    {
-        _claudeCredentials.ClearToken();
-        return ClaudeTokenStatus();
-    }
-
-    /// <summary>
-    /// 把通知收件人 open_id 同步进明文产品配置。Worker 的通知路径只读这份明文,
-    /// 不再在 S4U 会话里解 DPAPI(2026-09/10 间歇失败数小时的根因)。只在值变化时写。
-    /// </summary>
-    private void SyncNotifyRecipient(string? allowFrom)
-    {
-        string? recipient = NotificationWorker.FirstOpenId(allowFrom);
         try
         {
-            if (recipient is not null &&
-                !string.Equals(_configStore.Load().NotifyRecipientOpenId, recipient, StringComparison.Ordinal))
-            {
-                _configStore.Update(c => c.NotifyRecipientOpenId = recipient);
-            }
+            string path = _claudeCredentials.CredentialsPath;
+            return File.Exists(path) && File.GetLastWriteTimeUtc(path) > atUtc.UtcDateTime;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            ReportRequestFailure("feishu.recipient", ex);
+            return false;
         }
     }
 
@@ -1205,50 +1310,6 @@ public sealed class ControlPlaneBridge
         {
             // 本地诊断失败不能覆盖原始业务错误,也不能改变前端应答契约。
         }
-    }
-
-    /// <summary>
-    /// 读取当前 agent 选择与全部可选值。当前值经 Normalize 保证合法,
-    /// 即使 shadow 配置被手改坏也不会把非法值回给前端。
-    /// </summary>
-    private object GetAgent()
-    {
-        string current = CcConnectAgents.Normalize(_configStore.Load().CcConnectAgent);
-
-        // installed 决定界面能不能点:选一个本机没装 CLI 的 agent,
-        // cc-connect 重启后会起不动那个 agent —— 表现为机器人不回话,
-        // 而用户只会觉得"刚换了个模型就坏了",排查方向完全跑偏。
-        var options = CcConnectAgents.Supported
-            .Select(a => new { id = a.Id, display = a.Display, installed = CcConnectAgents.IsInstalled(a.Id) })
-            .ToArray();
-
-        return new { current, options };
-    }
-
-    /// <summary>
-    /// 设置 agent 选择。**必须走 Update 的锁内读-改-写**:配置可能同时被 Worker 的
-    /// 续跑引擎修改,整体写回旧快照会互相覆盖(本项目有过锁外读旧快照整体写回的事故)。
-    /// 返回 restartRequired=true,因为 cc-connect 运行时切不了 agent,必须重启才生效。
-    /// </summary>
-    private object SetAgent(JsonElement root)
-    {
-        string? raw = root.TryGetProperty("agent", out JsonElement agentEl) && agentEl.ValueKind == JsonValueKind.String
-            ? agentEl.GetString()
-            : null;
-
-        string next = CcConnectAgents.Normalize(raw);
-
-        // 拒绝选未安装的:写进去等于生成一份重启后起不来的配置,
-        // 而失败现象(机器人不回话)离原因(选了没装的 agent)非常远。
-        if (!CcConnectAgents.IsInstalled(next))
-        {
-            throw new InvalidOperationException(
-                $"本机未安装 {next} 的命令行工具,选它会让 cc-connect 重启后起不来。请先安装再切换。");
-        }
-
-        _configStore.Update(c => c.CcConnectAgent = next);
-
-        return new { current = next, restartRequired = true };
     }
 
     private static string DescribeWindow(string name) => name switch
@@ -1285,43 +1346,6 @@ public sealed class ControlPlaneBridge
     private sealed record PickFolderPayload(
         [property: JsonPropertyName("path")] string? Path);
 
-    /// <summary>飞书接入状态。**没有 appSecret 字段,这是刻意的**——实值不回传前端。</summary>
-    private sealed record FeishuPayload(
-        [property: JsonPropertyName("hasCredentials")] bool HasCredentials,
-        [property: JsonPropertyName("appIdMasked")] string? AppIdMasked,
-        [property: JsonPropertyName("allowFrom")] string? AllowFrom,
-        [property: JsonPropertyName("configPath")] string ConfigPath,
-        [property: JsonPropertyName("configExists")] bool ConfigExists,
-        // missing / ok / invalid / unknown —— 「文件在」和「加载得了」是两件事。
-        [property: JsonPropertyName("configState")] string ConfigState,
-        [property: JsonPropertyName("configSummary")] string ConfigSummary,
-        [property: JsonPropertyName("configProblems")] IReadOnlyList<string> ConfigProblems,
-        // agent / provider / model 对不上:配置照常加载,但行为不是用户以为的那样。
-        [property: JsonPropertyName("configWarnings")] IReadOnlyList<string> ConfigWarnings);
-
-    private sealed record CutoverPayload(
-        [property: JsonPropertyName("ok")] bool Ok,
-        [property: JsonPropertyName("message")] string Message,
-        [property: JsonPropertyName("projectCount")] int ProjectCount,
-        [property: JsonPropertyName("sanitizedToml")] string? SanitizedToml,
-        [property: JsonPropertyName("outPath")] string? OutPath,
-        [property: JsonPropertyName("configWritten")] bool ConfigWritten,
-        [property: JsonPropertyName("restartVerified")] bool RestartVerified,
-        [property: JsonPropertyName("agent")] string? Agent,
-        [property: JsonPropertyName("pid")] int? Pid,
-        [property: JsonPropertyName("phase")] string Phase);
-
-    private sealed record PreflightPayload(
-        [property: JsonPropertyName("verdict")] string Verdict,
-        [property: JsonPropertyName("canStart")] bool CanStart,
-        [property: JsonPropertyName("reason")] string? Reason,
-        [property: JsonPropertyName("conflicts")] IReadOnlyList<PreflightConflict> Conflicts);
-
-    private sealed record PreflightConflict(
-        [property: JsonPropertyName("pid")] int Pid,
-        [property: JsonPropertyName("kind")] string Kind,
-        [property: JsonPropertyName("detail")] string Detail);
-
     private sealed record AppInfoPayload(
         [property: JsonPropertyName("version")] string Version,
         [property: JsonPropertyName("shadowRoot")] string ShadowRoot,
@@ -1329,14 +1353,6 @@ public sealed class ControlPlaneBridge
 
     private sealed record NotificationsPayload(
         [property: JsonPropertyName("items")] IReadOnlyList<NotificationItem> Items);
-
-    private sealed record LocalBlockPayload(
-        [property: JsonPropertyName("active")] bool Active,
-        [property: JsonPropertyName("startUnix")] long? StartUnix,
-        [property: JsonPropertyName("endUnix")] long? EndUnix,
-        [property: JsonPropertyName("totalTokens")] long TotalTokens,
-        [property: JsonPropertyName("messageCount")] int MessageCount,
-        [property: JsonPropertyName("elapsedMs")] long ElapsedMs);
 
     private sealed record ArmPayload(
         [property: JsonPropertyName("armed")] bool Armed,
@@ -1351,7 +1367,43 @@ public sealed class ControlPlaneBridge
         [property: JsonPropertyName("engineText")] string EngineText,
         [property: JsonPropertyName("probeAgeSeconds")] long? ProbeAgeSeconds,
         [property: JsonPropertyName("resumeTarget")] ResumeTarget? ResumeTarget = null,
-        [property: JsonPropertyName("probeReason")] string ProbeReason = "");
+        [property: JsonPropertyName("probeReason")] string ProbeReason = "")
+    {
+        /// <summary>逐项目：会话、模型、状态与等待原因(按 Selected 顺序)。</summary>
+        [JsonPropertyName("projects")]
+        public IReadOnlyList<ArmProjectItem> Projects { get; init; } = [];
+
+        /// <summary>布防时需要告诉用户、但不阻止布防的提示(如会话正开在客户端、会话模型不在目录)。</summary>
+        [JsonPropertyName("warnings")]
+        public IReadOnlyList<string>? Warnings { get; init; }
+
+        /// <summary>
+        /// 后台 Worker 是否在跑(不论是否布防):完成通知和续跑都由它执行。true 要有同名进程且常驻 Worker 的
+        /// Named Pipe 应答;null = 核验不出(进程枚举失败,或有同名进程但管道不应答),界面显示未核实而不是「在跑」。
+        /// null 是有意义的结论,必须原样写出:桥的序列化选项默认丢掉 null 字段,字段一缺,页面就分不清
+        /// 「核验不出」和「还没读到」——页脚空白,机器人行照样显示可送达。
+        /// </summary>
+        [JsonPropertyName("workerRunning")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+        public bool? WorkerRunning { get; init; }
+    }
+
+    private sealed record ArmProjectItem(
+        [property: JsonPropertyName("path")] string Path,
+        [property: JsonPropertyName("name")] string Name,
+        [property: JsonPropertyName("sessionId")] string SessionId,
+        [property: JsonPropertyName("modelId")] string ModelId,
+        [property: JsonPropertyName("modelName")] string ModelName,
+        [property: JsonPropertyName("modelSource")] string ModelSource,
+        [property: JsonPropertyName("status")] string? Status,
+        [property: JsonPropertyName("category")] string Category,
+        [property: JsonPropertyName("reason")] string? Reason,
+        [property: JsonPropertyName("reasonText")] string ReasonText,
+        [property: JsonPropertyName("hint")] string Hint,
+        [property: JsonPropertyName("detail")] string? Detail,
+        [property: JsonPropertyName("resetAtUnix")] long? ResetAtUnix,
+        [property: JsonPropertyName("interruptedAtUnix")] long? InterruptedAtUnix,
+        [property: JsonPropertyName("client")] string? Client);
 
     private sealed record ProjectStatusItem(
         [property: JsonPropertyName("path")] string Path,
@@ -1402,5 +1454,6 @@ public sealed class ControlPlaneBridge
         [property: JsonPropertyName("isEnabled")] bool IsEnabled,
         [property: JsonPropertyName("configPath")] string? ConfigPath,
         [property: JsonPropertyName("detail")] string? Detail,
-        [property: JsonPropertyName("hookBroken")] bool HookBroken);
+        [property: JsonPropertyName("hookBroken")] bool HookBroken,
+        [property: JsonPropertyName("unverified")] bool Unverified = false);
 }

@@ -13,6 +13,18 @@ public sealed class ProjectRef
 
     /// <summary>布防时固定的原生会话 UUID，执行时禁止用全局 --last 猜测。</summary>
     public string SessionId { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 本项目续跑用的模型调用 ID,布防时冻结。默认跟随该会话最近一次真实应答的模型，
+    /// 用户可逐项目改选;多个项目可以指向同一个模型(共用同一份额度证据)。
+    /// 空 = 旧配置，沿用 <see cref="ResumeTarget.ModelId"/>。
+    /// </summary>
+    public string ModelId { get; set; } = string.Empty;
+
+    public string ModelName { get; set; } = string.Empty;
+
+    /// <summary>session(跟随会话)/ user(手选)/ default(会话模型不在目录时退回默认模型)。</summary>
+    public string ModelSource { get; set; } = string.Empty;
 }
 
 /// <summary>
@@ -75,9 +87,6 @@ public sealed class ProductConfig
     /// </summary>
     public bool SkipPermissions { get; set; }
 
-    /// <summary>cc-connect 项目绑定的 agent 类型。见 CcConnectAgents.Supported。</summary>
-    public string CcConnectAgent { get; set; } = "claudecode";
-
     /// <summary>
     /// 用户想开着的完成通知源(NotificationProviderKind 的名字)。
     ///
@@ -93,12 +102,18 @@ public sealed class ProductConfig
     public List<string> NotifySources { get; set; } = new();
 
     /// <summary>
-    /// 完成通知的收件人 open_id(明文)。
+    /// <see cref="NotifySources"/> 是否被记录过(界面开关、<c>notify enable/disable</c>、install 对账都会置 true)。
+    /// 用来区分「从未记录」的旧配置与「用户把通知源全关了」的空列表:后者要求投递端丢弃一切钩子事件。
+    /// </summary>
+    public bool NotifyIntentRecorded { get; set; }
+
+    /// <summary>
+    /// 飞书通知的收件人 open_id(明文，唯一真身)。
     ///
-    /// 它不是机密:同一个值本来就以明文写在 <c>~/.cc-connect/config.toml</c> 的 <c>allow_from</c> 里。
-    /// 原来 Worker 为了拿它去解整份 DPAPI 密文(含 app_secret),而 Worker 以 S4U 计划任务跑在会话 0,
-    /// 用户范围 DPAPI 在那里会间歇失败数小时(2026-09/10 日志实证)——通知就跟着静默丢失。
-    /// 把收件人放进明文配置后,Worker 的通知路径不再碰 DPAPI;app_secret 仍只由 GUI 使用。
+    /// 它不是机密，而是 lark-cli 所登录应用下的用户标识:由控制面「飞书通知」设置，
+    /// 或从 <c>lark-cli auth list</c> 识别(同一应用下的 open_id 才有效，open_id 按应用隔离)。
+    /// Worker 以 S4U 计划任务跑在会话 0,用户范围 DPAPI 在那里会间歇失败数小时(2026-09/10 日志实证),
+    /// 所以收件人必须是明文配置，投递路径不得为了它去解任何密文。
     /// </summary>
     public string NotifyRecipientOpenId { get; set; } = string.Empty;
 

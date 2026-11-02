@@ -50,6 +50,15 @@ public sealed record ResumeRunResult
 
     /// <summary>本次运行已经出现写入、命令或未知工具活动;一旦为 true 就禁止自动重放。</summary>
     public bool SideEffectsStarted { get; init; }
+
+    /// <summary>
+    /// 明确没有 spawn(执行计划创建失败、会话占用、令牌即将过期、spawn 前配置变化)。
+    /// 这类结果不可能有副作用：不锁周期、不消费中断，下一拍重新评估。
+    /// </summary>
+    public bool NotStarted { get; init; }
+
+    /// <summary>未启动的原因码与可读说明(不含凭据)。</summary>
+    public string? NotStartedDetail { get; init; }
 }
 
 /// <summary>续跑运行器最小接口(供 ResumeEngine 依赖注入与测试替身)。</summary>
@@ -140,12 +149,12 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
 
         if (Path.IsPathRooted(_claudeCommand) && !File.Exists(_claudeCommand))
         {
-            return result with { Status = "no-claude" };
+            return result with { Status = "no-claude", NotStarted = true, NotStartedDetail = "执行器不存在" };
         }
 
         if (!Directory.Exists(projectPath))
         {
-            return result with { Status = "no-claude" };
+            return result with { Status = "no-claude", NotStarted = true, NotStartedDetail = "项目目录不存在" };
         }
 
         // 换行必须显式失败:cmd /c 会在首个换行处截断 -p 参数(见 docs/LESSONS.md),
@@ -159,12 +168,16 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
         string tmpErr = Path.Combine(Path.GetTempPath(), "ccu-resume-" + Guid.NewGuid().ToString("N") + ".err");
         RunId runId = RunId.New();
 
+        // 项目级模型优先;旧配置没有项目模型时，执行计划已核验 ResumeModel 等于布防目标的默认模型。
+        string expectedModel = project.ModelId is { Length: > 0 } projectModel ? projectModel : config.ResumeModel;
         try
         {
             using ResumeExecutionPlan? plan = _execution?.Create(project, config);
             bool CurrentPlan() => (plan?.ConfigurationLease is not ExecutionConfigLease lease || lease.IsCurrent) &&
                 (config.ResumeTarget is not { } bound || _execution?.IsCurrent(bound) != false);
-            if (!CurrentPlan()) return result with { Status = "configuration-changed", StopRound = true };
+            // spawn 前发现配置变化:还没有任何进程，不是执行失败。beforeStart 之后发生时
+            // 调用方据 PreparedRunId 撤销预登记。
+            if (!CurrentPlan()) return result with { Status = "configuration-changed", NotStarted = true, NotStartedDetail = "配置在启动前发生变化" };
             // product_state 必须先持久化本次 RunId,再交给 ProcessSupervisor 登记并 spawn。
             // 否则 Worker 在 spawn 成功到回调落盘之间崩溃时,新 Worker 无法识别这次运行,
             // 可能自动重放已经产生过副作用的项目。
@@ -182,12 +195,12 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
 
                 if (!accepted)
                 {
-                    return result with { Status = "stopped", StopRound = true };
+                    return result with { Status = "stopped", StopRound = true, NotStarted = true, NotStartedDetail = "启动门禁未放行" };
                 }
 
                 result = result with { PreparedRunId = runId };
             }
-            if (!CurrentPlan()) return result with { Status = "configuration-changed", StopRound = true };
+            if (!CurrentPlan()) return result with { Status = "configuration-changed", NotStarted = true, NotStartedDetail = "配置在启动前发生变化" };
 
             var request = new ProcessStartRequest
             {
@@ -301,7 +314,7 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
                         if (type == "system" && row.TryGetProperty("subtype", out JsonElement subtype) && subtype.GetString() == "init")
                         {
                             invalidProtocol |= ++initCount != 1;
-                            actualModelMatched = row.TryGetProperty("model", out JsonElement model) && model.GetString() == config.ResumeModel;
+                            actualModelMatched = row.TryGetProperty("model", out JsonElement model) && model.GetString() == expectedModel;
                             invalidProtocol |= !actualModelMatched;
                         }
                         if (type == "result") invalidProtocol |= ++resultCount != 1 || initCount != 1;
@@ -344,9 +357,15 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
                 OutputBytes = outputBytes,
             };
         }
-        catch (InvalidOperationException) when (_execution is not null && result.RunId is null)
+        catch (ResumeDeferredException deferred) when (result.RunId is null)
         {
-            return result with { Status = "execution-unverified", StopRound = true };
+            return result with { Status = deferred.Reason, NotStarted = true, NotStartedDetail = deferred.Message };
+        }
+        catch (InvalidOperationException unverified) when (_execution is not null && result.RunId is null)
+        {
+            // 执行条件未核实(供应商/账号变化、组织策略、执行器缺失……)发生在 spawn 之前，
+            // 没有副作用：不锁周期，把原因交给界面，下一拍重新评估。
+            return result with { Status = "execution-unverified", NotStarted = true, NotStartedDetail = Truncate(unverified.Message) };
         }
         catch (Exception)
         {
@@ -612,6 +631,8 @@ public sealed class ClaudeResumeRunner : IClaudeResumeRunner
         sb.Append(" > \"").Append(tmpOut).Append("\" 2> \"").Append(tmpErr).Append("\"\"");
         return sb.ToString();
     }
+
+    private static string Truncate(string text) => text.Length <= 120 ? text : text[..120];
 
     private static string SafeRead(string path)
     {

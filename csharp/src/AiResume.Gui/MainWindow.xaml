@@ -2,9 +2,9 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
-        Title="AI Resume 控制面" Icon="icon.ico" Height="760" Width="1120" MinHeight="560" MinWidth="900"
+        Title="AI Resume 控制面" Icon="icon.ico" Height="760" Width="1120" MinHeight="600" MinWidth="900"
         WindowStartupLocation="CenterScreen"
-        Background="#0E1A1F" Foreground="#DDE9EB"
+        Background="#DEDACB" Foreground="#26231D"
         UseLayoutRounding="True" SnapsToDevicePixels="True"
         TextOptions.TextFormattingMode="Display">
   <!--
@@ -14,18 +14,16 @@
     收益不抵风险,留待视觉打磨阶段单独评估。
   -->
   <Grid>
-    <!-- 骨架:WebView2 就绪前显示,避免白屏 -->
-    <Border x:Name="Skeleton" Background="#0E1A1F">
+    <!-- 骨架:WebView2 就绪前显示,与页面同一块骨白面板,避免白屏或换色闪烁 -->
+    <Border x:Name="Skeleton" Background="#DEDACB">
       <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
-        <Border Width="34" Height="34" CornerRadius="9" Background="#3FBFB4" HorizontalAlignment="Center">
-          <TextBlock Text="AR" Foreground="#062024" FontWeight="Bold" FontSize="13"
-                     FontFamily="Consolas" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-        </Border>
-        <TextBlock x:Name="SkeletonText" Text="正在启动控制面…" Foreground="#63797F" FontSize="12.5"
-                   Margin="0,14,0,0" HorizontalAlignment="Center"/>
+        <TextBlock Text="AI RESUME" Foreground="#26231D" FontSize="20" FontFamily="Consolas"
+                   HorizontalAlignment="Center"/>
+        <TextBlock x:Name="SkeletonText" Text="正在启动控制面…" Foreground="#5E5A4F" FontSize="12.5"
+                   Margin="0,12,0,0" HorizontalAlignment="Center"/>
       </StackPanel>
     </Border>
 
-    <wv2:WebView2 x:Name="Host" Visibility="Collapsed" DefaultBackgroundColor="#0E1A1F"/>
+    <wv2:WebView2 x:Name="Host" Visibility="Collapsed" DefaultBackgroundColor="#DEDACB"/>
   </Grid>
 </Window>

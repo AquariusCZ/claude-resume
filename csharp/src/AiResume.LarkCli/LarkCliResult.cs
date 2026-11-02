@@ -14,11 +14,22 @@ public sealed class LarkCliResult
     /// <summary>从脱敏后 stdout 解析的信封;输出非 JSON 时为 null。</summary>
     public LarkEnvelope? Envelope { get; }
 
-    public LarkCliResult(int exitCode, string stdout, string stderr, LarkEnvelope? envelope)
+    /// <summary>
+    /// 退出码非 0 时的错误信封：lark-cli 把它写在 **stderr**,stdout 只作兜底。
+    /// 退出码为 0 时为 null。
+    /// </summary>
+    public LarkEnvelope? ErrorEnvelope { get; }
+
+    public TimeSpan Duration { get; }
+
+    public LarkCliResult(int exitCode, string stdout, string stderr, LarkEnvelope? envelope,
+        LarkEnvelope? errorEnvelope = null, TimeSpan duration = default)
     {
         ExitCode = exitCode;
         Stdout = stdout;
         Stderr = stderr;
         Envelope = envelope;
+        ErrorEnvelope = errorEnvelope;
+        Duration = duration;
     }
 }

@@ -164,6 +164,14 @@ public static class InstallCommand
 
             bool hooksOk = activation.HooksOk;
             File.Delete(Path.Combine(fullTarget, PreservedRootMarkerName));
+            // 旧令牌在实际状态根(ShadowPaths.Root,与安装位置无关;AIRESUME_SHADOW_DIR 可覆盖)下;
+            // 自定义 --target 时安装目录旁的 state 也清一遍。
+            RetireLegacyClaudeToken(ShadowPaths.Root);
+            string targetState = Path.Combine(fullTarget, ShadowPaths.StateFolder);
+            if (!string.Equals(Path.GetFullPath(targetState).TrimEnd('\\'), Path.GetFullPath(ShadowPaths.Root).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+            {
+                RetireLegacyClaudeToken(targetState);
+            }
 
             Console.WriteLine();
             Console.WriteLine("入口已全部指向安装目录,与仓库路径脱钩(改名/清 bin/换分支都不再影响)。");
@@ -549,7 +557,8 @@ public static class InstallCommand
         return false;
     }
 
-    private static bool CanPingWorker(TimeSpan timeout, int? expectedProcessId = null)
+    /// <summary>当前用户的常驻 Worker 是否经 Named Pipe 应答(协议版本一致;给了 PID 时还要 PID 相同)。</summary>
+    public static bool CanPingWorker(TimeSpan timeout, int? expectedProcessId = null)
     {
         try
         {
@@ -567,6 +576,35 @@ public static class InstallCommand
         => ping is not null &&
            string.Equals(ping.Version, PipeProtocol.Version, StringComparison.Ordinal) &&
            (!expectedProcessId.HasValue || ping.ProcessId == expectedProcessId.Value);
+
+    /// <summary>
+    /// v2.2 起 Claude 凭据只用 Claude Code 自己的登录(ADR-0006),v2.1 的 <c>claude setup-token</c> 长期令牌
+    /// 已无任何读者。留着它只是一份无人使用的加密凭据，安装时删除它及其拒绝标记;删不掉只提示，不影响安装结果。
+    /// </summary>
+    public static void RetireLegacyClaudeToken(string stateRoot)
+    {
+        foreach (string name in new[] { "claude-oauth-token.bin", "claude-oauth-token.bin.rejected.json" })
+        {
+            string path = Path.Combine(stateRoot, "secrets", name);
+            try
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                    Console.WriteLine($"已删除不再使用的 Claude 长期令牌文件 {name}");
+                    if (name.EndsWith(".bin", StringComparison.Ordinal))
+                    {
+                        // 删掉本地密文不等于吊销:setup-token 签发的令牌在服务端约一年有效。
+                        Console.WriteLine("  提示:删除本地文件不会在服务端吊销这份令牌;如需彻底作废,请在 Claude 账号的授权管理里撤销。");
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Console.Error.WriteLine($"注意:未能删除旧的 Claude 长期令牌文件 {path}({ex.GetType().Name}),它已不再被读取,请手动删除。");
+            }
+        }
+    }
 
     private static int Uninstall(string target)
     {
@@ -830,7 +868,7 @@ public static class InstallCommand
     {
         var registry = new NotificationRegistry();
         IReadOnlyList<NotificationProviderStatus> before = registry.ProbeAll();
-        SaveIntent(NotifyIntent.FromProbe(before));
+        SaveIntent(NotifyIntent.FromProbe(before, LoadIntent()));
         int preamble = RunUninstallPreamble(
             target,
             () => ShortcutCommand.Run(["shortcuts", "uninstall"]),
@@ -1315,10 +1353,17 @@ public static class InstallCommand
 
         var registry = new NotificationRegistry();
         IReadOnlyList<NotificationProviderStatus> probed = registry.ProbeAll();
-        List<NotificationProviderKind> targets = NotifyIntent.Targets(LoadIntent(), probed);
+        List<string> recorded = LoadIntent();
+        List<NotificationProviderKind> targets = NotifyIntent.Targets(recorded, probed);
+        // 意图里有、这次却读不出配置的源:开没开不知道。不去改写读不出的配置，意图原样保留，并按「未能对齐」如实返回。
+        List<NotificationProviderKind> unverified = NotifyIntent.Unverified(recorded, probed);
 
         var done = new List<NotificationProviderKind>();
-        bool allOk = true;
+        bool allOk = unverified.Count == 0;
+        foreach (NotificationProviderKind kind in unverified)
+        {
+            Console.Error.WriteLine($"警告:通知源 {kind} 的配置这次读不出来,开没开未核实;意图保留,稍后重新 install 对账。");
+        }
         foreach (NotificationProviderKind kind in targets)
         {
             try
@@ -1346,8 +1391,8 @@ public static class InstallCommand
         }
 
         // 意图代表用户想要的目标,不是本轮偶然成功的子集。失败项必须保留,
-        // 否则一次权限/磁盘错误会让后续安装永远不再重试。
-        SaveIntent(targets.Select(k => k.ToString()).ToList());
+        // 否则一次权限/磁盘错误会让后续安装永远不再重试;读不出配置的源同理。
+        SaveIntent(targets.Concat(unverified).Distinct().OrderBy(k => (int)k).Select(k => k.ToString()).ToList());
 
         // 核对到底:写完再探一次,确认配置里真的有了。写成功不等于探得到——
         // 本项目已经三次栽在"只看自己写了什么,不回头看世界变没变"上。
@@ -1386,7 +1431,11 @@ public static class InstallCommand
     {
         try
         {
-            new ProductConfigStore(ShadowPaths.EnsureRoot()).Update(c => c.NotifySources = sources);
+            new ProductConfigStore(ShadowPaths.EnsureRoot()).Update(c =>
+            {
+                c.NotifySources = sources;
+                c.NotifyIntentRecorded = true;
+            });
         }
         catch (Exception ex)
         {

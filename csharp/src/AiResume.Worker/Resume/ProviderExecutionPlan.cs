@@ -12,9 +12,26 @@ public sealed record ResumeExecutionPlan(AgentCommand Command, IReadOnlyList<str
     public void Dispose() => ConfigurationLease?.Dispose();
 }
 
+/// <summary>布防只核验执行条件，不检查会话占用;启动前才要求会话空闲、令牌够用。</summary>
+public enum ExecutionPurpose
+{
+    Arm,
+    Spawn,
+}
+
+/// <summary>
+/// 暂时不能启动、但不是执行失败：会话在客户端打开、同目录另一会话在跑、登录令牌即将过期。
+/// 不产生 RunId,不锁周期，下一拍重新评估。
+/// </summary>
+public sealed class ResumeDeferredException(string reason, string message) : InvalidOperationException(message)
+{
+    /// <summary>session-in-use / cwd-busy / session-unverified / token-expiring。</summary>
+    public string Reason { get; } = reason;
+}
+
 public interface IProviderExecutionPlan
 {
-    ResumeExecutionPlan Create(ProjectRef project, ProductConfig config);
+    ResumeExecutionPlan Create(ProjectRef project, ProductConfig config, ExecutionPurpose purpose = ExecutionPurpose.Spawn);
     bool IsCurrent(ResumeTarget target);
 }
 
@@ -26,10 +43,18 @@ public sealed class ProviderExecutionPlan : IProviderExecutionPlan
     private readonly Func<string, string, IEnumerable<string>> _configurationPaths;
     private readonly string _codexHome;
     private readonly Func<bool> _codexWriterLockVerified;
+    private readonly Func<DateTimeOffset> _clock;
+
+    /// <summary>
+    /// 续跑子进程拿到的是启动那一刻的 access token(环境变量里没有 refresh token,子进程无法自行续期)。
+    /// 剩余寿命不足这个值就先不启动，等 Claude Code 自己刷新：一次续跑至少能跑这么久而不中途 401。
+    /// </summary>
+    public static readonly TimeSpan MinimumTokenLifetime = TimeSpan.FromMinutes(45);
+
     public ProviderExecutionPlan(ProviderRegistry registry, ResumeSessionCatalog? sessions = null,
         Func<string, AgentCommand?>? command = null,
         Func<string, string, IEnumerable<string>>? configurationPaths = null, string? codexHome = null,
-        Func<bool>? codexWriterLockVerified = null)
+        Func<bool>? codexWriterLockVerified = null, Func<DateTimeOffset>? clock = null)
     {
         _registry = registry;
         _sessions = sessions ?? new ResumeSessionCatalog();
@@ -37,37 +62,54 @@ public sealed class ProviderExecutionPlan : IProviderExecutionPlan
         _configurationPaths = configurationPaths ?? ExecutionConfigLease.Paths;
         _codexHome = codexHome ?? CodexAuthProbe.ResolveCodexHome();
         _codexWriterLockVerified = codexWriterLockVerified ?? (() => AgentCommandLocator.CodexVersion() == "0.148.0");
+        _clock = clock ?? (() => DateTimeOffset.UtcNow);
     }
 
-    public ResumeExecutionPlan Create(ProjectRef project, ProductConfig config)
+    public ResumeExecutionPlan Create(ProjectRef project, ProductConfig config, ExecutionPurpose purpose = ExecutionPurpose.Spawn)
     {
         string agent = config.ResumeTarget?.Agent ?? "claudecode";
         var lease = ExecutionConfigLease.Acquire(_configurationPaths(agent, project.Path).Where(path =>
             !(agent == "claudecode" && Path.GetFileName(path) is ".claude.json" or ".config.json")));
         try
         {
-            ResumeExecutionPlan plan = CreateCore(project, config, lease);
+            ResumeExecutionPlan plan = CreateCore(project, config, lease, purpose);
             if (!lease.IsCurrent) throw new InvalidOperationException("配置在验证期间发生变化，请重新布防");
             return plan with { ConfigurationLease = lease };
         }
         catch { lease.Dispose(); throw; }
     }
 
-    private ResumeExecutionPlan CreateCore(ProjectRef project, ProductConfig config, ExecutionConfigLease lease)
+    private ResumeExecutionPlan CreateCore(ProjectRef project, ProductConfig config, ExecutionConfigLease lease, ExecutionPurpose purpose)
     {
         ResumeTarget target = config.ResumeTarget ?? throw new InvalidOperationException("需要重新选择供应商并布防");
         ProviderConnection? connection = _registry.Find(target.ProviderId);
         if (!target.IsValid || target.ModelId != config.ResumeModel ||
             connection?.Identity != target.ProviderIdentity || connection.Agent != target.Agent)
             throw new InvalidOperationException("供应商或账号已改变，需要重新布防");
+        string model = ResumeTarget.EffectiveModel(project, target);
+        if (!ProviderModels.IsSafeId(model)) throw new InvalidOperationException("项目的续跑模型无效，请重新布防");
         if (!_sessions.Matches(target.Agent, project)) throw new InvalidOperationException("原生会话归属无法核实");
         AgentCommand command = _command(target.Agent) ?? throw new InvalidOperationException("执行器未安装");
         var arguments = new List<string>(command.Prefix);
         var environment = new Dictionary<string, string?> { ["AI_RESUME_INTERNAL_RUN"] = "1" };
         if (target.Agent == "claudecode")
         {
-            if (_sessions.IsClaudeSessionIdle(project.SessionId) != true)
-                throw new InvalidOperationException("原生 Claude 会话仍被客户端占用或状态未核实，请先关闭该会话");
+            if (purpose == ExecutionPurpose.Spawn)
+            {
+                SessionOccupancy occupancy = _sessions.Occupancy(project);
+                if (occupancy.State != "idle")
+                    throw occupancy.State switch
+                    {
+                        "in-use" => new ResumeDeferredException("session-in-use", "原生 Claude 会话正在客户端打开"),
+                        "cwd-busy" => new ResumeDeferredException("cwd-busy", "同目录另一个 Claude 会话正在运行"),
+                        _ => new ResumeDeferredException("session-unverified", "原生 Claude 会话占用状态未核实"),
+                    };
+                // 到期时间与要注入的令牌出自同一次读取(connection),不另读文件:两次读之间 Claude Code 可能刚换了令牌。
+                if (connection.Kind == "claude-oauth" &&
+                    (connection.AccessTokenExpiresAtUtc is not { } expiry ||
+                     expiry - _clock() < MinimumTokenLifetime))
+                    throw new ResumeDeferredException("token-expiring", "Claude 登录令牌即将过期，等 Claude Code 自动续期后再续跑");
+            }
             ClaudeHostProvider.Validate(command, project.Path);
             environment[ClaudeHostProvider.Flag] = "1";
             environment["ANTHROPIC_BASE_URL"] = connection.Credentials.BaseUrl;
@@ -76,7 +118,7 @@ public sealed class ProviderExecutionPlan : IProviderExecutionPlan
                 ? string.Empty : connection.Credentials.BearerToken;
             environment["CLAUDE_CODE_OAUTH_TOKEN"] = connection.Kind == "claude-oauth" ? connection.Credentials.BearerToken : string.Empty;
             arguments.AddRange(new[] { "--resume", project.SessionId, "-p", config.ResumePrompt,
-                "--model", target.ModelId, "--output-format", "stream-json", "--verbose" });
+                "--model", model, "--output-format", "stream-json", "--verbose" });
             if (config.SkipPermissions) arguments.Add("--dangerously-skip-permissions");
         }
         else
@@ -138,7 +180,7 @@ public sealed class ProviderExecutionPlan : IProviderExecutionPlan
                 Override("model_providers." + provider + ".env_http_headers", "{" + string.Join(",", headerVariables) + "}");
             }
             arguments.AddRange(new[] { "exec", "resume", project.SessionId, config.ResumePrompt,
-                "--model", target.ModelId, "--json", "--skip-git-repo-check" });
+                "--model", model, "--json", "--skip-git-repo-check" });
         }
         return new(command, arguments, environment, target.Agent);
     }

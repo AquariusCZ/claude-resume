@@ -8,15 +8,16 @@ public sealed class ControlPlaneBridgeDemoTests
 {
     [Theory]
     [InlineData("projects.list")]
-    [InlineData("quota.local")]
     [InlineData("quota.get")]
     [InlineData("providers.catalog")]
-    [InlineData("claude.token.status")]
+    [InlineData("claude.login.status")]
     [InlineData("arm.get")]
-    [InlineData("feishu.status")]
+    [InlineData("arm.preview")]
     [InlineData("notifications.list")]
+    [InlineData("notify.channel")]
+    [InlineData("notify.check")]
+    [InlineData("notify.recipient.detect")]
     [InlineData("app.info")]
-    [InlineData("agent.get")]
     public async Task 截图模式只返回合成数据(string type)
     {
         var bridge = new ControlPlaneBridge(demoMode: true);

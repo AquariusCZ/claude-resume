@@ -337,7 +337,7 @@ public static partial class CodexAuthProbe
 
         try
         {
-            TomlTable root = TomlSerializer.Deserialize<TomlTable>(File.ReadAllText(configPath))
+            TomlTable root = TomlSerializer.Deserialize<TomlTable>(SharedFile.ReadAllText(configPath))
                 ?? new TomlTable();
             TomlTable effective = root;
             string profileName = ReadTableString(root, "profile");
@@ -567,7 +567,7 @@ public static partial class CodexAuthProbe
 
         try
         {
-            using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(authPath));
+            using JsonDocument doc = JsonDocument.Parse(SharedFile.ReadAllText(authPath));
             if (doc.RootElement.ValueKind != JsonValueKind.Object)
             {
                 return new AuthFileCredential(null, "auth.json", "Codex auth.json 不是对象", null);

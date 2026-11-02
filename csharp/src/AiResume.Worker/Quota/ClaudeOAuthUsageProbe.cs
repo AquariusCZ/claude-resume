@@ -14,24 +14,19 @@ public sealed record OAuthUsageResult(
     string? FailureReason,
     string CredentialFingerprint = "",
     string CredentialSource = "",
-    string? Note = null)
-{
-    /// <summary>401/403 是否被确认为令牌本身被拒(401,或带 Anthropic 结构化错误体的 403);CDN/网关裸 403 为 false,不持久标记。</summary>
-    public bool RejectionConfirmed { get; init; }
-}
+    string? Note = null);
 
 /// <summary>
 /// 通过 Claude Code 官方 OAuth usage 端点取配额。
 ///
 /// 上游:GET https://api.anthropic.com/api/oauth/usage。凭据由 <see cref="ClaudeCredentialSource"/>
-/// 解析:优先 AI Resume 自持的 <c>claude setup-token</c> 长期令牌,其次 Claude CLI 登录文件。
+/// 只读解析 Claude Code 自己的登录文件。
 ///
 /// 红线:
-/// 1. 只读 token,绝不刷新、绝不写回 Claude CLI 的凭据文件——续期由 Claude Code 自己完成;
+/// 1. 只读 token,绝不刷新、绝不写回 Claude Code 的凭据文件——续期由 Claude Code 自己完成;
 /// 2. token 不进日志、不进异常消息、不进任何返回值;
-/// 3. CLI token 剩余寿命低于 60 秒视同过期 → 不发请求,直接降级;
-/// 4. 凭据读不到 / JSON 损坏 / 无 access token → 降级,不抛;
-/// 5. 长期令牌被端点拒绝(401/403)时记下该令牌已被拒,之后改用 CLI 登录;用户重新保存令牌即清除记录。
+/// 3. token 剩余寿命低于 60 秒视同过期 → 不发请求，直接降级;
+/// 4. 凭据读不到 / JSON 损坏 / 无 access token → 降级，不抛。
 /// </summary>
 public sealed class ClaudeOAuthUsageProbe
 {
@@ -45,21 +40,14 @@ public sealed class ClaudeOAuthUsageProbe
     /// <param name="httpClient">可注入的 HttpClient(测试用假 handler);为 null 时自建(超时 15 秒)。</param>
     /// <param name="credentialsPath">Claude CLI 凭据文件路径;为 null 时用默认路径。</param>
     /// <param name="userAgent">显式 User-Agent;为 null 时按本机 Claude Code 版本解析。</param>
-    /// <param name="secretsRoot">
-    /// 长期令牌的 DPAPI 根目录。为 null 且显式给了 <paramref name="credentialsPath"/> 时,
-    /// 退回凭据文件所在目录——这样测试天然隔离,不会读到真机的长期令牌;
-    /// 两者都为 null 才使用生产状态目录。
-    /// </param>
+    /// <param name="credentials">凭据解析器;null 时按 <paramref name="credentialsPath"/> 构造(测试天然隔离)。</param>
     public ClaudeOAuthUsageProbe(
         HttpClient? httpClient = null,
         string? credentialsPath = null,
         string? userAgent = null,
-        string? secretsRoot = null,
         ClaudeCredentialSource? credentials = null)
     {
-        _credentials = credentials ?? new ClaudeCredentialSource(
-            credentialsPath,
-            secretsRoot ?? (credentialsPath is null ? null : Path.GetDirectoryName(Path.GetFullPath(credentialsPath))));
+        _credentials = credentials ?? new ClaudeCredentialSource(credentialsPath);
         _userAgent = userAgent;
 
         if (httpClient is null)
@@ -73,7 +61,7 @@ public sealed class ClaudeOAuthUsageProbe
         }
     }
 
-    /// <summary>凭据解析器(不含实值),供控制面显示凭据状态与保存/清除长期令牌。</summary>
+    /// <summary>凭据解析器(不含实值),供控制面显示登录状态。</summary>
     public ClaudeCredentialSource Credentials => _credentials;
 
     /// <summary>
@@ -93,32 +81,7 @@ public sealed class ClaudeOAuthUsageProbe
                     false, null, credential.FailureReason, credential.CredentialFingerprint, credential.Source, credential.Detail);
             }
 
-            OAuthUsageResult result = await FetchWithAsync(credential, cancellationToken).ConfigureAwait(false);
-            if (result.Ok || credential.Source != ClaudeCredentialSource.SourceStored ||
-                result.FailureReason is not ("token_rejected_401" or "token_rejected_403"))
-            {
-                return result;
-            }
-
-            // 只有服务端明确的令牌拒绝(401,或带 Anthropic 结构化错误体的 403)才持久记录;
-            // CDN/网关的裸 403 只影响本轮,下一轮仍先试长期令牌。记录绑定被拒的那份令牌的文件签名,
-            // 请求在途时用户换了令牌不会把新令牌误标为被拒。用户重新保存令牌时记录自动失效。
-            if (result.RejectionConfirmed)
-            {
-                _credentials.MarkStoredRejected(result.FailureReason, credential);
-            }
-
-            string why = result.RejectionConfirmed
-                ? "AI Resume 长期令牌被 usage 端点拒绝"
-                : "AI Resume 长期令牌请求被拒(HTTP 403,未确认为令牌失效,下一轮仍会先试它)";
-            ClaudeCredential cli = _credentials.ReadCli();
-            if (!cli.Ok)
-            {
-                return result with { Note = why + ",且 Claude CLI 未登录" };
-            }
-
-            OAuthUsageResult retry = await FetchWithAsync(cli, cancellationToken).ConfigureAwait(false);
-            return retry with { Note = why + ",已改用 Claude CLI 登录" };
+            return await FetchWithAsync(credential, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -150,7 +113,7 @@ public sealed class ClaudeOAuthUsageProbe
         }
     }
 
-    /// <summary>最多读 8 KB 正文:只用来判断错误形状,不保存、不记日志。</summary>
+    /// <summary>最多读 8 KB 正文：只用来判断错误形状，不保存、不记日志。</summary>
     private static async Task<string> ReadBoundedAsync(HttpContent content, CancellationToken cancellationToken)
     {
         try
@@ -215,16 +178,18 @@ public sealed class ClaudeOAuthUsageProbe
             if (!response.IsSuccessStatusCode)
             {
                 int status = (int)response.StatusCode;
+                // 401 一定是凭据问题;403 还可能来自 CDN/网关/代理拦截，只有 Anthropic 自己的结构化错误体
+                // 才算「登录无权读取额度」——否则会把网络问题误报成要用户重新 /login。
                 string reason = status switch
                 {
-                    401 or 403 => $"token_rejected_{status}",
+                    401 => "token_rejected_401",
+                    403 => LooksLikeAnthropicError(await ReadBoundedAsync(response.Content, cancellationToken).ConfigureAwait(false))
+                        ? "token_rejected_403"
+                        : "http_403_gateway",
                     408 or 504 => "gateway_timeout",
                     _ => $"http_{status}",
                 };
-                // 401 一定是凭据问题;403 还可能来自 CDN/网关拦截,只有 Anthropic 自己的结构化错误体才算确认。
-                bool confirmed = status == 401 ||
-                    (status == 403 && LooksLikeAnthropicError(await ReadBoundedAsync(response.Content, cancellationToken).ConfigureAwait(false)));
-                return new OAuthUsageResult(false, null, reason, fingerprint, source) { RejectionConfirmed = confirmed };
+                return new OAuthUsageResult(false, null, reason, fingerprint, source);
             }
 
             OAuthUsageResponse? payload;

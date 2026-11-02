@@ -27,7 +27,8 @@ public sealed record ProjectEntry(string Name, string Path, DateTimeOffset LastW
 public sealed class ProjectCatalog
 {
     private const int CacheMilliseconds = 3000;
-    private const int ReadHeadBytes = 65536;
+    /// <summary>会话头部最多读这么多字节(按行读，单行不设上限;见 <see cref="ReadHeadString"/>)。</summary>
+    private const int ReadHeadBytes = 32 * 1024 * 1024;
     private const int ScanLines = 60;
 
     private static readonly TimeSpan CacheWindow = TimeSpan.FromMilliseconds(CacheMilliseconds);
@@ -60,6 +61,7 @@ public sealed class ProjectCatalog
     }
 
     private readonly Func<string?> _userProfilePath;
+    private readonly string? _claudeConfigRoot;
     private readonly string _tempDir;
     private readonly string _productionAppDir;
     private readonly string _shadowRoot;
@@ -77,6 +79,10 @@ public sealed class ProjectCatalog
         string? shadowRoot = null)
     {
         _userProfilePath = userProfilePath ?? (() => Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+        // 会话目录与 Claude Code 一致跟随 CLAUDE_CONFIG_DIR(与会话绑定、续跑取证同一个根);注入了用户目录的测试不读环境变量。
+        _claudeConfigRoot = userProfilePath is null && Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR") is { Length: > 0 } configDir
+            ? configDir
+            : null;
         _tempDir = string.IsNullOrWhiteSpace(tempDir) ? Path.GetTempPath() : tempDir;
         _productionAppDir = string.IsNullOrWhiteSpace(productionAppDir)
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClaudeResume")
@@ -102,7 +108,7 @@ public sealed class ProjectCatalog
         }
 
         var discovered = new List<ProjectEntry>();
-        string root = discoveryRoot ?? Path.Combine(_userProfilePath() ?? string.Empty, ".claude", "projects");
+        string root = discoveryRoot ?? Path.Combine(_claudeConfigRoot ?? Path.Combine(_userProfilePath() ?? string.Empty, ".claude"), "projects");
         ProjectIndex? index = null;
         try
         {
@@ -377,37 +383,39 @@ public sealed class ProjectCatalog
         }
     }
 
-    internal static string? ExtractCwd(string jsonlPath)
+    internal static string? ExtractCwd(string jsonlPath) => ReadHeadString(jsonlPath, "cwd");
+
+    /// <summary>
+    /// 会话文件开头第一条带字符串属性 <paramref name="property"/> 的记录里的值;找不到或文件不可读返回 null。
+    /// 按行读(最多 <see cref="ScanLines"/> 行、<see cref="ReadHeadBytes"/> 字节),单行不设上限:首条提问里贴了截图时
+    /// 图片以 base64 内联在那一行——2026-11 本机 138 个会话里 43 个的首条带 cwd 的记录超过 64 KiB(最长约 2 MB),
+    /// 只读前 64 KiB 会把这些会话整份当成「读不出目录」。
+    /// </summary>
+    internal static string? ReadHeadString(string jsonlPath, string property)
     {
+        byte[] needle = Encoding.UTF8.GetBytes("\"" + property + "\"");
         try
         {
-            using var fs = new FileStream(jsonlPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            byte[] buffer = new byte[ReadHeadBytes];
-            int read = fs.Read(buffer, 0, buffer.Length);
-            string text = Encoding.UTF8.GetString(buffer, 0, read);
-            string[] lines = text.Split('\n');
-            int scanned = Math.Min(lines.Length, ScanLines);
-            for (int i = 0; i < scanned; i++)
+            foreach (byte[] line in ReadHeadLines(jsonlPath))
             {
-                string line = lines[i];
-                if (!line.Contains("\"cwd\"", StringComparison.Ordinal))
+                if (line.AsSpan().IndexOf(needle) < 0)
                 {
                     continue;
                 }
 
                 try
                 {
-                    using JsonDocument doc = JsonDocument.Parse(line);
+                    using JsonDocument doc = JsonDocument.Parse(line.AsMemory());
                     if (doc.RootElement.ValueKind == JsonValueKind.Object &&
-                        doc.RootElement.TryGetProperty("cwd", out JsonElement cwd) &&
-                        cwd.ValueKind == JsonValueKind.String)
+                        doc.RootElement.TryGetProperty(property, out JsonElement value) &&
+                        value.ValueKind == JsonValueKind.String)
                     {
-                        return cwd.GetString();
+                        return value.GetString();
                     }
                 }
                 catch (JsonException)
                 {
-                    // 单行损坏跳过,继续下一行。
+                    // 单行损坏或正在被追加的末行:跳过,继续下一行。
                 }
             }
         }
@@ -417,6 +425,54 @@ public sealed class ProjectCatalog
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// 逐行产出文件开头的完整行(UTF-8 字节，不含换行),最多 <see cref="ScanLines"/> 行;
+    /// 超出 <see cref="ReadHeadBytes"/> 字节预算的那一行不完整，不产出。打开或读取失败时由枚举方收到异常。
+    /// </summary>
+    internal static IEnumerable<byte[]> ReadHeadLines(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var line = new MemoryStream();
+        byte[] buffer = new byte[65536];
+        long total = 0;
+        int lines = 0;
+        int read;
+        while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            total += read;
+            int start = 0;
+            while (start < read)
+            {
+                int newline = Array.IndexOf(buffer, (byte)'\n', start, read - start);
+                if (newline < 0)
+                {
+                    line.Write(buffer, start, read - start);
+                    break;
+                }
+
+                line.Write(buffer, start, newline - start);
+                yield return line.ToArray();
+                line.SetLength(0);
+                start = newline + 1;
+                if (++lines >= ScanLines)
+                {
+                    yield break;
+                }
+            }
+
+            if (total >= ReadHeadBytes)
+            {
+                yield break;
+            }
+        }
+
+        if (line.Length > 0)
+        {
+            // 末行没有换行符:可能正被追加，交给 JSON 解析判断完整与否。
+            yield return line.ToArray();
+        }
     }
 
     private static string Fingerprint(ProductConfig config)

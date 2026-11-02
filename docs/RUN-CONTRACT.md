@@ -1,10 +1,18 @@
 # AI Resume RunContract v1
 
 > 状态:现役运行契约。2026-08-01 由 ADR-0002 接受，随后由 C# Worker 实现；Node/PowerShell 迁移阶段的接管顺序仅作为历史背景保留。当前实现与偏差以 `docs/ARCHITECTURE.md` 和 C# 回归为准。
+>
+> 2026-10-30 修订(v2.2,ADR-0006):cc-connect 已整体退役,AI Resume 不再承担任何飞书聊天、卡片或入站,飞书只剩 Worker 发出的完成通知。本契约只约束 AI Resume 自己启动的进程,现役落点如下:
+>
+> - **生产续跑**:`ResumeEngine` → `ClaudeResumeRunner` → `IProcessSupervisor`(`ProcessSupervisor`),子进程是 `AiResume.Worker.exe internal-agent-run` helper,不设客户端总时限。spawn 前先在 `product_state` 持久化本次 `ActiveRunId`(`CheckerCycle.PrepareActiveRun`),再由 supervisor 先写 `process_registry`、后 spawn 并加入 Job Object;全局同一时刻最多一个续跑进程。解除布防或移出队列时按精确 RunId 请求终止,未确认前以 `PendingCancellationRunId` 保留门禁并每拍重试;启动后的失败置周期级 `ReplayBlocked`,不自动重放。续跑运行不写 `runs` / `run_events`。真实用量上限中断后的逐项目续跑端到端仍待真机验证。
+> - **`TaskOrchestrator` + `RunStore`**:实现本文的 Start/Status/Cancel 接口与 `runs` 表。Worker 照常装配,`ObservationWorker` 按观察周期(默认 20 秒)调用其 `ObserveAsync`;但为它注册的 provider 适配器与健康探测是 `FakeProviderAdapter` / `FakeHealthProbe`,没有生产调用方,只在契约回归与断电恢复测试(`AIRESUME_TEST_AUTO_PROBE=1`)里产生运行。
+> - **没有生产 probe 运行**:GUI 供应商刷新使用零 token 的 `providers.catalog`,不启动推理型探测;`chat` / `query` / `modify` 原为飞书会话任务,现无调用方(`TaskKind` 枚举保留)。
+>
+> 下文凡把飞书/cc-connect 写成调用方或投递目标的地方,均已改为历史说明。
 
 ## 1. 目标与不变量
 
-RunContract 是 GUI、飞书/cc-connect、后台续跑与 provider adapter 之间唯一的 AI 运行协议。所有调用者只使用 `Start`、`Status`、`Cancel` 和统一事件流。
+RunContract 是 GUI、后台续跑与 provider adapter 之间唯一的 AI 运行协议,只约束 AI Resume 自己启动的进程。所有调用者只使用 `Start`、`Status`、`Cancel` 和统一事件流;生产续跑按同一语义经 `IProcessSupervisor` 落地(见文首修订)。原文还把飞书/cc-connect 列为调用方:自 ADR-0003 起 cc-connect 自己运行 agent、不经本契约,已于 2026-10-30 随 ADR-0006 整体退役。
 
 强制不变量:
 
@@ -15,7 +23,7 @@ RunContract 是 GUI、飞书/cc-connect、后台续跑与 provider adapter 之�
 5. DNS/TCP/TLS/reset、进程消失、监控/解析/存储异常属于 `failed_local`。
 6. 用户取消为 `cancelled`,不可 fallback。
 7. `sideEffectsStarted=true` 后禁止自动 fallback、自动重放和线路切换。
-8. 同一生产 run 的状态只有 C# `RunStore` 一个 writer。
+8. 同一生产 run 的状态只有 C# `RunStore` 一个 writer(现役生产续跑不经 `runs` 表,其运行身份由 Worker 单写 `product_state` 与 `process_registry`,见文首修订)。
 9. terminal settle-once;迟到输出不能覆盖 terminal。
 10. 进程未真实 close 或身份不明时 `childPending=true`,runKey 不释放。
 
@@ -164,7 +172,7 @@ queued -> starting -> running -> succeeded
 
 - ProviderAdapter 解析到明确成功 terminal;
 - terminal 与最终事件在同一事务写入;
-- 后续消息/图片发送由 outbox 负责,投递失败不改写 succeeded。
+- 后续通知投递(现役为完成通知队列 `completion-events\`,见 `COMPLETION-NOTIFICATIONS.md`)失败不改写 succeeded;原文中的消息/图片发送属于已退役的飞书聊天链路。
 
 ### failed_provider
 
@@ -264,7 +272,9 @@ ProviderAdapter 将工具/活动事件规范化为:
 | `run_events` | append-only seq 事件 |
 | `run_commands` | Start/Cancel 命令幂等结果 |
 | `process_registry` | PID、启动时间、签名、Job、childPending、最近观察 |
-| `outbox` | GUI/飞书/cc-connect/完成通知投递 |
+| `outbox` | 信封投递的幂等出队表(`OutboxStore`);现役没有生产调用方,完成通知走 `completion-events\` 文件队列,原列出的 GUI/飞书/cc-connect 投递已不存在 |
+
+现役 schema 以 `StorageDatabase`(v6)为准:逻辑上的 `run_commands` 落在 `runs.request_id`(UNIQUE,Start 幂等)与 `runs.cancel_command_id`(Cancel 幂等),没有独立表;另有 `product_state`(布防周期与续跑门禁)和 `quota_snapshots`(额度快照)两张产品表。
 
 事务边界:
 
@@ -282,7 +292,7 @@ Worker 启动扫描:
 1. 非 terminal run;
 2. terminal 且 `childPending=true` 的 run;
 3. starting 意图与临时/未完成进程登记;
-4. 未投递 outbox。
+4. 未投递的通知(现役为 `completion-events\` 队列,`NotificationWorker` 启动后立即扫一轮)。
 
 恢复判断:
 
@@ -314,13 +324,13 @@ HealthProbe 使用相同 RunContract,`taskKind=probe`:
 
 以下操作可设置 request timeout:
 
-- 飞书 send/reply/card patch;
-- 飞书图片上传、资源下载及落盘阶段;
-- lark-cli 单次 OpenAPI;
+- lark-cli 单次调用(现役只用于完成通知:`im +messages-send` 与 `auth list` 各 20 秒,`doctor` 30 秒);
 - Named Pipe 建连/单帧应答;
-- outbox 单次投递 attempt。
+- 通知队列单次投递 attempt。
 
-它们不得成为 AI run deadline。进度/结果投递失败由 outbox 重试;远端 create 重试复用同一幂等键。无法安全幂等的上传不自动重放。
+它们不得成为 AI run deadline。通知投递失败只在完成通知队列内按条目退避重试,不回写已结束运行的结果;远端发送重试复用同一幂等键(现役以事件 ID 作 `--idempotency-key`,超时按结果不明处理)。无法安全幂等的上传不自动重放。
+
+原文还列有飞书 send/reply/card patch 与飞书图片上传、资源下载及落盘阶段:它们属于 v1 Node 飞书机器人与此后由 cc-connect 承担的飞书聊天链路,AI Resume 现无对应操作。
 
 ## 12. 事件与轮询
 
@@ -330,7 +340,7 @@ RunStore 为每次变化分配单调 `seq`。Transport 可推送 `run.state_chan
 - 合法范围:15-30 秒;
 - terminal 后可停止常规轮询,但 `childPending=true` 时继续低频读取;
 - 同 run 的迟到 progress 不能覆盖 terminal;
-- GUI/飞书不得根据没有新事件自行生成失败卡。
+- GUI 不得根据没有新事件自行判定失败(原文同时约束的飞书失败卡片随飞书聊天链路一并退役)。
 
 ## 13. 最小门禁测试
 
@@ -345,9 +355,9 @@ RunStore 为每次变化分配单调 `seq`。Transport 可推送 `run.state_chan
 9. 重复 Start 返回同 runId,spawn=1;
 10. 重复 Cancel 终止请求=1;
 11. Worker 在 queued/starting/running/terminal-childPending 各点崩溃后恢复符合第 9 节;
-12. 结果发送 timeout 时 run 保持 succeeded,outbox 保留;
-13. 同一入站事件重放 100 次,run/远端消息重复数为 0;
-14. GUI/飞书只通过 Transport 消费事件,不存在直接 spawn 路径。
+12. 结果发送 timeout 时 run 保持 succeeded,待投递条目保留(现役为完成通知队列);
+13. (历史)同一入站事件重放 100 次,run/远端消息重复数为 0——飞书入站已随 ADR-0006 退役,本条不再有现役对象;
+14. GUI 对运行状态只读取 Worker 写下的持久状态/事件,不存在直接 spawn 路径(原文同时约束飞书,该面已随 ADR-0006 退役)。
 15. provider 启动或恢复核验期间并发 Cancel 不 spawn 新进程；已进入 supervisor 启动则完成登记后精确终止；
 16. Cancel 未确认时每拍重试，provider 失败且 childPending=true 时保持 runKey；
 17. 进程退出收尾中，已提交的用户 Cancel 优先于 provider 失败终态。

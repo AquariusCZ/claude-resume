@@ -3,6 +3,11 @@
 状态:已实现并通过离线回归(1264/1264)与两份独立只读对抗审查;真机验证分两段——安装/配置激活由本轮完成,
 Claude 长期令牌与 Codex 真实完成事件必须由用户操作后才能核实(2026-10-12)。
 
+> **2026-10-30 修订说明(ADR-0006)**:A1 作废——usage 端点不接受 setup-token 签发的令牌,长期令牌整套删除,额度只读 Claude Code 自己的登录,
+> 账号指纹改由 `oauthAccount` 派生。D1 中「收件人明文存 `NotifyRecipientOpenId`」仍有效,但「app_secret 只在 GUI 侧 CurrentUser DPAPI、Worker 不依赖 DPAPI」
+> 的投递设计被取代:lark-cli 自己的钥匙串同样是 CurrentUser DPAPI,S4U 下照样间歇失败,现由 GUI 保存机器范围凭据副本并经环境变量交给 lark-cli;
+> 收件人也不再从 `allow_from` 同步。E1 的 cc-connect 版本固定与 F1 中 cc-connect 相关条目随 cc-connect 退役作废。B1(Codex 官方账号)与 C1(Codex hooks)继续有效。
+
 ## 1. 背景:2026-10-12 盘点出的五处失效
 
 项目自 2026-09-07 起没有更新,控制面与引擎的多项功能在真机上已经静默失效。先按第一性原理核实每一条,

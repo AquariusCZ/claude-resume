@@ -75,46 +75,47 @@ public sealed class ControlPlaneBridgeProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task 长期令牌保存清除只回状态且不回传令牌()
+    public async Task 登录状态只回结论与到期时间且不回传令牌()
     {
         const string token = "sk-" + "ant-oat01-UNIQUE-test-token-value-0123456789"; // 拼接:避开密钥形状门禁
         string home = Path.Combine(_root, "claude-home");
-        Directory.CreateDirectory(home);
+        Directory.CreateDirectory(Path.Combine(home, ".claude"));
+        File.WriteAllText(Path.Combine(home, ".claude", ".credentials.json"), System.Text.Json.JsonSerializer.Serialize(new
+        {
+            claudeAiOauth = new
+            {
+                accessToken = token,
+                expiresAt = DateTimeOffset.UtcNow.AddHours(6).ToUnixTimeMilliseconds(),
+                refreshTokenExpiresAt = DateTimeOffset.UtcNow.AddDays(20).ToUnixTimeMilliseconds(),
+                subscriptionType = "max",
+            },
+        }));
+        File.WriteAllText(Path.Combine(home, ".claude.json"),
+            """{"oauthAccount":{"accountUuid":"acct-1","organizationUuid":"44444444-4444-4444-4444-444444444444","emailAddress":"user@example.invalid"}}""");
         var credentials = new ClaudeCredentialSource(
-            credentialsPath: Path.Combine(home, ".credentials.json"),
-            secretsRoot: Path.Combine(_root, "secrets"));
+            Path.Combine(home, ".claude", ".credentials.json"), Path.Combine(home, ".claude.json"));
         ControlPlaneBridge bridge = CreateBridge(claudeCredentials: credentials);
 
-        string before = await bridge.HandleAsync("""{"id":"s0","type":"claude.token.status"}""", CancellationToken.None);
-        Assert.Contains("\"hasStoredToken\":false", before, StringComparison.Ordinal);
+        string status = await bridge.HandleAsync("""{"id":"s0","type":"claude.login.status"}""", CancellationToken.None);
 
-        string saved = await bridge.HandleAsync(
-            $$"""{"id":"s1","type":"claude.token.save","token":"{{token}}"}""", CancellationToken.None);
-        Assert.Contains("claude.token.save.result", saved, StringComparison.Ordinal);
-        Assert.Contains("\"hasStoredToken\":true", saved, StringComparison.Ordinal);
-        Assert.Contains("\"activeSource\":\"ai-resume-token\"", saved, StringComparison.Ordinal);
-        Assert.DoesNotContain(token, saved, StringComparison.Ordinal);
-        Assert.True(credentials.ReadStored().Ok);
-
-        string cleared = await bridge.HandleAsync("""{"id":"s2","type":"claude.token.clear"}""", CancellationToken.None);
-        Assert.Contains("\"hasStoredToken\":false", cleared, StringComparison.Ordinal);
-        Assert.False(credentials.ReadStored().Ok);
+        Assert.Contains("claude.login.status.result", status, StringComparison.Ordinal);
+        Assert.Contains("\"verdict\":\"Ok\"", status, StringComparison.Ordinal);
+        Assert.Contains("\"accountVerified\":true", status, StringComparison.Ordinal);
+        Assert.DoesNotContain(token, status, StringComparison.Ordinal);
+        Assert.DoesNotContain("user@example.invalid", status, StringComparison.Ordinal);
+        Assert.DoesNotContain("44444444-4444", status, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task 长期令牌形状非法时拒绝保存且不回显输入()
+    public async Task 长期令牌入口已删除()
     {
-        var credentials = new ClaudeCredentialSource(
-            credentialsPath: Path.Combine(_root, "none", ".credentials.json"),
-            secretsRoot: Path.Combine(_root, "secrets-invalid"));
-        ControlPlaneBridge bridge = CreateBridge(claudeCredentials: credentials);
+        ControlPlaneBridge bridge = CreateBridge();
 
         string response = await bridge.HandleAsync(
             """{"id":"bad","type":"claude.token.save","token":"short token with spaces"}""", CancellationToken.None);
 
         Assert.Contains("claude.token.save.error", response, StringComparison.Ordinal);
         Assert.DoesNotContain("short token with spaces", response, StringComparison.Ordinal);
-        Assert.False(credentials.HasStoredToken);
     }
 
     private ControlPlaneBridge CreateBridge(
@@ -144,7 +145,7 @@ public sealed class ControlPlaneBridgeProviderTests : IDisposable
             folderPicker: folderPicker,
             claudeCredentials: claudeCredentials ?? new ClaudeCredentialSource(
                 credentialsPath: Path.Combine(_root, "fake-home", ".claude", ".credentials.json"),
-                secretsRoot: Path.Combine(_root, "fake-secrets")),
+                globalConfigPath: Path.Combine(_root, "fake-home", ".claude.json")),
             requestFailureReporter: requestFailureReporter,
             providerCatalog: providerCatalog ?? (_ => Task.FromResult<IReadOnlyList<ProviderObservation>>(Array.Empty<ProviderObservation>())));
     }

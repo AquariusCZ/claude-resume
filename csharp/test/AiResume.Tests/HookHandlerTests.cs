@@ -202,6 +202,42 @@ public class HookHandlerTests : IDisposable
     }
 
     /// <summary>
+    /// Stop 负载的 background_tasks(本机 Claude Code 的 schema:id/type/status/description,shell 带 command、
+    /// subagent 带 agent_type;在途 = running 或 pending):只有结束后会唤醒会话的子代理/workflow/云端会话才算「还在忙」。
+    /// </summary>
+    [Theory]
+    [InlineData("subagent", "pending", true)]
+    [InlineData("subagent", "running", true)]
+    [InlineData("workflow", "running", true)]
+    [InlineData("cloud session", "running", true)]
+    [InlineData("shell", "running", false)]
+    [InlineData("monitor", "running", false)]
+    [InlineData("teammate", "running", false)]
+    [InlineData("dream", "running", false)]
+    [InlineData("subagent", "completed", false)]
+    public void ClaudeStop_BackgroundBusy_OnlyForWorkThatWakesTheSession(string type, string status, bool busy)
+    {
+        string cwd = Path.Combine(_tempDir, "bg-" + type.Replace(' ', '-') + "-" + status);
+        Directory.CreateDirectory(cwd);
+        var task = new Dictionary<string, object?> { ["id"] = "t1", ["type"] = type, ["status"] = status, ["description"] = "合成任务" };
+        if (type == "shell") task["command"] = "npm run dev";
+        if (type == "subagent") task["agent_type"] = "general-purpose";
+        string stdinJson = JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["hook_event_name"] = "Stop",
+            ["session_id"] = "sess-bg",
+            ["cwd"] = cwd,
+            ["stop_hook_active"] = false,
+            ["background_tasks"] = new[] { task },
+        });
+
+        Assert.True(Program.TryWriteEvent(_tempDir, "claudecode", stdinJson, new Dictionary<string, string?>(), out string eventId));
+
+        using var doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(_tempDir, eventId + ".json")));
+        Assert.Equal(busy, doc.RootElement.TryGetProperty("backgroundBusy", out JsonElement flag) && flag.ValueKind == JsonValueKind.True);
+    }
+
+    /// <summary>
     /// 测试5:同一负载连续两次 TryWriteEvent,第二次返回 false,目录中只有一个文件,eventId 相同。
     /// </summary>
     [Fact]
@@ -585,6 +621,59 @@ public class HookHandlerTests : IDisposable
         Assert.True(Program.TryWriteEvent(_tempDir, "opencode", First("idle-1"), env, out string first));
         Assert.True(Program.TryWriteEvent(_tempDir, "opencode", First("idle-2"), env, out string second));
         Assert.NotEqual(first, second);
+    }
+
+    [Theory]
+    [InlineData("session.execution.succeeded", "completion", true)]
+    [InlineData("session.idle", "completion", true)]
+    [InlineData("session.execution.interrupted", "completion", false)]
+    [InlineData("permission.asked", "decision", true)]
+    [InlineData("form.created", "decision", true)]
+    [InlineData("session.execution.failed", "decision", true)]
+    [InlineData("session.execution.succeeded", "decision", false)]
+    public void TryWriteEvent_OpenCode2事件准入(string eventName, string kind, bool admitted)
+    {
+        string cwd = Path.Combine(_tempDir, "open2-" + eventName + "-" + kind);
+        Directory.CreateDirectory(cwd);
+        string payload = JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["hook_event_name"] = eventName,
+            ["session_id"] = "ses_test",
+            ["cwd"] = cwd,
+            ["event_id"] = "evt_" + eventName + kind,
+        });
+
+        bool written = Program.TryWriteEvent(_tempDir, "opencode", payload, new Dictionary<string, string?>(),
+            out _, out string reason, kind);
+
+        Assert.Equal(admitted, written);
+        if (!admitted)
+        {
+            Assert.Contains("opencode", reason, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void TryWriteEvent_OpenCode同一上游事件经不同实例到达只写一次()
+    {
+        var env = new Dictionary<string, string?>();
+        string Payload(string cwd, string timestamp) => JsonSerializer.Serialize(new Dictionary<string, object?>
+        {
+            ["hook_event_name"] = "session.execution.succeeded",
+            ["session_id"] = "ses_dup",
+            ["cwd"] = cwd,
+            ["event_id"] = "evt_0001",
+            ["timestamp"] = timestamp,
+        });
+        string a = Path.Combine(_tempDir, "dup-a");
+        string b = Path.Combine(_tempDir, "dup-b");
+        Directory.CreateDirectory(a);
+        Directory.CreateDirectory(b);
+
+        Assert.True(Program.TryWriteEvent(_tempDir, "opencode", Payload(a, "2026-10-30T08:00:00Z"), env, out string first, out _));
+        Assert.False(Program.TryWriteEvent(_tempDir, "opencode", Payload(b, "2026-10-30T08:00:05Z"), env, out string second, out string reason));
+        Assert.Equal(first, second);
+        Assert.Equal("duplicate", reason);
     }
 
     [Fact]

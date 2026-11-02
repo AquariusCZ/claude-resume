@@ -20,6 +20,18 @@ public sealed class EngineLivenessTests
     private static readonly DateTimeOffset Now = new(2026, 8, 8, 12, 0, 0, TimeSpan.Zero);
 
     [Fact]
+    public void 后台服务运行中要有常驻Worker的管道应答_同名的CLI进程不算()
+    {
+        // 有同名进程但管道不应答(notify test / install 这类 CLI 子命令,或别的 Windows 用户的 Worker):核验不出。
+        Assert.Null(EngineLiveness.ResidentWorker(true, () => false));
+        Assert.True(EngineLiveness.ResidentWorker(true, () => true));
+        Assert.Null(EngineLiveness.ResidentWorker(true, () => throw new IOException("管道忙")));
+        // 没有同名进程就是没在跑;枚举不了进程就是核验不出——都不去问管道。
+        Assert.False(EngineLiveness.ResidentWorker(false, () => throw new InvalidOperationException("不该被调用")));
+        Assert.Null(EngineLiveness.ResidentWorker(null, () => throw new InvalidOperationException("不该被调用")));
+    }
+
+    [Fact]
     public void 没布防就是没布防()
     {
         Assert.Equal(

@@ -64,20 +64,39 @@ public sealed class DpapiSecretStore
         Directory.CreateDirectory(_secretsDirectory);
 
         byte[] cipher = Protect(plaintext, scope);
-        string tmpPath = path + ".tmp";
+        string tmpPath = scope == DpapiScope.LocalMachine ? path + ".tmp-" + Guid.NewGuid().ToString("N") : path + ".tmp";
         try
         {
-            using (var stream = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
-            {
-                stream.Write(cipher, 0, cipher.Length);
-                stream.Flush(flushToDisk: true);
-            }
-
-            File.Move(tmpPath, path, overwrite: true);
             if (scope == DpapiScope.LocalMachine)
             {
-                HardenLocalMachineFileAcl(path);
+                // 机器范围密文从创建那一刻起就用受限 DACL,在临时文件上核验通过后才替换正式文件(同卷改名保留 DACL):
+                // 收不紧时只丢掉临时文件,上一份可用凭据原样保留;也不存在「已落盘、还没收紧」的时间窗。
+                FileSecurity security = RestrictedFileSecurity(out SecurityIdentifier[] allowed);
+                using (FileStream stream = new FileInfo(tmpPath).Create(
+                           FileMode.CreateNew, FileSystemRights.FullControl, FileShare.None, 4096, FileOptions.None, security))
+                {
+                    stream.Write(cipher, 0, cipher.Length);
+                    stream.Flush(flushToDisk: true);
+                }
+
+                VerifyRestrictedAcl(tmpPath, allowed);
+                File.Move(tmpPath, path, overwrite: true);
             }
+            else
+            {
+                using (var stream = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    stream.Write(cipher, 0, cipher.Length);
+                    stream.Flush(flushToDisk: true);
+                }
+
+                File.Move(tmpPath, path, overwrite: true);
+            }
+        }
+        catch (Exception ex) when (scope == DpapiScope.LocalMachine && ex is not OutOfMemoryException)
+        {
+            TryDelete(tmpPath);
+            throw new InvalidOperationException("无法以受限权限保存机器范围密文,已放弃保存(原有凭据未改动):" + ex.Message, ex);
         }
         catch
         {
@@ -153,47 +172,40 @@ public sealed class DpapiSecretStore
     }
 
     /// <summary>
-    /// 机器范围密文的文件 ACL:断开继承,只留当前用户、SYSTEM、Administrators 的完全控制。
-    /// 设置后读回核验;任何其它 SID 仍有 Allow 规则就删文件并抛错——宁可保存失败,也不留一份全机可解的密文。
+    /// 机器范围密文的文件 DACL:断开继承,只留当前用户、SYSTEM、Administrators 的完全控制。
     /// </summary>
-    private static void HardenLocalMachineFileAcl(string path)
+    private static FileSecurity RestrictedFileSecurity(out SecurityIdentifier[] allowed)
     {
-        try
+        SecurityIdentifier user = WindowsIdentity.GetCurrent().User
+            ?? throw new InvalidOperationException("无法取得当前用户 SID");
+        allowed =
+        [
+            user,
+            new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+        ];
+
+        var security = new FileSecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        foreach (SecurityIdentifier sid in allowed)
         {
-            var file = new FileInfo(path);
-            SecurityIdentifier user = WindowsIdentity.GetCurrent().User
-                ?? throw new InvalidOperationException("无法取得当前用户 SID");
-            var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
-            var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
-
-            FileSecurity security = file.GetAccessControl(AccessControlSections.Access);
-            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
-            foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
-            {
-                security.RemoveAccessRuleAll(rule);
-            }
-
-            foreach (SecurityIdentifier sid in new[] { user, system, admins })
-            {
-                security.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl, AccessControlType.Allow));
-            }
-
-            file.SetAccessControl(security);
-
-            FileSecurity applied = new FileInfo(path).GetAccessControl(AccessControlSections.Access);
-            foreach (FileSystemAccessRule rule in applied.GetAccessRules(true, true, typeof(SecurityIdentifier)))
-            {
-                if (rule.AccessControlType == AccessControlType.Allow &&
-                    rule.IdentityReference is SecurityIdentifier sid && sid != user && sid != system && sid != admins)
-                {
-                    throw new InvalidOperationException("令牌文件 ACL 收紧后仍有其它账号可读");
-                }
-            }
+            security.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl, AccessControlType.Allow));
         }
-        catch (Exception ex) when (ex is not OutOfMemoryException)
+
+        return security;
+    }
+
+    /// <summary>读回核验:任何其它 SID 仍有 Allow 规则就抛错——宁可保存失败,也不留一份全机可解的密文。</summary>
+    private static void VerifyRestrictedAcl(string path, SecurityIdentifier[] allowed)
+    {
+        FileSecurity applied = new FileInfo(path).GetAccessControl(AccessControlSections.Access);
+        foreach (FileSystemAccessRule rule in applied.GetAccessRules(true, true, typeof(SecurityIdentifier)))
         {
-            TryDelete(path);
-            throw new InvalidOperationException("无法收紧机器范围密文的文件权限,已放弃保存:" + ex.Message, ex);
+            if (rule.AccessControlType == AccessControlType.Allow &&
+                rule.IdentityReference is SecurityIdentifier sid && !allowed.Contains(sid))
+            {
+                throw new InvalidOperationException("机器范围密文的文件权限收紧后仍有其它账号可读");
+            }
         }
     }
 

@@ -32,6 +32,12 @@ public enum EngineVerdict
 
     /// <summary>已请求终止精确进程,但核验表明它仍然存活。</summary>
     CancelPending,
+
+    /// <summary>
+    /// 布防中、探测节奏也正常，但有同名进程却没有本用户的常驻 Worker 应答 Named Pipe:在不在监视核验不出。
+    /// 同名的可能只是 CLI 子命令或别的 Windows 用户的 Worker——不能凭它说「监视中」,也没有证据报「没人在盯」。
+    /// </summary>
+    WorkerUnverified,
 }
 
 /// <summary>
@@ -130,6 +136,29 @@ public static class EngineLiveness
         }
     }
 
+    /// <summary>
+    /// 常驻 Worker 在不在(界面「后台服务运行中」与机器人行用)。同名进程不够:<c>notify test</c>、<c>install</c>
+    /// 这些 CLI 子命令也叫 AiResume.Worker,别的 Windows 用户的 Worker 也会被枚举到。只有本用户的常驻 Worker
+    /// 开着 Named Pipe,能应答 ping 才算在跑;没有同名进程 → false;有进程但 ping 不通 → null(核验不出,既不报绿也不报红)。
+    /// 引擎判定(<see cref="Evaluate"/>)仍只看进程:ping 只决定「能不能说在跑」,不把核验不出升级成布防告警。
+    /// </summary>
+    public static bool? ResidentWorker(bool? processExists, Func<bool> ping)
+    {
+        if (processExists != true)
+        {
+            return processExists;
+        }
+
+        try
+        {
+            return ping() ? true : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
     /// <summary>给界面的一句话。措辞刻意区分"在等"和"没人在盯"——前者正常,后者要动手。</summary>
     public static string Describe(EngineVerdict verdict) => verdict switch
     {
@@ -142,6 +171,7 @@ public static class EngineLiveness
         EngineVerdict.RunActive => "已登记的续跑进程仍在运行",
         EngineVerdict.StateUnverified => "布防状态暂时无法核实",
         EngineVerdict.CancelPending => "已请求终止续跑进程,但它仍在运行",
+        EngineVerdict.WorkerUnverified => "后台服务没有应答,无法确认它在监视",
         _ => verdict.ToString(),
     };
 

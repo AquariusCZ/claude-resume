@@ -78,7 +78,7 @@ public sealed class QoderNotificationAdapter : INotificationAdapter
         {
             return new NotificationProviderStatus(
                 Kind, DisplayName, true, false, _settingsPath,
-                $"配置读取失败: {ex.Message}");
+                $"配置读取失败: {ex.Message}", Unverified: true);
         }
     }
 

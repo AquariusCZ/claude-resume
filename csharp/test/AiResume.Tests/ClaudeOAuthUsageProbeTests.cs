@@ -533,7 +533,8 @@ public class ClaudeOAuthUsageProbeTests
         var cases = new (string Name, Func<HttpMessageHandler> Handler, string ExpectedReason)[]
         {
             ("401", () => new FakeHandler("{}", HttpStatusCode.Unauthorized), "token_rejected_401"),
-            ("403", () => new FakeHandler("{}", HttpStatusCode.Forbidden), "token_rejected_403"),
+            ("403", () => new FakeHandler("""{"type":"error","error":{"type":"permission_error","message":"x"}}""", HttpStatusCode.Forbidden), "token_rejected_403"),
+            ("403-gateway", () => new FakeHandler("<html>blocked</html>", HttpStatusCode.Forbidden), "http_403_gateway"),
             ("504", () => new FakeHandler("{}", HttpStatusCode.GatewayTimeout), "gateway_timeout"),
             ("500", () => new FakeHandler("{}", HttpStatusCode.InternalServerError), "http_500"),
             ("network", () => new ThrowingHandler(new HttpRequestException("boom")), "failed_local"),
@@ -575,10 +576,10 @@ public class ClaudeOAuthUsageProbeTests
     [Fact]
     public async Task 同一组织轮换AccessToken仍得到同一账号指纹()
     {
-        const string organization = "org-stable-test";
+        const string organization = "33333333-3333-3333-3333-333333333333";
+        // 账号身份在 Claude Code 全局配置(凭据文件同目录的 .claude.json)里，凭据文件本身没有账号字段。
         string firstCredentials = $$"""
         {
-          "organizationUuid": "{{organization}}",
           "claudeAiOauth": {
             "accessToken": "token-one",
             "expiresAt": {{DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeMilliseconds()}}
@@ -591,10 +592,16 @@ public class ClaudeOAuthUsageProbeTests
         using var firstHttp = new HttpClient(firstHandler);
         using var secondHandler = new FakeHandler("{}");
         using var secondHttp = new HttpClient(secondHandler);
-        OAuthUsageResult first = await new ClaudeOAuthUsageProbe(
-            firstHttp, WriteCredentials(firstCredentials)).TryFetchAsync(CancellationToken.None);
-        OAuthUsageResult second = await new ClaudeOAuthUsageProbe(
-            secondHttp, WriteCredentials(secondCredentials)).TryFetchAsync(CancellationToken.None);
+        string firstPath = WriteCredentials(firstCredentials);
+        string secondPath = WriteCredentials(secondCredentials);
+        foreach (string path in new[] { firstPath, secondPath })
+        {
+            File.WriteAllText(Path.Combine(Path.GetDirectoryName(path)!, ".claude.json"),
+                "{\"oauthAccount\":{\"accountUuid\":\"acct-stable\",\"organizationUuid\":\"" + organization + "\"}}");
+        }
+
+        OAuthUsageResult first = await new ClaudeOAuthUsageProbe(firstHttp, firstPath).TryFetchAsync(CancellationToken.None);
+        OAuthUsageResult second = await new ClaudeOAuthUsageProbe(secondHttp, secondPath).TryFetchAsync(CancellationToken.None);
 
         Assert.NotEmpty(first.CredentialFingerprint);
         Assert.Equal(first.CredentialFingerprint, second.CredentialFingerprint);
@@ -642,6 +649,9 @@ public class ClaudeOAuthUsageProbeTests
         """;
 
         File.WriteAllText(path, content);
+        // 账号身份在同目录的 Claude Code 全局配置里(真实形状:凭据文件没有任何账号字段)。
+        File.WriteAllText(Path.Combine(dir, ".claude.json"),
+            """{"oauthAccount":{"accountUuid":"55555555-5555-5555-5555-555555555555","organizationUuid":"66666666-6666-6666-6666-666666666666"}}""");
         return path;
     }
 

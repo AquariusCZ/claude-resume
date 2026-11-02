@@ -14,6 +14,22 @@ namespace AiResume.Tests;
 /// </summary>
 public sealed class SecretsTests : IDisposable
 {
+    [Fact]
+    public void 安装时删除已退役的Claude长期令牌文件_其它机密原样保留()
+    {
+        string state = TestTemp.NewDir("retire-token");
+        string secrets = Path.Combine(state, "secrets");
+        Directory.CreateDirectory(secrets);
+        File.WriteAllText(Path.Combine(secrets, "claude-oauth-token.bin"), "fixture");
+        File.WriteAllText(Path.Combine(secrets, "claude-oauth-token.bin.rejected.json"), "{}");
+        File.WriteAllText(Path.Combine(secrets, "feishu-platform.bin"), "fixture");
+
+        AiResume.Worker.Migration.InstallCommand.RetireLegacyClaudeToken(state);
+        AiResume.Worker.Migration.InstallCommand.RetireLegacyClaudeToken(state);
+
+        Assert.Equal(new[] { "feishu-platform.bin" }, Directory.GetFiles(secrets).Select(Path.GetFileName));
+    }
+
     private readonly string _dir;
 
     public SecretsTests()
@@ -62,6 +78,38 @@ public sealed class SecretsTests : IDisposable
         var store = new DpapiSecretStore(_dir);
         await Assert.ThrowsAsync<ArgumentException>(() =>
             store.SaveAsync(credentialRef, new byte[] { 1 }, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task DpapiSecretStore_machine_scope_file_acl_only_user_system_admins()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var store = new DpapiSecretStore(_dir);
+        byte[] plaintext = Encoding.UTF8.GetBytes("machine-scope-fake");
+        await store.SaveAsync("machine-ref", plaintext, DpapiScope.LocalMachine, CancellationToken.None);
+        var file = new FileInfo(Path.Combine(_dir, "secrets", "machine-ref.bin"));
+
+        System.Security.AccessControl.FileSecurity acl = file.GetAccessControl();
+
+        Assert.True(acl.AreAccessRulesProtected);
+        var allowed = new HashSet<System.Security.Principal.SecurityIdentifier>
+        {
+            System.Security.Principal.WindowsIdentity.GetCurrent().User!,
+            new(System.Security.Principal.WellKnownSidType.LocalSystemSid, null),
+            new(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null),
+        };
+        var rules = acl.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier));
+        Assert.True(rules.Count > 0);
+        foreach (System.Security.AccessControl.FileSystemAccessRule rule in rules)
+        {
+            Assert.Contains((System.Security.Principal.SecurityIdentifier)rule.IdentityReference, allowed);
+        }
+
+        Assert.Equal(plaintext, await store.LoadAsync("machine-ref", CancellationToken.None));
     }
 
     [Fact]

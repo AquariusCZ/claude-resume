@@ -52,6 +52,17 @@ public sealed class QuotaService
     /// <summary>额度实时结果可用但跨窗口持久化退化时的脱敏诊断。</summary>
     public string? StorageWarning => Volatile.Read(ref _storageWarning);
 
+    /// <summary>usage 端点最近一次明确拒绝本机令牌(401 / 结构化 403)的记录;之后任何一次成功都清掉它。</summary>
+    public sealed record OAuthRejection(string Reason, DateTimeOffset AtUtc);
+
+    private OAuthRejection? _lastRejection;
+
+    /// <summary>
+    /// 服务端刚拒绝过本机 Claude 令牌:登录卡片不能只凭本地文件时间戳继续说「有效」(用户改了密码、被移出组织、
+    /// 在别处登出,本地文件都还是新的)。界面据此显示「被服务端拒绝 · 需 /login」。
+    /// </summary>
+    public OAuthRejection? LastRejection => Volatile.Read(ref _lastRejection);
+
     /// <summary>
     /// 取一份额度快照。<paramref name="forceRefresh"/> 为 true 时忽略缓存重新探测。
     /// 探测失败不抛异常,而是返回带 <c>UnavailableReason</c> 的快照——
@@ -81,6 +92,15 @@ public sealed class QuotaService
                 // 失败(无凭据/token 过期/网络)才降级到子进程探测——后者约 7 秒,
                 // 且 five_hour 只偶发下发,所以只当兜底,不当首选。
                 OAuthUsageResult oauth = await TryOAuthAsync(cancellationToken).ConfigureAwait(false);
+                if (oauth.Ok)
+                {
+                    Volatile.Write(ref _lastRejection, null);
+                }
+                else if (oauth.FailureReason is "token_rejected_401" or "token_rejected_403")
+                {
+                    Volatile.Write(ref _lastRejection, new OAuthRejection(oauth.FailureReason, now));
+                }
+
                 if (oauth is { Ok: true, Snapshot: { HasData: true } viaOAuth })
                 {
                     viaOAuth = viaOAuth with { EvidenceSource = UsageEvidenceSource.OAuth, CredentialFingerprint = oauth.CredentialFingerprint };
@@ -150,6 +170,28 @@ public sealed class QuotaService
     }
 
     /// <summary>
+    /// 取一份不早于 <paramref name="maxAge"/> 的快照(先等在途的那次刷新完成;成功与失败的结果都算，失败如实带着原因)。
+    /// 控制面同一轮刷新里，供应商目录的 Claude 行复用 quota.get 刚拿到的读数，不再对 usage 端点多发一次。
+    /// </summary>
+    public async Task<UsageSnapshot> GetRecentAsync(TimeSpan maxAge, CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_cached is { } cached && _clock() - _cachedAt <= maxAge)
+            {
+                return cached;
+            }
+        }
+        finally
+        {
+            _gate.Release();
+        }
+
+        return await GetAsync(true, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// 把 OAuth 失败分类翻成用户看得懂、也能据以行动的一句话。
     /// 不含 token、响应正文或凭据路径;Note 由探针生成,同样不含实值。
     /// </summary>
@@ -162,11 +204,11 @@ public sealed class QuotaService
 
         return oauth.FailureReason switch
         {
-            "no_credentials" or "token_expired" or "stored_token_unreadable" or "stored_token_empty" =>
-                "Claude 凭据不可用:请在终端运行 claude 并 /login,或在控制面保存 claude setup-token 长期令牌",
-            "token_rejected_401" or "token_rejected_403" => oauth.CredentialSource == ClaudeCredentialSource.SourceStored
-                ? "AI Resume 长期令牌被服务端拒绝,请重新运行 claude setup-token 并在控制面更换令牌"
-                : "Claude CLI 登录被服务端拒绝,请在终端运行 claude 并 /login",
+            "token_expired" => "Claude Code 访问令牌已过期：打开一次 Claude Code 即自动续期，之后额度恢复读取",
+            "no_credentials" or "login_expired" => "Claude Code 未登录或登录已到期：请在终端运行 claude 并 /login",
+            "token_rejected_401" or "token_rejected_403" => "Claude Code 登录被服务端拒绝：请在终端运行 claude 并 /login",
+            "http_403_gateway" => "Claude 额度接口被网络或网关拦截(HTTP 403),稍后自动重试",
+            "credential_store_moved" => "Claude Code 已改用 Windows 凭据管理器保存登录,AI Resume 读不到额度凭据",
             "http_429" => "Claude 额度接口限流(HTTP 429),稍后自动重试",
             "gateway_timeout" => "Claude 额度接口网关超时,稍后自动重试",
             "failed_local" => "Claude 额度请求网络失败,稍后自动重试",
@@ -278,6 +320,10 @@ public sealed class QuotaService
 
             long nowUnix = now.ToUnixTimeSeconds();
             bool observationIsOlder = observation.CapturedAt < previous.CapturedAt;
+            // 较新的实时 OAuth 读数带着明确百分比时以它为准:同一 reset 代次里用量也会合法下降(中途升级套餐、
+            // 服务端提前重置)。v2.2 起快照按稳定的账号指纹保存,旧的 100% 若一直取大,会卡到周窗口重置(最长 7 天)。
+            // 「同代单调取大」只留给较旧/晚到的观测与非 OAuth 观测,防跨进程晚提交把 100% 倒写回 99%。
+            bool liveAuthoritative = !observationIsOlder && observation.EvidenceSource == UsageEvidenceSource.OAuth;
             Dictionary<string, UsageWindow> allPriorByIdentity = previous.Buckets
                 .SelectMany(bucket => bucket.Windows)
                 .Where(window => window.ResetAtUnix is null || window.ResetAtUnix > nowUnix)
@@ -313,6 +359,10 @@ public sealed class QuotaService
                     // percent-only 旧观测无法证明自己属于 prior 的新 reset 代次。
                     // 宁可保留较新窗口,也不能把旧 100% 吸进新周期。
                     merged.Add(CarryWindow(prior, nowUnix));
+                }
+                else if (liveAuthoritative && current.UsedPercent is not null)
+                {
+                    merged.Add(TakeLiveWindow(current, prior, nowUnix));
                 }
                 else if (IsSameWindowGeneration(current, prior))
                 {
@@ -476,6 +526,25 @@ public sealed class QuotaService
         };
     }
 
+    /// <summary>
+    /// 较新的实时 OAuth 窗口(带明确百分比):百分比以本次为准。只缺 resetAt 时才向同代旧值借重置时间——
+    /// 但本次读数比旧值低又没给 resetAt,就证明不了还是同一代(0% + 无 reset 往往是新窗口还没开始),不借。
+    /// </summary>
+    private static UsageWindow TakeLiveWindow(UsageWindow current, UsageWindow prior, long nowUnix)
+    {
+        bool borrowReset = current.ResetAtUnix is null && prior.ResetAtUnix is not null &&
+                           !(prior.UsedPercent is { } priorUsed && current.UsedPercent < priorUsed);
+        long? reset = borrowReset ? prior.ResetAtUnix : current.ResetAtUnix;
+        return current with
+        {
+            ResetAtUnix = reset,
+            ResetAfterSeconds = reset is { } unix
+                ? (int)Math.Min(Math.Max(0, unix - nowUnix), int.MaxValue)
+                : current.ResetAfterSeconds,
+            CarriedForward = current.CarriedForward || borrowReset,
+        };
+    }
+
     private static UsageWindow CarryWindow(UsageWindow prior, long nowUnix) => prior with
     {
         ResetAfterSeconds = prior.ResetAtUnix is { } reset
@@ -484,8 +553,14 @@ public sealed class QuotaService
         CarriedForward = true,
     };
 
+    /// <summary>
+    /// 进程内只用一个默认探针:凭据解析器的「全局配置正被改写时沿用上次成功的账号」与解析缓存只在同一实例内生效,
+    /// 每次新建会让改写瞬间得到空指纹(这一拍额度未核实、快照不写),HttpClient 也被反复创建。
+    /// </summary>
+    private static readonly Lazy<ClaudeOAuthUsageProbe> DefaultOAuthProbe = new(() => new ClaudeOAuthUsageProbe());
+
     private static async Task<OAuthUsageResult> DefaultOAuthProbeAsync(CancellationToken cancellationToken)
-        => await new ClaudeOAuthUsageProbe().TryFetchAsync(cancellationToken).ConfigureAwait(false);
+        => await DefaultOAuthProbe.Value.TryFetchAsync(cancellationToken).ConfigureAwait(false);
 
     /// <summary>
     /// 默认探测:工作目录固定为 shadow 根,让探测会话落进一个已知的 .claude/projects 目录,

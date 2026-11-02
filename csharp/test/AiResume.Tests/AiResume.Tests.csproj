@@ -24,8 +24,6 @@
     <ProjectReference Include="..\..\src\AiResume.Secrets\AiResume.Secrets.csproj" />
     <!-- S3-A:lark-cli 进程封装测试(假 CLI 离线) -->
     <ProjectReference Include="..\..\src\AiResume.LarkCli\AiResume.LarkCli.csproj" />
-    <!-- S6-A:cc-connect wrapper 进程监督与配置生成(无 cc-connect 依赖) -->
-    <ProjectReference Include="..\..\src\AiResume.Wrapper\AiResume.Wrapper.csproj" />
     <!-- S8-D:hook 处理器的抑制判定/事件 ID/幂等写入需要单元测试覆盖 -->
     <ProjectReference Include="..\..\src\AiResume.Hook\AiResume.Hook.csproj" />
     <!-- S7-D:布防是产品核心控制面,ControlPlaneBridge 的 arm.get/arm.set 需要覆盖 -->

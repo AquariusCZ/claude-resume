@@ -211,7 +211,7 @@ public sealed class CodexHooksNotificationAdapter : INotificationAdapter
         }
         catch (Exception ex)
         {
-            return new NotificationProviderStatus(Kind, DisplayName, installed, false, _hooksPath, $"探测异常: {ex.Message}");
+            return new NotificationProviderStatus(Kind, DisplayName, installed, false, _hooksPath, $"探测异常: {ex.Message}", Unverified: true);
         }
     }
 

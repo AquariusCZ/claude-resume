@@ -138,4 +138,64 @@ public sealed class NotifyIntentTests
     {
         Assert.Empty(NotifyIntent.Toggle(null, NotificationProviderKind.Qoder, false));
     }
+
+    [Fact]
+    public void 拨开关先记意图_改客户端失败就把这一项的意图恢复原样()
+    {
+        // v2.2 起意图也是投递端的来源过滤:界面显示开着、意图却没记上,这个来源的事件会被全部丢弃。
+        var store = new AiResume.Worker.Products.ProductConfigStore(TestTemp.NewDir("notify-intent-apply"));
+        store.Update(c => c.NotifySources = new List<string> { "ClaudeCode" });
+
+        Assert.Throws<IOException>(() => NotifyIntent.Apply(store, NotificationProviderKind.OpenCode, true,
+            () => throw new IOException("插件目录被占用")));
+        var restored = store.Load();
+        Assert.Equal(new[] { "ClaudeCode" }, restored.NotifySources);
+        Assert.False(restored.NotifyIntentRecorded);
+
+        bool changed = false;
+        NotifyIntent.Apply(store, NotificationProviderKind.OpenCode, true, () => changed = true);
+        var applied = store.Load();
+        Assert.True(changed);
+        Assert.Equal(new[] { "ClaudeCode", "OpenCode" }, applied.NotifySources);
+        Assert.True(applied.NotifyIntentRecorded);
+    }
+
+    [Fact]
+    public void 改客户端时部分生效后才失败_意图跟着实际状态走_证明没生效才恢复()
+    {
+        var store = new AiResume.Worker.Products.ProductConfigStore(TestTemp.NewDir("notify-intent-partial"));
+        store.Update(c => c.NotifySources = new List<string> { "ClaudeCode" });
+
+        // 新插件已经写好，清理旧单文件时失败:插件在跑，意图不能被改回「关」(否则投递端把它的事件全丢掉)。
+        Assert.Throws<IOException>(() => NotifyIntent.Apply(store, NotificationProviderKind.OpenCode, true,
+            () => throw new IOException("旧插件文件被占用"), () => true));
+        Assert.Equal(new[] { "ClaudeCode", "OpenCode" }, store.Load().NotifySources);
+        Assert.True(store.Load().NotifyIntentRecorded);
+
+        // 探不出实际状态:保留这次的选择。
+        Assert.Throws<IOException>(() => NotifyIntent.Apply(store, NotificationProviderKind.Codex, true,
+            () => throw new IOException("hooks.json 被占用"), () => null));
+        Assert.Contains("Codex", store.Load().NotifySources);
+
+        // 探测证明根本没生效:恢复原意图。
+        Assert.Throws<IOException>(() => NotifyIntent.Apply(store, NotificationProviderKind.Codex, false,
+            () => throw new IOException("hooks.json 被占用"), () => true));
+        Assert.Contains("Codex", store.Load().NotifySources);
+    }
+
+    [Fact]
+    public void 探测失败的源不进对账目标_也不从意图里抹掉()
+    {
+        var probed = new[]
+        {
+            S(NotificationProviderKind.ClaudeCode, true, true),
+            new NotificationProviderStatus(NotificationProviderKind.OpenCode, "OpenCode", false, false, null, "探测异常", Unverified: true),
+        };
+        string[] recorded = { "ClaudeCode", "OpenCode" };
+
+        Assert.Equal(new[] { NotificationProviderKind.ClaudeCode }, NotifyIntent.Targets(recorded, probed));
+        Assert.Equal(new[] { NotificationProviderKind.OpenCode }, NotifyIntent.Unverified(recorded, probed));
+        Assert.Equal(new[] { "ClaudeCode", "OpenCode" }, NotifyIntent.FromProbe(probed, recorded));
+        Assert.Equal(new[] { "ClaudeCode" }, NotifyIntent.FromProbe(probed));
+    }
 }

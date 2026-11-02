@@ -382,10 +382,12 @@ public sealed class CheckerCycleTests : IDisposable
         Assert.Equal(CheckerState.PhaseWaiting, state.Phase);
         Assert.Empty(state.ActiveRunId);
         Assert.Empty(state.ActiveProjectPath);
-        Assert.False(state.ProjectStatus!.ContainsKey("C:\\Repo\\A"));
+        // 没有 spawn 就没有副作用：项目回到待续跑(limited),不是失败，也不被移出队列。
+        Assert.Equal("limited", state.ProjectStatus!["C:\\Repo\\A"]);
         CheckerState persisted = new ProductStateStore(_dbPath).Load();
         Assert.Empty(persisted.ActiveRunId);
-        Assert.False(persisted.ProjectStatus!.ContainsKey("C:\\Repo\\A"));
+        Assert.Equal("limited", persisted.ProjectStatus!["C:\\Repo\\A"]);
+        Assert.False(persisted.ReplayBlocked);
     }
 
     [Fact]

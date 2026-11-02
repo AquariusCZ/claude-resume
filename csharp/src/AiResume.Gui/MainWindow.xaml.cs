@@ -46,28 +46,11 @@ public partial class MainWindow : Window
                 exceptionType),
             demoMode: _screenshotMode);
         Loaded += async (_, _) => await InitializeHostAsync();
-        Closing += OnClosing;
         Closed += (_, _) =>
         {
             _cts.Cancel();
             _loggerProvider.Dispose();
         };
-    }
-
-    private void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
-    {
-        if (!_bridge.IsCutoverInProgress)
-        {
-            return;
-        }
-
-        e.Cancel = true;
-        MessageBox.Show(
-            this,
-            "cc-connect 正在切换配置并验证新进程。为保证失败时可以完成回滚,请等待操作结束后再关闭窗口。",
-            "正在切换 cc-connect",
-            MessageBoxButton.OK,
-            MessageBoxImage.Information);
     }
 
     /// <summary>
@@ -116,6 +99,22 @@ public partial class MainWindow : Window
             core.Settings.AreDevToolsEnabled = ShouldEnableDevTools();
             core.Settings.IsPasswordAutosaveEnabled = false;
             core.Settings.IsGeneralAutofillEnabled = false;
+            // 关掉浏览器加速键(F5/Ctrl+R 重载、Ctrl+F、Ctrl+P 等):F5 交给页面做「刷新额度与状态」。
+            // 关掉缩放:Ctrl±/Ctrl+滚轮会改变 DPR,点阵字随之失去整数倍而发糊。
+            core.Settings.AreBrowserAcceleratorKeysEnabled = false;
+            core.Settings.IsZoomControlEnabled = false;
+
+            // 控制面只承载自己的页面:拖进来的文件或链接、页面里的跳转与新窗口一律拦下——
+            // 被导航进来的任何页面都能经 postMessage 调用全部 RPC(布防、改收件人、保存机器人凭据)。
+            Host.AllowExternalDrop = false;
+            core.NavigationStarting += (_, e) =>
+            {
+                if (!IsControlPlaneUri(e.Uri))
+                {
+                    e.Cancel = true;
+                }
+            };
+            core.NewWindowRequested += (_, e) => e.Handled = true;
 
             string wwwroot = Path.Combine(AppContext.BaseDirectory, "wwwroot");
             core.SetVirtualHostNameToFolderMapping(
@@ -153,6 +152,12 @@ public partial class MainWindow : Window
             SkeletonText.Text = $"控制面初始化失败:{SecretRedactor.RedactText(ex.Message)}";
         }
     }
+
+    /// <summary>只认本机虚拟主机上的控制面页面(https://controlplane.airesume.local/…)。</summary>
+    internal static bool IsControlPlaneUri(string? uri) =>
+        Uri.TryCreate(uri, UriKind.Absolute, out Uri? parsed) &&
+        parsed.Scheme == Uri.UriSchemeHttps &&
+        string.Equals(parsed.Host, VirtualHost, StringComparison.OrdinalIgnoreCase);
 
     internal static bool ShouldEnableDevTools(Func<string, string?>? environmentVariable = null)
     {
@@ -192,16 +197,6 @@ public partial class MainWindow : Window
             // 12 秒是被额度探测抬上来的:它要拉起 claude 子进程,冷缓存实测约 7 秒
             // (项目发现只要几十毫秒)。截图是自测通道,宁可慢也不要截出"正在探测"。
             await Task.Delay(_screenshotMode ? 2000 : 20000).ConfigureAwait(true);
-            int providerIndex = Array.FindIndex(args, a => a == "--screenshot-provider");
-            if (_screenshotMode && providerIndex >= 0 && providerIndex + 1 < args.Length &&
-                args[providerIndex + 1] is "deepseek" or "codex-active")
-            {
-                string provider = System.Text.Json.JsonSerializer.Serialize(args[providerIndex + 1]);
-                await Host.CoreWebView2.ExecuteScriptAsync(
-                    "const p=document.getElementById('resumeProvider');p.value=" + provider +
-                    ";p.dispatchEvent(new Event('change'));const m=document.getElementById('resumeModel');m.selectedIndex=1;m.dispatchEvent(new Event('change'));");
-                await Task.Delay(100).ConfigureAwait(true);
-            }
             Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(target))!);
             await using var fs = new FileStream(target, FileMode.Create, FileAccess.Write);
             await Host.CoreWebView2.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png, fs)
@@ -225,6 +220,12 @@ public partial class MainWindow : Window
         string request;
         try
         {
+            // 只受理控制面自己的页面发来的请求(纵深防御:导航已被拦下,这里再核一次来源)。
+            if (!IsControlPlaneUri(e.Source))
+            {
+                return;
+            }
+
             request = e.WebMessageAsJson;
         }
         catch (Exception)

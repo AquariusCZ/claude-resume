@@ -33,6 +33,7 @@ public sealed class NotificationHookProcessTests : IDisposable
     [InlineData("cline", "TaskComplete")]
     [InlineData("qoder", "Stop")]
     [InlineData("opencode", "session.idle")]
+    [InlineData("opencode", "session.execution.succeeded")]
     public async Task HookExe_StdinProtocols_WriteOneEvent(string source, string eventName)
     {
         string shadow = Path.Combine(_root, source);

@@ -1,8 +1,10 @@
 # 踩坑记录 & 开发经验(为以后项目准备)
 
-这份文档记录 AI Resume(内部运行目录仍名为 ClaudeResume)开发过程中**真实踩过的坑、失败的尝试、以及最终的正确解法**,并尽量指到代码位置。目的是:以后做类似项目(Windows + PowerShell + Node + Claude Code CLI + 飞书机器人)时,别再踩同样的坑。
+这份文档记录 AI Resume 开发过程中**真实踩过的坑、失败的尝试、以及最终的正确解法**,并尽量指到代码位置。目的是:以后做类似项目(Windows 后台服务 + Claude Code / OpenCode 等 AI CLI + 飞书)时,别再踩同样的坑。
 
-> 阅读方式:每条都是「现象 → 原因 → 解法 → 代码位置」。带 ★ 的是最隐蔽、最花时间才定位的坑。
+> 阅读方式:第一~十三节大体是「现象 → 原因 → 解法 → 代码位置」,第十四节起是「现象 → 根因 → 规则 → 代码位置」。带 ★ 的是最隐蔽、最花时间才定位的坑。
+>
+> **时代背景**:第一~八节来自 v1(Windows PowerShell 5.1 GUI/引擎 + Node 飞书机器人,运行目录 `%LOCALAPPDATA%\ClaudeResume\`)。v1 运行时已于 2026-08-08 删除,文中的 `picker.ps1`、`lib.ps1`、`checker.ps1`、`feishu-agent.js`、`test/*.js` 只能在 git 历史里查到;教训本身仍然有效。第九节起是 C# v2(运行目录 `%LOCALAPPDATA%\AI Resume\`)。cc-connect 已于 2026-10-30 随 ADR-0006 整体退役,涉及它的条目只作历史背景,其中的通用纪律仍然有效。
 
 ---
 
@@ -44,7 +46,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
    - 同时,右栏 Chip 把内容固定成 272px,模板内部又硬加 28px padding;在真机 150% DPI 下“立即刷新”“15 分钟”被水平裁切。
    - 解法:动态 XAML 必须独立 XML parse + 真正 `XamlReader.Load`;`-SelfTest` 通过按钮事件打开弹窗、逐项切换 8 个模型、比较 ContentPresenter 与内容实际宽度,失败返回非零。再用外部 UI Automation 对**运行目录中的真实窗口**执行 Invoke/Selection,并在实际 DPI 截屏。Chip 模板只使用 `TemplateBinding Padding`,内容用 `* + Auto` 列自适应,不写与容器等宽的固定 Width。位置:`picker.ps1` `Show-AISettingsWindow` / `Assert-ChipContentFits`。
 
-9. **启动 `.cmd` 不能用 `Start-Process claude.cmd -RedirectStandardOutput`**(UseShellExecute=false 无法 exec .cmd)。解法:`cmd.exe /c claude.cmd …` + tail 重定向文件 + 递归按 `ParentProcessId` **杀整个进程树**(返回的 PID 只是 cmd 外壳)。
+9. **启动 `.cmd` 不能用 `Start-Process claude.cmd -RedirectStandardOutput`**(UseShellExecute=false 无法 exec .cmd)。解法:`cmd.exe /c claude.cmd …` + tail 重定向文件 + 递归按 `ParentProcessId` **杀整个进程树**(返回的 PID 只是 cmd 外壳)。(注:经 `cmd.exe /c` 起的进程,多行参数会在换行处被截断,见第二节第 1 条与第十四节第 1 条。)
 
 ---
 
@@ -58,6 +60,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
    - 为什么难查:手动复刻时我用的是**单行** prompt,侥幸绕过,复刻一直"成功";真实 agent 用多行 framing 才暴露。**教训:复刻 bug 必须用和线上完全一致的输入(尤其是否含换行)。**
    - 解法:**prompt 改走 stdin**,不走命令行参数。`spawn(..., {stdio:['pipe','pipe','pipe']})` 后 `child.stdin.write(prompt); child.stdin.end()`。stdin 不受命令行换行影响,原样送达。
    - 位置:`feishu-agent.js` `runClaude`(`args.push('-p', ...)` 不带 prompt;prompt 写进 stdin)。该修复曾用多行暗号做真实端到端验证;后续改动必须继续保持 prompt 只经 stdin 传递。
+   - 后续:2026-10-30 同一个坑在 C# 的飞书投递路径(经 `cmd.exe /c` 调 lark-cli 的 npm 垫片)里第三次出现,见第十四节第 1 条。
 
 2. **★ spawn 开着 stdin pipe 不写,新版 claude 会干等 stdin**(`"no stdin data received in 3s, proceeding without it"`),然后**不执行 `-p` 就空退出**(exit 0、无 result)。
    - 这条和上一条是同一次排查里先后出现的:先发现 stdin 干等(一度改成 `stdio:['ignore',...]`),后来因为要用 stdin 传 prompt,改成**主动 write + end**——一举解决"干等"和"换行截断"两个问题。
@@ -95,7 +98,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
    - stream-json 里可能有**多个 result 行**(plan 模式两段式:主对话先返回"已启动探索任务"、子任务完成再返回最终答案)。scanLine 逐行扫,取最后一个 result 的 `is_error`。
    - 兜底:没有 result 但有 assistant 文本时,把 assistant 文本返回(别给用户空的"未拿到结果")。位置:`runClaude` 的 close 分支。
 
-8. **claude 的 stderr 一开始被完全忽略,失败时一片空白无从诊断**。加上"失败时记录 exit code + stderr 尾 + 是否有 assistant 文本"后,才定位到"no stdin data received"。**教训:外部进程的 stderr 一定要留一份,失败日志才有线索。**
+8. **claude 的 stderr 一开始被完全忽略,失败时一片空白无从诊断**。加上"失败时记录 exit code + stderr 尾 + 是否有 assistant 文本"后,才定位到"no stdin data received"。**教训:外部进程的 stderr 一定要留一份,失败日志才有线索。**(2026-10-30 又一次:lark-cli 的结构化错误信封写在 stderr,封装只读 stdout,见第十四节第 3 条。)
 
 9. **`rate_limit_event` 只在窗口被用到一定程度才由服务器下发**(5h 窗口很空时根本不发 5h 数字)。所以额度显示要能处理"某个窗口暂时没数据"。位置:`Test-ClaudeReady` / GUI 额度 chip 显示 `5h 低`。
 
@@ -104,10 +107,13 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
     - 新证据:2026-08-19 的 `claude-vscode` 会话已明确执行全局 `Stop` command Hook。VS Code 日志记录 Hook 返回，同一 session transcript 保留正确中文 cwd，11 秒后 Worker 以同一来源投递成功；本机证据覆盖 Claude Code 2.1.233/2.1.235 代次。官方现行文档也把 IDE extensions 列入相同 Hook 事件范围。
     - 结论:VS Code 扩展没有“原生飞书完成通知”，但它会加载 `~/.claude/settings.json`，从而通过 AI Resume 注册的 `AiResume.Hook.exe claudecode` 间接通知。2.1.232 的缺失是历史版本行为，至少从本机后续版本实证已经恢复。
     - 诊断:仍需同时关联 VS Code Hook 日志、Claude transcript、`completion-events` 和 `worker.notify.item`；`notify list` 全绿只证明配置可执行，不能单独证明某个宿主版本会产生事件。
+    - 2026-10-30 补充:钩子已改为官方 exec form(`command` 只放 `AiResume.Hook.exe`,`args` 放参数),并新增 `StopFailure` 与真正等人的 `Notification` 订阅,见第十四节第 8 条。
 
 ---
 
 ## 三、飞书(Feishu)机器人的坑
+
+> 本节是 v1 Node 飞书机器人的教训。v2.2 起 AI Resume 已没有任何飞书入站(聊天、卡片、菜单),飞书只用于经官方 lark-cli 发完成通知;「mock 必须照抄真实结构」「长任务进程死了谁告诉用户」等通用纪律仍然有效。
 
 0. **★★★ 长跑任务的结果最容易丢在「进程被重启」上,而用户只看到心跳刷屏后一片死寂**。
    - 现场:某次「修改项目」跑了 11 分钟以上,飞书里堆了 40+ 条「思考中…(已 690s)」然后**永远没有结果**。查日志:全部日志里最长的「完成」记录只有 428s,那次运行**没有任何完成记录**——因为我在那期间部署重启了 node,in-flight 的 `bg()` 任务连同 child 一起消失了。
@@ -125,7 +131,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
      - `im.messageResource.get`(下载)→ `{ writeFile(path), getReadableStream(), headers }`。
    - 代码按"都有 `.data`"写成 `res.data.image_key` → 永远 `undefined` → `drainImageOut` 拿不到 key 就**什么都不发、还把文件删了**:claude 生成的图在线上**静默消失**,而 mock 返回的是 `{data:{image_key}}`,单测一路绿。
    - 解法:①取值**两种结构都兼容**;②**mock 必须照抄线上真实结构**(这次直接用真 API 打一次、把 `Object.keys()` 打印出来对齐);③拿不到 key 时**必须出声**(日志 + 告诉用户查 `im:resource`),绝不静默删文件。
-   - 通用教训:**mock 是你对 API 的假设,不是 API**。凡是"线上不工作但测试全绿",第一个怀疑对象就是 mock 与真实返回结构不一致——用一次真实调用打印结构来校准,成本 30 秒。
+   - 通用教训:**mock 是你对 API 的假设,不是 API**。凡是"线上不工作但测试全绿",第一个怀疑对象就是 mock 与真实返回结构不一致——用一次真实调用打印结构来校准,成本 30 秒。(同一形状在 2026-10-30 又出现了两次,见第十四节第 3、4 条。)
 
 0b. **飞书图片有两种事件形态**:单独发送是没有正文的 `image`;图片和说明放在同一气泡会变成带语言包的富文本 `post`。只处理 `image`,或用 `message_type !== 'text'` 一刀切,都会让合法图文问题在进入 AI 前消失。
    - 解法:`image` 仍用 `im.messageResource.get` 下载后按 **chat+sender** 挂起到该用户下一条文字;`post` 必须解析 `{zh_cn:{title,content:[[...]]}}`(并兼容扁平 body),同时提取段落文字和 `img.image_key`,最多下载前 6 张(单张 10MB),并把这些文件只绑定到当前事件。进入后台任务前同步 claim,否则后到图片会串进先到问题;群聊若只按 chatId 排队,viewer 的图还可能注入 owner 修改。上限必须施加在**最终合并请求**而非各自队列,否则 6 张暂存+6 张 post 仍会变成 12 张;合并时当前 post 图优先。
@@ -137,13 +143,13 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 1. **★ 卡片回调(`card.action.trigger`)必须几秒内返回**,否则飞书报"目标回调服务超时未响应"。
    - 仅靠约定 `onCardAction` 内部不 `await` 不够:后续维护只要加回一个挂起的网络调用,整个 WS ACK 又会被拖住;async IIFE 也会先同步执行到第一个 `await`,文件扫描仍可阻塞。现在在**注册边界**用 `dispatchEvent` + `setImmediate`,保证在 handler 的同步前缀之前就返回;同时按 chat 串行 handler,否则“忘记查询”与紧随其后的新问题会并发,新问题可能恢复正在删除的 thread。`test/session-pick.js` 同时覆盖永久挂起 patch、150ms 同步忙等、毫秒 ACK 与同聊天严格顺序。
 
-2. **飞书开发者后台三处配置是分开的,少一个都不通**:事件配置(订阅 `im.message.receive_v1` / `card.action.trigger` / `application.bot.menu_v6`)、回调配置(订阅方式设 **长连接**)、机器人自定义菜单;改完还要**发布版本**。嵌入式浏览器里配容易出错,用真实浏览器配。
+2. **飞书开发者后台三处配置是分开的,少一个都不通**:事件配置(订阅 `im.message.receive_v1` / `card.action.trigger` / `application.bot.menu_v6`)、回调配置(订阅方式设 **长连接**)、机器人自定义菜单;改完还要**发布版本**。嵌入式浏览器里配容易出错,用真实浏览器配。(v2.2 只发通知,事件订阅与长连接都不再需要;机器人仍要有发消息的权限。)
 
 3. **★ 控制卡「堆叠」与「被抢」是一对相互矛盾的坑**,来回改了好几版才平衡:
    - 只用一张控制卡原地 patch → 延迟/重复的底部菜单事件会把**项目卡 patch 回主菜单卡**(被抢);
    - 让项目卡独立、菜单发新卡 → 菜单事件**堆一堆主菜单卡**(堆叠)。
    - 中间方案:底部菜单事件 = 重绘「当前该显示的那张卡」且不改 session(项目里幂等重画,积压投递不堆不抢);想回主菜单用卡上的「⬅ 主菜单」。
-   - **现役方案**:底部主菜单是“逃生口”,任何状态都重置为 idle 并在底部补一张新卡;普通导航由 `enqueueControlCard` **按 chat 串行写入**,任务执行时跟随实时 `lastCard`,它已被文字顶走就必须在底部新建,绝不回退 patch 入队时的旧卡。`controlCardEpoch` 让慢 patch 不能跨越普通消息的可见性代次重新登记为 live。项目卡绑项目 hash,会话卡再绑随机 token + profile;过期卡、独立模型卡和进度卡都不得抢占 `lastCard`。
+   - **当时的方案**:底部主菜单是“逃生口”,任何状态都重置为 idle 并在底部补一张新卡;普通导航由 `enqueueControlCard` **按 chat 串行写入**,任务执行时跟随实时 `lastCard`,它已被文字顶走就必须在底部新建,绝不回退 patch 入队时的旧卡。`controlCardEpoch` 让慢 patch 不能跨越普通消息的可见性代次重新登记为 live。项目卡绑项目 hash,会话卡再绑随机 token + profile;过期卡、独立模型卡和进度卡都不得抢占 `lastCard`。
    - 位置:`feishu-agent.js` `enqueueControlCard`/`presentControlCard`/`requestSessionCard`/`onBotMenu`;回归:`test/card-flow.js` + `test/session-pick.js`。
 
 4. **飞书会「补投」用户之前积压的点击**(用户狂点几十次,事件会陆续到达),3 秒时间窗去重挡不住。所以关键是让重复/延迟事件**幂等**(见上条),而不是单纯去重。
@@ -165,7 +171,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 
 ## 四、部署 & 工程习惯
 
-1. **★ 改了 `src/` 线上不自动生效** —— 机器人从 `%LOCALAPPDATA%\ClaudeResume\` 跑。改完必须:复制到 AppDir → 精确定位命令行含 `ClaudeResume\feishu-agent.js` 的 node PID并用 `taskkill /PID <pid> /T /F` 终止整棵进程树(VBS 守护约 8s 重启)→ 确认恰好 1 个该进程并在日志看到 `ws client ready`。不要只杀 node 父进程,也不要误杀机器上的其他 Node 服务。见 `CLAUDE.md`。**每次都容易忘,吃过好几次"改了没反应"的亏。**
+1. **★ 改了 `src/` 线上不自动生效** —— 机器人从 `%LOCALAPPDATA%\ClaudeResume\` 跑。改完必须:复制到 AppDir → 精确定位命令行含 `ClaudeResume\feishu-agent.js` 的 node PID并用 `taskkill /PID <pid> /T /F` 终止整棵进程树(VBS 守护约 8s 重启)→ 确认恰好 1 个该进程并在日志看到 `ws client ready`。不要只杀 node 父进程,也不要误杀机器上的其他 Node 服务。见 `CLAUDE.md`。**每次都容易忘,吃过好几次"改了没反应"的亏。**(v2 同样如此:改了 `csharp/` 必须重新 `install`,运行的是 `%LOCALAPPDATA%\AI Resume\` 里的副本,见 `CLAUDE.md`「部署」。)
 
 2. **火绒(Huorong)会删 `.lnk → powershell -WindowStyle Hidden` 这种组合**。所有隐藏启动走 `wscript` 隐藏的 `.vbs` + 计划任务,不用那个模式。
 
@@ -177,7 +183,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 
 ## 五、日志系统(踩过的坑 + 现在的约定)
 
-日志被反复弄坏过好几次(空白、错日期、乱码、失败无信息)。这里一次讲清:**有哪些日志、写在哪、怎么读、踩过什么坑**,以后照这个来,别再弄错。
+日志被反复弄坏过好几次(空白、错日期、乱码、失败无信息)。这里一次讲清:**有哪些日志、写在哪、怎么读、踩过什么坑**,以后照这个来,别再弄错。(本节的文件与函数都是 v1 的;v2 的日志在 `%LOCALAPPDATA%\AI Resume\state\logs\`,「失败必留证据」「绝不用 UTC 拼文件名」等约定照旧。)
 
 ### 有哪些日志(都在 `%LOCALAPPDATA%\ClaudeResume\logs\`)
 - `run-<yyyyMMdd>.log` —— 续跑引擎(`checker.ps1` / `lib.ps1` 的 `Write-CcuLog`),按**本地日期**每天一个。**GUI 主窗口 + 弹出大窗显示的就是它。**
@@ -196,7 +202,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 6. **日志无限增长**:node 的 stdout 只涨不清。修:vbs 重启前 >1MB 删;`Clear-OldCaches` cap 2MB;`run/feishu-<date>.log` 保留 30 天。
 7. **彩色日志的坑**:GUI 用 TextBlock 的 `Inlines` 按级别(info/ok/warn/error/launch/stream)着色(`Set-LogColored`),不是纯文本。改日志**行格式**时,注意别破坏着色用的正则/前缀,否则颜色乱或整块变默认色。
 
-### 现在的约定(改日志前先看这条)
+### 当时的约定(v1;v2 沿用其中的原则)
 - **写**:引擎用 `Write-CcuLog`(本地时间、`run-<当天>`),agent 用 `logLine`(本地时间、`feishu-<当天>`)。**绝不用 UTC**。
 - **读/显示**:一律经 `Read-LogTail`(读**最新** `run-*.log`、UTF-8)。**别再引用启动时固定的日期文件名。**
 - **失败必留证据**:任何外部进程(claude 等)失败,必须把 exit code + stderr 尾记进日志。
@@ -208,7 +214,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 
 2. **「先选模式,再对话」**:进项目先选 只读/修改,而不是默认改。用户原话:"能直接对我的项目做出修改太可怕了"。
 
-3. **长任务必须持续可见,但不能刷屏**:旧实现每 15s 新发一条“思考中”,12 分钟就堆约 48 条。现役实现是 `startProgress`:每次运行只发**一张进度卡**,约 20s 原地 patch 已用时,结束后把同一张卡改成完成态,结果另发到底部;同一次运行的 tick/stop 必须串行,否则慢 tick 会在完成 patch 之后落地,把卡片改回“进行中”。但本地超时不等于 SDK 请求被取消:tick 若已超时,最终态必须另发新卡,避免迟到的旧请求覆盖。`trackRun` 负责进程重启后的中断告知。回归:`test/progress-image.js`。
+3. **长任务必须持续可见,但不能刷屏**:旧实现每 15s 新发一条“思考中”,12 分钟就堆约 48 条。当时的实现是 `startProgress`:每次运行只发**一张进度卡**,约 20s 原地 patch 已用时,结束后把同一张卡改成完成态,结果另发到底部;同一次运行的 tick/stop 必须串行,否则慢 tick 会在完成 patch 之后落地,把卡片改回“进行中”。但本地超时不等于 SDK 请求被取消:tick 若已超时,最终态必须另发新卡,避免迟到的旧请求覆盖。`trackRun` 负责进程重启后的中断告知。回归:`test/progress-image.js`。
 
 4. **用量透明**:每条结果末尾报 `⏱ 耗时 · 输出 N tokens · ≈ $成本`,用户能感知每次问答的开销。位置:`runClaude` 采集 usage/cost、`fmtMeta` 拼接。
 
@@ -232,7 +238,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 
 2. **对抗式复审(adversarial review)真能抓到人肉漏掉的 bug**。一次多视角并行复审 + 逐条独立复核,确认了 9 个问题(含 1 个高危:只读查询污染 `--continue` 池)。写完复杂状态机后值得跑一轮。
 
-3. **复刻 bug 要用线上一模一样的输入**。"复刻成功但线上失败"两次都栽在这:第一次是并发占用会话,第二次是单行 vs 多行 prompt。差一点点条件,结论就相反。
+3. **复刻 bug 要用线上一模一样的输入**。"复刻成功但线上失败"两次都栽在这:第一次是并发占用会话,第二次是单行 vs 多行 prompt。差一点点条件,结论就相反。(第三次:lark-cli 封装的测试同样经 `cmd.exe /c` 起脚本,却只喂单行文本,复现不了换行截断,见第十四节第 1 条。)
 
 3b. **★★★ 测试绝不能对真实项目跑「修改」会话** —— 墨菲定律的现场处刑。routing 测试为了验证"会话里回复『选 A』不被菜单劫持",resume 了 claude-resume 的**真实最新会话**发了"选 A",然后 300ms 后发"停止"止损。结果:那个被唤醒的 claude(带着旧会话上下文、`--dangerously-skip-permissions`)把"选 A"理解成执行此前讨论的方案 A,**替我 git commit 并 push 了整个工作区**;"停止"因 running-map 注册的时序差没拦住。它推的恰好只是我自己未提交的重构(无损),纯属运气。
    - 修法:这类断言只需要"announce 出现 + 没弹菜单",把 work 会话 id 换成**不存在的假 uuid**——`--resume` 秒报错退出,零副作用;测试模型 pin 到 haiku。
@@ -242,7 +248,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 
 5. **同一个外部 CLI 的“新建/续接”不能各拼一套参数**。Codex 首轮在隔离的非 Git cwd 中带 `--skip-git-repo-check`,但 `exec resume` 分支漏了,于是首轮全绿、第二轮统一在模型调用前退出。修法不是再给 resume 手补一次,而是让两种模式共用 `buildCodexArgs` 的 provider/model/tool/Git 不变量,只保留 CLI 语法差异;离线断言两边参数,真 API 冒烟必须包含非 Git cwd 的第二轮 resume。
 
-6. **完成 hook 的一次回调不等于一个用户可见顶层任务**。Codex Desktop 的 projectless 工作区会生成 `Documents\Codex\日期\slug`(例如 `wo-x`),subagent/ephemeral turn 也可能各自产生不同 eventId;纯去重无法把它们合并。现役准入要求 Codex thread 有本地持久化 rollout,并排除无 Git 根的 projectless 生成目录。先定义“什么值得通知”,再谈事件去重。
+6. **完成 hook 的一次回调不等于一个用户可见顶层任务**。Codex Desktop 的 projectless 工作区会生成 `Documents\Codex\日期\slug`(例如 `wo-x`),subagent/ephemeral turn 也可能各自产生不同 eventId;纯去重无法把它们合并。现役准入要求 Codex thread 有本地持久化 rollout,并排除无 Git 根的 projectless 生成目录。先定义“什么值得通知”,再谈事件去重。(OpenCode 2.x 同理:只对顶层会话通知,子会话的结束不是整个任务的结束,依据见 `UPSTREAM-ARCHITECTURE-RESEARCH.md` 的 OpenCode 2.2.3 盘点。)
 
 ---
 
@@ -263,6 +269,11 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 11. **稳定性收尾**:卡片堆叠/抢卡、stdin 传 prompt(换行截断)、旧 15s 消息心跳改为单张进度卡、用量报告、离线自测台。
 12. **多 AI + 会话治理**:OpenAI GPT-5.6 Sol、DeepSeek V4/V4 Pro、Claude 共存;GUI 重塑为 AI Resume 工作台。飞书 scratch 14 天归档/30 天删除,项目 work 永不自动删;Claude transcript+artifact 可恢复移动,Codex 用原生 archive/unarchive/delete。
 13. **服务状态改为真实健康探测**:GUI 启动/手动刷新实测三家 provider,不再把配置或安装状态冒充可用;Claude 未登录等失败同步驱动服务行和额度区。
+14. **C# v2 迁移(2026-08,Stage 0-11)**:WPF + WebView2 控制面 + Worker 服务 + SQLite/WAL,AI 运行改为 Start/Status/Cancel(ADR-0001/0002);v1 运行时 2026-08-07 停用、2026-08-08 从工作树删除。
+15. **直接使用 cc-connect(2026-08-06,ADR-0003)**:飞书聊天与会话交给 cc-connect,AI Resume 收敛为续跑编排、项目发现、完成通知与控制面 GUI 四件事。
+16. **按供应商固定目标续跑(2026-09-07,ADR-0004)**:布防固定供应商、账号、执行器、模型与原生会话 UUID。此后真机上一次自动续跑都没有发生,根因直到 v2.2 才查清(第十四节第 4、5 条)。
+17. **v2.1(2026-10-12,ADR-0005)**:Codex 改走官方账号与 hooks 通知;Claude 额度改用 setup-token 长期令牌(v2.2 推翻,第十四节第 9 条)。
+18. **v2.2(2026-10-30,ADR-0006)**:cc-connect 整体退役(手机远程交给 Claude Code 官方 Remote Control,飞书只发完成通知);逐项目续跑;完成通知送达修复;OpenCode 2.x 插件;GUI 重排(菜单栏、逐项目模型队列)。
 
 ---
 
@@ -287,7 +298,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
    要问"我这次运行让别的程序在哪里写了什么"。** 起 agent 尤其如此:
    它有自己的持久化,不受你的 `finally` 管辖。
 2. **同类风险清单**(新增探测/子进程时逐条过):Claude Code 的 `~/.claude/projects/<cwd编码>/`、
-   Codex 的 thread rollout、cc-connect 的 `~/.cc-connect/sessions/`。
+   Codex 的 thread rollout、cc-connect 的 `~/.cc-connect/sessions/`(cc-connect 已于 2026-10-30 退役,这一项只作历史)。
    凡是把 cwd 当成会话身份的工具,随机 cwd = 无限增长的记录。
 3. **`codex exec` 也必须给固定或一次性目录,但理由相反**:它起的是真 agent,
    不指定工作目录就继承调用方的 cwd,无人值守的探测会落到用户仓库里(v1 的 `CodexProbe` 曾为此固定目录;v2.1 起不再启动 Codex 探测进程,供应商证据全部走 HTTP)。
@@ -306,6 +317,8 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 | Codex「可用 · 凭据已验证」 | `/v1/models` 200 而推理路由 403 |
 | `install` 退出码 0 + "入口已全部指向安装目录" | 五个通知源一个都没启用 |
 | 计划任务 `State=Running` | `PT72H` 会掐断、拔电源就停、崩了不拉起 |
+
+> 2026-10-30 注:表中「飞书已配置」「cc-connect 配置已生成」两行对应的功能已随 cc-connect 退役删除(v2.2 的飞书机器人凭据只有经 `lark-cli doctor` 在线核验后才保存,「可送达」只认投递健康文件里的真实送达记录)。同一形状在 v2.2 又出现了一次:OpenCode 插件被宿主拒绝加载,界面仍显示「已启用」,见第十四节第 6 条。
 
 ### 根因是同一个:判据只看配置,不看世界
 
@@ -327,7 +340,8 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
    误判更糟:它会告诉用户一份能用的配置坏了。
    注意标志位置:`cc-connect --config X config format` 会**获取实例锁**(走启动路径),
    必须写成 `config format --config X`;并且它会**重写文件**,所以只能校验副本。
-3. **核对不了要说核对不了。** 找不到 cc-connect、命令不是 exe 形式、路径读不了 ——
+   (cc-connect 已退役,这个例子只作历史;纪律本身不变。v2.2 的同类做法:OpenCode 插件是否生效以 OpenCode 自己的加载日志为准,机器人凭据是否有效以 `lark-cli doctor` 为准。)
+3. **核对不了要说核对不了。** 找不到 cc-connect(已退役,例子只作历史)、命令不是 exe 形式、路径读不了 ——
    一律返回"未核实"而不是"没问题"。**把未知说成正常,和把故障说成正常一样是在骗人,只是方向相反。**
 
 ### 特别记一笔:B3 —— 现状被自己的上一步清空
@@ -375,7 +389,7 @@ worker 日志里没有 `Application is shutting down`(排除优雅退出)。
 
 **解法**:Startup 快捷方式改指 `AiResume.Launcher.exe`(WinExe 垫片,`CreateNoWindow`
 拉起 Worker 后自己退出),Worker 保持控制台程序形态不变 —— `install` / `notify` /
-`feishu-check` 都要 stdout。想再要"挂了自动重启",用
+`feishu-check` 都要 stdout(`feishu-check` 已于 v2.2 删除,通道体检改为 `notify check`)。想再要"挂了自动重启",用
 `scripts/register-autostart.ps1` 提权升级成 S4U 计划任务
 (非提权注册一律 `0x80070005`,所以不能塞进 install)。
 
@@ -397,11 +411,13 @@ UTF-8 无 BOM 的中文会被解码坏,连 here-string 的结束符都认不出�
    解法:要一份**自己保管**的凭据(`claude setup-token` 一年期令牌,官方为无人值守签发),CLI 只作回退;
    仍然只读不刷新。教训:**依赖别人会话的功能,必须把那个依赖本身做成一等状态行**——
    不是等它失败后显示「未核实」,而是让「它靠谁活着」随时可见。
+   > 2026-10-30 注(ADR-0006):这条的**解法已被推翻**——setup-token 签发的令牌作用域只有 `user:inference`,usage 端点一律 403,读不到额度(见第十四节第 9 条)。v2.2 回到只读 Claude Code 自己的登录,并把「它靠谁活着」做成主动提醒:界面单列「Claude 登录」一块,`ClaudeLoginReminder` 在登录到期前 3 天、2 天、1 天、12 小时与已过期各发一次飞书提醒。教训本身(依赖要做成一等状态)仍然成立。
 2. **★★ 一次成功样本不能证明间歇性故障不存在。** 2026-08-14 验证过「S4U session 0 下 DPAPI 能解密」,
    `outcome=Sent`,于是写进了文档。2026-10 的日志里 `CryptUnprotectData` 连续失败几个小时后又自愈,
    `worker.notify.sweep_failed` 刷了一屏。解法:后台进程**只解密它必须解密的东西**——投递只需要
    收件人 `open_id`(不是秘密),明文存 `config.json`;Worker 真正必须读的 Claude 令牌用 LocalMachine 范围。
    教训:凡是「在另一个安全上下文里跑」的路径,验证要看**一段时间的失败率**,不是一次结果。
+   > 2026-10-30 注:「投递只需要收件人」只对 AI Resume 自己的代码成立——Worker 启动的 lark-cli 每次发送仍要解它自己钥匙串里的 CurrentUser DPAPI 密文,故障点只是移了过去,见第十四节第 2 条。「Claude 令牌用 LocalMachine 范围」随 setup-token 一起删除;现役用 LocalMachine 范围保存的是飞书机器人凭据副本(`state\secrets\feishu-bot.bin`)。
 3. **★ 单值共享键会被任何程序无痕覆盖。** `~/.codex/config.toml` 的 `notify` 只能放一条命令,
    AI Resume 把自己链在前面、用 `--previous-notify` 转发旧值。Codex Desktop 的 computer-use 功能上线后直接把它
    改写成自己的命令,AI Resume 的链整体消失,`notify list` 的所有权检查再精巧也救不回来。
@@ -413,10 +429,96 @@ UTF-8 无 BOM 的中文会被解码坏,连 here-string 的结束符都认不出�
    `interrupt` 信任记录,拿它复算,一次就对上了。教训:**对接别人的二进制契约,测试里必须有一条来自真实世界的样本**,
    和「mock 必须照抄线上返回结构」是同一条纪律。
 
-顺带两条平台事实:cc-connect v1.4.1 的 `cmd` 用 Go `strings.Fields` 拆分,参数里不能有空格;
+顺带两条平台事实(cc-connect 已于 2026-10-30 退役,这两条只作历史):cc-connect v1.4.1 的 `cmd` 用 Go `strings.Fields` 拆分,参数里不能有空格;
 cc-connect 给 codex agent 配 provider 时会 `ensureCodexAuth` 改写 `~/.codex/auth.json`,与用户自己的 ChatGPT 登录互斥——
 这是把 Codex 固定到官方账号、并从 cc-connect 删除 codex-only 第三方 provider 的直接原因。
 
 ---
 
-_维护提示:再遇到新坑,按上面的分类追加一条(现象→原因→解法→代码位置);改了状态机先跑 `node test/card-flow.js`,改了查询或安全边界再跑对应离线回归与 `query-security.js` / `chat-security.js`。_
+## 十四、v2.2 体检挖出来的教训(2026-10-30)
+
+这一轮体检(ADR-0006 §1)从几个现象查起:布防后「一直不能自动续跑」、飞书通知「时灵时不灵」,以及顺带查出的 OpenCode 通知自 10-29 起全部失效。逐条查下去,教训几乎都是同一个形状:**我们只核对了自己这一段,故障在链路的下一段**——Worker 不再解 DPAPI,它启动的 lark-cli 还在解;插件文件写好了,宿主却不加载;测试断言了错误信封,信封却写在另一条流里;账号指纹「有值」,却是会轮换的令牌。
+
+1. **★★★ 经 `cmd.exe /c` 调 npm 垫片,多行参数在第一个换行处被截断——同一个坑第三次出现**
+   - 现象:飞书通知只有第一行(「✅ 项目 已完成」),第二行「来源 · 时间」从来没到;`--idempotency-key` 从未送到飞书,文档里写的「本地去重 + 飞书 uuid」两道保险实际只有一道;五个通知源的冒烟消息内容完全相同,分不出来源。截断后的参数仍然合法,lark-cli 不报错,所以一直没人发现。
+   - 根因:旧的投递代码在 PATH 上只找到 npm 装的 `lark-cli.cmd`,注释写着「lark-cli 在 Windows 上没有 .exe」,于是经 `cmd.exe /c` 启动。通知文本是「标题\n来源 · HH:mm」,cmd 在第一个换行(LF、CRLF 都一样)处截断,其后的第二行、`--idempotency-key`、`--format` 全部丢失。其实 npm 包里就有官方二进制 `node_modules/@larksuite/cli/bin/lark-cli.exe`,`.cmd` 只是包装它的垫片——「PATH 上找不到 .exe」不等于「没有 .exe」。
+   - 此前出现过两次:第一节第 9 条(v1 用 `cmd.exe /c claude.cmd` 起 Claude)与第二节第 1 条(v1 的 `claude -p "多行文本"` 被 cmd 截断,改走 stdin)。C# 续跑运行器也早有防护(`ClaudeResumeRunner` 在没有执行计划的旧路径上对多行提示词显式失败),但新增 lark-cli 调用点时没人对照这条教训;封装的测试同样经 `cmd.exe /c` 起脚本,却只喂单行文本,复现不了(第七节第 3 条)。
+   - 规则:① 外部 CLI 一律直接启动真正的 exe;PATH 上只有 `.cmd` / `.ps1` 时去找它包装的二进制,找不到就报 `launch_failed`,**绝不回退 `cmd.exe`**;② 仍需经 `cmd.exe` 的调用点(如 `ClaudeCodeProbe` 的诊断探测、续跑运行器的旧路径)只能传单行固定参数,参数含换行必须显式失败;③ 新增任何外部进程调用,评审时都要回答「经不经 shell、参数会不会含换行」;④ 参数保真要有测试:直接启动回显替身,断言含 LF 的参数和它后面的参数原样到达。
+   - 位置:`LarkCliNotificationChannel.ResolveExecutable`(只返回 exe)、`LarkCliInvoker`(`ArgumentList`、UTF-8)、`LarkCliInvokerTests`(参数保真用例)。
+
+2. **★★★ S4U 会话 0 里,第三方 CLI 解不开它自己的 CurrentUser DPAPI——10-12 修掉的是自己那一段,故障点移到了 lark-cli**
+   - 现象:10-13 起完成通知成簇失败、又成簇恢复,日志只有笼统的 `send_rejected`;同一秒多条能一起成功,不像频控。10-26 至 10-30 投递成功 179 次、失败 158 次(含重试)。
+   - 根因:Worker 跑在 S4U 计划任务的会话 0。lark-cli 1.0.81 在 Windows 上把 appSecret 存在 `HKCU\Software\LarkCli\keychain` 里,是 CurrentUser 范围的 DPAPI 密文,每次 `--as bot` 都要先解密再换 tenant_access_token。S4U 登录不保存口令,解 CurrentUser 密文会间歇报 `0x8009000B`(推断与 LSASS 的主密钥缓存是否过期有关,微软没有公开说明)。系统的 DPAPI 运行日志(Microsoft-Windows-Crypto-DPAPI/Operational)与投递日志逐条对齐:10-14 以来 312 次失败投递中 300 次(96%)对得上,每条失败恰好伴随 2 次 DPAPI 失败,全成功的轮次一次也没有。
+   - 为什么说「故障点移动了」:10-12 之前 Worker 自己读 CurrentUser DPAPI 的 `feishu-platform.bin` 取收件人,08-14 起累计 5103 次 `sweep_failed`(同一个 `0x8009000B`);10-12 改读明文收件人后 `sweep_failed` 归零,`send_rejected` 从 10-13 开始成批出现。「Worker 投递路径不得依赖 DPAPI」只管住了我们自己的代码,没管住 Worker 启动的子进程(第十三节第 2 条)。
+   - 规则:① 「后台安全上下文里不得依赖 CurrentUser 密文」必须覆盖**整棵进程树**:Worker 启动的每个第三方 CLI 把凭据存在哪、用什么范围加密,接入前就要查清;② 修掉一个故障后,看失败是「消失了」还是「换了名字」——旧错误归零的同时出现新的成簇失败,先怀疑同一根因;③ 优先用上游官方的凭据注入方式:lark-cli 的环境变量凭据提供者(`LARKSUITE_CLI_APP_ID/APP_SECRET/BRAND/STRICT_MODE`,本机 dry-run 证实优先于钥匙串),由 AI Resume 在交互会话里保存一份 **LocalMachine** 范围、ACL 收紧到当前用户 + SYSTEM + Administrators 的副本,保存前用 `lark-cli doctor` 在线核验,Worker 只读、只经子进程环境变量传递;④ 间歇性故障要看一段时间的失败率和系统侧日志,一次成功不算数;⑤ 升级 lark-cli 前复核钥匙串用法(1.0.90 起有存进钥匙串的 tenant access token),别让 DPAPI 依赖从另一个口子回来。
+   - 位置:`FeishuBotCredentials`(`state\secrets\feishu-bot.bin`,可一次性导入 v2.1 的 `feishu-platform.bin`)、`LarkCliNotificationChannel.BuildEnvironment`、`DpapiSecretStore`(LocalMachine 分支与 ACL 收紧)。**待真机验证**:用户在「飞书通知设置」保存或导入一次凭据后,S4U Worker 的真实送达,以及发送时刻 DPAPI 运行日志里不再出现新的 `0x8009000B`。
+
+3. **★★ 错误信封写在 stderr,封装只读 stdout;测试按猜的形状 mock,一直全绿**
+   - 现象:直到 2026-10-30,AI Resume 没有记下过一个真实的飞书错误码,所有失败都是 `send_rejected`;lark-cli 自己的日志(`~/.lark-cli/logs/auth-*.log`)只记 OAuth 设备流,也没有。上一条的根因只能靠系统 DPAPI 日志反推。
+   - 根因:lark-cli 的官方错误契约(`errs/ERROR_CONTRACT.md`、lark-shared Skill)规定**错误信封写 stderr**、stdout 留空,退出码按类型区分(validation=2、authentication / authorization / config=3、network=4、api=1、policy=6、internal=5、confirmation=10)。旧的 `LarkCliInvoker` 只解析 stdout,发送函数只返回 bool,exit 10 的提示也从 stdout 取。`LarkCliInvokerTests` 把错误信封 mock 在 stdout 上,`type` 还是编出来的 `scope`、`confirm`——测试断言的是我们对 lark-cli 的想象。
+   - 同一形状此前出现过一次:第三节第 0a 条(`im.image.create` 没有 `data` 外壳);本轮还有另一处:Claude 凭据测试的夹具凭空给 `.credentials.json` 加了顶层 `organizationUuid`(下一条)。
+   - 规则:① 对接外部 CLI 前,先用**本机实际版本**录一次成功、业务失败、未知命令三种输出,stdout、stderr、退出码都录;mock 只能照抄录制样本,并注明版本与日期;② 结构化错误两条流都要解析(先 stderr、后 stdout),把 code、log_id、retryable、retry_after 落进日志——「被拒绝」不是诊断;③ 失败要分级:条目级只退避这一条,通道级(凭据、权限、网络、频控)熔断整个通道、不再逐条撞墙,参数类永久错误进死信;一段时间(现役 30 分钟,跨轮记账)内两条不同事件命中同一永久类别时升级为通道级(多半是 CLI 契约变了),免得 CLI 一升级就把所有通知送进死信。最初写成「同一轮里两条」,常态下一轮只有一条事件,这条保险永远不会触发,见第 10 条。
+   - 位置:`LarkEnvelope`(code / log_id / retryable / retry_after_seconds / message_id)、`LarkCliInvoker`(`TryParse(stderr) ?? stdout 信封`)、`NotifyClassifier`、`CompletionNotifier`(`completion-events\dead\`、`completion-notify-health.json`)、`LarkCliInvokerTests`(本机录制的 stderr 样本)。
+
+4. **★★★ 账号指纹取自会轮换的令牌:同一个账号每 8 小时被判一次「供应商已改变」**
+   - 现象:布防后最多约 8 小时,续跑就永久停在 `provider-changed`,界面让用户「解除后重新布防」,重新布防后照旧。生产库 `quota_snapshots` 里同一账号攒了 28 个不同指纹,每个都在令牌刷新时刻附近失效;10-20 的现场是布防不到 3 小时后就再没离开过 `provider-changed`。
+   - 根因:代码想用 `.credentials.json` 顶层的 `organizationUuid` 做账号指纹,读不到时退回 `SHA256("token:" + accessToken)`。真实文件顶层只有 `claudeAiOauth` 与 `mcpOAuth`,**根本没有账号字段**,于是指纹永远是令牌哈希;访问令牌约 8 小时一换,`ProviderRegistry` 派生的供应商身份随之改变。测试夹具凭空写了顶层 `organizationUuid`,所以「同账号指纹稳定」的用例一直是绿的。
+   - 规则:① 身份必须取自**身份**,不能取自会轮换的凭据——Claude 账号身份来自 Claude Code 全局配置的 `oauthAccount`(组织 + 账号 UUID,与 `claude auth status` 的 orgId 同源);② 核实不了身份就如实为空、让续跑等待,**绝不拿凭据哈希顶替**——「顶替」看似保住了可用性,实际是把「不知道」伪装成「已改变」;③ 第三方文件的测试夹具必须从真实文件录制结构(值脱敏),夹具里出现真实文件没有的字段,就是测试在说谎;④ 「供应商已改变」要用户重新布防,代价很高,它的判据必须能区分「账号真的换了」与「令牌刷新了」。
+   - 位置:`ClaudeCredentialSource`(`AccountMaterial`:按长度与写入时间缓存,正被改写读不出时沿用上一次成功的值,多份全局配置给出不同账号时视为未核实)、`ProviderRegistry.Read`(身份为空时 `CredentialFailure=account_unverified`)。升级到 v2.2 后,旧布防周期里的身份是令牌派生的,必然判为 `provider-changed`,需要重新布防一次。
+
+5. **★★ 周期级聚合粒度过粗:一个项目卡住,整个周期等待;没启动的失败也锁死周期**
+   - 现象:2026-09-07 引入「固定目标续跑」后,真机上一次自动续跑都没有发生过(8 月的旧引擎在 08-13 至 08-29 间续跑过多次);10-20 那批 `notready` 日志有 66 条看不出原因。
+   - 根因:除了上一条的指纹漂移,还有两个各自足以卡死的设计,本质都是把本该独立的维度压成了周期级的一个结论:
+     - **额度**:scoped 门禁要求目标模型必须有自己的 `weekly_scoped` 正证据,且按「整桶 Allowed / LimitReached」聚合。本账号只有 5 小时、7 天与 Fable 三个窗口,所以 Opus 项目永远「未核实」;Fable 周额度一满,Opus 项目也被一起挡住。测试把「只有主窗口」「只有别的模型的 scoped」「别的模型的 scoped 满额」都固化成了 `Ready=false`,把过度保守当成了安全。
+     - **占用与未启动**:占用检查遍历全部 Selected(包括已经成功的项目),任何一个会话开着就整轮不续;额度就绪后只要撞上一次瞬时占用,计划创建就抛异常,经 `execution-unverified` 置 `ReplayBlocked`,整个周期锁死、必须重新布防——可那时根本还没 spawn,不可能有副作用。
+     - **可观测性**:`resume.probe.notready` 不带原因,`OnNotReady` 把白名单以外的原因一律压成 `unknown`,事后无法定位卡在哪。
+   - 规则:① 先按第一性原理拆维度:义务(这个会话要不要续)、额度(这个模型现在能不能跑)、占用(这个会话有没有被别人拿着)按项目或按模型判定,只有「自己有没有未确认退出的进程」是全局的;② 保守要作用在最小粒度上:「未知」只让**这一个项目**等待,不让整个周期等待;③ 只有可能已产生副作用的结果(进程已启动)才锁住自动重放,「没启动」不是「失败」——记 `not-started:<原因>`,下一拍重新评估;④ 每一种等待都要落一个可读的原因码,日志与界面都能说清卡在哪;⑤ 把「拒绝放行」写进测试期望之前,先问它是安全需要还是实现限制。
+   - 同一形状:通知投递的旧退避也是全局的——一轮里任一条失败,整个队列按 30 秒到 15 分钟加倍退避,永久失败的那条永不出队、也没有死信;10-12 起 462 个事件里 86 个被拖延,中位 30 分钟。现已改为单条退避 + 通道熔断 + 死信(第 3 条)。
+   - 位置:`ProjectAdmission`(义务 / 额度 / 占用三维)、`CheckerCycle.OnProbe` / `NoteProject` / `PrepareActiveRun`(中断 uuid 持久化于 `ConsumedInterruptions`,同一次中断最多续一次)、`ResumeEngine`(逐项目最终门禁、`resume.probe.evaluated` 逐项目原因)、`QuotaResumeProbe.Evaluate`(只看目标模型族相关窗口)、`ProviderExecutionPlan`(`ResumeDeferredException`)。进程启动后的失败仍按 ADR-0002 锁住本周期的自动重放(`ReplayBlocked` 保留)。**待真机验证**:一次真实的用量上限中断后的逐项目自动续跑。
+
+6. **★★ 上游大版本升级静默废掉插件,界面的「已启用」无法证伪**
+   - 现象:10-29 起 OpenCode 的完成通知一条也没有,10 月 Worker 日志里 OpenCode 来源的投递是 0 条,而 GUI 和 `notify list` 照样显示「已启用 / 可送达」。
+   - 根因:OpenCode Desktop 走 `latest` 自动升级通道,10-29 从 1.19.5 升到 2.2.x。2.x 不再运行 v1 插件(官方迁移指南原话 "V1 plugin implementations do not run in V2"),我们生成的单文件插件每次启动都被拒:`failed to load plugin … Plugin must export a default definition with an id and an effect or setup function`,到 10-30 已有 296 条——全在 OpenCode 自己的日志里。而我们的 Probe 只看「插件文件在不在、首行标记对不对」,`HookHealth` 只看 `AiResume.Hook.exe` 在不在,两样都为真,结论却为假(第十一节的同一个形状)。光改导出形状也不够:v2 的事件载荷从 `properties` 换成了 `data`,`session.idle` 已废弃且服务端不再发布,v1 的 `$` 也没了。
+   - 旁证:v1 时期(8/14 至 10/28)OpenCode 也只投递过 1 条,原因已无法核实;opencode.ai 网站上的插件与配置文档仍是 v1 的,官方 v2 迁移指南的示例还在用 `session.idle`——文档与实现不一致时以源码为准。
+   - 规则:① 宿主插件的「已启用」必须来自**宿主自己的加载证据**:插件写入之后,宿主日志里出现本插件的 `loading plugin` 才算已加载,`failed to load plugin` 标断链,没有记录就显示「待核实」;② 接在别人扩展机制上的功能,要把宿主版本当成依赖来跟踪——宿主会自动升级,「上个月能用」不是证据,大版本升级后必须复核;③ 所有权判据要认得我方**每一代**生成物,否则一升级,自己的旧文件就变成「别人的」,原位迁移与停用都会失败;④ 读上游 API 以本机实际版本的源码与生成类型为准,网站文档可能落后一个大版本。
+   - 位置:`OpenCodeNotificationAdapter`(v2 目录形态插件 `plugins/airesume-notify/index.ts`;`ReadLoadEvidence` 读 `~/.local/share/opencode/log/opencode.log` 末尾 4 MB;`IsManagedV2Source` / `IsManagedLegacySource`)、`AiResume.Hook`(接受 `session.execution.succeeded` / `permission.asked` / `form.created` / `session.execution.failed`,OpenCode 事件 ID 只按上游 id 计算)。**待真机验证**:OpenCode 2.2.3 内真实加载新插件并在任务完成时发出通知。
+
+7. **★ 官方能力已经覆盖的桥接层,要按使用证据及时退役(cc-connect)**
+   - 现象:为了「在飞书里驱动 AI」,AI Resume 一直维护着 cc-connect 的配置生成、校验、激活事务、单消费者预检与计划任务核验(当时是 `CLAUDE.md` 里最长的一段门禁),还把上游钉死在 v1.4.1;可 10 月飞书入站只有 2 条,cron 在 34 次启动中一直是 0,微信平台整个周期只收到 1 条消息,却刷出 1 万多行连接失败;计划任务早已被用户自己停用。
+   - 根因:采用上游时只论证了「它能做什么」,没设「它实际被用了多少」的复核点。用户的用法早已迁到 Claude Code 官方 Remote Control(手机聊天、附件、权限、停止、切模型),桥接层继续存在只剩维护成本,`~/.cc-connect` 里还留着多份明文密钥。
+   - 规则:① 引入任何桥接 / 代理类上游时,同时写下「出现什么证据就退役它」;② 定期按使用证据(入站量、命令分布、定时任务数)复核组件价值,而不是按功能清单;③ 官方能力覆盖后,删掉自有实现比「冻结隐藏」更安全——留着的生成 / 重启入口随时可能把不再需要的平台重新拉起;④ 退役时只删自己的代码与数据,别人的程序与配置(计划任务、npm 包、`~/.cc-connect`)只写进文档交给用户清理,并提醒吊销其中的明文密钥。
+   - 位置:ADR-0006 §2.A、`UPSTREAM-ARCHITECTURE-RESEARCH.md`「2026-10-30 退役评估」。已知缺口:手机驱动 OpenCode / Codex 的能力随之放弃。
+
+8. **★ 只订阅了「正常结束」:失败路径完全无声,还按臆测丢掉了真正的结束**
+   - 现象:用量上限中断、登录失效这类最需要把人叫回来的情况,飞书一条通知都没有;开着 `/goal` 等阻断型 Stop hook 时,真正结束的那一次反而收不到。
+   - 根因:Claude Code 的回合因 API 错误结束时**不触发 `Stop`**,而是触发 `StopFailure`(2.1.78+),我们只订阅了 `Stop`;`Notification` 的 matcher 也漏了真正在等人的 `quota_auto_resume_stale` / `quota_auto_resume_disabled`。2026-08 的设计把 `stop_hook_active=true` 理解成「递归,丢弃」,而官方含义只是「Claude 正因某个 Stop hook 而继续」——我方 hook 从不阻断,丢弃它吞掉的正是最后那次结束。钩子还写成带引号的 shell 字符串,在 Claude Code 回退 PowerShell 时是 ParserError(本机复现),只是因为本机装了 Git Bash 才一直没暴露。
+   - 规则:① 订阅上游事件前,先把官方列出的**全部终止与等待事件**列成表,逐个写明订阅与否和理由——成功、失败、中断、等人缺一不可;② 字段语义以官方文档为准,自己的推断要标成推断,上游文档更新后复核;③ 调用形态用官方推荐的(Claude Code hooks 对单个 exe 用 exec form:`command` 只放 exe、`args` 放参数),不依赖「本机恰好装了某个 shell」;④ 去重与合并放在投递端按会话做(稳定期 + 同会话后者替代前者),不在入口按某个标志直接丢。
+   - 位置:`ClaudeCodeNotificationAdapter`(三组 exec form:`Stop` / `StopFailure --kind=failure` / `Notification --kind=decision`)、`AiResume.Hook`(`ShouldSuppress` 对 claudecode 不再按 `stop_hook_active` 丢弃;`ReadClaudeDetails`)、`CompletionNotifier`(对 Claude Code 完成类事件:20 秒稳定期、同会话 2 分钟内替代、后台任务未完时最多暂缓 30 分钟)。**待真机核实**:claude.ai 用量上限触发的 `StopFailure` 的 `error` 是否为 `rate_limit`。
+
+9. **★ 「官方签发的长期令牌」不等于「能读你要的接口」:凭据方案上线前要真调一次**
+   - 现象:v2.1 把 `claude setup-token` 长期令牌定为额度读取的主路径;用户真的保存了令牌之后,usage 端点以 403 拒绝了它(拒绝标记与界面上都是 `token_rejected_403`),额度照样读不到。
+   - 根因:setup-token 签发的令牌作用域只有 `user:inference`(官方文档写明只能发模型请求),而 usage 端点需要 `user:profile`——Claude Code 自己取用量时也要求这个作用域。ADR-0005 落地时没有用这枚令牌对 usage 端点真调过一次(它的状态行写着「Claude 长期令牌……必须由用户操作后才能核实」),而方案在纸面上很合理:官方签发、为无人值守设计、一年有效。
+   - 规则:① 凭据方案写进 ADR 之前,先用它对目标端点做一次只读、零推理的真实调用,核对作用域;② 「官方为无人值守签发」只说明它能做官方声明的事,不说明它能读你要的数据;③ 回到只读 Claude Code 自己的登录后,不要为了「保活」去刷新或代刷——refresh token 一次性轮换,外部刷新会把用户登出;能做的是提醒:令牌待续期时让续跑等待,登录将到期时按天提醒用户 `/login`。
+   - 位置:`ClaudeCredentialSource`(只读,`ClaudeLoginVerdict`)、`ClaudeLoginReminder`、`InstallCommand.RetireLegacyClaudeToken`(`install` 删除旧的 `state\secrets\claude-oauth-token.bin` 与 `.rejected.json`)。
+
+10. **★★ 新写的投递保险,一半按「测试里的形状」而不是「真实的到达节奏」设计(同日交叉审查)**
+   - 现象:上面几条修完、测试全绿后,两路独立的对抗性审查又找出同一形状的一串问题:① 「同一轮两条事件命中同类永久失败就升级熔断」——Worker 每 15 秒一轮,真实事件几乎总是一轮一条,这条保险永远凑不齐;② 结果不明(超时)的重发没有上限,会一直持续到飞书 uuid 一小时去重窗口之外,真的重复送达;退出码 0 但多打了一行提示的输出被当失败重试,同样会重复;③ 「可送达」只看有没有成功过——之后的条目级失败(收件人跨应用)、或刚改过凭据/收件人,界面照样是绿的;④ 通知意图用「列表为空」同时表示「旧配置从没记录过」与「用户把通知源全关了」,全关的用户照样收到残留链路的通知;⑤ 积压超过一天的「已完成」在恢复后一次冲刷出去,文案只有 HH:mm,看起来像刚发生。
+   - 根因:单元测试一轮塞进两条事件、一次失败一次成功,断言的是「这一轮怎么处理」,没有人按真实节奏(一轮一条、失败会跨很多轮、设置会在两次投递之间改)去推演;正面状态取自「历史上发生过」,而不是「最近一次、在当前设置下」。
+   - 规则:① 去重、升级、封顶这类窗口一律用**时间**定义并跨轮持久化,不用「同一轮」「同一批」;② 可能已经生效的副作用(结果不明的发送)只能在对端去重窗口之内重试,窗口外宁可进死信也不盲发;外部 CLI 的退出码 0 就是成功,输出格式不认识不等于失败;③ 绿色要同时满足「最近一次尝试成功」与「那次成功时的设置指纹等于现在」,两者任一不成立就降级为琥珀;④ 「没有记录」与「记录为空」是两种状态,持久化意图要能区分(`NotifyIntentRecorded`);⑤ 通知有时效:超过时效的不补发,宁可进死信也不制造误导;⑥ 测试除了「这一轮的处理」,还要有「真实节奏」的用例:一轮一条地跨轮推进时钟。
+   - 位置:`CompletionNotifier`(`StaleAfter`、`AmbiguousCap`、`PermanentWindow`、`completion-notify-sessions.json`)、`DeliveryHealth.LastAttemptOk` / `SuccessFingerprint`、`NotifyFingerprint`、`LarkCliNotificationChannel`(`sent_unverified`)、`CompletionNotifier.IsSourceEnabled`、`ProductConfig.NotifyIntentRecorded`、`index.html` 的 `AR.notifyModel`。
+
+11. **★★ 「续的那一下失败了」被当成「已经续上了」;上游悄悄换了存储,读的还是旧文件(同日第二轮交叉审查)**
+   - 现象:① 会话被用量上限打断后,原生自动继续在重置点撞上 529、或用户输入后令牌被拒,Claude Code 会再写一条合成错误记录(`isApiErrorMessage=true`,`error` 是 `server_error` / `authentication_failed`)。证据层只看「最近一条 assistant 记录是不是 rate_limit」,于是判「已在别处续上」——项目记为完成、永远不再续,界面还说「已在客户端继续」。② OpenCode 2.x 把登录凭据搬进了自己的 SQLite(`opencode.db` 的 `credential` 表),`auth.json` 只在 2.x 首次启动时导入一次;AI Resume 读的仍是 `auth.json`,下一次在 OpenCode 里换密钥,面板就又挂着旧账户的余额——正是用户最初抱怨的那个现象。③ 通知钩子把 monitor(发布 Artifact 后自动订阅评论)、teammate、开发服务器这类常驻任务算成「还在忙」,每次完成都推迟 30 分钟。
+   - 根因:都是只认了一种形状:「不是 A 就是 B」(不是限流就是续上了;不是 shell 就是在忙),而上游的取值空间比这大;以及把「这个文件过去是真身」当成永久事实。
+   - 规则:① 判定「状态已改变」之前,先把上游可能写出的记录类型列全(本机录一遍真实会话里出现过的 `error` 取值,只读键名与取值),对每一类写明归属;拿不准的类别跳过或判未核实,绝不归入会触发不可逆动作的那一类;② 依赖第三方的本地存储时,每次大版本升级都要复核「它现在把数据写在哪」;读不到新存储才退回旧文件,并在来源里标明;③ 「在忙」这类判断用白名单(会唤醒会话的子代理、workflow、云端会话),不用黑名单。
+   - 位置:`ClaudeSessionEvidence`(跳过非限流合成记录、`LastReplyAtUtc`)、`ResumeSessionCatalog.ContinuedInAnotherSession` / `SameProcess`、`OpenCodeCredentials.ReadDatabaseKey`、`AiResume.Hook` 的 `background_tasks` 白名单。
+
+12. **★★ 「读前 64 KiB 就够了」与「判断不了就当没有」:同一类放行,藏在三处(2026-11-02 修复轮复审)**
+   - 现象:① 会话头部只读前 64 KiB 找 `cwd`:本机 138 个 Claude Code 会话里 43 个的首条带 `cwd` 的记录超过 64 KiB(首条提问贴了截图,图片 base64 内联,单行最长约 2 MB),这些会话在项目发现、会话绑定、转录定位与「换会话接着干」判定里全都「读不出目录」——绑定退回更旧的会话、或续跑永远停在未核实;② `ContinuedInAnotherSession` 读不了目录或读不出新会话的归属时回答「没人接着干」,于是放行续旧会话;③ OpenCode 凭据库可读但没有 DeepSeek 行时退回 `auth.json`,拿 OpenCode 早已不用的旧密钥查余额并点绿。
+   - 根因:固定字节上限是按「平常的记录很短」设的,没有按真实分布量过;布尔返回值没有给「判断不了」留位置,只能被折成某个肯定答案;「库没有这一行」和「库读不了」被同一个 null 表达,下游只能二选一。
+   - 规则:① 解析上游行式文件按行读,单行不设上限,只给总量设预算,上限要按本机真实分布量过再定;② 安全门禁类判定一律三态(是 / 否 / 判断不了),判断不了只导致等待;③ 「没有」与「读不了」必须用不同的返回值表达,读不了显示未核实,绝不退回另一个可能过时的来源。
+   - 位置:`ProjectCatalog.ReadHeadString` / `ReadHeadLines`、`ResumeSessionCatalog.ContinuedInAnotherSession`(`bool?`,另以文件创建时间识别分叉续写)、`CheckerCycle`(superseded 记入 `ConsumedInterruptions`)、`OpenCodeCredentials.ReadDatabaseKey`、`ClaudeCredentialSource`(`unreadable` / `ClaudeLoginVerdict.Unverified`)。
+
+---
+
+_维护提示:再遇到新坑,按上面的分类追加一条(现象 → 根因 → 规则 → 代码位置)。现役回归是 `dotnet test csharp\AiResume.sln`(`GuiPageContractTests` 与 `OpenCodeNotificationAdapterTests` 需要本机 node);v1 的 `node test/*.js` 回归已随 v1 运行时删除,只在 git 历史里。_

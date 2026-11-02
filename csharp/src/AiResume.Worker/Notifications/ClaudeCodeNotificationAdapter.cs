@@ -8,25 +8,60 @@ using System.Text.Json.Nodes;
 namespace AiResume.Worker.Notifications;
 
 /// <summary>
-/// Claude Code 通知适配器:管理 ~/.claude/settings.json 中 hooks.Stop 的合并写入/移除。
-/// 所有权由首个可执行文件名 + 固定来源参数共同证明。
+/// Claude Code 通知适配器：管理 <c>~/.claude/settings.json</c> 里 AI Resume 自己的三组 hooks。
+///
+/// 按官方 hooks 文档(2026-10-30 核对,本机 CLI 2.1.300 / VS Code 2.1.280 / Desktop 2.1.309):
+/// <list type="bullet">
+/// <item><b>Stop</b>:回合正常结束 → 「已完成」。官方说明 Stop 不支持 matcher,所以不写。</item>
+/// <item><b>StopFailure</b>(2.1.78+):回合因 API 错误结束时 Stop <i>不</i>触发，改发它——用量上限、登录失效、
+///   账单问题此前完全没有通知。不写 matcher = 接收全部 error。</item>
+/// <item><b>Notification</b>:只订阅“真的在等你”的几种 notification_type。</item>
+/// </list>
+/// 一律写成官方推荐的 <b>exec form</b>(<c>command</c> 只放 exe 绝对路径,<c>args</c> 放参数,2.1.139+):
+/// 不经过 shell。旧版写的是带引号的整条 shell 命令，Claude Code 回退到 PowerShell 时会 ParserError(本机复现过)。
+///
+/// 所有权：可执行文件名精确等于 <see cref="MarkerFileName"/>,且参数只能是 <c>claudecode</c> 加我方 <c>--kind=</c> 开关;
+/// 旧的 shell form 照样认领，以便迁移。只增删我方条目，用户自己的 hook 与分组原样保留——
+/// 我方条目若混在用户的分组里，会被移出去单独成组，而不是改写那一组的 matcher。
 /// </summary>
 public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
 {
-    /// <summary>所有权标记文件名,用于识别 AI Resume 写入的条目。</summary>
+    /// <summary>所有权标记文件名，用于识别 AI Resume 写入的条目。</summary>
     public const string MarkerFileName = "AiResume.Hook.exe";
+
+    private const string Source = "claudecode";
+
+    /// <summary>
+    /// “在等你”的类型。2026-10-30 起补上 <c>quota_auto_resume_stale</c>(额度已重置但电脑睡过头，等你按回车)
+    /// 与 <c>quota_auto_resume_disabled</c>(不会自己继续，需要你处理)。
+    /// 仍不订阅 idle_prompt(回合结束 60 秒提醒，与 Stop 重复)、auth_success、agent_completed 等。
+    /// </summary>
+    public const string DecisionMatcher =
+        "permission_prompt|worker_permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input|quota_auto_resume_stale|quota_auto_resume_disabled";
+
+    /// <summary>一组受管 hook:事件名、我方 kind 开关(null = 完成)、matcher(null = 不写)。</summary>
+    private sealed record ManagedGroup(string Event, string? KindSwitch, string? Matcher, string Label);
+
+    private static readonly ManagedGroup[] Groups =
+    [
+        new("Stop", null, null, "完成"),
+        new("StopFailure", "--kind=failure", null, "中断"),
+        new("Notification", "--kind=decision", DecisionMatcher, "等你"),
+    ];
 
     private readonly string _settingsPath;
 
-    /// <summary>
-    /// 初始化适配器。
-    /// </summary>
-    /// <param name="settingsPath">settings.json 路径;默认 %USERPROFILE%\.claude\settings.json。</param>
+    /// <param name="settingsPath">
+    /// settings.json 路径;默认与 Claude Code 一致:<c>%CLAUDE_CONFIG_DIR%</c>(设置了时)否则 <c>%USERPROFILE%\.claude</c>
+    /// 下的 settings.json——写到 Claude Code 不读的位置,界面却说「已安装」,就是一句无法证伪的假话。
+    /// </param>
     public ClaudeCodeNotificationAdapter(string? settingsPath = null)
     {
         _settingsPath = settingsPath ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".claude", "settings.json");
+            Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR") is { Length: > 0 } configDir
+                ? configDir
+                : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude"),
+            "settings.json");
     }
 
     /// <inheritdoc />
@@ -53,68 +88,105 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
                     Kind, DisplayName, true, false, _settingsPath, "配置文件不存在");
             }
 
-            var json = File.ReadAllText(_settingsPath);
-            using var doc = JsonDocument.Parse(json);
-            var own = FindOwnCommand(doc.RootElement);
-            var isEnabled = own is not null;
-            return new NotificationProviderStatus(
-                Kind, DisplayName, true, isEnabled, _settingsPath,
-                isEnabled ? "已安装 AI Resume 通知钩子" : "未安装 AI Resume 通知钩子",
-                HookCommand: own);
+            if (JsonNode.Parse(File.ReadAllText(_settingsPath)) is not JsonObject root)
+            {
+                return new NotificationProviderStatus(
+                    Kind, DisplayName, true, false, _settingsPath, "配置文件根节点不是 JSON 对象");
+            }
+
+            OwnEntry[] own = FindOwnEntries(root).ToArray();
+            if (own.Length == 0)
+            {
+                return new NotificationProviderStatus(
+                    Kind, DisplayName, true, false, _settingsPath, "未安装 AI Resume 通知钩子");
+            }
+
+            // 「已启用」必须三组都在且形状正确:只剩 Stop 时，中断与「等你」两类通知永远不会到。
+            string[] drift = Groups
+                .Where(group => !own.Any(entry => IsCanonical(entry, group)))
+                .Select(group => group.Label)
+                .ToArray();
+            string hookCommand = own[0].Command;
+            return drift.Length == 0
+                ? new NotificationProviderStatus(Kind, DisplayName, true, true, _settingsPath,
+                    "已安装 AI Resume 通知钩子(完成 / 中断 / 等你)", HookCommand: hookCommand)
+                : new NotificationProviderStatus(Kind, DisplayName, true, true, _settingsPath,
+                    $"钩子不完整或为旧格式(缺:{string.Join("、", drift)});关掉再打开本开关或重新安装即可修复",
+                    HookCommand: hookCommand, HookBroken: true);
         }
         catch (Exception ex)
         {
             return new NotificationProviderStatus(
                 Kind, DisplayName, true, false, _settingsPath,
-                $"配置读取失败: {ex.Message}");
+                $"配置读取失败: {ex.Message}", Unverified: true);
         }
     }
 
     /// <inheritdoc />
     public void Enable(string hookCommand)
     {
-        if (string.IsNullOrWhiteSpace(hookCommand))
-            throw new ArgumentException("hookCommand 不能为空", nameof(hookCommand));
+        string exe = HookCommand.ExtractExecutable(hookCommand) ??
+                     throw new ArgumentException("hookCommand 不能为空", nameof(hookCommand));
+        if (exe.Contains('"') || !Path.IsPathFullyQualified(exe))
+            throw new ArgumentException("hook 可执行文件必须是不含引号的绝对路径", nameof(hookCommand));
 
         var dir = Path.GetDirectoryName(_settingsPath);
         if (string.IsNullOrEmpty(dir))
             throw new InvalidOperationException("无法确定配置目录路径");
         Directory.CreateDirectory(dir);
 
-        JsonNode? root;
-        if (File.Exists(_settingsPath))
+        JsonObject root = ReadRoot() ?? new JsonObject();
+        OwnEntry[] own = FindOwnEntries(root).ToArray();
+
+        // 已经恰好是三组规范条目、且没有多余的我方条目:幂等空操作，不改写文件、不调整顺序。
+        bool canonical = own.Length == Groups.Length &&
+                         Groups.All(group => own.Count(entry => IsCanonical(entry, group, exe)) == 1);
+        if (canonical)
         {
-            try
+            return;
+        }
+
+        if (root["hooks"] is not JsonObject hooks)
+        {
+            hooks = new JsonObject();
+            root["hooks"] = hooks;
+        }
+
+        RemoveOwnEntries(hooks);
+        foreach (ManagedGroup group in Groups)
+        {
+            if (hooks[group.Event] is not JsonArray array)
             {
-                var json = File.ReadAllText(_settingsPath);
-                root = JsonNode.Parse(json);
+                array = new JsonArray();
+                hooks[group.Event] = array;
             }
-            catch (Exception ex)
+
+            var args = new JsonArray { Source };
+            if (group.KindSwitch is not null)
             {
-                throw new InvalidOperationException($"读取现有配置失败: {ex.Message}", ex);
+                args.Add(group.KindSwitch);
             }
+
+            var entry = new JsonObject();
+            if (group.Matcher is not null)
+            {
+                entry["matcher"] = group.Matcher;
+            }
+
+            entry["hooks"] = new JsonArray
+            {
+                new JsonObject
+                {
+                    ["type"] = "command",
+                    ["command"] = exe,
+                    ["args"] = args,
+                    ["timeout"] = 30,
+                },
+            };
+            array.Add(entry);
         }
-        else
-        {
-            root = new JsonObject();
-        }
 
-        if (root is not JsonObject rootObj)
-            throw new InvalidOperationException("配置文件根节点不是 JSON 对象");
-
-        string desiredCommand = HookCommand.Format(hookCommand, "claudecode");
-
-        // 两类条目都要保证存在,且**各自刷新各自的命令**:
-        // Stop 说"跑完了",Notification 说"停下来等你决定",命令不同(后者带 --kind=decision),
-        // 所以刷新必须按事件分别进行 —— 全局刷成同一条会让两者互相覆盖。
-        bool changed = EnsureEventEntry(rootObj, StopEvent, string.Empty, desiredCommand);
-        changed |= EnsureEventEntry(
-            rootObj, NotificationEvent, DecisionMatcher, desiredCommand + " " + DecisionArgument);
-
-        if (changed)
-        {
-            AtomicWrite(rootObj);
-        }
+        AtomicWrite(root);
     }
 
     /// <inheritdoc />
@@ -123,307 +195,161 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
         if (!File.Exists(_settingsPath))
             return;
 
-        JsonNode? root;
+        JsonObject? root = ReadRoot();
+        if (root?["hooks"] is not JsonObject hooks)
+            return;
+
+        if (!RemoveOwnEntries(hooks))
+            return;
+
+        if (hooks.Count == 0)
+            root.Remove("hooks");
+
+        AtomicWrite(root);
+    }
+
+    private JsonObject? ReadRoot()
+    {
+        if (!File.Exists(_settingsPath))
+            return null;
+
         try
         {
-            var json = File.ReadAllText(_settingsPath);
-            root = JsonNode.Parse(json);
+            return JsonNode.Parse(File.ReadAllText(_settingsPath)) as JsonObject
+                   ?? throw new InvalidOperationException("配置文件根节点不是 JSON 对象");
         }
-        catch (Exception ex)
+        catch (JsonException ex)
         {
             throw new InvalidOperationException($"读取现有配置失败: {ex.Message}", ex);
         }
-
-        if (root is not JsonObject rootObj)
-            return;
-
-        if (!rootObj.TryGetPropertyValue("hooks", out var hooksNode) || hooksNode is not JsonObject hooksObj)
-            return;
-
-        bool changed = false;
-        foreach (string eventName in ManagedEvents)
-        {
-            changed |= RemoveOwnEntriesFrom(hooksObj, eventName);
-        }
-
-        if (!changed)
-            return;
-
-        // 若 hooks 对象为空则移除 hooks 键
-        if (hooksObj.Count == 0)
-            rootObj.Remove("hooks");
-
-        AtomicWrite(rootObj);
     }
 
-    /// <summary>从某个事件的分组里移除我方条目;返回是否有改动。</summary>
-    private static bool RemoveOwnEntriesFrom(JsonObject hooksObj, string eventName)
+    /// <summary>我方的一条 hook:所在事件、所在分组、命令原文、kind 开关、是否 exec form、分组里是否还有别人的 hook。</summary>
+    private sealed record OwnEntry(string Event, JsonObject Group, JsonObject Hook, string Command,
+        string? KindSwitch, bool ExecForm, bool SharedGroup);
+
+    private static IEnumerable<OwnEntry> FindOwnEntries(JsonObject root)
     {
-        if (!hooksObj.TryGetPropertyValue(eventName, out var stopNode) || stopNode is not JsonArray stopArray)
-            return false;
+        if (root["hooks"] is not JsonObject hooks)
+            yield break;
 
-        bool changed = false;
-
-        // 从后往前遍历,便于移除
-        for (int i = stopArray.Count - 1; i >= 0; i--)
+        foreach ((string eventName, JsonNode? eventNode) in hooks)
         {
-            if (stopArray[i] is not JsonObject stopEntry)
+            if (eventNode is not JsonArray groups)
                 continue;
 
-            if (!stopEntry.TryGetPropertyValue("hooks", out var entryHooksNode) || entryHooksNode is not JsonArray entryHooks)
-                continue;
-
-            // 移除我方 command 条目
-            for (int j = entryHooks.Count - 1; j >= 0; j--)
+            foreach (JsonObject group in groups.OfType<JsonObject>())
             {
-                if (entryHooks[j] is JsonObject hookObj &&
-                    hookObj.TryGetPropertyValue("command", out var cmdNode) &&
-                    cmdNode is JsonValue cmdValue &&
-                    cmdValue.TryGetValue<string>(out var cmdStr) &&
-                    IsOwnCommand(cmdStr))
+                if (group["hooks"] is not JsonArray entries)
+                    continue;
+
+                foreach (JsonObject hook in entries.OfType<JsonObject>())
                 {
-                    entryHooks.RemoveAt(j);
-                    changed = true;
+                    if (TryParseOwn(hook, out string? command, out string? kindSwitch, out bool execForm))
+                    {
+                        yield return new OwnEntry(eventName, group, hook, command!, kindSwitch, execForm, entries.Count > 1);
+                    }
                 }
             }
-
-            // 若 hooks 数组为空则移除整个分组
-            if (entryHooks.Count == 0)
-            {
-                stopArray.RemoveAt(i);
-                changed = true;
-            }
         }
-
-        // 数组空了就把事件键也去掉,不留一个空壳
-        if (stopArray.Count == 0)
-            hooksObj.Remove(eventName);
-
-        return changed;
     }
 
     /// <summary>
-    /// 找出我方条目的**命令原文**;没有则返回 null。
-    ///
-    /// 原来只返回 bool。但"配置里有这条命令"和"这条命令跑得起来"是两件事——
-    /// 把原文交出去,注册表才能再问一句文件在不在(见 <see cref="HookHealth"/>)。
+    /// 是否我方条目。exec form:command 的文件名是标记 exe,args 是 <c>["claudecode", 我方开关…]</c>;
+    /// 旧 shell form:没有 args,由 <see cref="HookCommand.IsManaged"/> 判定整条命令。
     /// </summary>
-    private static string? FindOwnCommand(JsonElement root)
+    private static bool TryParseOwn(JsonObject hook, out string? command, out string? kindSwitch, out bool execForm)
     {
-        if (root.ValueKind != JsonValueKind.Object)
-            return null;
-
-        if (!root.TryGetProperty("hooks", out var hooks) || hooks.ValueKind != JsonValueKind.Object)
-            return null;
-
-        if (!hooks.TryGetProperty("Stop", out var stop) || stop.ValueKind != JsonValueKind.Array)
-            return null;
-
-        foreach (var entry in stop.EnumerateArray())
-        {
-            if (entry.ValueKind != JsonValueKind.Object)
-                continue;
-
-            if (!entry.TryGetProperty("hooks", out var entryHooks) || entryHooks.ValueKind != JsonValueKind.Array)
-                continue;
-
-            foreach (var hook in entryHooks.EnumerateArray())
-            {
-                if (hook.ValueKind != JsonValueKind.Object)
-                    continue;
-
-                if (hook.TryGetProperty("command", out var cmd) &&
-                    cmd.ValueKind == JsonValueKind.String &&
-                    cmd.GetString() is { } cmdStr &&
-                    IsOwnCommand(cmdStr))
-                {
-                    return cmdStr;
-                }
-            }
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// 检查 JsonObject 中是否包含我方条目。
-    /// </summary>
-    private static bool ContainsOwnEntry(JsonObject root)
-    {
-        if (!root.TryGetPropertyValue("hooks", out var hooksNode) || hooksNode is not JsonObject hooksObj)
-            return false;
-
-        if (!hooksObj.TryGetPropertyValue("Stop", out var stopNode) || stopNode is not JsonArray stopArray)
-            return false;
-
-        foreach (var entryNode in stopArray)
-        {
-            if (entryNode is not JsonObject entryObj)
-                continue;
-
-            if (!entryObj.TryGetPropertyValue("hooks", out var entryHooksNode) || entryHooksNode is not JsonArray entryHooks)
-                continue;
-
-            foreach (var hookNode in entryHooks)
-            {
-                if (hookNode is not JsonObject hookObj)
-                    continue;
-
-                if (hookObj.TryGetPropertyValue("command", out var cmdNode) &&
-                    cmdNode is JsonValue cmdValue &&
-                    cmdValue.TryGetValue<string>(out var cmdStr) &&
-                    IsOwnCommand(cmdStr))
-                {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private static bool RefreshOwnCommands(JsonObject root, string desiredCommand)
-    {
-        bool changed = false;
-        if (!root.TryGetPropertyValue("hooks", out JsonNode? hooksNode) || hooksNode is not JsonObject hooksObj ||
-            !hooksObj.TryGetPropertyValue("Stop", out JsonNode? stopNode) || stopNode is not JsonArray stopArray)
+        command = null;
+        kindSwitch = null;
+        execForm = false;
+        if (hook["command"] is not JsonValue commandValue || !commandValue.TryGetValue(out string? text) ||
+            string.IsNullOrWhiteSpace(text))
         {
             return false;
         }
 
-        foreach (JsonNode? entryNode in stopArray)
+        if (hook.ContainsKey("args"))
         {
-            if (entryNode is not JsonObject entryObj ||
-                !entryObj.TryGetPropertyValue("hooks", out JsonNode? entryHooksNode) ||
-                entryHooksNode is not JsonArray entryHooks)
+            if (hook["args"] is not JsonArray args || args.Count == 0 ||
+                args.Any(arg => arg is not JsonValue value || !value.TryGetValue(out string? _)) ||
+                !string.Equals(Path.GetFileName(HookCommand.ExtractExecutable(text) ?? string.Empty), MarkerFileName,
+                    StringComparison.OrdinalIgnoreCase))
             {
-                continue;
+                return false;
             }
 
-            foreach (JsonNode? hookNode in entryHooks)
+            string[] values = args.Select(arg => arg!.GetValue<string>()).ToArray();
+            if (!string.Equals(values[0], Source, StringComparison.OrdinalIgnoreCase) ||
+                !values.Skip(1).All(value => value.StartsWith("--kind=", StringComparison.Ordinal)))
             {
-                if (hookNode is not JsonObject hookObj ||
-                    !hookObj.TryGetPropertyValue("command", out JsonNode? commandNode) ||
-                    commandNode is not JsonValue commandValue ||
-                    !commandValue.TryGetValue(out string? command) ||
-                    !IsOwnCommand(command) ||
-                    string.Equals(command, desiredCommand, StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                hookObj["command"] = desiredCommand;
-                changed = true;
-            }
-        }
-
-        return changed;
-    }
-
-    /// <summary>任务跑完。</summary>
-    private const string StopEvent = "Stop";
-
-    /// <summary>AI 停下来等人。种类由 matcher 选定,不依赖 payload 里的字段名。</summary>
-    private const string NotificationEvent = "Notification";
-
-    /// <summary>
-    /// 只订阅"AI 在等你"的那几种。
-    ///
-    /// 2026-10-12 加回 <c>permission_prompt</c>:Claude Desktop / VS Code 经 Agent SDK 跑时,
-    /// 权限等待不会以 agent_needs_input 出现,而是在用户没回应约 6 秒后发 permission_prompt
-    /// (官方 hooks 文档);不订阅它,桌面版"停下来等你批准"就永远推不到飞书。
-    /// 仍不含 idle_prompt:它按时间触发,每次回合结束后都会响,只会变成噪音。
-    /// </summary>
-    private const string DecisionMatcher = "agent_needs_input|elicitation_dialog|elicitation_url_dialog|permission_prompt";
-
-    private const string DecisionArgument = "--kind=decision";
-
-    private static readonly string[] ManagedEvents = [StopEvent, NotificationEvent];
-
-    /// <summary>
-    /// 保证某个事件下有一条我方条目且命令是最新的。已存在就地刷新(保留用户其余结构),
-    /// 不存在则追加。返回是否有改动。
-    /// </summary>
-    private static bool EnsureEventEntry(
-        JsonObject root, string eventName, string matcher, string desiredCommand)
-    {
-        if (!root.TryGetPropertyValue("hooks", out var hooksNode) || hooksNode is not JsonObject hooksObj)
-        {
-            hooksObj = new JsonObject();
-            root["hooks"] = hooksObj;
-        }
-
-        if (!hooksObj.TryGetPropertyValue(eventName, out var arrayNode) || arrayNode is not JsonArray array)
-        {
-            array = new JsonArray();
-            hooksObj[eventName] = array;
-        }
-
-        bool found = false;
-        bool changed = false;
-        foreach (JsonNode? entryNode in array)
-        {
-            if (entryNode is not JsonObject entryObj ||
-                !entryObj.TryGetPropertyValue("hooks", out JsonNode? entryHooksNode) ||
-                entryHooksNode is not JsonArray entryHooks)
-            {
-                continue;
+                return false;
             }
 
-            foreach (JsonNode? hookNode in entryHooks)
-            {
-                if (hookNode is not JsonObject hookObj ||
-                    !hookObj.TryGetPropertyValue("command", out JsonNode? commandNode) ||
-                    commandNode is not JsonValue commandValue ||
-                    !commandValue.TryGetValue(out string? command) ||
-                    !IsOwnCommand(command))
-                {
-                    continue;
-                }
-
-                found = true;
-                if (!string.Equals(command, desiredCommand, StringComparison.Ordinal))
-                {
-                    hookObj["command"] = desiredCommand;
-                    changed = true;
-                }
-
-                // matcher 也可能是旧值(比如后来加了新的通知类型),一并对齐。
-                if (!string.Equals(entryObj["matcher"]?.GetValue<string>(), matcher, StringComparison.Ordinal))
-                {
-                    entryObj["matcher"] = matcher;
-                    changed = true;
-                }
-            }
+            command = text;
+            kindSwitch = values.Skip(1).LastOrDefault();
+            execForm = true;
+            return true;
         }
 
-        if (found)
+        if (!HookCommand.IsManaged(text, MarkerFileName, Source))
         {
-            return changed;
+            return false;
         }
 
-        array.Add(new JsonObject
-        {
-            ["matcher"] = matcher,
-            ["hooks"] = new JsonArray
-            {
-                new JsonObject
-                {
-                    ["type"] = "command",
-                    ["command"] = desiredCommand,
-                    ["timeout"] = 30,
-                },
-            },
-        });
+        command = text;
+        kindSwitch = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+            .LastOrDefault(token => token.StartsWith("--kind=", StringComparison.Ordinal));
         return true;
     }
 
-    private static bool IsOwnCommand(string? command)
-        => HookCommand.IsManaged(command, MarkerFileName, "claudecode");
+    private static bool IsCanonical(OwnEntry entry, ManagedGroup group, string? exe = null) =>
+        entry.ExecForm && !entry.SharedGroup &&
+        string.Equals(entry.Event, group.Event, StringComparison.Ordinal) &&
+        string.Equals(entry.KindSwitch, group.KindSwitch, StringComparison.Ordinal) &&
+        (exe is null || string.Equals(entry.Command, exe, StringComparison.OrdinalIgnoreCase)) &&
+        string.Equals(entry.Group["matcher"] is JsonValue matcher && matcher.TryGetValue(out string? text) ? text : null,
+            group.Matcher, StringComparison.Ordinal) &&
+        entry.Hook["args"] is JsonArray args && args.Count == (group.KindSwitch is null ? 1 : 2);
 
-    /// <summary>
-    /// 原子写回:先备份原文件为 .bak,再写临时文件并替换。
-    /// </summary>
+    /// <summary>从所有事件里移除我方条目，空分组与空事件键一并移除;用户自己的 hook 原样保留。</summary>
+    private static bool RemoveOwnEntries(JsonObject hooks)
+    {
+        bool changed = false;
+        foreach (string eventName in hooks.Select(pair => pair.Key).ToArray())
+        {
+            if (hooks[eventName] is not JsonArray groups)
+                continue;
+
+            for (int i = groups.Count - 1; i >= 0; i--)
+            {
+                if (groups[i] is not JsonObject group || group["hooks"] is not JsonArray entries)
+                    continue;
+
+                for (int j = entries.Count - 1; j >= 0; j--)
+                {
+                    if (entries[j] is JsonObject hook && TryParseOwn(hook, out _, out _, out _))
+                    {
+                        entries.RemoveAt(j);
+                        changed = true;
+                    }
+                }
+
+                if (entries.Count == 0)
+                {
+                    groups.RemoveAt(i);
+                    changed = true;
+                }
+            }
+
+            if (groups.Count == 0)
+                hooks.Remove(eventName);
+        }
+
+        return changed;
+    }
+
+    /// <summary>原子写回：先备份原文件为 .bak,再写临时文件并替换。</summary>
     private void AtomicWrite(JsonNode root)
     {
         var dir = Path.GetDirectoryName(_settingsPath);
@@ -431,11 +357,9 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
             throw new InvalidOperationException("无法确定配置目录路径");
         Directory.CreateDirectory(dir);
 
-        // 备份原文件(覆盖式)
         if (File.Exists(_settingsPath))
         {
-            var bakPath = _settingsPath + ".bak";
-            File.Copy(_settingsPath, bakPath, true);
+            File.Copy(_settingsPath, _settingsPath + ".bak", true);
         }
 
         var tempPath = _settingsPath + ".tmp";
@@ -454,7 +378,6 @@ public sealed class ClaudeCodeNotificationAdapter : INotificationAdapter
         }
         catch
         {
-            // 清理临时文件,不留半成品
             try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { /* 忽略清理失败 */ }
             throw;
         }

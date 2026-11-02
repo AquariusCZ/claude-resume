@@ -11,13 +11,15 @@ public sealed record ProviderObservation(
     ProviderModelCatalog Catalog, decimal? Balance, string? Currency,
     bool QuotaKnown, bool Limited, string? Problem, UsageSnapshot? Usage = null)
 {
-    /// <summary>凭据来源标签(不含实值),如 claude-oauth:ai-resume-token / auth.json:chatgpt。</summary>
+    /// <summary>凭据来源标签(不含实值),如 claude-oauth:claude-cli / auth.json:chatgpt / opencode-auth。</summary>
     public string? CredentialSource { get; init; }
 
     public object ToPayload() => new
     {
         id = Id, name = Name, agent = Agent, kind = Kind, identity = Identity,
         credentialSource = CredentialSource,
+        // 只有 Claude Code / Codex 原生会话能续跑;DeepSeek(OpenCode)行只展示余额。
+        resumable = Agent is "claudecode" or "codex" && Identity.Length > 0,
         models = Catalog.Models.Select(m => new { id = m.Id, name = m.Name }),
         modelsVerified = Catalog.Verified, source = Catalog.Source,
         observedAtUtc = Catalog.ObservedAtUtc, balance = Balance, currency = Currency,
@@ -30,11 +32,13 @@ public sealed record ProviderObservation(
                 name = w.Name, usedPercent = w.UsedPercent, resetAtUnix = w.ResetAtUnix,
                 windowSeconds = w.WindowSeconds, carriedForward = w.CarriedForward, status = w.Status,
             }),
+        // 按行的用途说话:Claude Code 指向 DeepSeek 端点的 claude-api 行(Kind 也是 deepseek)是可续跑的,
+        // 只有 OpenCode 那一行才是「只展示」。
         resumeNote = Kind == "chatgpt"
             ? "账号窗口与模型可用性来自 ChatGPT 官方接口；账号未限额且目标模型可用时自动续跑"
-            : Kind == "deepseek"
-                ? "本周期固定调用 ID；供应商可能更新同一 ID 的后端版本"
-                : "布防时固定供应商与调用 ID，下次布防重新选择",
+            : Agent == "opencode"
+                ? "OpenCode 使用的 DeepSeek 账户余额，只展示，不参与续跑"
+                : "布防时按项目固定模型调用 ID，下次布防重新选择",
     };
 }
 
@@ -64,19 +68,23 @@ public sealed class ProviderCatalogService
 
     public ProviderRegistry Registry => _registry;
 
-    public async Task<IReadOnlyList<ProviderObservation>> ReadAsync(CancellationToken ct)
+    /// <summary>
+    /// 全部供应商行。<paramref name="reuseQuotaWithin"/> 给出时，Claude 订阅行复用这么新的额度读数(先等在途的那次刷新完成):
+    /// 控制面同一轮刷新里 quota.get 刚拿过实时读数，再对 usage 端点强制请求一次只会多吃 429。续跑与布防不传，照旧取实时读数。
+    /// </summary>
+    public async Task<IReadOnlyList<ProviderObservation>> ReadAsync(CancellationToken ct, TimeSpan? reuseQuotaWithin = null)
     {
         IReadOnlyList<ProviderConnection> connections = _registry.Read();
-        return await Task.WhenAll(connections.Select(p => ObserveAsync(p, ct))).ConfigureAwait(false);
+        return await Task.WhenAll(connections.Select(p => ObserveAsync(p, ct, reuseQuotaWithin))).ConfigureAwait(false);
     }
 
-    public async Task<ProviderObservation> ObserveAsync(ProviderConnection connection, CancellationToken ct)
+    public async Task<ProviderObservation> ObserveAsync(ProviderConnection connection, CancellationToken ct, TimeSpan? reuseQuotaWithin = null)
     {
         try
         {
             ProviderObservation observation = _observe is not null
                 ? await _observe(connection, ct).ConfigureAwait(false)
-                : await ObserveCoreAsync(connection, ct).ConfigureAwait(false);
+                : await ObserveCoreAsync(connection, ct, reuseQuotaWithin).ConfigureAwait(false);
             ProviderConnection? current = _registry.Find(connection.Id);
             if (current?.Identity != connection.Identity)
                 return Unavailable(connection, "查询期间供应商或账号已改变，请刷新");
@@ -86,46 +94,94 @@ public sealed class ProviderCatalogService
         catch (Exception) { return Unavailable(connection, "供应商数据暂时无法读取"); }
     }
 
-    public async Task<ResumeTarget> BindAsync(string providerId, string modelId, CancellationToken ct)
+    public async Task<ResumeTarget> BindAsync(string providerId, string modelId, CancellationToken ct) =>
+        (await BindWithCatalogAsync(providerId, modelId, ct).ConfigureAwait(false)).Target;
+
+    /// <summary>布防：固定供应商、账号与默认模型，同时交回本次已核实的实时目录供逐项目选模型。</summary>
+    public async Task<(ResumeTarget Target, ProviderModelCatalog Catalog)> BindWithCatalogAsync(
+        string providerId, string modelId, CancellationToken ct)
     {
         ProviderConnection connection = _registry.Find(providerId)
             ?? throw new InvalidOperationException("供应商已改变，请刷新后重新选择");
+        if (connection.Agent is not ("claudecode" or "codex"))
+            throw new InvalidOperationException(connection.Name + " 只显示余额，不是续跑目标");
+        if (connection.Identity.Length == 0)
+            throw new InvalidOperationException(connection.Credentials.Problem ?? "账号身份未核实，暂不能布防");
         ProviderObservation observation = await ObserveAsync(connection, ct).ConfigureAwait(false);
         ProviderModel? model = observation.Catalog.Models.SingleOrDefault(m => m.Id == modelId);
+        // 目录没读出来多半是凭据问题(需 /login、令牌待续期):把真实原因带给用户，「刷新后重试」解决不了它。
+        if (!observation.Catalog.Verified && (connection.Credentials.Problem ?? observation.Problem) is { Length: > 0 } why)
+            throw new InvalidOperationException("读不到供应商的实时模型目录:" + why);
         if (!observation.Catalog.Verified || model is null || !ProviderModels.IsSafeId(modelId))
             throw new InvalidOperationException("无法从当前供应商目录确认所选模型，请刷新后重试");
-        return new ResumeTarget
+        return (new ResumeTarget
         {
             ProviderId = connection.Id, ProviderIdentity = connection.Identity,
             ProviderName = connection.Name, Agent = connection.Agent, ModelId = model.Id,
             ModelName = model.Name, BoundAtUtc = DateTimeOffset.UtcNow,
-        };
+        }, observation.Catalog);
     }
 
-    public async Task<ClaudeProbeResult> CheckAsync(ResumeTarget target, CancellationToken ct)
+    public async Task<ClaudeProbeResult> CheckAsync(ResumeTarget target, CancellationToken ct) =>
+        (await CheckModelsAsync(target, [target.ModelId], ct).ConfigureAwait(false))[target.ModelId];
+
+    /// <summary>
+    /// 一次供应商观测，逐个模型给出额度结论。同一账号的多个项目共用这一份实时证据，不为每个项目重复请求。
+    /// 原因码区分：账号身份未核实(identity-unverified)与凭据暂不可用(credentials-unavailable,如令牌过期)
+    /// 都只是等待;只有身份确实变了才是 provider-changed(需重新布防)。
+    /// </summary>
+    public async Task<IReadOnlyDictionary<string, ClaudeProbeResult>> CheckModelsAsync(
+        ResumeTarget target, IReadOnlyCollection<string> models, CancellationToken ct)
     {
+        Dictionary<string, ClaudeProbeResult> All(ClaudeProbeResult result) =>
+            models.Distinct(StringComparer.Ordinal).ToDictionary(model => model, _ => result, StringComparer.Ordinal);
+
         ProviderConnection? connection = _registry.Find(target.ProviderId);
-        if (!target.IsValid || connection?.Identity != target.ProviderIdentity || connection.Agent != target.Agent)
-            return new ClaudeProbeResult { Reason = "provider-changed" };
+        if (!target.IsValid || connection is null || connection.Agent != target.Agent)
+            return All(new ClaudeProbeResult { Reason = "provider-changed" });
+        if (connection.Identity.Length == 0)
+            return All(new ClaudeProbeResult { Reason = "identity-unverified", Detail = connection.CredentialFailure });
+        if (connection.Identity != target.ProviderIdentity)
+            return All(new ClaudeProbeResult { Reason = "provider-changed" });
+        if (connection.Kind == "claude-oauth" && connection.Credentials.Problem is not null)
+            return All(new ClaudeProbeResult { Reason = "credentials-unavailable", Detail = connection.CredentialFailure });
+
         ProviderObservation observation = await ObserveAsync(connection, ct).ConfigureAwait(false);
-        if (!observation.Catalog.Verified || !observation.Catalog.Models.Any(m => m.Id == target.ModelId))
-            return new ClaudeProbeResult { Reason = "model-unverified" };
-        if (connection.Kind == "claude-oauth" && observation.Usage is { } snapshot)
+        var results = new Dictionary<string, ClaudeProbeResult>(StringComparer.Ordinal);
+        foreach (string model in models.Distinct(StringComparer.Ordinal))
         {
-            return _quotaProbe.Evaluate(snapshot, target.ModelId, _quota.StorageWarning);
+            if (!observation.Catalog.Verified || !observation.Catalog.Models.Any(m => m.Id == model))
+            {
+                // 两种情况都只等待，但对用户的说法不同:目录这次没读出来(限流、网络)≠ 模型已经不在目录里。
+                results[model] = new ClaudeProbeResult
+                {
+                    Reason = "model-unverified",
+                    Detail = observation.Catalog.Verified ? "absent" : "catalog-unverified",
+                };
+            }
+            else if (connection.Kind == "claude-oauth" && observation.Usage is { } snapshot)
+            {
+                results[model] = _quotaProbe.Evaluate(snapshot, model, _quota.StorageWarning);
+            }
+            else if (connection.Kind == "chatgpt")
+            {
+                results[model] = observation.Usage is { } chatGpt ? EvaluateChatGpt(chatGpt, model) : new ClaudeProbeResult();
+            }
+            else if (!observation.QuotaKnown)
+            {
+                results[model] = new ClaudeProbeResult { Detail = observation.Problem };
+            }
+            else
+            {
+                results[model] = new ClaudeProbeResult
+                {
+                    Ready = !observation.Limited && observation.Balance > 0,
+                    Reason = observation.Limited ? "limited" : observation.Balance > 0 ? "ok" : "unknown",
+                };
+            }
         }
-        if (connection.Kind == "chatgpt")
-        {
-            return observation.Usage is { } chatGpt
-                ? EvaluateChatGpt(chatGpt, target.ModelId)
-                : new ClaudeProbeResult();
-        }
-        if (!observation.QuotaKnown) return new ClaudeProbeResult();
-        return new ClaudeProbeResult
-        {
-            Ready = !observation.Limited && observation.Balance > 0,
-            Reason = observation.Limited ? "limited" : observation.Balance > 0 ? "ok" : "unknown",
-        };
+
+        return results;
     }
 
     /// <summary>
@@ -159,10 +215,15 @@ public sealed class ProviderCatalogService
             SevenDayResetUtc = secondary?.ResetAtUnix is { } s ? DateTimeOffset.FromUnixTimeSeconds(s) : null,
             FiveHourUtil = primary?.UsedPercent is { } pu ? pu / 100d : null,
             SevenDayUtil = secondary?.UsedPercent is { } su ? su / 100d : null,
+            BlockingResetUtc = limited
+                ? account.Windows.Concat(model is null ? [] : [model])
+                    .Where(w => w.Status == "blocked" && w.ResetAtUnix is not null)
+                    .Select(w => (DateTimeOffset?)DateTimeOffset.FromUnixTimeSeconds(w.ResetAtUnix!.Value)).Max()
+                : null,
         };
     }
 
-    private async Task<ProviderObservation> ObserveCoreAsync(ProviderConnection connection, CancellationToken ct)
+    private async Task<ProviderObservation> ObserveCoreAsync(ProviderConnection connection, CancellationToken ct, TimeSpan? reuseQuotaWithin)
     {
         CodexProviderCredentials credentials = connection.Credentials;
         if (credentials.Problem is not null || (connection.Agent != "codex" && string.IsNullOrEmpty(credentials.BearerToken)))
@@ -197,7 +258,9 @@ public sealed class ProviderCatalogService
 
         if (connection.Kind == "claude-oauth")
         {
-            UsageSnapshot snapshot = await _quota.GetAsync(true, ct).ConfigureAwait(false);
+            UsageSnapshot snapshot = reuseQuotaWithin is { } window
+                ? await _quota.GetRecentAsync(window, ct).ConfigureAwait(false)
+                : await _quota.GetAsync(true, ct).ConfigureAwait(false);
             // 目录查询和额度查询分别读认证；账号指纹必须再次与连接快照配对。
             string expected = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
                 System.Text.Encoding.UTF8.GetBytes(connection.Id + ":" + snapshot.CredentialFingerprint)));

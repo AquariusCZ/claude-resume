@@ -464,7 +464,8 @@ public sealed class ResumeEngineTests : IDisposable
         Assert.False(persistedState.ReplayBlocked);
         Assert.Empty(persistedState.ActiveRunId);
         Assert.Empty(persistedState.ActiveProjectPath);
-        Assert.False(persistedState.ProjectStatus?.ContainsKey(config.Selected[0].Path) == true);
+        // 撤销预登记后项目回到待续跑，下一拍可以再次启动。
+        Assert.Equal("limited", persistedState.ProjectStatus?[config.Selected[0].Path]);
         Assert.Equal(0, _runner.CallCount);
     }
 

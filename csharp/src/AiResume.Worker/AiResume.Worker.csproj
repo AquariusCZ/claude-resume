@@ -22,8 +22,6 @@
     <ProjectReference Include="..\AiResume.Secrets\AiResume.Secrets.csproj" />
     <!-- S2-G:Named Pipe 服务端(GUI ping/命令) -->
     <ProjectReference Include="..\AiResume.Ipc\AiResume.Ipc.csproj" />
-    <!-- S10:preflight 复用 SingleConsumerGuard(单消费者铁律的核验入口) -->
-    <ProjectReference Include="..\AiResume.Wrapper\AiResume.Wrapper.csproj" />
     <!-- S12:完成通知经官方 lark-cli 投递(项目规则:不手写同类 SDK 请求) -->
     <ProjectReference Include="..\AiResume.LarkCli\AiResume.LarkCli.csproj" />
   </ItemGroup>

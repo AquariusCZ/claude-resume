@@ -8,17 +8,26 @@ namespace AiResume.Tests;
 public sealed class NotificationWorkerTests
 {
     [Theory]
-    [InlineData(0, 30)]
     [InlineData(1, 30)]
     [InlineData(2, 60)]
     [InlineData(3, 120)]
     [InlineData(20, 900)]
-    public void ComputeRetryDelay_UsesBoundedExponentialBackoff(int failedRounds, int expectedSeconds)
+    public void 单条重试按指数退避且有上限和抖动(int attempts, int expectedSeconds)
     {
-        TimeSpan delay = NotificationWorker.ComputeRetryDelay(TimeSpan.FromSeconds(30), failedRounds);
+        TimeSpan delay = CompletionNotifier.ItemBackoff(attempts);
 
-        Assert.Equal(TimeSpan.FromSeconds(expectedSeconds), delay);
+        Assert.InRange(delay.TotalSeconds, expectedSeconds * 0.8 - 0.001, expectedSeconds * 1.2 + 0.001);
     }
+
+    [Theory]
+    [InlineData("keychain_unavailable", 1, null, 60)]
+    [InlineData("keychain_unavailable", 9, null, 600)]
+    [InlineData("rate_limit", 1, 7, 7)]
+    [InlineData("network", 3, null, 120)]
+    [InlineData("auth_config", 1, null, 1800)]
+    [InlineData("permission_or_recipient", 5, null, 1800)]
+    public void 通道熔断按错误类别退避(string @class, int consecutive, int? retryAfter, int expectedSeconds)
+        => Assert.Equal(TimeSpan.FromSeconds(expectedSeconds), CompletionNotifier.ChannelBackoff(@class, consecutive, retryAfter));
 
     [Fact]
     public async Task StartAsync_SweepsPendingEventsImmediately()

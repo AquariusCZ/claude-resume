@@ -52,9 +52,11 @@ public class ControlPlaneBridgeArmTests : IDisposable
 
     private ControlPlaneBridge CreateBridge(
         Func<string, bool?>? activeResumeDetector = null,
-        Func<bool?>? engineProcessDetector = null)
+        Func<bool?>? engineProcessDetector = null,
+        Func<bool>? workerPing = null)
     {
         return new ControlPlaneBridge(
+            workerPing: workerPing,
             catalog: null,
             configFactory: null,
             notificationRegistry: null,
@@ -63,7 +65,7 @@ public class ControlPlaneBridgeArmTests : IDisposable
             stateStore: new ProductStateStore(_dbPath),
             engineProcessDetector: engineProcessDetector ?? (() => true),
             activeResumeDetector: activeResumeDetector,
-            resumeBinding: (provider, model, paths, config, ct) =>
+            resumeBinding: (provider, model, paths, projectModels, config, ct) =>
             {
                 if (!ClaudeModelFamilies.TryNormalizeConfiguredModel(model, out _))
                     throw new ArgumentException("供应商目录中不存在所选模型");
@@ -156,6 +158,134 @@ public class ControlPlaneBridgeArmTests : IDisposable
         Assert.Equal(paths, payload.GetProperty("selected").EnumerateArray().Select(e => e.GetString()).ToArray());
         Assert.False(string.IsNullOrEmpty(payload.GetProperty("cycleId").GetString()));
         Assert.Equal("fable", new ProductConfigStore(_configDir).Load().ResumeModel);
+    }
+
+    [Fact]
+    public async Task 布防把逐项目模型交给绑定并回带提示_arm_get逐项目说明模型与等待原因()
+    {
+        IReadOnlyDictionary<string, string>? received = null;
+        var bridge = new ControlPlaneBridge(
+            configStore: new ProductConfigStore(_configDir),
+            stateStore: new ProductStateStore(_dbPath),
+            engineProcessDetector: () => true,
+            activeResumeDetector: _ => false,
+            resumeBinding: (provider, model, paths, projectModels, config, ct) =>
+            {
+                received = projectModels;
+                var target = new ResumeTarget { ProviderId = provider, ProviderIdentity = "test-account", Agent = "claudecode", ModelId = model, ModelName = "Claude Opus 5.5", BoundAtUtc = DateTimeOffset.UtcNow };
+                ProjectRef[] projects = paths.Select(p => new ProjectRef
+                {
+                    Path = p, Name = Path.GetFileName(p), SessionId = Guid.NewGuid().ToString("D"),
+                    ModelId = projectModels.TryGetValue(p, out string? chosen) && chosen.Length > 0 ? chosen : model,
+                    ModelName = projectModels.TryGetValue(p, out string? named) && named.Length > 0 ? "Claude Fable 5.1" : "Claude Opus 5.5",
+                    ModelSource = projectModels.TryGetValue(p, out string? source) && source.Length > 0 ? "user" : "session",
+                }).ToArray();
+                return Task.FromResult(new AiResume.Worker.Resume.BoundResumeSelection(target, projects) { Warnings = new[] { "beta:会话正在客户端打开" } });
+            });
+        string[] paths = { @"C:\proj\alpha", @"C:\proj\beta" };
+        string request = $$$"""
+            {"id":"m1","type":"arm.set","armed":true,"resumeModel":"claude-opus-5-5","paths":["{{{J(paths[0])}}}","{{{J(paths[1])}}}"],
+             "projectModels":{"{{{J(paths[0])}}}":"claude-fable-5-1","{{{J(paths[1])}}}":""}}
+            """;
+
+        JsonElement payload = GetPayload(await bridge.HandleAsync(request, CancellationToken.None));
+
+        Assert.Equal("claude-fable-5-1", received![paths[0]]);
+        Assert.Equal(string.Empty, received[paths[1]]);
+        Assert.Equal("beta:会话正在客户端打开", Assert.Single(payload.GetProperty("warnings").EnumerateArray()).GetString());
+        JsonElement[] projects = payload.GetProperty("projects").EnumerateArray().ToArray();
+        Assert.Equal("claude-fable-5-1", projects[0].GetProperty("modelId").GetString());
+        Assert.Equal("user", projects[0].GetProperty("modelSource").GetString());
+        Assert.Equal("claude-opus-5-5", projects[1].GetProperty("modelId").GetString());
+
+        ProductConfig armed = new ProductConfigStore(_configDir).Load();
+        var stateStore = new ProductStateStore(_dbPath);
+        CheckerState state = stateStore.Load();
+        state.CycleId = armed.ArmCycleId;
+        state.Phase = CheckerState.PhaseWaiting;
+        state.ProjectStatus = new Dictionary<string, string> { [paths[0]] = "limited", [paths[1]] = "limited" };
+        state.ProjectNotes = new Dictionary<string, ProjectNote>
+        {
+            [paths[0]] = new() { Reason = "quota:limited", Detail = "weekly_scoped:Fable:blocked", ResetAtUnix = 1_800_000_000 },
+            [paths[1]] = new() { Reason = "session-in-use", Client = "claude-desktop" },
+        };
+        stateStore.Save(state);
+
+        JsonElement got = GetPayload(await bridge.HandleAsync("""{"id":"m2","type":"arm.get"}""", CancellationToken.None));
+        JsonElement[] rows = got.GetProperty("projects").EnumerateArray().ToArray();
+        // 队列行只放得下短句;卡在哪个窗口、会话开在哪个客户端放进悬停说明。
+        Assert.Equal("等额度", rows[0].GetProperty("reasonText").GetString());
+        Assert.Equal("Fable 周额度已用尽", rows[0].GetProperty("hint").GetString());
+        Assert.Equal(1_800_000_000, rows[0].GetProperty("resetAtUnix").GetInt64());
+        Assert.Equal("会话开着 · 关闭后续跑", rows[1].GetProperty("reasonText").GetString());
+        Assert.StartsWith("会话开在 Claude 桌面端", rows[1].GetProperty("hint").GetString());
+        Assert.Equal("waiting", rows[1].GetProperty("category").GetString());
+        Assert.True(got.GetProperty("workerRunning").GetBoolean());
+    }
+
+    [Fact]
+    public async Task 核验不出Worker时workerRunning以null原样写出_不能被序列化丢掉()
+    {
+        // 有同名进程但常驻 Worker 的管道不应答(CLI 子命令、别的用户的 Worker):核验不出。
+        // 桥的序列化默认丢 null 字段;这个字段一缺,页面会把它当成「还没读到」,页脚空白、机器人行照样可送达。
+        JsonElement unanswered = GetPayload(await CreateBridge(engineProcessDetector: () => true, workerPing: () => false)
+            .HandleAsync("""{"id":"w1","type":"arm.get"}""", CancellationToken.None));
+        Assert.True(unanswered.TryGetProperty("workerRunning", out JsonElement flag));
+        Assert.Equal(JsonValueKind.Null, flag.ValueKind);
+
+        JsonElement unknown = GetPayload(await CreateBridge(engineProcessDetector: () => null)
+            .HandleAsync("""{"id":"w2","type":"arm.get"}""", CancellationToken.None));
+        Assert.Equal(JsonValueKind.Null, unknown.GetProperty("workerRunning").ValueKind);
+
+        JsonElement answered = GetPayload(await CreateBridge(engineProcessDetector: () => true, workerPing: () => true)
+            .HandleAsync("""{"id":"w3","type":"arm.get"}""", CancellationToken.None));
+        Assert.True(answered.GetProperty("workerRunning").GetBoolean());
+        JsonElement down = GetPayload(await CreateBridge(engineProcessDetector: () => false)
+            .HandleAsync("""{"id":"w4","type":"arm.get"}""", CancellationToken.None));
+        Assert.False(down.GetProperty("workerRunning").GetBoolean());
+    }
+
+    [Fact]
+    public async Task 布防中有同名进程但常驻Worker不应答时不说监视中()
+    {
+        var bridge = CreateBridge(engineProcessDetector: () => true, workerPing: () => false);
+        var store = new ProductConfigStore(_configDir);
+        var config = store.Load();
+        config.Armed = true;
+        config.ArmCycleId = "cycle-ping";
+        config.Selected = new List<ProjectRef> { new() { Name = "alpha", Path = @"C:\proj\alpha", SessionId = "00000000-0000-4000-8000-000000000001" } };
+        store.Save(config);
+
+        JsonElement got = GetPayload(await bridge.HandleAsync("""{"id":"p1","type":"arm.get"}""", CancellationToken.None));
+
+        Assert.Equal("WorkerUnverified", got.GetProperty("engine").GetString());
+        Assert.Equal(JsonValueKind.Null, got.GetProperty("workerRunning").ValueKind);
+    }
+
+    [Fact]
+    public async Task 布防预演只读本地会话事实_不调用绑定()
+    {
+        bool bound = false;
+        var bridge = new ControlPlaneBridge(
+            configStore: new ProductConfigStore(_configDir),
+            stateStore: new ProductStateStore(_dbPath),
+            engineProcessDetector: () => true,
+            activeResumeDetector: _ => false,
+            resumeBinding: (_, _, _, _, _, _) => { bound = true; throw new InvalidOperationException("预演不得布防"); },
+            resumePreview: (provider, paths) => paths.Select(p => new AiResume.Worker.Resume.ProjectPreview(
+                p, Path.GetFileName(p), "00000000-0000-4000-8000-000000000001", "claude-opus-5-5", "interrupted", "five_hour",
+                DateTimeOffset.FromUnixTimeSeconds(1_800_000_000), DateTimeOffset.FromUnixTimeSeconds(1_799_990_000), "in-use", "claude-desktop", null)).ToArray());
+
+        JsonElement payload = GetPayload(await bridge.HandleAsync(
+            $$"""{"id":"p1","type":"arm.preview","providerId":"claude-subscription","paths":["{{J(@"C:\proj\alpha")}}"]}""",
+            CancellationToken.None));
+
+        Assert.False(bound);
+        JsonElement item = Assert.Single(payload.GetProperty("items").EnumerateArray());
+        Assert.Equal("claude-opus-5-5", item.GetProperty("sessionModel").GetString());
+        Assert.Equal("interrupted", item.GetProperty("evidence").GetString());
+        Assert.Equal("in-use", item.GetProperty("session").GetString());
+        Assert.Equal(1_800_000_000, item.GetProperty("limitResetsAtUnix").GetInt64());
     }
 
     [Fact]

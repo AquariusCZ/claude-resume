@@ -160,7 +160,10 @@ public sealed class ProductStateStore
         }
 
         if (state.LimitedRefires < 0 ||
-            state.ProjectStatus?.Any(kv => string.IsNullOrEmpty(kv.Key) || kv.Value is null) == true)
+            state.ProjectLimitedRefires?.Any(kv => string.IsNullOrEmpty(kv.Key) || kv.Value < 0) == true ||
+            state.ProjectStatus?.Any(kv => string.IsNullOrEmpty(kv.Key) || kv.Value is null) == true ||
+            state.ProjectNotes?.Any(kv => string.IsNullOrEmpty(kv.Key) || kv.Value?.Reason is null) == true ||
+            state.ConsumedInterruptions?.Any(kv => string.IsNullOrEmpty(kv.Key) || string.IsNullOrEmpty(kv.Value)) == true)
         {
             throw new InvalidDataException("product_state 项目状态或计数无效。");
         }

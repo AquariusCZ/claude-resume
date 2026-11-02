@@ -1,16 +1,14 @@
 using System.Text.Json;
 using AiResume.Core;
-using AiResume.Worker.Migration;
 using AiResume.Worker.Probes;
 using AiResume.Worker.Quota;
 using AiResume.Worker.Resume;
-using AiResume.Wrapper;
 using Xunit;
 
 namespace AiResume.Tests;
 
 /// <summary>
-/// Codex 官方供应商(B1):面板行、续跑放行规则、执行计划与 cc-connect 配置生成。
+/// Codex 官方供应商(B1):面板行、续跑放行规则与执行计划。
 /// 真实响应形状来自 2026-10-12 本机 wham/usage 录制(账号/邮箱字段已脱敏)。
 /// </summary>
 public sealed class CodexOfficialProviderTests
@@ -257,132 +255,5 @@ public sealed class CodexOfficialProviderTests
 
         var ex = Assert.Throws<InvalidOperationException>(() => planner.Create(new ProjectRef { Path = project, SessionId = session }, config));
         Assert.Contains("profile", ex.Message, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void 未登录时OfficialCodexCommand拒绝猜测端点()
-    {
-        string emptyHome = TestTemp.NewDir("codex-official-cmd-nologin");
-        var ex = Assert.Throws<InvalidOperationException>(() => CutoverConfigCommand.OfficialCodexCommand(null, emptyHome));
-        Assert.Contains("codex login", ex.Message, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void claudecode用户自写的cmd在重新生成时原样保留()
-    {
-        string dir = TestTemp.NewDir("codex-official-user-cmd");
-        string path = Path.Combine(dir, "config.toml");
-        var config = new CcConnectConfig(
-            new[] { new CcConnectProject("ai-resume", "claudecode", @"C:\w", AdminFrom: "ou_1") },
-            new CcConnectPlatformOptions("cli_x", "secret", "ou_1"));
-        CcConnectConfigGenerator.Write(path, config);
-        string written = File.ReadAllText(path);
-        Assert.Contains("      work_dir = \"C:\\\\w\"", written, StringComparison.Ordinal);
-        // 用户手工给 claudecode 指定 shim。
-        File.WriteAllText(path, written.Replace("      work_dir = \"C:\\\\w\"", "      work_dir = \"C:\\\\w\"\n      cmd = \"C:\\\\tools\\\\claude.cmd\""));
-
-        CcConnectConfigGenerator.Write(path, config);
-
-        string again = File.ReadAllText(path);
-        var root = Tomlyn.TomlSerializer.Deserialize<Tomlyn.Model.TomlTable>(again)!;
-        var projects = (Tomlyn.Model.TomlTableArray)root["projects"];
-        var options = (Tomlyn.Model.TomlTable)((Tomlyn.Model.TomlTable)((Tomlyn.Model.TomlTable)projects[0])["agent"])["options"];
-        Assert.Equal(@"C:\tools\claude.cmd", options["cmd"]);
-        Assert.Equal(1, again.Split("cmd = ").Length - 1);
-    }
-
-    [Fact]
-    public void 生成器删除只服务codex的provider并写入官方cmd()
-    {
-        string existing = """
-            [[providers]]
-              name = "deepseek"
-              api_key = "k1"
-              base_url = "https://api.deepseek.com/anthropic"
-              model = "deepseek-chat"
-
-            [[providers]]
-              name = "sub2api"
-              api_key = "k2"
-              base_url = "https://sub2api.example.invalid"
-              model = "gpt-5.6-sol"
-              agent_types = ["codex"]
-
-              [[providers.models]]
-                model = "gpt-5.6-sol"
-                alias = "[AI Resume] GPT-5.6 Sol"
-
-              [providers.codex]
-                wire_api = "responses"
-
-            [[providers]]
-              name = "both"
-              api_key = "k3"
-              base_url = "https://both.example.invalid/v1"
-              agent_types = ["codex", "claudecode"]
-
-            [management]
-              enabled = true
-              port = 9820
-              token = "t"
-            """;
-
-        string cleaned = CcConnectConfigGenerator.RemoveCodexOnlyProviders(existing, out IReadOnlyList<string> removed);
-
-        Assert.Equal(new[] { "sub2api" }, removed);
-        Assert.DoesNotContain("sub2api", cleaned, StringComparison.Ordinal);
-        Assert.DoesNotContain("[AI Resume] GPT-5.6 Sol", cleaned, StringComparison.Ordinal);
-        Assert.Contains("name = \"deepseek\"", cleaned, StringComparison.Ordinal);
-        Assert.Contains("name = \"both\"", cleaned, StringComparison.Ordinal);
-        Assert.Contains("[management]", cleaned, StringComparison.Ordinal);
-        Assert.Equal(cleaned, CcConnectConfigGenerator.RemoveCodexOnlyProviders(cleaned, out IReadOnlyList<string> again));
-        Assert.Empty(again);
-
-        string cmd = CutoverConfigCommand.OfficialCodexCommand("https://chatgpt.com/backend-api/codex");
-        Assert.Equal("codex -c model_provider=\"openai\" -c openai_base_url=\"https://chatgpt.com/backend-api/codex\"", cmd);
-        Assert.Throws<InvalidOperationException>(() => CutoverConfigCommand.OfficialCodexCommand("https://x y"));
-
-        var config = new CcConnectConfig(
-            new[] { new CcConnectProject("ai-resume", "codex", @"C:\w", AdminFrom: "ou_1", Cmd: cmd) },
-            new CcConnectPlatformOptions("cli_x", "secret", "ou_1"));
-        string rendered = CcConnectConfigGenerator.RenderSanitized(config);
-        Assert.Contains("cmd = \"codex -c model_provider=\\\"openai\\\" -c openai_base_url=\\\"https://chatgpt.com/backend-api/codex\\\"\"", rendered, StringComparison.Ordinal);
-        Assert.DoesNotContain("provider_refs", rendered, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void Write带removeCodexOnlyProviders时产出可被Tomlyn解析且cmd落在agentOptions()
-    {
-        string dir = TestTemp.NewDir("codex-official-write");
-        string path = Path.Combine(dir, "config.toml");
-        File.WriteAllText(path, """
-            [[providers]]
-              name = "sub2api"
-              api_key = "k2"
-              base_url = "https://sub2api.example.invalid"
-              agent_types = ["codex"]
-
-            [management]
-              enabled = true
-              port = 9820
-              token = "t"
-            """);
-        string cmd = CutoverConfigCommand.OfficialCodexCommand("https://chatgpt.com/backend-api/codex");
-        var config = new CcConnectConfig(
-            new[] { new CcConnectProject("ai-resume", "codex", @"C:\w", AdminFrom: "ou_1", Cmd: cmd) },
-            new CcConnectPlatformOptions("cli_x", "secret", "ou_1"));
-
-        CcConnectConfigGenerator.Write(path, config, removeCodexOnlyProviders: true);
-
-        string written = File.ReadAllText(path);
-        var root = Tomlyn.TomlSerializer.Deserialize<Tomlyn.Model.TomlTable>(written)!;
-        Assert.False(root.ContainsKey("providers"));
-        var projects = (Tomlyn.Model.TomlTableArray)root["projects"];
-        var options = (Tomlyn.Model.TomlTable)((Tomlyn.Model.TomlTable)((Tomlyn.Model.TomlTable)projects[0])["agent"])["options"];
-        Assert.Equal(cmd, options["cmd"]);
-        Assert.Equal(9820L, ((Tomlyn.Model.TomlTable)root["management"])["port"]);
-        // 字段归我方所有:再次写入不会堆出第二行 cmd。
-        CcConnectConfigGenerator.Write(path, config, removeCodexOnlyProviders: true);
-        Assert.Equal(1, File.ReadAllText(path).Split("cmd = ").Length - 1);
     }
 }

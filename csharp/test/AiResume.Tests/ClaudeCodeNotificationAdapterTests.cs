@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using AiResume.Worker.Notifications;
@@ -8,8 +9,8 @@ using Xunit;
 namespace AiResume.Tests;
 
 /// <summary>
-/// ClaudeCodeNotificationAdapter 的单元测试。
-/// 所有测试均在系统临时目录下创建唯一子目录,避免触碰真实用户配置。
+/// ClaudeCodeNotificationAdapter:三组 exec form hooks(Stop / StopFailure / Notification)的合并、迁移与清理。
+/// 配置形状照抄官方 hooks 文档(command + args + timeout,2.1.139+)。全部在临时目录，绝不碰真实 ~/.claude。
 /// </summary>
 public class ClaudeCodeNotificationAdapterTests : IDisposable
 {
@@ -17,10 +18,12 @@ public class ClaudeCodeNotificationAdapterTests : IDisposable
     private readonly string _settingsPath;
     private readonly ClaudeCodeNotificationAdapter _adapter;
 
+    // 路径刻意含空格：安装目录就叫 "AI Resume",exec form 不经过 shell,带空格的绝对路径合法。
+    private const string TestHookExe = "C:\\Users\\x\\AppData\\Local\\AI Resume\\AiResume.Hook.exe";
+
     public ClaudeCodeNotificationAdapterTests()
     {
         _tempDir = TestTemp.NewDir("AiResumeTests");
-        Directory.CreateDirectory(_tempDir);
         _settingsPath = Path.Combine(_tempDir, "settings.json");
         _adapter = new ClaudeCodeNotificationAdapter(_settingsPath);
     }
@@ -40,22 +43,46 @@ public class ClaudeCodeNotificationAdapterTests : IDisposable
         }
     }
 
-    // 必须含 ClaudeCodeNotificationAdapter.MarkerFileName("AiResume.Hook.exe"),
-    // 否则写入的条目不会被自身的所有权判定认出,IsEnabled 与幂等断言都会失败。
-    private const string TestHookCommand = "C:\\tools\\AiResume.Hook.exe";
-    private const string ExpectedStoredCommand = "\"C:\\tools\\AiResume.Hook.exe\" claudecode";
+    private sealed record OwnHook(string Event, string? Matcher, string Command, string[] Args, int GroupSize);
 
-    /// <summary>
-    /// 场景1:目录不存在 -> Probe 的 IsInstalled=false,不抛异常。
-    /// </summary>
+    private OwnHook[] ReadOwnHooks()
+    {
+        using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(_settingsPath));
+        if (!doc.RootElement.TryGetProperty("hooks", out JsonElement hooks))
+        {
+            return [];
+        }
+
+        var result = new List<OwnHook>();
+        foreach (JsonProperty eventProperty in hooks.EnumerateObject())
+        {
+            foreach (JsonElement group in eventProperty.Value.EnumerateArray())
+            {
+                JsonElement entries = group.GetProperty("hooks");
+                foreach (JsonElement hook in entries.EnumerateArray())
+                {
+                    string command = hook.GetProperty("command").GetString() ?? string.Empty;
+                    if (!command.Contains("AiResume.Hook.exe", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    string[] args = hook.TryGetProperty("args", out JsonElement argsElement)
+                        ? argsElement.EnumerateArray().Select(a => a.GetString()!).ToArray()
+                        : [];
+                    string? matcher = group.TryGetProperty("matcher", out JsonElement m) ? m.GetString() : null;
+                    result.Add(new OwnHook(eventProperty.Name, matcher, command, args, entries.GetArrayLength()));
+                }
+            }
+        }
+
+        return result.ToArray();
+    }
+
     [Fact]
     public void Probe_DirectoryNotExists_ReturnsNotInstalled()
     {
-        // 删除目录
-        if (Directory.Exists(_tempDir))
-        {
-            Directory.Delete(_tempDir, true);
-        }
+        Directory.Delete(_tempDir, true);
 
         var status = _adapter.Probe();
 
@@ -65,9 +92,6 @@ public class ClaudeCodeNotificationAdapterTests : IDisposable
         Assert.NotNull(status.Detail);
     }
 
-    /// <summary>
-    /// 场景2:目录存在但无 settings.json -> IsInstalled=true, IsEnabled=false。
-    /// </summary>
     [Fact]
     public void Probe_DirectoryExistsNoFile_ReturnsInstalledNotEnabled()
     {
@@ -76,411 +100,199 @@ public class ClaudeCodeNotificationAdapterTests : IDisposable
         Assert.True(status.IsInstalled);
         Assert.False(status.IsEnabled);
         Assert.Equal(_settingsPath, status.ConfigPath);
-        Assert.NotNull(status.Detail);
-    }
-
-    /// <summary>
-    /// 场景3:Enable 后 IsEnabled=true 且 settings.json 中出现含 MarkerFileName 的 command。
-    private static (string Matcher, string Command) ReadOwnEntry(string json, string eventName)
-    {
-        using JsonDocument doc = JsonDocument.Parse(json);
-        JsonElement group = doc.RootElement.GetProperty("hooks").GetProperty(eventName);
-        foreach (JsonElement entry in group.EnumerateArray())
-        {
-            foreach (JsonElement hook in entry.GetProperty("hooks").EnumerateArray())
-            {
-                string command = hook.GetProperty("command").GetString() ?? string.Empty;
-                if (command.Contains("AiResume.Hook", StringComparison.OrdinalIgnoreCase))
-                {
-                    return (entry.GetProperty("matcher").GetString() ?? string.Empty, command);
-                }
-            }
-        }
-
-        throw new Xunit.Sdk.XunitException($"{eventName} 下没有我方条目");
     }
 
     [Fact]
-    public void Enable_同时写入完成与决策两类条目()
+    public void Enable_按官方exec形式写入完成_中断_等你三组()
     {
-        _adapter.Enable(TestHookCommand);
+        _adapter.Enable(TestHookExe);
 
-        string json = File.ReadAllText(_settingsPath);
-        (string stopMatcher, string stopCommand) = ReadOwnEntry(json, "Stop");
-        (string notifyMatcher, string notifyCommand) = ReadOwnEntry(json, "Notification");
+        OwnHook[] own = ReadOwnHooks();
+        Assert.Equal(3, own.Length);
 
-        Assert.Equal(string.Empty, stopMatcher);
-        Assert.DoesNotContain("--kind=", stopCommand, StringComparison.Ordinal);
+        OwnHook stop = Assert.Single(own, h => h.Event == "Stop");
+        Assert.Null(stop.Matcher);                       // 官方:Stop 不支持 matcher
+        Assert.Equal(TestHookExe, stop.Command);         // exec form:command 只放 exe,不加引号
+        Assert.Equal(new[] { "claudecode" }, stop.Args);
 
-        // 只订阅"AI 在等你"的那几种。permission_prompt 自 2026-10-12 起订阅:桌面版/VS Code 的
-        // 权限等待只以它出现;idle_prompt 按时间触发会变成噪音,仍不订阅。
-        Assert.Equal("agent_needs_input|elicitation_dialog|elicitation_url_dialog|permission_prompt", notifyMatcher);
-        Assert.EndsWith("--kind=decision", notifyCommand, StringComparison.Ordinal);
-        Assert.DoesNotContain("idle_prompt", notifyMatcher, StringComparison.Ordinal);
+        OwnHook failure = Assert.Single(own, h => h.Event == "StopFailure");
+        Assert.Null(failure.Matcher);                    // 不写 matcher = 接收全部 error
+        Assert.Equal(new[] { "claudecode", "--kind=failure" }, failure.Args);
+
+        OwnHook decision = Assert.Single(own, h => h.Event == "Notification");
+        Assert.Equal(ClaudeCodeNotificationAdapter.DecisionMatcher, decision.Matcher);
+        Assert.Contains("quota_auto_resume_stale", decision.Matcher, StringComparison.Ordinal);
+        Assert.Contains("permission_prompt", decision.Matcher, StringComparison.Ordinal);
+        Assert.DoesNotContain("idle_prompt", decision.Matcher, StringComparison.Ordinal);
+        Assert.Equal(new[] { "claudecode", "--kind=decision" }, decision.Args);
+
+        var status = _adapter.Probe();
+        Assert.True(status.IsEnabled);
+        Assert.False(status.HookBroken);
+        Assert.Equal(TestHookExe, status.HookCommand);
     }
 
     [Fact]
-    public void Enable_两类命令互不覆盖且重复调用不再改动()
+    public void Enable_重复调用幂等且不改写文件()
     {
-        _adapter.Enable(TestHookCommand);
+        _adapter.Enable(TestHookExe);
         string first = File.ReadAllText(_settingsPath);
-        _adapter.Enable(TestHookCommand);
-        string second = File.ReadAllText(_settingsPath);
+        DateTime firstWrite = File.GetLastWriteTimeUtc(_settingsPath);
 
-        // 刷新逻辑若不按事件分别进行,第二次会把两条刷成同一个命令。
-        Assert.Equal(first, second);
-        Assert.NotEqual(ReadOwnEntry(second, "Stop").Command, ReadOwnEntry(second, "Notification").Command);
+        _adapter.Enable(TestHookExe);
+
+        Assert.Equal(first, File.ReadAllText(_settingsPath));
+        Assert.Equal(firstWrite, File.GetLastWriteTimeUtc(_settingsPath));
     }
 
     [Fact]
-    public void Enable_就地刷新陈旧命令而不新增第二条()
+    public void Enable_把旧shell格式迁移为exec形式且不留第二条()
     {
+        // v2.1 及以前写出的真实形状。
         File.WriteAllText(_settingsPath, """
             {
+              "model": "opus",
               "hooks": {
                 "Stop": [
-                  {"matcher":"","hooks":[{"type":"command","command":"C:/old/AiResume.Hook.exe claudecode"}]}
+                  {"matcher":"","hooks":[{"type":"command","command":"\"C:\\old\\AI Resume\\AiResume.Hook.exe\" claudecode","timeout":30}]}
                 ],
                 "Notification": [
-                  {"matcher":"idle_prompt","hooks":[{"type":"command","command":"C:/old/AiResume.Hook.exe claudecode --kind=decision"}]}
+                  {"matcher":"agent_needs_input|elicitation_dialog|elicitation_url_dialog|permission_prompt","hooks":[{"type":"command","command":"\"C:\\old\\AI Resume\\AiResume.Hook.exe\" claudecode --kind=decision","timeout":30}]}
                 ]
               }
             }
             """);
+        Assert.True(_adapter.Probe().HookBroken);   // 只剩旧格式两组:中断类永远不会到,必须标出来
 
-        _adapter.Enable(TestHookCommand);
+        _adapter.Enable(TestHookExe);
 
-        string json = File.ReadAllText(_settingsPath);
-        using JsonDocument doc = JsonDocument.Parse(json);
-        JsonElement hooks = doc.RootElement.GetProperty("hooks");
-        Assert.Single(hooks.GetProperty("Stop").EnumerateArray());
-        Assert.Single(hooks.GetProperty("Notification").EnumerateArray());
-        // matcher 也要对齐:后来新增的通知类型不能因为旧配置而永远收不到。
-        Assert.Equal("agent_needs_input|elicitation_dialog|elicitation_url_dialog|permission_prompt",
-            ReadOwnEntry(json, "Notification").Matcher);
-        Assert.EndsWith("--kind=decision", ReadOwnEntry(json, "Notification").Command, StringComparison.Ordinal);
+        OwnHook[] own = ReadOwnHooks();
+        Assert.Equal(3, own.Length);
+        Assert.All(own, h => Assert.Equal(TestHookExe, h.Command));
+        Assert.DoesNotContain("C:\\old", File.ReadAllText(_settingsPath), StringComparison.Ordinal);
+        Assert.Contains("\"model\": \"opus\"", File.ReadAllText(_settingsPath), StringComparison.Ordinal);
+        Assert.False(_adapter.Probe().HookBroken);
     }
 
     [Fact]
-    public void Disable_两类条目一起清掉并保留用户自己的钩子()
+    public void Enable_我方条目混在用户分组时移出单独成组且不改用户matcher()
     {
-        _adapter.Enable(TestHookCommand);
+        File.WriteAllText(_settingsPath, """
+            {"hooks":{"Notification":[
+              {"matcher":"permission_prompt","hooks":[
+                {"type":"command","command":"C:\\me\\beep.exe"},
+                {"type":"command","command":"C:\\tools\\AiResume.Hook.exe","args":["claudecode","--kind=decision"]}
+              ]}
+            ]}}
+            """);
+
+        _adapter.Enable(TestHookExe);
+
+        using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(_settingsPath));
+        JsonElement groups = doc.RootElement.GetProperty("hooks").GetProperty("Notification");
+        JsonElement userGroup = groups.EnumerateArray().Single(g =>
+            g.GetProperty("hooks").EnumerateArray().Any(h => h.GetProperty("command").GetString() == "C:\\me\\beep.exe"));
+        Assert.Equal("permission_prompt", userGroup.GetProperty("matcher").GetString());
+        Assert.Equal(1, userGroup.GetProperty("hooks").GetArrayLength());
+        OwnHook decision = Assert.Single(ReadOwnHooks(), h => h.Event == "Notification");
+        Assert.Equal(1, decision.GroupSize);
+        Assert.Equal(ClaudeCodeNotificationAdapter.DecisionMatcher, decision.Matcher);
+    }
+
+    [Fact]
+    public void Disable_清掉全部我方条目并保留用户钩子()
+    {
+        _adapter.Enable(TestHookExe);
         JsonNode root = JsonNode.Parse(File.ReadAllText(_settingsPath))!;
         ((JsonObject)root["hooks"]!)["Notification"]!.AsArray().Add(new JsonObject
         {
             ["matcher"] = "idle_prompt",
             ["hooks"] = new JsonArray { new JsonObject { ["type"] = "command", ["command"] = "user-own.exe" } },
         });
+        ((JsonObject)root["hooks"]!)["SubagentStop"] = new JsonArray
+        {
+            new JsonObject
+            {
+                ["hooks"] = new JsonArray
+                {
+                    new JsonObject { ["type"] = "command", ["command"] = TestHookExe, ["args"] = new JsonArray { "claudecode" } },
+                },
+            },
+        };
         File.WriteAllText(_settingsPath, root.ToJsonString());
 
         _adapter.Disable();
 
         string json = File.ReadAllText(_settingsPath);
+        Assert.Empty(ReadOwnHooks());
+        Assert.Contains("user-own.exe", json, StringComparison.Ordinal);
         using JsonDocument doc = JsonDocument.Parse(json);
         JsonElement hooks = doc.RootElement.GetProperty("hooks");
         Assert.False(hooks.TryGetProperty("Stop", out _));
-        // 用户自己的条目必须留着,而我方那条必须没了。
-        Assert.Contains("user-own.exe", json, StringComparison.Ordinal);
-        Assert.DoesNotContain("--kind=decision", json, StringComparison.Ordinal);
-    }
-
-    /// </summary>
-    [Fact]
-    public void Enable_CreatesEntry_IsEnabledTrue()
-    {
-        _adapter.Enable(TestHookCommand);
-
-        var status = _adapter.Probe();
-        Assert.True(status.IsInstalled);
-        Assert.True(status.IsEnabled);
-
-        var json = File.ReadAllText(_settingsPath);
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-
-        Assert.True(root.TryGetProperty("hooks", out var hooks));
-        Assert.True(hooks.TryGetProperty("Stop", out var stop));
-        Assert.Equal(JsonValueKind.Array, stop.ValueKind);
-        Assert.Single(stop.EnumerateArray());
-
-        var entry = stop[0];
-        Assert.True(entry.TryGetProperty("hooks", out var entryHooks));
-        Assert.Equal(JsonValueKind.Array, entryHooks.ValueKind);
-        Assert.Single(entryHooks.EnumerateArray());
-
-        var hook = entryHooks[0];
-        Assert.True(hook.TryGetProperty("command", out var cmd));
-        Assert.Equal(ExpectedStoredCommand, cmd.GetString());
-        Assert.Contains(ClaudeCodeNotificationAdapter.MarkerFileName, cmd.GetString(), StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// <summary>
-    /// 场景4:既有配置保留 - 预置含其他顶层字段与其他 hook 事件的 settings.json,Enable 后这些内容必须原样保留。
-    /// </summary>
-    [Fact]
-    public void Enable_PreservesExistingConfiguration()
-    {
-        var existingJson = new JsonObject
-        {
-            ["theme"] = "dark",
-            ["hooks"] = new JsonObject
-            {
-                ["SessionStart"] = new JsonArray
-                {
-                    new JsonObject
-                    {
-                        ["matcher"] = "",
-                        ["hooks"] = new JsonArray
-                        {
-                            new JsonObject
-                            {
-                                ["type"] = "command",
-                                ["command"] = "C:\\other\\session-start.cmd",
-                                ["timeout"] = 15
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        File.WriteAllText(_settingsPath, existingJson.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-
-        _adapter.Enable(TestHookCommand);
-
-        var json = File.ReadAllText(_settingsPath);
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-
-        // 顶层字段保留
-        Assert.True(root.TryGetProperty("theme", out var theme));
-        Assert.Equal("dark", theme.GetString());
-
-        // SessionStart 保留
-        Assert.True(root.TryGetProperty("hooks", out var hooks));
-        Assert.True(hooks.TryGetProperty("SessionStart", out var sessionStart));
-        Assert.Equal(JsonValueKind.Array, sessionStart.ValueKind);
-        Assert.Single(sessionStart.EnumerateArray());
-
-        var sessionEntry = sessionStart[0];
-        Assert.True(sessionEntry.TryGetProperty("hooks", out var sessionHooks));
-        Assert.Equal(JsonValueKind.Array, sessionHooks.ValueKind);
-        Assert.Single(sessionHooks.EnumerateArray());
-        Assert.True(sessionHooks[0].TryGetProperty("command", out var sessionCmd));
-        Assert.Equal("C:\\other\\session-start.cmd", sessionCmd.GetString());
-
-        // Stop 中我方条目存在
-        Assert.True(hooks.TryGetProperty("Stop", out var stop));
-        Assert.Equal(JsonValueKind.Array, stop.ValueKind);
-        Assert.Single(stop.EnumerateArray());
-    }
-
-    /// <summary>
-    /// 场景5:重复 Enable 幂等 - 连续两次 Enable,hooks.Stop 中我方条目只有一条。
-    /// </summary>
-    [Fact]
-    public void Enable_Twice_Idempotent()
-    {
-        _adapter.Enable(TestHookCommand);
-        _adapter.Enable(TestHookCommand);
-
-        var json = File.ReadAllText(_settingsPath);
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-
-        Assert.True(root.TryGetProperty("hooks", out var hooks));
-        Assert.True(hooks.TryGetProperty("Stop", out var stop));
-        Assert.Equal(JsonValueKind.Array, stop.ValueKind);
-        Assert.Single(stop.EnumerateArray());
-    }
-
-    /// <summary>
-    /// 场景6:Disable 只移除我方 - 预置我方条目 + 别人的 Stop 条目,Disable 后别人的还在、我方的没了。
-    /// </summary>
-    [Fact]
-    public void Disable_RemovesOnlyOwnEntries()
-    {
-        var existingJson = new JsonObject
-        {
-            ["hooks"] = new JsonObject
-            {
-                ["Stop"] = new JsonArray
-                {
-                    // 别人的条目
-                    new JsonObject
-                    {
-                        ["matcher"] = "",
-                        ["hooks"] = new JsonArray
-                        {
-                            new JsonObject
-                            {
-                                ["type"] = "command",
-                                ["command"] = "C:\\other\\stop-hook.cmd",
-                                ["timeout"] = 30
-                            }
-                        }
-                    },
-                    // 我方条目
-                    new JsonObject
-                    {
-                        ["matcher"] = "",
-                        ["hooks"] = new JsonArray
-                        {
-                            new JsonObject
-                            {
-                                ["type"] = "command",
-                                ["command"] = TestHookCommand,
-                                ["timeout"] = 30
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        File.WriteAllText(_settingsPath, existingJson.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-
-        _adapter.Disable();
-
-        var json = File.ReadAllText(_settingsPath);
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-
-        Assert.True(root.TryGetProperty("hooks", out var hooks));
-        Assert.True(hooks.TryGetProperty("Stop", out var stop));
-        Assert.Equal(JsonValueKind.Array, stop.ValueKind);
-        Assert.Single(stop.EnumerateArray());
-
-        var remainingEntry = stop[0];
-        Assert.True(remainingEntry.TryGetProperty("hooks", out var entryHooks));
-        Assert.Equal(JsonValueKind.Array, entryHooks.ValueKind);
-        Assert.Single(entryHooks.EnumerateArray());
-        Assert.True(entryHooks[0].TryGetProperty("command", out var cmd));
-        Assert.Equal("C:\\other\\stop-hook.cmd", cmd.GetString());
-        Assert.DoesNotContain(ClaudeCodeNotificationAdapter.MarkerFileName, cmd.GetString(), StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// <summary>
-    /// 场景7:Disable 未启用时不抛异常(幂等)。
-    /// </summary>
-    [Fact]
-    public void Disable_NotEnabled_NoException()
-    {
-        // 目录存在但无文件
-        var exception = Record.Exception(() => _adapter.Disable());
-        Assert.Null(exception);
-
-        // 目录不存在
-        if (Directory.Exists(_tempDir))
-        {
-            Directory.Delete(_tempDir, true);
-        }
-        exception = Record.Exception(() => _adapter.Disable());
-        Assert.Null(exception);
-    }
-
-    /// <summary>
-    /// 场景8:settings.json 内容为非法 JSON -> Probe 不抛异常。
-    /// </summary>
-    [Fact]
-    public void Probe_InvalidJson_NoException()
-    {
-        File.WriteAllText(_settingsPath, "{ invalid json content !!!");
-
-        var exception = Record.Exception(() => _adapter.Probe());
-        Assert.Null(exception);
-
-        var status = _adapter.Probe();
-        Assert.True(status.IsInstalled);
-        Assert.False(status.IsEnabled);
-        Assert.NotNull(status.Detail);
-        Assert.Contains("配置读取失败", status.Detail);
-    }
-
-    /// <summary>
-    /// 场景9:Enable 会生成 .bak 备份文件。
-    /// </summary>
-    [Fact]
-    public void Enable_CreatesBackupFile()
-    {
-        // 先创建初始配置
-        var initialJson = new JsonObject
-        {
-            ["theme"] = "light"
-        };
-        File.WriteAllText(_settingsPath, initialJson.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-
-        _adapter.Enable(TestHookCommand);
-
-        var bakPath = _settingsPath + ".bak";
-        Assert.True(File.Exists(bakPath));
-
-        // 备份内容应为原始内容
-        var bakContent = File.ReadAllText(bakPath);
-        using var bakDoc = JsonDocument.Parse(bakContent);
-        var bakRoot = bakDoc.RootElement;
-        Assert.True(bakRoot.TryGetProperty("theme", out var theme));
-        Assert.Equal("light", theme.GetString());
-        Assert.False(bakRoot.TryGetProperty("hooks", out _));
+        Assert.False(hooks.TryGetProperty("StopFailure", out _));
+        Assert.False(hooks.TryGetProperty("SubagentStop", out _));
+        Assert.False(_adapter.Probe().IsEnabled);
     }
 
     [Fact]
-    public void Enable_RefreshesLegacyBarePathWithQuotedSourceCommand()
+    public void Enable_保留其它顶层字段与别的事件()
     {
-        var legacy = new JsonObject
-        {
-            ["hooks"] = new JsonObject
-            {
-                ["Stop"] = new JsonArray
-                {
-                    new JsonObject
-                    {
-                        ["matcher"] = "",
-                        ["hooks"] = new JsonArray
-                        {
-                            new JsonObject
-                            {
-                                ["type"] = "command",
-                                ["command"] = TestHookCommand,
-                                ["timeout"] = 30,
-                            },
-                        },
-                    },
-                },
-            },
-        };
-        File.WriteAllText(_settingsPath, legacy.ToJsonString());
+        File.WriteAllText(_settingsPath, """
+            {"theme":"dark","hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"C:\\other\\session-start.cmd","timeout":15}]}]}}
+            """);
 
-        _adapter.Enable(TestHookCommand);
+        _adapter.Enable(TestHookExe);
 
-        Assert.Equal(ExpectedStoredCommand, _adapter.Probe().HookCommand);
+        using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(_settingsPath));
+        Assert.Equal("dark", doc.RootElement.GetProperty("theme").GetString());
+        JsonElement sessionStart = doc.RootElement.GetProperty("hooks").GetProperty("SessionStart");
+        Assert.Equal("C:\\other\\session-start.cmd",
+            sessionStart[0].GetProperty("hooks")[0].GetProperty("command").GetString());
+        Assert.True(File.Exists(_settingsPath + ".bak"));
     }
 
     [Fact]
-    public void Disable_DoesNotTreatMarkerInUserArgumentsAsOwnership()
+    public void 参数不同的同名exe与参数里出现标记都不算我方条目()
     {
-        const string userCommand = "\"C:\\tools\\notify.exe\" --label AiResume.Hook.exe";
-        var root = new JsonObject
-        {
-            ["hooks"] = new JsonObject
-            {
-                ["Stop"] = new JsonArray
-                {
-                    new JsonObject
-                    {
-                        ["hooks"] = new JsonArray
-                        {
-                            new JsonObject { ["type"] = "command", ["command"] = userCommand },
-                        },
-                    },
-                },
-            },
-        };
-        File.WriteAllText(_settingsPath, root.ToJsonString());
+        File.WriteAllText(_settingsPath, """
+            {"hooks":{"Stop":[
+              {"hooks":[{"type":"command","command":"\"C:\\tools\\notify.exe\" --label AiResume.Hook.exe"}]},
+              {"hooks":[{"type":"command","command":"C:\\tools\\AiResume.Hook.exe","args":["claudecode","--verbose"]}]}
+            ]}}
+            """);
 
-        _adapter.Enable(TestHookCommand);
+        _adapter.Enable(TestHookExe);
         _adapter.Disable();
 
         string preserved = File.ReadAllText(_settingsPath);
-        Assert.Contains("notify.exe", preserved);
-        Assert.Contains("--label AiResume.Hook.exe", preserved);
+        Assert.Contains("--label AiResume.Hook.exe", preserved, StringComparison.Ordinal);
+        Assert.Contains("--verbose", preserved, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Disable_未启用时不抛异常()
+    {
+        Assert.Null(Record.Exception(() => _adapter.Disable()));
+        Directory.Delete(_tempDir, true);
+        Assert.Null(Record.Exception(() => _adapter.Disable()));
+    }
+
+    [Fact]
+    public void Probe_非法JSON不抛异常()
+    {
+        File.WriteAllText(_settingsPath, "{ invalid json content !!!");
+
+        var status = _adapter.Probe();
+
+        Assert.True(status.IsInstalled);
+        Assert.False(status.IsEnabled);
+        Assert.Contains("配置读取失败", status.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Enable_拒绝相对路径或带引号的可执行文件()
+    {
+        Assert.Throws<ArgumentException>(() => _adapter.Enable("AiResume.Hook.exe"));
+        Assert.False(File.Exists(_settingsPath));
     }
 }

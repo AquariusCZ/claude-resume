@@ -82,19 +82,42 @@ public sealed class QuotaResumeProbeTests
     [InlineData("Fable Sonnet")]
     [InlineData("Fable 5 Opus")]
     [InlineData("claude-fable-sonnet")]
-    public async Task 含多个模型族的Scoped显示名不能按首个模型放行(string scopeName)
+    [InlineData("Mythic")]
+    public async Task 认不出模型族的Scoped一律当作约束目标模型(string scopeName)
     {
+        // 不知道它管不管目标，就当它管:未满时不挡，满额时按限流处理，绝不忽略。
         DateTimeOffset now = DateTimeOffset.Parse("2026-08-21T06:00:00Z");
-        UsageSnapshot snapshot = Snapshot(now, allowed: true,
+        UsageSnapshot open = Snapshot(now, allowed: true,
             Window("five_hour", 25, now.AddHours(4)),
             Window("seven_day", 79, now.AddDays(3)),
             Window("weekly_scoped:" + scopeName, 20, now.AddDays(3)));
+        UsageSnapshot exhausted = Snapshot(now, allowed: false,
+            Window("five_hour", 25, now.AddHours(4)),
+            Window("seven_day", 79, now.AddDays(3)),
+            Window("weekly_scoped:" + scopeName, 100, now.AddDays(3)));
+
+        ClaudeProbeResult ready = await CreateProbe(now, _ => open).ProbeAsync("claude-opus-5-5", "ignored");
+        ClaudeProbeResult limited = await CreateProbe(now, _ => exhausted).ProbeAsync("claude-opus-5-5", "ignored");
+
+        Assert.True(ready.Ready);
+        Assert.True(limited.IsLimited);
+        Assert.Contains(scopeName, limited.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task 同族不同版本的Scoped满额也挡住目标()
+    {
+        DateTimeOffset now = DateTimeOffset.Parse("2026-08-21T06:00:00Z");
+        UsageSnapshot snapshot = Snapshot(now, allowed: false,
+            Window("five_hour", 25, now.AddHours(4)),
+            Window("seven_day", 79, now.AddDays(3)),
+            Window("weekly_scoped:Opus 5", 100, now.AddDays(3)));
         var probe = CreateProbe(now, _ => snapshot);
 
-        ClaudeProbeResult result = await probe.ProbeAsync("fable", "ignored");
+        ClaudeProbeResult result = await probe.ProbeAsync("claude-opus-5-5", "ignored");
 
+        Assert.True(result.IsLimited);
         Assert.False(result.Ready);
-        Assert.Equal("unknown", result.Reason);
     }
 
     [Fact]
@@ -113,36 +136,40 @@ public sealed class QuotaResumeProbeTests
     }
 
     [Fact]
-    public async Task 健康空库只有主窗口时不能证明未知原会话模型可用()
+    public async Task 目标模型没有专属窗口时由主窗口决定()
     {
+        // 2026-10-30 体检根因 b:账号只有 weekly_scoped:Fable,原规则要求 Opus 也得有自己的 scoped 窗口，
+        // 于是 Opus 项目永远放行不了。一次成功 OAuth 响应的 limits 列出的就是账号全部模型级上限。
         DateTimeOffset now = DateTimeOffset.Parse("2026-08-21T06:00:00Z");
         UsageSnapshot snapshot = Snapshot(now, allowed: true,
             Window("five_hour", 25, now.AddHours(4)),
             Window("seven_day", 79, now.AddDays(3)));
         var probe = CreateProbe(now, _ => snapshot);
 
-        ClaudeProbeResult result = await probe.ProbeAsync("fable", "ignored");
+        ClaudeProbeResult result = await probe.ProbeAsync("claude-opus-5-5", "ignored");
 
-        Assert.False(result.Ready);
-        Assert.False(result.IsLimited);
-        Assert.Equal("unknown", result.Reason);
+        Assert.True(result.Ready);
+        Assert.Equal("ok", result.Reason);
     }
 
     [Fact]
-    public async Task 只有其它模型Scoped时不能证明Fable可用()
+    public async Task 其它模型族满额不挡目标模型()
     {
-        DateTimeOffset now = DateTimeOffset.Parse("2026-08-21T06:00:00Z");
-        UsageSnapshot snapshot = Snapshot(now, allowed: true,
-            Window("five_hour", 25, now.AddHours(4)),
-            Window("seven_day", 79, now.AddDays(3)),
-            Window("weekly_scoped:Sonnet", 20, now.AddDays(3)));
+        // 真机形状:Fable 周额度打满时 Opus 项目照常可续;反过来也一样。
+        DateTimeOffset now = DateTimeOffset.Parse("2026-10-30T06:00:00Z");
+        UsageSnapshot snapshot = Snapshot(now, allowed: false,
+            Window("five_hour", 0, now.AddHours(4)),
+            Window("seven_day", 54, now.AddDays(3)),
+            Window("weekly_scoped:Fable", 100, now.AddDays(3)));
         var probe = CreateProbe(now, _ => snapshot);
 
-        ClaudeProbeResult result = await probe.ProbeAsync("claude-fable-5", "ignored");
+        ClaudeProbeResult opus = await probe.ProbeAsync("claude-opus-5-5", "ignored");
+        ClaudeProbeResult fable = await probe.ProbeAsync("claude-fable-5-1", "ignored");
 
-        Assert.False(result.Ready);
-        Assert.False(result.IsLimited);
-        Assert.Equal("unknown", result.Reason);
+        Assert.True(opus.Ready);
+        Assert.False(opus.IsLimited);
+        Assert.True(fable.IsLimited);
+        Assert.Equal("weekly_scoped:Fable:blocked", fable.Detail);
     }
 
     [Fact]
@@ -158,9 +185,9 @@ public sealed class QuotaResumeProbeTests
 
         ClaudeProbeResult result = await probe.ProbeAsync("fable", "ignored");
 
-        Assert.False(result.Ready);
+        Assert.True(result.Ready);
         Assert.False(result.IsLimited);
-        Assert.Equal("unknown", result.Reason);
+        Assert.Equal("ok", result.Reason);
     }
 
     [Fact]

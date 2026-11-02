@@ -4,28 +4,27 @@
 
 ## 文档与版本真身
 
-- 当前大版本为 **AI Resume v2**(2026-10-12 起 2.1.x,决策见 ADR-0005);版本号唯一真身是 `csharp/Directory.Build.props` 的 `<Version>`,三个项目都从它继承。禁止在别处硬编码版本;面板铭牌上的 BUILD 读的就是它。
-- `README.md` 负责用户使用/安装,`docs/ARCHITECTURE.md` 负责现役机制与完整配置,`AI_GUIDE.md` 负责飞书只读问答,`docs/LESSONS.md` 只放历史教训与仍有效的工程经验。
+- 当前大版本为 **AI Resume v2**(2026-10-30 起 2.2.x,决策见 ADR-0006);版本号唯一真身是 `csharp/Directory.Build.props` 的 `<Version>`,所有项目都从它继承。禁止在别处硬编码版本;面板铭牌上的版本读的就是它。
+- `README.md` 负责用户使用/安装,`docs/ARCHITECTURE.md` 负责现役机制与完整配置,`AI_GUIDE.md` 负责 AI 只读问答导览,`docs/LESSONS.md` 只放历史教训与仍有效的工程经验。
 - 跨 provider、会话 schema、GUI 流程、部署或安全边界的大改,必须同步上述受影响文档并刷新 `AI_GUIDE.md` 第一行的 project-tour 时间标记;历史说法不得继续冒充现役行为。
-- **现役实现是 `csharp/` 下的 C# 实现**(v1 的 PowerShell + Node 运行时已于 2026-08-08 删除,查阅走 git 历史)。现役机制与门禁分别以 `docs/ARCHITECTURE.md`、`docs/CLAUDE-QUOTA-ACQUISITION.md`、`docs/COMPLETION-NOTIFICATIONS.md` 和 `AI_GUIDE.md` 为准;ADR-0003 修订 ADR-0001 的 cc-connect 边界,AI Resume 自己启动的进程仍遵循 ADR-0002 + `docs/RUN-CONTRACT.md`。`RECOVERY-AUDIT`、`MIGRATION-*`、`STATE-OWNERSHIP`、`STAGE-*`、`AUDIT-*`、`design/`、`evidence/` 等历史迁移证据已全部移入 `docs/history/`,不得当成当前运行说明。
+- **现役实现是 `csharp/` 下的 C# 实现**(v1 的 PowerShell + Node 运行时已于 2026-08-08 删除,查阅走 git 历史)。现役机制与门禁分别以 `docs/ARCHITECTURE.md`、`docs/CLAUDE-QUOTA-ACQUISITION.md`、`docs/COMPLETION-NOTIFICATIONS.md` 和 `AI_GUIDE.md` 为准;AI Resume 自己启动的进程遵循 ADR-0002 + `docs/RUN-CONTRACT.md`。`RECOVERY-AUDIT`、`MIGRATION-*`、`STATE-OWNERSHIP`、`STAGE-*`、`AUDIT-*`、`design/`、`evidence/`、`FEISHU-BOT-GUIDE` 等历史材料已全部移入 `docs/history/`,不得当成当前运行说明。
+- **cc-connect 已于 2026-10-30 整体退役(ADR-0006)**:AI Resume 不再生成、激活、重启或检查 cc-connect,也不再有飞书聊天、会话或授权名单;飞书只用于完成通知。ADR-0001/0003 中 cc-connect 相关内容、ADR-0005 的 A1(setup-token)与 E1 版本固定只作历史记录。
 
 ## 现役架构
 
-- `cc-connect` **直接运行,不再由 wrapper 包装**(ADR-0003):它负责飞书/多平台协议、会话编排与持久化、agent 与 turn 生命周期、停止(`/stop` 经 bridge)、cron、崩溃恢复、Web admin;`lark-cli` 与官方 `lark-*` Skills 是飞书 OpenAPI 能力层。**核心原则:接受 cc-connect 的用法约定,适配而非改造**——用法差异(`send` 不承载停止、provider 切换走管理 API、配置变更需重启而非 reload)一律适配。本轮(2026-10-12)固定上游版本:cc-connect 1.4.1、Codex npm 0.148.0、Claude Code CLI 2.1.296;升级 cc-connect 1.5.0 需单独 ADR(ADR-0005 E1)。
-- **AI Resume 只做四件事**(ADR-0003 §2.2):① 按供应商证据进行限额后自动续跑编排(唯一不可替代的核心——cc-connect 只读取 `LimitReached`,不做排队续跑);② 动态项目发现;③ 本地完成通知(可配置注册表);④ Windows 控制面 GUI(AI Resume 退化后 GUI 即主要用户界面,质量即产品质量)。限额数据**自行获取**(ADR-0003 §2.3 已按证据推翻原「消费 cc-connect `UsageReport`」的判断:它依赖 `creack/pty`,`pty_unsupported.go` 的构建约束命中 Windows,管理 API 也没有 usage 端点)。取数主路径是官方 `GET https://api.anthropic.com/api/oauth/usage`;凭据由 `ClaudeCredentialSource` 按顺序提供:① AI Resume 自持的 `claude setup-token` 长期令牌(只经 GUI「Claude · 凭据」粘贴,DPAPI **LocalMachine** 范围存 `state\secrets\claude-oauth-token.bin`,S4U Worker 可读);② Claude Code 登录文件(`%USERPROFILE%\.claude\.credentials.json`)。两者**只读、绝不刷新、绝不写回**——刷新会与 Claude Code 争用 refresh token;CLI token 剩余寿命 < 60 秒视同过期;自持令牌被 usage 端点 401/403 拒绝时写 `.rejected.json` 标记并回退 CLI,重新保存即清除(ADR-0005 A1)。令牌绝不进入聊天、日志、RPC 回包或截图。失败显示未核实，允许同账号未过期历史读数按承接规则展示；现役生产刷新不降级为 AI 推理。`ClaudeCodeProbe` 只保留显式诊断/兼容能力。
-- **自动续跑额度入口由 `AddQuotaResumeAdmission` 统一注册 `ProviderResumeProbe` + `ProviderCatalogService`。** Claude 订阅继续复用 `QuotaService` 持久化、账号指纹、稀疏合并与 `QuotaResumeProbe` scoped 门禁，禁止以 CLI/Haiku 成功代替目标模型恢复。布防必须从当前供应商实时目录选择实际模型 ID，并保存 `ResumeTarget` 与所选项目的原生会话 UUID；旧配置缺绑定时等待重新布防。模型目录升级不重写当前周期。每个后续项目启动前重新取证；任一异步边界比较完整供应商/账号/agent/模型身份。Claude 需主窗口与匹配的 scoped 全部实时可用、无承接、无存储故障；版本化 scoped 不跨版本授权。DeepSeek 与支持兼容余额接口的第三方需实时正余额。Codex 现役供应商是官方 ChatGPT/OpenAI 账号(`CodexAuthProbe.ReadOfficialCredentials` 只读 `~/.codex/auth.json`,不读 `config.toml` 的第三方桥,也不改它);面板读 `/backend-api/codex/models` 与 `/backend-api/wham/usage`,放行由 `ProviderCatalogService.EvaluateChatGpt` 判定:账号主/次窗口全部 allowed 且 0 ≤ percent < 100、无附加限额或 `spend_control` 命中、目标模型未在 `model_usage` 标为不可用 → ready;任一限额命中 → limited;无数据或缺百分比 → unknown 等待(ADR-0005 B1)。`config.toml` 显式配置的非官方、非回环第三方 provider 只作附加行。未知、失效、账号变化或不支持的认证/配置保持未核实；不自动换供应商重放。运行器通过受监督的 `internal-agent-run` helper 使用 ArgumentList 与精确 UUID；Claude 用原生 host-provider 能力固定连接，组织/动态管理约束无法核实时拒绝；Codex 官方账号用 `-c model_provider="openai" -c openai_base_url=<官方端点>` 覆盖、由 Codex 自己的 `auth.json` 提供凭据,不传环境凭据;Codex 静态第三方保留原 provider ID,用 CLI 覆盖连接字段、环境承载凭据。Codex 错误 JSONL 不含结构化限流码，未知/错误/重路由/损坏输出均阻断自动重放。详见 ADR-0004。
-- 飞书长连接是**集群模式**:同一个应用有两个进程连着时事件会被随机投给其中一个,表现为「机器人时灵时不灵」。因此本机**只能有一个 cc-connect 消费者**,启动前走单消费者预检。
-- **cc-connect 配置激活契约**:GUI 的「生成并重启 cc-connect」与 CLI `AiResume.Worker.exe cc-connect-apply` 共用 `CcConnectApplyCommand.Apply`,必须跨窗口/跨进程串行化,操作中禁止正常关窗。先在 `config.toml` 同目录生成候选,用上游 `config format --config <副本>` 验证,再核验 `daemon.json` 的 `work_dir` / `binary_path`、生产与候选 `[management]` 完全一致且含 token、当前管理 API 可达且版本固定为 v1.4.1、锁 PID;计划任务必须是根路径唯一同名任务,action/脚本精确匹配,账号/触发器账号 SID 等于当前用户,principal 为 S4U+Limited,settings 为 PT0S、两项电池停机均关闭、RestartCount=3/RestartInterval=PT1M、IgnoreNew,且只有一个已启用的登录触发器按 PT5M 无限重复。计划任务脚本必须设置 `AI_RESUME_INTERNAL_RUN=1`;生成配置还必须在 `projects.agent.options.env` 写入同一标记并保留用户其它环境变量,这样 daemon 进程树和每个上游 agent 子进程都有独立证据。两次单消费者检查只豁免当前锁 PID,旧 `feishu-agent.js` 与 `feishu-launch.vbs` 都是冲突。随后核对生产文件哈希并原子提交候选,通过 `POST http://127.0.0.1:<port>/api/v1/restart` 让上游在 S4U 安全上下文内执行 `Engine.Stop`、关闭平台/agent 会话并自拉新 OS 进程;禁止调用裸 `daemon restart` 或 `restart --force`,也禁止由交互式 GUI 检查/强杀 S4U daemon 进程。HTTP 结果必须区分 accepted/rejected/unknown,连接中断先观察锁/API/日志换代,不得直接当成未执行。成功必须同时证明锁 PID 变化、本次操作内的新启动时间、目标 project+agent、同一稳定 PID 代次内出现 config loaded / Feishu ready / running,并验证更晚 LastRunTime 的新任务实例、任务直接拥有新 PID,或重启前已存在的 watchdog(任务归属以任务计划程序 `IRunningTask.EnginePID` 是否在锁 PID 父进程链上为准,LastRunTime ±5 秒的 powershell 启发式只在取不到运行实例时回退——PT5M 重复触发会让 LastRunTime 每 5 分钟推进,稳态下它对不上早已启动的 watchdog);rearm 后必须再探测管理 API,确认仍是同一 PID/version/agent。日志证据不得跨 PID 拼接,每条启动 marker 必须不早于本次请求与当前 PID 写入锁文件的时间。未验证时仅在生产文件仍精确等于本次提交字节时回滚,不得覆盖外部写入。provider/模型/TOML 语义字符串不得 Trim,名称、值、`agent_types` 与各 agent map 键遵循上游大小写敏感和同名 last-wins;Tomlyn 必须兼容表数组与内联数组;明确的 `/anthropic` 有效端点不得引用给 Codex(除非存在 Codex endpoint override);缺当前 agent 模型候选时只补 `[[providers.agent_model_lists.<agent>]]`,不得扩展封闭的内联表或覆盖用户列表。所有供应商只补有效默认值或保留用户显式列表；禁止按当前版本猜测 Sol/Terra/Luna 等候选，实时目录由控制面单独读取。生成的 Codex alias 必须以 `[AI Resume] ` 提供可跨上游 CRUD TOML 重编码的所有权证据;`config format` 本身保留注释,无标记列表不得迁移。唯一兼容 provider 自动写入活动选择,多候选不猜。项目顶层、agent、agent options 与自定义子表必须按原层级保留;合法尾注释、引号式表头、引号式 owned 赋值键和缩进的后续全局表必须与 Tomlyn 解析一致;切 agent 时通过 Tomlyn 结构树发现任何 `agent.providers` 都必须失败关闭,不得静默带入新 agent。任何一项不明都不得报成功。codex agent 走官方账号(ADR-0005 B1):生成前删除 `agent_types` 恰为 `["codex"]` 的第三方 provider 并先备份 `config.toml.bak-ai-resume-<时间>`,项目不引用 provider,写 `cmd = "codex -c model_provider=\"openai\" -c openai_base_url=\"…\""`;上游用 `strings.Fields` 拆分 `cmd`,端点含空白或引号时拒绝生成。
-- **agent 切换后的会话语义以上游为准**:cc-connect v1.4.1 在新 Engine 创建时调用 `sessions.InvalidateForAgent`,清空旧 agent 的原生 session ID 并更新会话 `AgentType`;因此验证重启成功后无需为了 agent 生效强制 `/new`。但 `Session.ActiveProvider` 不会随之清空:同名 provider 若仍适用于新 agent,可能被会话恢复;用 `/provider switch` 修改,只有需要全新上下文时才用 `/new`。
-- 新增通用飞书消息/文档/日历/任务/OpenAPI 能力前,必须先检查官方 lark-cli 与对应 Skill;已有官方命令时优先调用/封装它,不得继续手写同类 SDK 请求。入站事件编排、AI Resume 自有状态和安全边界不因使用 CLI 自动消失。
-- `lark-*` Skills 只使用用户级 `%USERPROFILE%\.agents\skills` 真身及现有 Codex/Claude Code/Cline/Copilot 桥接,禁止复制进仓库。lark-cli 的用户/bot 身份、scope、risk level、结构化错误和高风险确认契约必须原样保留。
-- 固定上游快照与平台实证见 `docs/UPSTREAM-ARCHITECTURE-RESEARCH.md`;任何引入双写、wrapper→Go fork 或决定整体替换/回退的方案都必须先形成新 ADR 并经用户确认。
-- C# Worker **只承担 AI Resume 自有职责**:续跑编排、项目发现、完成通知 outbox、进程监督(`ProcessSupervisor` 用于自己启动的进程)与 GUI 后端;**不镜像 cc-connect 内部的会话/授权/turn 状态机**。ADR-0002 的 RunContract 只适用于 AI Resume 自己启动的进程(续跑、探测)。AI 生成和健康探测不设客户端总时限,静默指标不得触发失败。
+- **AI Resume 只做四件事**:① 按供应商证据进行限额后**逐项目**自动续跑编排(唯一不可替代的核心);② 动态项目发现;③ 本地完成通知(可配置注册表,经官方 lark-cli 发飞书私信);④ Windows 控制面 GUI(GUI 即主要用户界面,质量即产品质量)。手机远程交互交给 Claude Code 官方 Remote Control,AI Resume 不实现任何聊天通道。
+- **限额数据自行获取**(上游 cc-connect 的 `GetUsage` 依赖 `creack/pty`,在 Windows 上不可用,结论见 `docs/UPSTREAM-ARCHITECTURE-RESEARCH.md`)。取数主路径是官方 `GET https://api.anthropic.com/api/oauth/usage`;凭据只来自 **Claude Code 自己的登录**(`%USERPROFILE%\.claude\.credentials.json`,或 `CLAUDE_CONFIG_DIR`),由 `ClaudeCredentialSource` **共享只读、绝不刷新、绝不写回**——refresh token 一次性轮换,任何外部刷新都会把用户登出;访问令牌由正在运行的官方 Claude Code(含 Remote Control 桥)轮换,登录本身(`refreshTokenExpiresAt`,约 30 天)只能由用户 `/login` 续期。v2.1 的 `claude setup-token` 长期令牌已删除(usage 端点不接受它),`install` 会删掉旧的 `state\secrets\claude-oauth-token.bin`。判定 `ClaudeLoginVerdict`:Ok / TokenExpired / LoginExpiring(≤3 天)/ LoginExpired / LoggedOut / StoreMoved(Windows 凭据管理器灰度)/ Unverified(登录文件在但读不出或解析不了,多半正被改写:判断不了,绝不说成未登录,原因码 `unreadable`);`ClaudeLoginReminder` 在到期前 3 天、2 天、1 天、12 小时与已过期各发一次飞书提醒,登录被 Claude Code 清空(到期时间随之消失)时每个本地日提醒一次,直到恢复。令牌绝不进入日志、RPC 回包或截图。失败显示未核实,允许同账号未过期历史读数按承接规则展示;现役生产刷新不降级为 AI 推理。
+- **账号指纹只由账号材料派生**:Claude Code 全局配置(`<配置根>\.config.json` 非空时优先,否则 `~/.claude.json`;默认构造还交叉核对 `<配置根>\.claude.json`,不一致视为未核实)里 `oauthAccount` 的组织 + 账号 UUID 的不可逆哈希;读不到时身份为空、续跑等待,**绝不退回令牌指纹**(令牌约 8 小时轮换,v2.1 因此把同一账号反复判成「供应商已改变」;v2.1 的布防因此在升级后必须解除并重新布防)。
+- **自动续跑额度入口由 `AddQuotaResumeAdmission` 统一注册 `ProviderResumeProbe` + `ProviderCatalogService`。** 布防从当前供应商实时目录**逐项目**选择实际模型 ID(手选 > 该会话最近实际用的模型 > 目标默认;`ProjectRef.ModelId/ModelName/ModelSource`),保存 `ResumeTarget`(供应商/账号/agent)与每个项目的原生会话 UUID;共用同一模型的项目共享一次额度观测、串行续跑。旧配置的空 `ProjectRef.ModelId` 沿用 `ResumeTarget.ModelId`。每个项目按四个维度判定(`ProjectAdmission`):义务(会话转录尾部最近一条真实应答或限流记录——限流以外的合成错误记录跳过,续的那一下失败了不等于续上了)、额度(按该项目的模型)、占用(`~/.claude/sessions/<pid>.json`;只有「活着的进程比登记的启动得晚」才算 PID 复用,字段语义变了就判未核实,绝不把开着的会话当空闲)、全局进程门禁;任何未知只导致等待。**启动前的失败(会话刚被打开、令牌剩余 < 45 分钟、执行条件未核实、配置刚变化)只记 `not-started:<原因>` 并跳过本轮,不锁周期**(不会自己好的原因连续 3 次发一次飞书提醒);进程启动后的失败仍阻断自动重放。同一次中断(uuid 持久化于 `ConsumedInterruptions`)最多续一次;被打断后会话里已有新的真实应答、或中断后同目录新开的会话接着干了(首条记录晚于中断,或会话文件在中断之后才创建——分叉续写会复制旧记录),都视为已在别处继续,这次中断随即记为已处理,那个新会话之后被删或读不到也不回头续旧会话;判断不了(目录读不了、疑似新会话读不出归属)只等待。会话头部按行读、单行不设 64 KiB 上限(首条提问贴图时一行可达数 MB)。每个项目启动前最终门禁重读会话尾部与占用;门禁与在途存续只比较**这个项目自己的**执行身份(`ResumeTarget.ProjectIdentity`),别的项目增删不得杀掉正在跑的项目。「一跑就被限流」按项目计数,本轮跳过该项目及同模型的其它项目(它们凭的是同一份刚被推翻的额度证据),别的模型照常轮到,不得让排在队首的误判项目饿死别的项目。Claude 额度门禁只看目标模型相关窗口:5h/7d 主窗口(必须是本次实时读数且 0 ≤ % < 100)+ 同模型族的 weekly_scoped(认不出族的视为相关;同一重置周期的承接读数未满不阻塞);其它族的 scoped 用尽不挡本项目;禁止以 CLI/Haiku 成功代替目标模型恢复。打开着的交互会话交给 Claude Code 原生 `autoContinueAtUsageLimit`,AI Resume 不重复续跑,额度恢复 10 分钟后仍开着且未继续则飞书提醒一次。Codex 现役供应商是官方 ChatGPT/OpenAI 账号(`CodexAuthProbe.ReadOfficialCredentials` 只读 `~/.codex/auth.json`,不读也不改 `config.toml` 的第三方桥);面板读 `/backend-api/codex/models` 与 `/backend-api/wham/usage`,放行由 `ProviderCatalogService.EvaluateChatGpt` 判定(账号主/次窗口全部 allowed 且 0 ≤ percent < 100、无附加限额或 `spend_control` 命中、目标模型未在 `model_usage` 标为不可用 → ready;任一限额命中 → limited;无数据或缺百分比 → unknown 等待)。`config.toml` 显式配置的非官方、非回环第三方 provider 只作附加行。DeepSeek 行只读 **OpenCode** 的 DeepSeek 密钥(OpenCode 2.x 把凭据存在 `opencode.db`(`OPENCODE_DB` 可改)的 `credential` 表,`auth.json` 只在首次启动时导入一次;只读库:库里没有 DeepSeek 就是 OpenCode 没存、不再拿 `auth.json` 的旧密钥,库读不了显示未核实,只有库或表根本不存在才看 `auth.json`;端点按 OpenCode 2.x 的配置层合并后判断:`OPENCODE_CONFIG_DIR`(否则 XDG)下的 opencode.json/.jsonc → `OPENCODE_CONFIG` → `OPENCODE_CONFIG_CONTENT` → `%ProgramData%\opencode` 托管层,1.x 的 config.json 不读)、只展示余额,`resumable=false`;AI Resume 不保存任何 DeepSeek key。读别人的凭据/配置文件一律共享读写与删除打开。未知、失效、账号变化或不支持的认证/配置保持未核实;不自动换供应商重放。运行器通过受监督的 `internal-agent-run` helper 使用 ArgumentList 与精确 UUID;Claude 用原生 host-provider 能力固定连接并注入当前访问令牌(剩余寿命须 ≥ 45 分钟),组织/动态管理约束无法核实时拒绝;Codex 官方账号用 `-c model_provider="openai" -c openai_base_url=<官方端点>` 覆盖、由 Codex 自己的 `auth.json` 提供凭据;Codex 静态第三方保留原 provider ID,用 CLI 覆盖连接字段、环境承载凭据。Codex 错误 JSONL 不含结构化限流码,未知/错误/重路由/损坏输出均阻断自动重放。详见 ADR-0004 与 ADR-0006。
+- 新增通用飞书消息/文档/日历/任务/OpenAPI 能力前,必须先检查官方 lark-cli 与对应 Skill;已有官方命令时优先调用/封装它,不得手写同类 SDK 请求。lark-cli 的 bot 身份、scope、结构化错误(stdout **与 stderr** 两种信封)与高风险确认契约必须原样保留。`lark-*` Skills 只使用用户级 `%USERPROFILE%\.agents\skills` 真身及现有桥接,禁止复制进仓库。
+- **lark-cli 只能直接启动真正的 `lark-cli.exe`(先找 `%APPDATA%\npm` 下 npm 包内的 `node_modules/@larksuite/cli/bin/lark-cli.exe`,再按 PATH 的绝对路径条目找包内 exe 或独立 `lark-cli.exe`;相对路径条目一律跳过,子进程环境里有 App Secret),绝不经 `cmd.exe /c` 或 `lark-cli.cmd` 垫片**:cmd 会在换行处截断多行参数,`--idempotency-key` 因此从未送达(2026-10-30 实证)。子进程设 `LARKSUITE_CLI_NO_UPDATE_NOTIFIER` / `LARKSUITE_CLI_NO_SKILLS_NOTIFIER`,stdout/stderr 用 UTF-8。
+- 固定上游快照与平台实证见 `docs/UPSTREAM-ARCHITECTURE-RESEARCH.md`;任何引入双写、fork 上游或整体替换/回退的方案都必须先形成新 ADR 并经用户确认。
+- C# Worker **只承担 AI Resume 自有职责**:续跑编排、项目发现、完成通知 outbox 与投递、登录到期提醒、进程监督(`ProcessSupervisor` 只用于自己启动的进程)与 GUI 后端;不镜像 Claude Code / OpenCode 内部的会话状态机,只读它们公开落盘的产物(会话登记、转录、日志)。ADR-0002 的 RunContract 只适用于 AI Resume 自己启动的进程(续跑、探测)。AI 生成和健康探测不设客户端总时限,静默指标不得触发失败。
 
 ## 部署(C# 控制面与续跑引擎)
 
 v1 的 PowerShell + Node 运行时(仓库根的 `src/` 与 `test/`)已于 2026-08-08 从工作树删除;
-需要查阅时用 `git log -- src test` 或检出 `059c46f` 之前的提交。现役实现全部在 `csharp/` 下。Worker 现役命令只有 `install / uninstall / preflight / shortcuts / feishu-check / cc-connect-apply / notify`;v1 迁移命令 `migrate` / `import-feishu` / `sync-dirs` / `cutover-config` 已于 2026-10-12 删除。`cc-connect-apply` 与 GUI 按钮走同一激活契约。
+需要查阅时用 `git log -- src test` 或检出 `059c46f` 之前的提交。现役实现全部在 `csharp/` 下。Worker 现役命令只有 `install / uninstall / shortcuts / notify [list|check|test|enable <源>|disable <源>]`(另有内部 `internal-agent-run`);v1 迁移命令与 v2.1 的 `feishu-check` / `cc-connect-apply` / `preflight` 已删除。不带子命令才以常驻服务启动,未知子命令返回 2。
 
 改完 `csharp/` 里的任何代码,**线上不会自动生效**——运行的是安装目录里的副本:
 
@@ -34,14 +33,14 @@ dotnet build csharp\AiResume.sln -c Release
 csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe install
 ```
 
-`install` 把三个项目(Gui / Worker / Hook)的产物合并复制到 `%LOCALAPPDATA%\AI Resume\`,
+`install` 把四个项目(Gui / Worker / Hook / Launcher)的产物合并复制到 `%LOCALAPPDATA%\AI Resume\`,
 重建桌面/开始菜单/开机自启入口,并按持久化的通知意图(`ProductConfig.NotifySources`)
-对账重建五个完成通知钩子。同一规范化目标目录的完整安装事务必须由目标哈希命名互斥体跨进程串行化；安装必须先 staging 校验并备份将覆盖的运行文件,之后才停止旧 Worker；
-安装还必须冻结 staging 的逐文件 SHA-256,提交只复制冻结清单并逐项复核；后台 Worker 不得继承 install 调用方的 stdout/stderr 重定向句柄。新 Worker 必须存活且 Named Pipe pong 的 PID 精确等于本次启动 PID。回滚不完整时保留 staging/backup,
+对账重建五个完成通知钩子。同一规范化目标目录的完整安装事务必须由目标哈希命名互斥体跨进程串行化;安装必须先 staging 校验并备份将覆盖的运行文件,之后才停止旧 Worker;
+安装还必须冻结 staging 的逐文件 SHA-256,提交只复制冻结清单并逐项复核;后台 Worker 不得继承 install 调用方的 stdout/stderr 重定向句柄。新 Worker 必须存活且 Named Pipe pong 的 PID 精确等于本次启动 PID。回滚不完整时保留 staging/backup,
 禁止在 finally 删除唯一恢复材料。通知源原位刷新,失败项仍保留在持久意图中供下次重试。
 **通知源未能对齐时返回 2,Worker 未启动时返回 3,回滚不完整时返回 4,均不得当成功处理。**
 
-`uninstall` 从安装目录执行时必须经清单约束的临时 Worker 完成:helper 先关闭快捷方式与钩子源,再把全部 payload/marker/manifest 事务性移动到 temp 私有退役区,完成后才返回成功；失败原路恢复,恢复不完整保留 helper 目录。无信号、坏信号或 helper 提前退出时,父进程只能报告恢复材料绝对路径,禁止清理 helper 目录。成功后的清理只碰退役区,不得在父进程返回后再触碰安装目录,否则会与立即重装竞态。`state\`(内含 DPAPI 加密的飞书凭据与运行数据库)和未知文件必须保留；未知文件存在时写精确 preserved-root marker,只允许后续重装,不得据此授权卸载。不会删除用户自己的 `settings.json`。
+`uninstall` 从安装目录执行时必须经清单约束的临时 Worker 完成:helper 先关闭快捷方式与钩子源,再把全部 payload/marker/manifest 事务性移动到 temp 私有退役区,完成后才返回成功;失败原路恢复,恢复不完整保留 helper 目录。无信号、坏信号或 helper 提前退出时,父进程只能报告恢复材料绝对路径,禁止清理 helper 目录。成功后的清理只碰退役区,不得在父进程返回后再触碰安装目录,否则会与立即重装竞态。`state\`(内含 DPAPI 加密的飞书机器人凭据与运行数据库)和未知文件必须保留;未知文件存在时写精确 preserved-root marker,只允许后续重装,不得据此授权卸载。不会删除用户自己的 `settings.json`。
 
 GUI 是 WPF + WebView2,前端在 `csharp/src/AiResume.Gui/wwwroot/`。
 **已打开的窗口不会热更新**:部署后必须关掉旧窗口再打开。
@@ -49,21 +48,24 @@ GUI 是 WPF + WebView2,前端在 `csharp/src/AiResume.Gui/wwwroot/`。
 ## GUI 服务状态语义
 
 - **界面上每一句肯定句都必须能被外部证伪(2026-08-08 第二轮审计后的硬规则)。** 判据不得停在"我们自己那一步":
-  「已启用」要核对钩子命令指向的可执行文件是否存在(`HookHealth`),断链时标 `hookBroken` 并显红,不得继续显示成普通的"开";
-  「已配置(飞书)」只代表 DPAPI 里有值,真实结论必须来自 `FeishuCredentialVerifier` 换一次 tenant_access_token,且**飞书把业务错误码放在 200 响应体里,只看 HTTP 状态会把 `code=10003` 读成成功**;
-  「cc-connect 配置已生成」必须由 **cc-connect 自己的解析器**判定(`CcConnectConfigValidator` → `config format --config <副本>`;标志必须在子命令之后,前置 `--config` 会获取实例锁走启动路径;该命令会重写文件,只能校验副本);
-  「监视中」必须同时满足 `config.Armed`、引擎进程存活与探测新鲜度(`EngineLiveness`),引擎不在时压过一切阶段文案显红。
+  通知源「钩子正常」要核对钩子命令指向的可执行文件是否存在(`HookHealth`),断链时标 `hookBroken` 并显红;OpenCode 的「已加载」只以 OpenCode 自己的日志(`~/.local/share/opencode/log/opencode.log`,数据目录跟随 `XDG_DATA_HOME`)为证据,以插件写入之后的最后一条结论为准,没有记录就是「待核实」;
+  飞书机器人「可送达」只来自投递健康文件里的**真实送达记录**,且必须确认后台 Worker 在跑(`workerRunning === true`;还没读到或核验不出都不行)、最近一次尝试成功、并核对得上那次成功之后没改过凭据/收件人/lark-cli(`settingsVerified === true`,比不出来同样只能「待核实」)——历史成功不证明现在送得到;机器人凭据只有经 `lark-cli doctor` 在线核验、飞书确实换得到 bot token 后才保存;
+  「监视中」必须同时满足 `config.Armed`、引擎进程存活、探测新鲜度(`EngineLiveness`)与本用户常驻 Worker 应答 Named Pipe:引擎不在时压过一切阶段文案显红,有同名进程却不应答显琥珀「监视状态未核实」(`WorkerUnverified`)。
   核对不出结论时一律显示「未核实」,**绝不显示「没问题」**。
-- **通知源意图必须持久化。** `ProductConfig.NotifySources` 记录"用户想开哪几个",`install` 按 `NotifyIntent.Targets`(意图 ∪ 现状 ∩ 本机已装)对账重建,`uninstall` 关闭前先记录现状。只按现状恢复必然失败——卸载会把现状清空。安装未能对齐通知源时**不得返回 0**。
-- Codex 完成通知走 0.148.0 hooks(ADR-0005 C1):`~/.codex/hooks.json` 的 `hooks.Stop` 末尾追加 AI Resume 自己的分组,`config.toml` 写 `[hooks.state."<hooks.json 全路径>:stop:<g>:<h>"].trusted_hash`(与上游 canonical JSON SHA-256 一致,本机 oracle 复算过);只增删自己的分组和哈希等于我方命令哈希的信任记录,旧 `notify` 残留只提示不改写。已打开的 Codex 会话不重载 hooks.json,新会话才生效;信任不匹配时 `notify list` 标 hookBroken 并提示在 codex `/hooks` 信任。
-- 完成通知收件人 `open_id` 以明文存 `ProductConfig.NotifyRecipientOpenId`,由 GUI 从飞书 `allow_from` 同步;Worker 只对旧配置回退 DPAPI。S4U session 0 下 `CryptUnprotectData` 会间歇失败数小时(2026-10 实证),Worker 投递路径不得再依赖 DPAPI;app_secret 仍只在 GUI 侧 CurrentUser DPAPI(ADR-0005 D1)。
+- 收进菜单的东西(Codex 额度、Codex/Cline/Qoder 通知源、供应商明细)若处于启用或故障状态,主界面必须留一句提示,隐藏不得掩盖启用态或断链。
+- **通知源意图必须持久化。** `ProductConfig.NotifySources` 记录"用户想开哪几个",`install` 按 `NotifyIntent.Targets`(意图 ∪ 现状 ∩ 本机已装)对账重建,`uninstall` 关闭前先记录现状。只按现状恢复必然失败——卸载会把现状清空。探测失败(`Unverified`,开没开不知道)的源不改写它的配置、意图原样保留,install 按未对齐返回。安装未能对齐通知源时**不得返回 0**。`notify enable/disable` 与界面开关必须先写意图、再改客户端配置(`NotifyIntent.Apply`):意图也是投递端的来源过滤,写不进去就不能改开关;改客户端失败时再探一次实际状态,只有证明这次改动根本没生效才把这一项意图恢复原样,已部分生效(如新插件已写好、清理旧文件失败)或探不出时保留这次的选择——否则插件在跑、意图却被改回「关」,事件会被投递端全部丢弃。
+- Claude Code 钩子写在 `~/.claude/settings.json`(与 Claude Code 一致跟随 `CLAUDE_CONFIG_DIR`),用官方 exec form(`command` 只放 `AiResume.Hook.exe` 绝对路径,`args` 放参数),三组:`Stop`、`StopFailure`(`--kind=failure`)、`Notification`(`--kind=decision`,matcher 见 `ClaudeCodeNotificationAdapter.DecisionMatcher`);只增删我方条目,混在用户分组里的我方条目移出单独成组,不改写用户分组的 matcher。Claude Code 热加载 settings。
+- Codex 完成通知走 0.148.0 hooks(ADR-0005 C1):`~/.codex/hooks.json` 的 `hooks.Stop` 末尾追加 AI Resume 自己的分组,`config.toml` 写 `[hooks.state."<hooks.json 全路径>:stop:<g>:<h>"].trusted_hash`(与上游 canonical JSON SHA-256 一致);只增删自己的分组和哈希等于我方命令哈希的信任记录,旧 `notify` 残留只提示不改写。已打开的 Codex 会话不重载 hooks.json,新会话才生效;信任不匹配时 `notify list` 标 hookBroken 并提示在 codex `/hooks` 信任。
+- OpenCode 只支持 2.x:写官方 v2 目录形态插件 `~/.config/opencode/plugins/airesume-notify/index.ts`(配置目录跟随 `XDG_CONFIG_HOME`);拒绝覆盖别人的 `index.*`/`server.*`/`package.json`,迁移旧单文件插件时留 `.bak`。
+- **完成通知投递**:Worker(S4U 计划任务、会话 0)读 GUI 保存的**机器范围** DPAPI 机器人凭据 `state\secrets\feishu-bot.bin`(ACL 收紧到当前用户 + SYSTEM + Administrators),经环境变量 `LARKSUITE_CLI_APP_ID/APP_SECRET/BRAND/STRICT_MODE` 交给 lark-cli;没有副本时退回 lark-cli 自己的钥匙串(S4U 下会间歇失败,界面标琥珀)。S4U 会话 0 下解 **CurrentUser** DPAPI 会间歇失败数小时(0x8009000B,2026-10 两次实证),Worker 路径不得依赖任何 CurrentUser 密文——包括第三方 CLI 自己的。收件人 `open_id` 明文存 `ProductConfig.NotifyRecipientOpenId`,由「飞书通知设置」识别(`lark-cli auth list`)或填写。投递失败按 `NotifyClassifier` 分级:单条失败只推迟该条,凭据/网络/限流熔断整个通道,凭据文件或收件人一变立即解除,永久错误进 `completion-events\dead\`;日志只记类别、错误码、log_id、退出码与耗时,不记正文与凭据。
 - OpenAI / DeepSeek / Claude 的绿色「可用」必须来自启动时或手动刷新的**真实外部请求证据**;API Key 已填写、CLI 命令存在只能说明“可探测”,绝不能显示成可用。对配置了 CC Switch 风格用量查询的 Sub2API provider,成功返回、账户未显式失效且余额大于 0 的 `/v1/usage` 是其 provider/account 可用证据,可直接点绿;这不等于对每一次未来推理请求作绝对保证。
-- **现役 GUI 供应商刷新使用零 token 的 `providers.catalog`。** Claude 读取 Models API 与 OAuth usage，DeepSeek 读取 Models API 与 balance，当前 Codex 第三方复用带凭据的 `/models` 与兼容 `/v1/usage`，ChatGPT 使用 `/backend-api/codex/models` 与 `/backend-api/wham/usage`。模型可列不等于额度可用；数据源失败分别降级，不保留旧绿。旧 `providers.probe` RPC 已于 2026-10-12 删除;GUI 没有任何推理型探测。
-- **前端字号一律走 rem,1rem = 点阵字设计尺寸 12px。** 开机脚本按 `devicePixelRatio` 把 `html` 的基准挪到"乘上缩放率正好是 12 的整数倍"的值(150% → 16px);字距用 rem 折算的整数设计像素;`font-synthesis:none` 与 `-webkit-font-smoothing:none` 是点阵字清晰的前提,不得移除。布局尺寸仍用 px,不随字号缩放。
-- Claude 探测必须区分未登录、订阅/额度、网络/超时、模型不可用和未安装;「未登录」要同时说明自持令牌与 CLI 两个来源各自的状态;探测失败时额度区不得回退成「空闲」。
-- OAuth usage 请求必须复现 Claude Code 的协议形状:`Accept: application/json`、`anthropic-beta: oauth-2025-04-20`、`anthropic-version: 2023-06-01` 与 `User-Agent: claude-code/<本机版本>`;普通 UA 会进入更激进的 429 桶。解析逐字段优先使用现代 `limits` 的 `session` / `weekly_all` / `weekly_scoped`,兼容旧顶层窗口。权威额度快照在后台请求中延迟写入 SQLite `quota_snapshots`,不得阻塞 WPF 首帧;以 `organizationUuid` 的不可逆账号指纹隔离,缺失时才退回 token 指纹。跨进程更新必须在同一个 SQLite `IMMEDIATE` 事务内重读、合并并写回,禁止锁外读旧快照后整体覆盖。OAuth 与 CLI 都按稀疏观测处理:当前明确字段优先,缺字段/缺窗口不是 tombstone;仅在同账号、同稳定窗口身份、同一未来 `resetAtUnix` 周期内承接并标记“最近服务端读数”。主窗口身份是协议 kind;scoped 身份是规范化完整 scope 的 SHA-256,不能按显示名或数组序号猜。账号变化、身份变化、reset 换代或到期立即失效;纯承接值不得渲染成绿色实时正常。详细协议、故障边界和真机验证手册见 `docs/CLAUDE-QUOTA-ACQUISITION.md`。
-- GUI 的 provider 行由 `ProviderCatalogService` 聚合，复用 `CodexAuthProbe` / `CodexBalanceProbe` / `DeepSeekProbe`。第三方 OpenAI-compatible provider 的余额按当前 Codex provider 只读请求 `/v1/usage`(根地址补 `/v1`,已含 `/v1` 不重复),兼容 CC Switch usage_script 的 `remaining` / `quota.remaining` / `balance`,默认 USD;成功、账户有效且余额大于 0 时按 CC Switch 语义直接显示绿色,余额为 0、账户失效、401/403、402/429 等明确失败优先。没有有效余额证据的 provider 显示额度未核实，不因目录成功而点绿。官方 OpenAI/ChatGPT 端点不请求该第三方路由,ChatGPT OAuth token 也不得发往额外余额接口;这不是 ChatGPT Plus/Pro 订阅额度。DeepSeek 只有余额接口成功后才能绿。任一探针异常只降级自身,不得拖垮整个 provider 面板。provider 可用性与 Claude 额度是两套证据,不得相互代替。正式任务一旦可能产生副作用,不得在失败时换 provider 自动重放。
-- 现役 GUI 只提供 `AiResume.Gui.exe --screenshot <png>` 离屏证据入口;公开截图必须使用合成数据,不得上传真实项目名、app_id 或本机路径。改服务状态逻辑后必须跑 `dotnet test`,并在部署后的真实窗口核验状态行。
+- **现役 GUI 供应商刷新使用零 token 的 `providers.catalog`。** Claude 读取 Models API 与 OAuth usage,DeepSeek 读取 Models API 与 balance(密钥来自 OpenCode),当前 Codex 第三方复用带凭据的 `/models` 与兼容 `/v1/usage`,ChatGPT 使用 `/backend-api/codex/models` 与 `/backend-api/wham/usage`。模型可列不等于额度可用;数据源失败分别降级,不保留旧绿。GUI 没有任何推理型探测。页面每块数据到了就各自绘制(额度磁贴不等最慢的供应商目录);目录在 `quota.get` 返回之后才读,Claude 行复用这一轮 1 分钟内的额度读数,一轮刷新只请求一次 usage 端点;登录状态在额度请求结束后再读一次,「被服务端拒绝」反映的是这一轮的结果。
+- **前端字号一律走 rem,1rem = 点阵字设计尺寸 12px。** 开机脚本按 `devicePixelRatio` 把 `html` 的基准挪到"乘上缩放率正好是 12 的整数倍"的值(150% → 16px);字距用 rem 折算的整数设计像素;`font-synthesis:none` 与 `-webkit-font-smoothing:none` 是点阵字清晰的前提,不得移除。布局尺寸仍用 px,不随字号缩放;窄列放不下的文案用短句 + 悬停说明,窄磁贴用容器查询换短标题。WebView2 必须关闭浏览器加速键与缩放(`AreBrowserAcceleratorKeysEnabled` / `IsZoomControlEnabled`),否则 Ctrl± 会让点阵字失去整数倍。
+- 页面的语义集中在 `index.html` 的 `<script id="vm">` 纯函数视图模型(`AR.*`),`GuiPageContractTests` 在 Node 里直接驱动它断言「无证据不绿」等语义;改界面语义必须改视图模型并补断言,不要把判断散落进渲染代码。
+- Claude 登录状态必须区分有效、令牌待续期、即将到期、已过期、未登录与凭据位置变化;登录失效时额度区不得回退成「空闲」。
+- OAuth usage 请求必须复现 Claude Code 的协议形状:`Accept: application/json`、`anthropic-beta: oauth-2025-04-20`、`anthropic-version: 2023-06-01` 与 `User-Agent: claude-code/<本机版本>`;普通 UA 会进入更激进的 429 桶。解析逐字段优先使用现代 `limits` 的 `session` / `weekly_all` / `weekly_scoped`,兼容旧顶层窗口。权威额度快照在后台请求中延迟写入 SQLite `quota_snapshots`,不得阻塞 WPF 首帧;以账号指纹隔离。跨进程更新必须在同一个 SQLite `IMMEDIATE` 事务内重读、合并并写回,禁止锁外读旧快照后整体覆盖。OAuth 与 CLI 都按稀疏观测处理:当前明确字段优先,缺字段/缺窗口不是 tombstone;仅在同账号、同稳定窗口身份、同一未来 `resetAtUnix` 周期内承接并标记“最近服务端读数”。主窗口身份是协议 kind;scoped 身份是规范化完整 scope 的 SHA-256,不能按显示名或数组序号猜。账号变化、身份变化、reset 换代或到期立即失效;纯承接值不得渲染成绿色实时正常。详细协议、故障边界和真机验证手册见 `docs/CLAUDE-QUOTA-ACQUISITION.md`。
+- GUI 的 provider 行由 `ProviderCatalogService` 聚合,复用 `CodexAuthProbe` / `CodexBalanceProbe` / `DeepSeekProbe`。第三方 OpenAI-compatible provider 的余额按当前 Codex provider 只读请求 `/v1/usage`(根地址补 `/v1`,已含 `/v1` 不重复),兼容 CC Switch usage_script 的 `remaining` / `quota.remaining` / `balance`,默认 USD;成功、账户有效且余额大于 0 时按 CC Switch 语义直接显示绿色,余额为 0、账户失效、401/403、402/429 等明确失败优先。没有有效余额证据的 provider 显示额度未核实,不因目录成功而点绿。官方 OpenAI/ChatGPT 端点不请求该第三方路由,ChatGPT OAuth token 也不得发往额外余额接口;这不是 ChatGPT Plus/Pro 订阅额度。DeepSeek 只有余额接口成功后才能绿。任一探针异常只降级自身,不得拖垮整个 provider 面板。provider 可用性与 Claude 额度是两套证据,不得相互代替。正式任务一旦可能产生副作用,不得在失败时换 provider 自动重放。
+- 现役 GUI 只提供 `AiResume.Gui.exe --screenshot <png>` 离屏证据入口(演示模式只回合成数据;`--screenshot-unarmed` 为未布防态);公开截图必须使用合成数据并把 `AIRESUME_SHADOW_DIR` 指向临时目录,不得上传真实项目名、app_id、open_id 或本机路径。改服务状态逻辑后必须跑 `dotnet test`,并在部署后的真实窗口核验状态行。
 
 ## 自测(改完必跑)
 
@@ -71,34 +73,35 @@ GUI 是 WPF + WebView2,前端在 `csharp/src/AiResume.Gui/wwwroot/`。
 dotnet test csharp\AiResume.sln
 ```
 
-全量 xUnit 门禁约 30 秒;用例数以当次 `dotnet test` 输出和 `AI_GUIDE.md` 的最新记录为准,不在规则层硬编码。红线:**绝不**对真实项目或真实会话启动 AI 运行,
+全量 xUnit 门禁约 40 秒;用例数以当次 `dotnet test` 输出和 `AI_GUIDE.md` 的最新记录为准,不在规则层硬编码。`GuiPageContractTests` 与 `OpenCodeNotificationAdapterTests` 需要本机 `node`。红线:**绝不**对真实项目或真实会话启动 AI 运行,
 不碰 `~/.claude`、`~/.codex`、`~/.qoder`、`~/.config/opencode` 和 `%LOCALAPPDATA%\AI Resume\state`,
 不发任何付费 API 请求。探测判定一律对**录下来的真实响应**断言,不对臆想的结构断言——
-mock 猜错结构的结果是测试全绿、线上静默失效(已实测过一次)。
+mock 猜错结构的结果是测试全绿、线上静默失效(已实测过两次:`im.image.create` 的外壳、lark-cli 写在 stderr 的错误信封)。
 
 - **临时目录只能经 `TestTemp` 申请**(`NewDir` / `NewFile` / `NewPath`)。
   直接用 `Path.GetTempPath()` 会在用户的 `%TEMP%` 里堆垃圾——2026-08-08 数出来 1499 个。
   需要「这个目录不存在」当前提的用例必须用 `NewPath`,`NewDir` 会把前提创没了。
-- 界面证据:`AiResume.Gui.exe --screenshot <png>` 离屏截图(等 20 秒待数据填充)。
+- 界面证据:`AiResume.Gui.exe --screenshot <png>` 离屏截图(演示模式约 2 秒后截取)。
   要产出**公开可用**的截图必须喂合成数据,真机数据里有用户的项目名与 app_id。
-- 改了通知钩子/安装流程,除单测外还要真机跑一次 `install` 并核对
-  `AiResume.Worker.exe notify list` 的「可送达」列全为 True、退出码为 0。
+- 改了通知钩子/投递/安装流程,除单测外还要真机跑一次 `install`,核对 `AiResume.Worker.exe notify list` 的「可送达」列全为 True、退出码为 0,
+  并用 `notify check`(lark-cli doctor)与 `notify test`(冒烟事件走完整链路,等待真实送达)确认通道。
 
 ## 测试红线(真踩过的事故,绝不重犯)
 
-- **测试绝不能对真实项目/真实会话启动任何 AI 修改运行**——曾经一个测试 resume 了真实会话,AI 带着旧上下文执行并 push 了 commit;"事后停止"拦不住。要么用不存在的假会话 id,要么设 `FEISHU_TEST_NO_AI=1`。
-- **mock 必须照抄线上 API 的真实返回结构**(如 `im.image.create` 返回顶层 `{image_key}`,无 `data` 外壳)——mock 猜错结构 = 测试全绿但线上静默失效。拿不准就真调一次打印 `Object.keys()`。
+- **测试绝不能对真实项目/真实会话启动任何 AI 修改运行**——曾经一个测试 resume 了真实会话,AI 带着旧上下文执行并 push 了 commit;"事后停止"拦不住。要么用不存在的假会话 id,要么注入假 `IClaudeResumeRunner` 与 `TestTemp` 下的合成会话目录;`FEISHU_TEST_NO_AI` 是 v1 Node 测试的开关,C# 代码里没有读者,不要依赖它。
+- **mock 必须照抄线上 API 的真实返回结构**(如 `im.image.create` 返回顶层 `{image_key}`,无 `data` 外壳;lark-cli 失败时信封在 stderr)——mock 猜错结构 = 测试全绿但线上静默失效。拿不准就真调一次打印 `Object.keys()`。
 - 现役 RunContract 对 chat/query/modify/resume/probe 都不设客户端总时限,统一使用 Start/Status/Cancel。只有结构化 HTTP 408/504 或 `gateway_timeout` 是 `failed_provider`;DNS/TCP/TLS/reset、进程消失、解析和监控异常是 `failed_local`;用户停止为 `cancelled` 且不得 fallback。`heartbeatAt`、`lastOutputAt`、`silentSeconds` 只是指标。
 - AI Resume 自己启动的进程必须先把 PID、创建时间、命令签名、Job 与 `childPending` 写入 SQLite `process_registry`;登记失败立即拒绝/终止。只有身份完整匹配才允许终止,未知不得当 gone。真实 close/error 前保持 runKey,只有 `childPending=false` 后才释放并清理登记。
-- 布防周期、项目状态和额度快照由 SQLite/WAL 与 `ProductConfigStore` 的锁内读改写持久化;跨进程更新必须在事务/锁内重读最新值后合并。解除布防只停止后台自动续跑,不影响 cc-connect 中由用户发起的聊天任务。
+- 布防周期、项目状态(含 `ProjectNotes`、`ConsumedInterruptions`)和额度快照由 SQLite/WAL 与 `ProductConfigStore` 的锁内读改写持久化;跨进程更新必须在事务/锁内重读最新值后合并。解除布防只停止后台自动续跑,不影响用户自己在客户端里的会话。
 
 ## 安全约束
 
-- 飞书 `allow_from` 必须非空;GUI、DPAPI 存储、配置生成和校验均 fail-closed。生成配置把同一授权名单写入每个项目的 `admin_from`;现役没有 viewer/陌生人只读三态(研究性 `CcConnectAuthMapper` 已于 2026-10-12 删除)。
-- 飞书 app secret 由 `%LOCALAPPDATA%\AI Resume\state\secrets` 下的 DPAPI 存储持有;Claude/Codex 等 provider 凭据继续由各自上游认证文件或环境变量持有。任何令牌、密码、私钥都不得进入仓库、日志、截图、TOML 脱敏输出或测试夹具。
-- 修改飞书授权、项目管理员或 provider 配置时必须保持 fail-closed;无法证明授权名单有效时拒绝生成/激活,不能退回“空名单放行所有人”。
+- 飞书机器人凭据(app_id + app_secret)只经 GUI「飞书通知设置」进入,`lark-cli doctor` 在线核验通过后才以 DPAPI **LocalMachine** 范围存 `%LOCALAPPDATA%\AI Resume\state\secrets\feishu-bot.bin`,保存后把文件 ACL 收紧到当前用户 + SYSTEM + Administrators 并读回核验,收不紧就放弃保存;界面只回遮蔽后的 app_id,实值只出现在用户输入那一刻、本进程调用栈与 lark-cli 子进程的环境变量里,绝不进 argv、日志、RPC 回包或截图。
+- Claude/Codex/OpenCode 等 provider 凭据继续由各自上游认证文件或环境变量持有;AI Resume 只读,不复制、不保存。任何令牌、密码、私钥都不得进入仓库、日志、截图或测试夹具。
+- 不读取、不改写也不删除 `~/.cc-connect` 等已退役组件的配置;其中的明文密钥由用户自行清理与吊销。
 
 ## 会话生命周期
 
-- 现役飞书会话由 cc-connect v1.4.1 管理;GUI 尚未提供会话归档/删除窗口。
-- 研究性 `CcConnectSessionBridge`、`CcConnectAuthMapper`、`CcConnectSupervisor` 已于 2026-10-12 随 v2.1 删除(从未有生产调用方);如需会话归档/删除或 owner/viewer 模型,必须先盘点上游接口、形成新 ADR 并补真实集成验证,不得把历史文档中的 14/30 天策略写成现役事实。
+- 会话属于各客户端(Claude Code / OpenCode / Codex)自己;AI Resume 只读它们公开落盘的产物:Claude Code 的 `~/.claude/projects/**/<会话 UUID>.jsonl` 转录(用量上限中断证据与最近使用的模型)和 `~/.claude/sessions/<pid>.json` 运行登记(占用判定;只有活着的进程比登记的启动得晚才算 PID 复用)。
+- 续跑只用布防时绑定的精确会话 UUID(`internal-agent-run` 以 ArgumentList 传入),不新建会话、不改写转录;会话开在客户端时不续跑,交给客户端自己继续。
+- 研究性 `CcConnectSessionBridge`、`CcConnectAuthMapper`、`CcConnectSupervisor` 已于 2026-10-12 删除,cc-connect 整体已于 2026-10-30 退役;如需会话归档/删除等能力,必须先盘点上游接口、形成新 ADR 并补真实集成验证。

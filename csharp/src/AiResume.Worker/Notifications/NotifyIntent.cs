@@ -16,12 +16,27 @@ namespace AiResume.Worker.Notifications;
 /// </summary>
 public static class NotifyIntent
 {
-    /// <summary>把探测结果里**已启用**的那些,折成可持久化的意图名单。</summary>
-    public static List<string> FromProbe(IEnumerable<NotificationProviderStatus> probed)
-        => probed.Where(s => s.IsEnabled)
-                 .Select(s => s.Kind.ToString())
-                 .Distinct(StringComparer.OrdinalIgnoreCase)
-                 .ToList();
+    /// <summary>
+    /// 把探测结果里**已启用**的那些,折成可持久化的意图名单。探测失败(<see cref="NotificationProviderStatus.Unverified"/>)
+    /// 的源开没开不知道:<paramref name="recorded"/> 里原有的意图原样保留，不能当成「没开」抹掉——
+    /// 意图也是投递端的来源过滤，抹掉后这个源的事件会被静默丢弃。
+    /// </summary>
+    public static List<string> FromProbe(IEnumerable<NotificationProviderStatus> probed, IEnumerable<string>? recorded = null)
+    {
+        List<NotificationProviderStatus> list = probed.ToList();
+        return list.Where(s => s.IsEnabled).Select(s => s.Kind)
+                   .Concat(Unverified(recorded, list))
+                   .Select(k => k.ToString())
+                   .Distinct(StringComparer.OrdinalIgnoreCase)
+                   .ToList();
+    }
+
+    /// <summary>意图里记着、但这次探测失败(开没开不知道)的源:对账时不碰它们的配置，也不改它们的意图。</summary>
+    public static List<NotificationProviderKind> Unverified(IEnumerable<string>? recorded, IReadOnlyList<NotificationProviderStatus> probed)
+    {
+        var unverified = probed.Where(s => s.Unverified).Select(s => s.Kind).ToHashSet();
+        return Parse(recorded).Where(unverified.Contains).ToList();
+    }
 
     /// <summary>把名字解析回枚举,丢掉无法识别的;顺序去重,按枚举序稳定输出。</summary>
     public static List<NotificationProviderKind> Parse(IEnumerable<string>? names)
@@ -54,12 +69,14 @@ public static class NotifyIntent
     ///
     /// 注意目标里**包含已经开着且健康的那些** —— 安装要把它们重指到新的安装目录,
     /// 不是只补缺失的。跳过它们会让钩子继续指着仓库 bin,清一次 bin 就断,而且断得没有任何提示。
+    /// 探测失败的源(<see cref="NotificationProviderStatus.Unverified"/>)不在目标里:读不出的配置不能去改写;
+    /// 它们的意图由 <see cref="Unverified"/> 单独保留。
     /// </summary>
     public static List<NotificationProviderKind> Targets(
         IEnumerable<string>? recorded,
         IReadOnlyList<NotificationProviderStatus> probed)
     {
-        var installed = probed.Where(s => s.IsInstalled).Select(s => s.Kind).ToHashSet();
+        var installed = probed.Where(s => s.IsInstalled && !s.Unverified).Select(s => s.Kind).ToHashSet();
 
         var want = new HashSet<NotificationProviderKind>(Parse(recorded));
         foreach (NotificationProviderStatus s in probed)
@@ -89,5 +106,70 @@ public static class NotifyIntent
         }
 
         return set.OrderBy(k => (int)k).Select(k => k.ToString()).ToList();
+    }
+
+    /// <summary>
+    /// 拨动一个通知源:先把意图写进配置，再改客户端配置(<paramref name="change"/>)。
+    /// v2.2 起意图不只是重装时恢复的依据，还是投递端的来源过滤——意图没记下、开关却改了，
+    /// 界面显示开着，投递端照旧意图把这个来源的事件全部丢弃。所以意图写不进去就直接失败、客户端配置不动。
+    /// 改客户端失败时这一项的意图跟着实际状态走(<paramref name="actualEnabled"/>:改动可能已经部分生效，
+    /// 比如新插件写好了、清理旧文件时才失败),探不出实际状态时保留这次的选择;不提供探测时恢复原样。然后照样抛出。
+    /// </summary>
+    public static void Apply(Products.ProductConfigStore store, NotificationProviderKind kind, bool enabled, Action change,
+        Func<bool?>? actualEnabled = null)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(change);
+        bool wasIntended = false;
+        bool wasRecorded = false;
+        try
+        {
+            store.Update(c =>
+            {
+                wasIntended = Parse(c.NotifySources).Contains(kind);
+                wasRecorded = c.NotifyIntentRecorded;
+                c.NotifySources = Toggle(c.NotifySources, kind, enabled);
+                c.NotifyIntentRecorded = true;
+            });
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or TimeoutException)
+        {
+            throw new InvalidOperationException($"通知源意图没能写进配置({ex.Message}),开关未改动,请稍后重试。", ex);
+        }
+
+        try
+        {
+            change();
+        }
+        catch
+        {
+            bool? actual = null;
+            try
+            {
+                actual = actualEnabled?.Invoke();
+            }
+            catch (Exception)
+            {
+                // 探不出:按「不知道」处理。
+            }
+
+            // 只有探测证明这次改动根本没生效(实际状态仍是改之前的反面)才恢复原意图;已经生效或探不出时保留这次的选择——
+            // 否则新插件已经装上、意图却被改回「关」,投递端会把它送来的事件全部丢弃。
+            bool intended = actualEnabled is null || actual == !enabled ? wasIntended : enabled;
+            try
+            {
+                store.Update(c =>
+                {
+                    c.NotifySources = Toggle(c.NotifySources, kind, intended);
+                    c.NotifyIntentRecorded = intended == enabled || wasRecorded;
+                });
+            }
+            catch (Exception)
+            {
+                // 改不了:意图与现状暂时不一致,下次 install 按意图对账;原始错误照样抛给调用方。
+            }
+
+            throw;
+        }
     }
 }

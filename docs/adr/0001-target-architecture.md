@@ -8,6 +8,14 @@
 - 补充决策:AI 运行生命周期由 `docs/adr/0002-run-lifecycle-contract.md` 细化;冲突处以 ADR-0002 为准
 - 关联:`docs/history/MIGRATION-BASELINE.md`、`docs/history/STATE-OWNERSHIP.md`、`docs/EVENT-CONTRACTS.md`、`docs/RUN-CONTRACT.md`、`docs/UPSTREAM-ARCHITECTURE-RESEARCH.md`
 
+> **2026-10-30 修订说明(v2.2)**:下列部分已被 ADR-0006(`docs/adr/0006-retire-cc-connect-per-project-resume.md`)取代或不再适用。正文保留为 2026-08-01 的历史决策记录,不再改写;现役事实以 `docs/ARCHITECTURE.md` 与 ADR-0006 为准。
+>
+> - **cc-connect 相关全部失效。** ADR-0003 已把 cc-connect 从「被 wrapper 包装的编排内核」改为直接运行的上游;ADR-0006 让它整体退役,手机远程交互改用 Claude Code 官方 Remote Control。因此目标 4、目标 7、约束前两条、决策 1 中的「cc-connect 编排」、决策 2、决策 4、决策 5、替代方案表中以 cc-connect 为前提的结论、「C# 与 cc-connect 边界」整节,以及「安全」「回滚」「后果」中关于 cc-connect 与飞书单一消费者的条目都不再适用。AI Resume 不消费任何飞书事件,也不生成、校验或激活 cc-connect 配置;`AiResume.Wrapper` 项目与 Worker 命令 `cc-connect-apply`、`preflight`、`feishu-check` 已删除。
+> - **lark-cli 能力层(目标 5、决策 6)继续有效,现役只用于完成通知。** Worker 直接启动 `lark-cli.exe`(不经 cmd.exe),以 `im +messages-send --as bot` 私信,事件 ID 作 `--idempotency-key`;高风险确认(exit 10)仍不自动 `--yes`,按通道故障处理。机器人凭据来自 AI Resume 保存的机器范围 DPAPI 副本 `state\secrets\feishu-bot.bin`,经 `LARKSUITE_CLI_APP_ID`、`LARKSUITE_CLI_APP_SECRET`、`LARKSUITE_CLI_BRAND=feishu`、`LARKSUITE_CLI_STRICT_MODE=bot` 环境变量交给 lark-cli,没有副本时退回 lark-cli 自己的钥匙串;不再按 profile 选择身份。S4U Worker 经该副本的真实投递待真机验证。
+> - **决策 3 的进程边界继续有效,但只覆盖 AI Resume 自己启动的进程(后台续跑)。** Job Object、durable 进程登记(`process_registry`)、stop barrier 与 RunContract 语义见 `docs/RUN-CONTRACT.md`;其中「completion outbox(SQLite)」没有成为现役投递路径——完成通知走 `state\completion-events\` 文件队列(格式见 `docs/EVENT-CONTRACTS.md` 第 16 节),SQLite `outbox` 表没有生产调用方。
+> - **完成边界(目标 6、决策 7)继续有效并已扩展。** 注册表共有 Claude Code、Codex、Cline、Qoder、OpenCode 五个来源(ADR-0003 §3);v2.2 起 Claude Code 钩子改用官方 exec form 并新增 `StopFailure`,OpenCode 改为官方 v2 插件(在 OpenCode 2.x 内真实加载待真机验证),GUI 主界面默认只显示 Claude Code 与 OpenCode。DeepSeek Copilot Chat 仍不新增完成边界。
+> - **「长期密钥只存 C# 机密存储」的现役形态。** Claude 凭据不由 AI Resume 保存,只读 Claude Code 自己的登录;DeepSeek 密钥只读 OpenCode 的配置(找不到时回退环境变量 `DEEPSEEK_API_KEY`);AI Resume 自持并在投递中使用的只有飞书机器人凭据副本。
+
 ## 背景
 
 现役 AI Resume v2(`src/package.json` 唯一版本真身)由 PowerShell 5.1 GUI/引擎 + Node `feishu-agent.js` + JSON/marker 状态构成;`feishu-agent.js` 单体同时处理长连接、鉴权、会话、卡片、图片、运行锁、健康探测与完成投递,缺陷集中在生命周期边界。2026-07-31 上游研究与 2026-08-01 阶段 0 基线确认:采用 cc-connect 与官方 lark-cli 作为目标组件,并以 .NET 10 重构产品内核与 GUI。

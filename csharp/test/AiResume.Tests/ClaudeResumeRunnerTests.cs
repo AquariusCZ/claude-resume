@@ -219,7 +219,7 @@ public sealed class ClaudeResumeRunnerTests : IDisposable
 
     private sealed class IsolatedPlan(string executable) : IProviderExecutionPlan
     {
-        public ResumeExecutionPlan Create(ProjectRef project, ProductConfig config) =>
+        public ResumeExecutionPlan Create(ProjectRef project, ProductConfig config, ExecutionPurpose purpose = ExecutionPurpose.Spawn) =>
             new(new AgentCommand(executable, Array.Empty<string>()), Array.Empty<string>(),
                 new Dictionary<string, string?>(), "claudecode");
         public bool IsCurrent(ResumeTarget target) => true;

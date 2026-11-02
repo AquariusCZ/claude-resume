@@ -27,7 +27,10 @@ public sealed record NotificationProviderStatus(
     // 「命令指向的程序还在不在」—— 光有 IsEnabled 回答不了"我收得到通知吗"。
     string? HookCommand = null,
     // 已启用、但命令指向的可执行文件确证不存在。此时通知永远不会到。
-    bool HookBroken = false);
+    bool HookBroken = false,
+    // 探测本身失败(配置正被改写、被占用、读出异常):开没开**不知道**。界面必须显示「未核实」,
+    // 不能把 IsEnabled=false 说成肯定的「已关闭」,也不能把 IsInstalled=false 说成「未检测到」。
+    bool Unverified = false);
 
 /// <summary>单个 provider 的适配器。所有实现必须满足安全要求。</summary>
 public interface INotificationAdapter
@@ -110,7 +113,8 @@ public sealed class NotificationRegistry
                         IsInstalled: false,
                         IsEnabled: false,
                         ConfigPath: null,
-                        Detail: $"探测异常: {ex.Message}"));
+                        Detail: $"探测异常: {ex.Message}",
+                        Unverified: true));
                 }
             }
             return results;
@@ -132,6 +136,28 @@ public sealed class NotificationRegistry
         }
 
         return s with { HookBroken = true, Detail = HookHealth.BrokenDetail(s.HookCommand) };
+    }
+
+    /// <summary>单个通知源此刻开没开:true / false;探测失败(未核实)或没有这个适配器时为 null。</summary>
+    public bool? ProbeEnabled(NotificationProviderKind kind)
+    {
+        lock (_lock)
+        {
+            if (!_adapters.TryGetValue(kind, out var adapter))
+            {
+                return null;
+            }
+
+            try
+            {
+                NotificationProviderStatus status = adapter.Probe();
+                return status.Unverified ? null : status.IsEnabled;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
     }
 
     /// <summary>
