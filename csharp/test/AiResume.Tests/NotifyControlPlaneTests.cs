@@ -1,4 +1,5 @@
 using System.Text.Json;
+using AiResume.Secrets;
 using AiResume.Worker.Notifications;
 using AiResume.Worker.Products;
 using AiResume.Worker.Quota;
@@ -9,8 +10,9 @@ using Xunit;
 namespace AiResume.Tests;
 
 /// <summary>
-/// 「完成通知 → 飞书」控制面：凭据经 lark-cli doctor 核验后才落盘、收件人规整、测试通知走真实队列;
-/// 以及 Claude Code 登录到期提醒。假 lark-cli 是 TestTemp 下的 .cmd 脚本，输出照抄 1.0.81 录制形状(合成 ID)。
+/// 「完成通知 → 飞书」控制面：凭据经真实换令牌 + 一次只读机器人接口调用核验后才落盘(ADR-0007)、收件人规整、
+/// 测试通知走真实队列;以及 Claude Code 登录到期提醒。假 lark-cli 是 TestTemp 下的 .cmd 脚本，输出照抄 1.0.81 录制形状
+/// (合成 ID);换令牌端点是 <see cref="FeishuTokenStub"/>,绝不真调飞书。
 /// </summary>
 public sealed class NotifyControlPlaneTests
 {
@@ -19,15 +21,25 @@ public sealed class NotifyControlPlaneTests
     private const string Users = """[{"appId":"cli_test000000","tokenStatus":"valid","userName":"测试用户","userOpenId":"ou_0123456789abcdef0123456789abcdef"}]""";
 
     [Fact]
-    public async Task 只有doctor在线核验通过的凭据才落盘_不通过不写()
+    public async Task 只有真实换到令牌且机器人接口调通的凭据才落盘_不通过不写()
     {
         string root = TestTemp.NewDir("notify-control");
         string fake = FakeLarkCli(root);
-        var control = new NotifyControlPlane(new ProductConfigStore(root), root, new FeishuBotCredentials(root), () => fake);
+        var control = new NotifyControlPlane(new ProductConfigStore(root), root, new FeishuBotCredentials(root), () => fake,
+            new FeishuTenantToken(new FeishuTokenStub()));
 
+        // 飞书拒绝换令牌(录制形状 10014):不落盘，说明里带错误码与 log_id,绝不回显 App Secret。
         var refused = await Assert.ThrowsAsync<InvalidOperationException>(
             () => control.SetCredentialAsync("cli_test000000", "fake-wrong-secret", CancellationToken.None));
-        Assert.Contains("verify failed", refused.Message);
+        Assert.Contains("10014", refused.Message);
+        Assert.Contains("log-10014", refused.Message);
+        Assert.DoesNotContain("fake-wrong-secret", refused.Message);
+        Assert.False(new FeishuBotCredentials(root).Exists);
+
+        // 换到了令牌，机器人接口却被拒(应用没开机器人能力或缺权限):同样不落盘。
+        var noBot = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => control.SetCredentialAsync("cli_test000000", "fake-nobot-secret", CancellationToken.None));
+        Assert.Contains("机器人接口被拒", noBot.Message);
         Assert.False(new FeishuBotCredentials(root).Exists);
 
         NotifyChannelStatus saved = await control.SetCredentialAsync("cli_test000000", "fake-good-secret", CancellationToken.None);
@@ -36,9 +48,113 @@ public sealed class NotifyControlPlaneTests
         Assert.Equal("cli_te…00", saved.AppIdMasked);
         Assert.True(new FeishuBotCredentials(root).TryLoad(out _, out string secret));
         Assert.Equal("fake-good-secret", secret);
-        Assert.True((await control.CheckAsync(CancellationToken.None)).BotReady);
+
+        // 诊断：副本路径先换令牌、调机器人接口(决定就绪),再附注入令牌后的 doctor;令牌不出现在任何说明里。
+        LarkDoctorReport check = await control.CheckAsync(CancellationToken.None);
+        Assert.True(check.BotReady);
+        Assert.Null(check.Problem);
+        Assert.Equal("env", check.CredentialSource);
+        Assert.Equal(["tenant_token", "bot_api"], check.Checks.Take(2).Select(item => item.Name));
+        Assert.Contains(check.Checks, item => item.Name == "bot_identity" && item.Status == "pass");
+        Assert.DoesNotContain(check.Checks, item => (item.Message ?? string.Empty).Contains(FeishuTokenStub.Good, StringComparison.Ordinal));
+        // doctor 看的是用户自己的 lark-cli 配置:不带副本路径的私有配置目录;机器人接口那次带。
+        string[] calls = File.ReadAllLines(Path.Combine(root, "calls.txt"));
+        Assert.Contains(calls, line => line.Trim() == "api|cli_test000000|" + Path.Combine(root, "lark-cli"));
+        Assert.Contains(calls, line => line.Trim() == "doctor|cli_test000000|");
 
         Assert.Equal("keychain", control.ClearCredential().CredentialSource);
+    }
+
+    [Fact]
+    public async Task 机器人未启用或doctor出问题时说法分明_doctor的问题不推翻核验结论()
+    {
+        string root = TestTemp.NewDir("notify-control-bot");
+        string fake = FakeLarkCli(root);
+        var control = new NotifyControlPlane(new ProductConfigStore(root), root, new FeishuBotCredentials(root), () => fake,
+            new FeishuTenantToken(new FeishuTokenStub()));
+
+        // 机器人信息接口调通了，但 activate_status 不是 2(停用或待启用):发不了消息，不落盘。
+        var inactive = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => control.SetCredentialAsync("cli_test000000", "fake-inactive-secret", CancellationToken.None));
+        Assert.Contains("机器人没有启用", inactive.Message);
+        Assert.Contains("activate_status_1", inactive.Message);
+        Assert.False(new FeishuBotCredentials(root).Exists);
+
+        // 换令牌与机器人接口都过、doctor 自己出问题:就绪与问题只看前两步,doctor 的问题只作附注检查项。
+        await control.SetCredentialAsync("cli_test000000", "fake-doctor-fail-secret", CancellationToken.None);
+        LarkDoctorReport check = await control.CheckAsync(CancellationToken.None);
+        Assert.True(check.BotReady);
+        Assert.Null(check.Problem);
+        Assert.Contains(check.Checks, item => item.Name == "doctor" && item.Status == "warn");
+    }
+
+    [Fact]
+    public async Task 副本读不出时诊断与识别都如实报错_状态标明读不出()
+    {
+        string root = TestTemp.NewDir("notify-control-unreadable");
+        string fake = FakeLarkCli(root);
+        var credentials = new FeishuBotCredentials(root);
+        credentials.Save("cli_test000000", "fake-good-secret");
+        File.WriteAllBytes(credentials.SecretPath, [1, 2, 3, 4]);
+        var control = new NotifyControlPlane(new ProductConfigStore(root), root, credentials, () => fake, new FeishuTenantToken(new FeishuTokenStub()));
+
+        NotifyChannelStatus status = control.Describe();
+        Assert.Equal("env", status.CredentialSource);
+        Assert.True(status.CredentialUnreadable);
+        Assert.Null(status.AppIdMasked);
+
+        LarkDoctorReport check = await control.CheckAsync(CancellationToken.None);
+        Assert.False(check.BotReady);
+        Assert.Equal("credential_copy", Assert.Single(check.Checks).Name);
+        Assert.False(File.Exists(Path.Combine(root, "calls.txt")));
+        // 没法按应用过滤：不能把别的应用下的 open_id 当候选递出去。
+        await Assert.ThrowsAsync<InvalidOperationException>(() => control.DetectRecipientsAsync(CancellationToken.None));
+
+        credentials.Delete();
+        Assert.False(control.Describe().CredentialUnreadable);
+    }
+
+    [Fact]
+    public async Task 导入旧版凭据同样先换令牌并调通机器人接口()
+    {
+        string root = TestTemp.NewDir("notify-control-import");
+        string fake = FakeLarkCli(root);
+        var control = new NotifyControlPlane(new ProductConfigStore(root), root, new FeishuBotCredentials(root), () => fake,
+            new FeishuTenantToken(new FeishuTokenStub()));
+        async Task Legacy(string secret) => await new DpapiSecretStore(root).SaveAsync(FeishuBotCredentials.LegacyCredentialRef,
+            JsonSerializer.SerializeToUtf8Bytes(new { AppId = "cli_test000000", AppSecret = secret, AllowFrom = "ou_x" }), CancellationToken.None);
+
+        await Legacy("fake-wrong-secret");
+        var refused = await Assert.ThrowsAsync<InvalidOperationException>(() => control.ImportLegacyAsync(CancellationToken.None));
+        Assert.Contains("旧版飞书凭据未导入", refused.Message);
+        Assert.Contains("10014", refused.Message);
+        Assert.False(new FeishuBotCredentials(root).Exists);
+
+        await Legacy("fake-good-secret");
+        NotifyChannelStatus imported = await control.ImportLegacyAsync(CancellationToken.None);
+        Assert.Equal("env", imported.CredentialSource);
+        Assert.True(new FeishuBotCredentials(root).TryLoad(out _, out string secret));
+        Assert.Equal("fake-good-secret", secret);
+    }
+
+    [Fact]
+    public async Task 副本在却换不到令牌时诊断不跑doctor_也不把AppSecret交给lark_cli()
+    {
+        string root = TestTemp.NewDir("notify-control-refused");
+        string fake = FakeLarkCli(root);
+        new FeishuBotCredentials(root).Save("cli_test000000", "fake-wrong-secret");
+        var control = new NotifyControlPlane(new ProductConfigStore(root), root, new FeishuBotCredentials(root), () => fake,
+            new FeishuTenantToken(new FeishuTokenStub()));
+
+        LarkDoctorReport check = await control.CheckAsync(CancellationToken.None);
+
+        Assert.False(check.BotReady);
+        Assert.Equal("env", check.CredentialSource);
+        LarkDoctorCheck token = Assert.Single(check.Checks);
+        Assert.Equal("tenant_token", token.Name);
+        Assert.Equal("fail", token.Status);
+        Assert.Contains("10014", check.Problem);
+        Assert.False(File.Exists(Path.Combine(root, "calls.txt")), "没换到令牌就不该启动 lark-cli");
     }
 
     [Fact]
@@ -262,23 +378,66 @@ public sealed class NotifyControlPlaneTests
     }
 
     /// <summary>
-    /// 假 lark-cli:doctor 只在环境变量凭据为 fake-good-secret 或未注入凭据(钥匙串)时报 bot 就绪;auth list 输出一个用户。
+    /// 假 lark-cli(照 1.0.81 实测行为):auth list 输出一个用户;其它调用每次记一行「命令|APP_ID|CONFIG_DIR」。env 来源只认现成令牌——
+    /// 环境里只有 App Secret 时一律回 token_missing(真 lark-cli 不会拿它去换);有令牌却没有 App ID 时报错。
+    /// api(机器人信息接口):Good / DoctorFail 成功且 activate_status=2,Inactive 成功但 activate_status=1,NoBot 回授权错误
+    /// (NotificationDeliveryTests 里 1.0.81 录制的 authorization/missing_scope 形状),其余回 99991663。
+    /// doctor:Good 或未注入凭据(钥匙串)报 bot 就绪,DoctorFail 输出不认识的格式，其余 verify failed。
     /// </summary>
     private static string FakeLarkCli(string root)
     {
         string path = Path.Combine(root, "lark-cli-fake.cmd");
+        static string BotInfo(int status) => "{\"code\":0,\"msg\":\"ok\",\"bot\":{\"activate_status\":" + status +
+                                             ",\"app_name\":\"test-bot\",\"open_id\":\"ou_fedcba9876543210fedcba9876543210\"}}";
         File.WriteAllText(path, string.Join("\r\n",
             "@echo off",
             "if \"%1\"==\"auth\" (",
             "  echo " + Users,
             "  exit /b 0",
             ")",
-            "if \"%LARKSUITE_CLI_APP_SECRET%\"==\"fake-wrong-secret\" (",
+            "echo %1^|%LARKSUITE_CLI_APP_ID%^|%LARKSUITE_CLI_CONFIG_DIR%>> \"%~dp0calls.txt\"",
+            "if defined LARKSUITE_CLI_APP_SECRET (",
+            "  echo " + FeishuTokenStub.TokenMissingEnvelope + " 1>&2",
+            "  exit /b 3",
+            ")",
+            "if defined LARKSUITE_CLI_TENANT_ACCESS_TOKEN if not defined LARKSUITE_CLI_APP_ID (",
+            "  echo {\"ok\":false,\"error\":{\"type\":\"config\",\"message\":\"LARKSUITE_CLI_TENANT_ACCESS_TOKEN is set but LARKSUITE_CLI_APP_ID is missing\"}} 1>&2",
+            "  exit /b 3",
+            ")",
+            "if \"%1\"==\"api\" goto api",
+            "if \"%LARKSUITE_CLI_TENANT_ACCESS_TOKEN%\"==\"" + FeishuTokenStub.Good + "\" (",
+            "  echo " + Doctor,
+            "  exit /b 0",
+            ")",
+            "if \"%LARKSUITE_CLI_TENANT_ACCESS_TOKEN%\"==\"" + FeishuTokenStub.DoctorFail + "\" (",
+            "  echo not-a-doctor-report",
+            "  exit /b 0",
+            ")",
+            "if defined LARKSUITE_CLI_TENANT_ACCESS_TOKEN (",
             "  echo " + DoctorFail,
             "  exit /b 0",
             ")",
             "echo " + Doctor,
             "exit /b 0",
+            ":api",
+            "if \"%LARKSUITE_CLI_TENANT_ACCESS_TOKEN%\"==\"" + FeishuTokenStub.Good + "\" (",
+            "  echo " + BotInfo(2),
+            "  exit /b 0",
+            ")",
+            "if \"%LARKSUITE_CLI_TENANT_ACCESS_TOKEN%\"==\"" + FeishuTokenStub.DoctorFail + "\" (",
+            "  echo " + BotInfo(2),
+            "  exit /b 0",
+            ")",
+            "if \"%LARKSUITE_CLI_TENANT_ACCESS_TOKEN%\"==\"" + FeishuTokenStub.Inactive + "\" (",
+            "  echo " + BotInfo(1),
+            "  exit /b 0",
+            ")",
+            "if \"%LARKSUITE_CLI_TENANT_ACCESS_TOKEN%\"==\"" + FeishuTokenStub.NoBot + "\" (",
+            "  echo {\"ok\":false,\"identity\":\"bot\",\"error\":{\"type\":\"authorization\",\"subtype\":\"missing_scope\",\"message\":\"m\"}} 1>&2",
+            "  exit /b 3",
+            ")",
+            "echo " + FeishuTokenStub.TokenInvalidEnvelope + " 1>&2",
+            "exit /b 3",
             string.Empty));
         return path;
     }

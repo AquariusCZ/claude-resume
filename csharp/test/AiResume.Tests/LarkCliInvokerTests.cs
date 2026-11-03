@@ -123,6 +123,35 @@ public class LarkCliInvokerTests : IDisposable
     }
 
     [Fact]
+    public async Task Invoke_TokenEnvironmentIsRedactedAndNullRemovesInheritedVariables()
+    {
+        // 注入的访问令牌(名字含 TOKEN)与 App Secret 一样进脱敏集合;值为 null 的键从继承来的环境里删掉
+        // (副本路径就是这样删掉用户环境里残留的 LARKSUITE_CLI_APP_SECRET)。用一个本测试独有的变量名验证删除，不影响并行用例。
+        string inherited = "AIRESUME_TEST_INHERITED_" + Guid.NewGuid().ToString("N");
+        Environment.SetEnvironmentVariable(inherited, "inherited-value");
+        try
+        {
+            string echo = "console.log(JSON.stringify({ok:true,data:{token:process.env.LARKSUITE_CLI_TENANT_ACCESS_TOKEN,inherited:process.env['" + inherited + "'] ?? null}}))";
+            var invoker = new LarkCliInvoker("node", new[] { "-e", echo, "--" }, environment: new Dictionary<string, string?>
+            {
+                ["LARKSUITE_CLI_TENANT_ACCESS_TOKEN"] = "t-fakegood0000000000000000",
+                [inherited] = null,
+            });
+
+            var result = await invoker.InvokeAsync(Array.Empty<string>());
+
+            using var envelope = result.Envelope!;
+            Assert.Equal("[REDACTED]", envelope.Data!.Value.GetProperty("token").GetString());
+            Assert.Equal(System.Text.Json.JsonValueKind.Null, envelope.Data!.Value.GetProperty("inherited").ValueKind);
+            Assert.DoesNotContain("t-fakegood0000000000000000", result.Stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(inherited, null);
+        }
+    }
+
+    [Fact]
     public async Task Invoke_Timeout_KillsProcessTreeAndThrows()
     {
         // 挂起 30 秒的 ping;超时 300ms 必须触发,且不能真的等 30 秒。

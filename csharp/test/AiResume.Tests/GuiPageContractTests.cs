@@ -249,6 +249,21 @@ public sealed class GuiPageContractTests
             assert.deepEqual(m.rows.map(r => r.text), ['未核实', '未核实']); assert.ok(m.rows.every(r => !r.installed));
             const blocked = AR.notifyModel(list, { ...base, health: { state: 'blocked', reason: 'keychain_unavailable', lastErrorCode: 1 } }, {}, now).robot;
             assert.equal(blocked.led, 'bad'); assert.equal(blocked.text, AR.DELIVERY_REASON.keychain_unavailable);
+            // 换令牌路径(ADR-0007)的熔断原因都要有自己的文案与说明，不能落成笼统的「投递受阻」。
+            for (const reason of ['credential_unreadable', 'token_unexpected', 'cli_contract', 'auth_config', 'network', 'network_timeout', 'rate_limit']) {
+                const r = AR.notifyModel(list, { ...base, health: { state: 'blocked', reason } }, {}, now).robot;
+                assert.ok(AR.DELIVERY_REASON[reason], reason); assert.equal(r.text, AR.DELIVERY_REASON[reason]);
+                assert.ok(AR.DELIVERY_DETAIL[reason], reason); assert.ok(r.title.includes(AR.DELIVERY_DETAIL[reason]), reason);
+            }
+            // 换令牌这一步失败与 lark-cli 失败同名类别:悬停标出是哪一段、细类是什么。
+            const tokenBlocked = AR.notifyModel(list, { ...base, health: { state: 'blocked', reason: 'network', lastErrorType: 'tenant_token', lastErrorSubtype: 'server_error:http_502@direct' } }, {}, now).robot;
+            assert.match(tokenBlocked.title, /换取令牌时失败/); assert.match(tokenBlocked.title, /server_error:http_502@direct/);
+            assert.doesNotMatch(AR.notifyModel(list, { ...base, health: { state: 'blocked', reason: 'network', lastErrorType: 'network' } }, {}, now).robot.title, /换取令牌时/);
+            // 副本在却读不出:投递会拒发、不改用钥匙串——显红，压过历史成功;也不能说成「lark-cli 默认应用」。
+            const copyUnreadable = AR.notifyModel(list, { ...healthy, appIdMasked: null, credentialUnreadable: true, settingsVerified: true }, {}, now, true);
+            assert.equal(copyUnreadable.robot.led, 'bad'); assert.equal(copyUnreadable.robot.text, AR.DELIVERY_REASON.credential_unreadable);
+            assert.equal(copyUnreadable.app, ''); assert.doesNotMatch(copyUnreadable.robot.title, /默认应用/);
+            assert.equal(AR.notifyModel(list, { ...base, appIdMasked: null, credentialSource: 'keychain', health: null }, {}, now, true).app, 'lark-cli 默认应用');
             assert.equal(AR.notifyModel(list, { ...base, health: null }, {}, now, true).robot.text, '待核实');
             const keychainOnly = AR.notifyModel(list, { ...base, credentialSource: 'keychain', health: null }, {}, now, true).robot;
             assert.equal(keychainOnly.led, 'wait'); assert.equal(keychainOnly.text, '未存凭据副本'); assert.match(keychainOnly.title, /后台服务/);

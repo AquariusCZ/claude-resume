@@ -131,14 +131,20 @@ public static class NotifyCommand
 
     /// <summary>
     /// <c>notify check</c>:诊断飞书通知通道。lark-cli 是否找得到、凭据来源(机器范围副本 env / lark-cli 钥匙串)、
-    /// 收件人、后台服务最近的真实投递结论，再跑一次 <c>lark-cli doctor</c>(在线，只读)。全部就绪返回 0,否则 2。
+    /// 收件人、后台服务最近的真实投递结论，再做一次在线只读诊断：有副本时真实换令牌并调一次机器人接口，
+    /// 再附 <c>lark-cli doctor</c>;没有副本时只跑 doctor。全部就绪返回 0,否则 2。
     /// </summary>
     private static int Check()
     {
         var control = new NotifyControlPlane();
         NotifyChannelStatus status = control.Describe();
         Console.WriteLine($"lark-cli: {(status.LarkCliFound ? "找到" : "未找到(npm i -g @larksuite/cli)")}");
-        Console.WriteLine($"机器人凭据: {(status.CredentialSource == "env" ? "AI Resume 机器范围副本 " + status.AppIdMasked : "lark-cli 钥匙串(AI Resume 未存机器范围副本,后台服务可能读不到)")}");
+        Console.WriteLine($"机器人凭据: {(status.CredentialSource != "env" ? "lark-cli 钥匙串(AI Resume 未存机器范围副本,后台服务可能读不到)" : status.CredentialUnreadable ? "AI Resume 机器范围副本读不出(已损坏、正被占用或换过机器;投递会暂停,请在「飞书通知设置」重新保存)" : "AI Resume 机器范围副本 " + status.AppIdMasked + "(换取 tenant_access_token 后注入 lark-cli)")}");
+        if (status.CredentialSource == "env")
+        {
+            // 换令牌请求自己的网络路径(与 lark-cli 同一规则:只认 HTTPS_PROXY / NO_PROXY);后台服务的环境可能与这个终端不同。
+            Console.WriteLine($"换令牌网络路径(本终端环境): {FeishuTenantToken.DescribeRoute(Environment.GetEnvironmentVariable)}");
+        }
         Console.WriteLine($"收件人: {(status.RecipientSet ? status.RecipientMasked : "未设置")}");
         if (status.Health is { } health)
         {
@@ -155,17 +161,20 @@ public static class NotifyCommand
         }
 
         LarkDoctorReport report = control.CheckAsync(CancellationToken.None).GetAwaiter().GetResult();
+        // 检查项:tenant_token / bot_api 是副本路径的换令牌与机器人接口调用，其余来自 lark-cli doctor。
         foreach (LarkDoctorCheck check in report.Checks)
         {
-            Console.WriteLine($"  doctor {check.Name}: {check.Status} {check.Message}");
+            Console.WriteLine($"  {check.Name}: {check.Status} {check.Message}");
         }
 
         if (report.Problem is not null)
         {
-            Console.WriteLine($"  doctor: {report.Problem}");
+            Console.WriteLine($"  问题: {report.Problem}");
         }
 
-        // 最近一次真实投递失败(条目级,如收件人跨应用)时不报就绪:doctor 只证明机器人身份,不证明收件人可达。
+        Console.WriteLine($"诊断用的凭据: {report.CredentialSource switch { "env" => "AI Resume 机器范围副本", "keychain" => "lark-cli 钥匙串", _ => "无" }}");
+
+        // 最近一次真实投递失败(条目级,如收件人跨应用)时不报就绪:诊断只证明机器人身份,不证明收件人可达。
         bool ready = status.LarkCliFound && status.RecipientSet && report.BotReady && status.Health?.State != "blocked" &&
                      status.Health?.LastAttemptOk != false;
         Console.WriteLine(ready ? "结论: 飞书通知通道就绪" : "结论: 飞书通知通道未就绪(见上)");

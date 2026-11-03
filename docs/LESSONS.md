@@ -318,7 +318,7 @@ GUI(`picker.ps1`)和引擎(`checker.ps1`/`lib.ps1`)跑在 **Windows PowerShell 5
 | `install` 退出码 0 + "入口已全部指向安装目录" | 五个通知源一个都没启用 |
 | 计划任务 `State=Running` | `PT72H` 会掐断、拔电源就停、崩了不拉起 |
 
-> 2026-10-30 注:表中「飞书已配置」「cc-connect 配置已生成」两行对应的功能已随 cc-connect 退役删除(v2.2 的飞书机器人凭据只有经 `lark-cli doctor` 在线核验后才保存,「可送达」只认投递健康文件里的真实送达记录)。同一形状在 v2.2 又出现了一次:OpenCode 插件被宿主拒绝加载,界面仍显示「已启用」,见第十四节第 6 条。
+> 2026-10-30 注:表中「飞书已配置」「cc-connect 配置已生成」两行对应的功能已随 cc-connect 退役删除(v2.2 的飞书机器人凭据只有经在线核验后才保存——起初用 `lark-cli doctor`,它在 env 来源下从不换令牌,对任何密钥都失败,2026-11-02 起改为真实换令牌 + 一次机器人接口调用(第十四节第 14 条),「可送达」只认投递健康文件里的真实送达记录)。同一形状在 v2.2 又出现了一次:OpenCode 插件被宿主拒绝加载,界面仍显示「已启用」,见第十四节第 6 条。
 
 ### 根因是同一个:判据只看配置,不看世界
 
@@ -450,8 +450,8 @@ cc-connect 给 codex agent 配 provider 时会 `ensureCodexAuth` 改写 `~/.code
    - 现象:10-13 起完成通知成簇失败、又成簇恢复,日志只有笼统的 `send_rejected`;同一秒多条能一起成功,不像频控。10-26 至 10-30 投递成功 179 次、失败 158 次(含重试)。
    - 根因:Worker 跑在 S4U 计划任务的会话 0。lark-cli 1.0.81 在 Windows 上把 appSecret 存在 `HKCU\Software\LarkCli\keychain` 里,是 CurrentUser 范围的 DPAPI 密文,每次 `--as bot` 都要先解密再换 tenant_access_token。S4U 登录不保存口令,解 CurrentUser 密文会间歇报 `0x8009000B`(推断与 LSASS 的主密钥缓存是否过期有关,微软没有公开说明)。系统的 DPAPI 运行日志(Microsoft-Windows-Crypto-DPAPI/Operational)与投递日志逐条对齐:10-14 以来 312 次失败投递中 300 次(96%)对得上,每条失败恰好伴随 2 次 DPAPI 失败,全成功的轮次一次也没有。
    - 为什么说「故障点移动了」:10-12 之前 Worker 自己读 CurrentUser DPAPI 的 `feishu-platform.bin` 取收件人,08-14 起累计 5103 次 `sweep_failed`(同一个 `0x8009000B`);10-12 改读明文收件人后 `sweep_failed` 归零,`send_rejected` 从 10-13 开始成批出现。「Worker 投递路径不得依赖 DPAPI」只管住了我们自己的代码,没管住 Worker 启动的子进程(第十三节第 2 条)。
-   - 规则:① 「后台安全上下文里不得依赖 CurrentUser 密文」必须覆盖**整棵进程树**:Worker 启动的每个第三方 CLI 把凭据存在哪、用什么范围加密,接入前就要查清;② 修掉一个故障后,看失败是「消失了」还是「换了名字」——旧错误归零的同时出现新的成簇失败,先怀疑同一根因;③ 优先用上游官方的凭据注入方式:lark-cli 的环境变量凭据提供者(`LARKSUITE_CLI_APP_ID/APP_SECRET/BRAND/STRICT_MODE`,本机 dry-run 证实优先于钥匙串),由 AI Resume 在交互会话里保存一份 **LocalMachine** 范围、ACL 收紧到当前用户 + SYSTEM + Administrators 的副本,保存前用 `lark-cli doctor` 在线核验,Worker 只读、只经子进程环境变量传递;④ 间歇性故障要看一段时间的失败率和系统侧日志,一次成功不算数;⑤ 升级 lark-cli 前复核钥匙串用法(1.0.90 起有存进钥匙串的 tenant access token),别让 DPAPI 依赖从另一个口子回来。
-   - 位置:`FeishuBotCredentials`(`state\secrets\feishu-bot.bin`,可一次性导入 v2.1 的 `feishu-platform.bin`)、`LarkCliNotificationChannel.BuildEnvironment`、`DpapiSecretStore`(LocalMachine 分支与 ACL 收紧)。**待真机验证**:用户在「飞书通知设置」保存或导入一次凭据后,S4U Worker 的真实送达,以及发送时刻 DPAPI 运行日志里不再出现新的 `0x8009000B`。
+   - 规则:① 「后台安全上下文里不得依赖 CurrentUser 密文」必须覆盖**整棵进程树**:Worker 启动的每个第三方 CLI 把凭据存在哪、用什么范围加密,接入前就要查清;② 修掉一个故障后,看失败是「消失了」还是「换了名字」——旧错误归零的同时出现新的成簇失败,先怀疑同一根因;③ 优先用上游官方的凭据注入方式:lark-cli 的环境变量凭据来源(优先于钥匙串),由 AI Resume 在交互会话里保存一份 **LocalMachine** 范围、ACL 收紧到当前用户 + SYSTEM + Administrators 的副本,Worker 只读、只经子进程环境变量传递〔2026-11-02 更正:env 来源只收现成令牌,当初写的 `APP_ID/APP_SECRET` + 「dry-run 证实」+ doctor 核验这条路对任何密钥都失败;现役是副本自己换 tenant_access_token、只注入 App ID + 令牌,保存前真实换令牌并调一次机器人接口,见第 14 条与 ADR-0007〕;④ 间歇性故障要看一段时间的失败率和系统侧日志,一次成功不算数;⑤ 升级 lark-cli 前复核钥匙串用法(1.0.90 起有存进钥匙串的 tenant access token),别让 DPAPI 依赖从另一个口子回来。
+   - 位置:`FeishuBotCredentials`(`state\secrets\feishu-bot.bin`,可一次性导入 v2.1 的 `feishu-platform.bin`)、`LarkCliNotificationChannel.ResolveCredentialAsync`(现役:换令牌后注入,第 14 条)、`DpapiSecretStore`(LocalMachine 分支与 ACL 收紧)。**2026-11-02 真机验证**:用户在「飞书通知设置」保存凭据后,由 S4U 计划任务拉起的会话 0 Worker 经副本换令牌真实送达(`credentialSource=env`),当天 DPAPI 运行日志没有 8198、Worker 日志没有 `0x8009000B`。这只是一次会话 0 的发送样本(规则 ④),失败率仍按 COMPLETION-NOTIFICATIONS §6 第 5 条观察;「导入旧版凭据」这条路没有真机走过。
 
 3. **★★ 错误信封写在 stderr,封装只读 stdout;测试按猜的形状 mock,一直全绿**
    - 现象:直到 2026-10-30,AI Resume 没有记下过一个真实的飞书错误码,所有失败都是 `send_rejected`;lark-cli 自己的日志(`~/.lark-cli/logs/auth-*.log`)只记 OAuth 设备流,也没有。上一条的根因只能靠系统 DPAPI 日志反推。
@@ -524,6 +524,12 @@ cc-connect 给 codex agent 配 provider 时会 `ensureCodexAuth` 改写 `~/.code
    - 根因:① 把「hook 触发了」等同于「用户的一个会话结束了」——全局 settings 里的 hook 对本机任何 claude 进程都生效,包括没有转录、谁都打不开也续不了的程序化调用;② 去重只按事件:每次程序化调用都是新会话、新 eventId,而用量上限是账号级的,同一周期里每一次撞墙都被当成新消息;③ 文案是写死的套话,不读布防状态、不看这个会话在不在布防范围,也不给重置时间。
    - 规则:① 通知的准入要有「这是用户能接着干的会话吗」的外部证据(转录落盘);判断不了照发,确认没有才丢;② 去重的粒度要对准「新信息」:同一会话同一限额周期(服务端给的 `rateLimitType + resetsAt`,加配置根)只提醒一次,同时发生的合成一条;程序化调用靠第 ① 条拦,别指望靠会话去重——它每次都是新会话;判周期前先等转录写完,事件晚于证据里的重置时间时证据作废;③ 文案里每一句关于「接下来会发生什么」的话,都要在投递那一刻按真实状态(布防快照,连同引擎已知会一直等的原因:要重新布防、登录失效、监视卡住)生成,读不出就写「未核实」——与界面「肯定句可证伪」同一条规则;只说自己会做什么,不替上游承诺;④ 排查「谁发的通知」先看进程的工作目录与命令行,而不是只看事件内容。
    - 位置:`CompletionNotifier`(§5.3 第 6、7 步:`session_not_persisted`、`same_limit_cycle`、`completion-notify-limits.json`,`BuildLimitText` / `OutlookFor`)、`NotifyFacts`(转录、进程登记、`custom-title`、布防快照)。
+
+14. **★★★ 「dry-run 证实」+「假 CLI 认 App Secret 就报就绪」:机器人凭据副本对任何密钥都存不进去(2026-11-02,ADR-0007)**
+   - 现象:用户在「飞书通知设置」保存 App ID / App Secret,三次都报 `no tat available from credential source "env"`;故意编错的密钥报错一字不差。v2.2 上线以来机器范围副本一次也没存成功,后台投递一直落在 S4U 下不可靠的 lark-cli 钥匙串上——第 2 条要修的那个故障其实从未修好。
+   - 根因:lark-cli 1.0.81 的 env 凭据来源只接受现成令牌(`LARKSUITE_CLI_TENANT_ACCESS_TOKEN`),给它 `LARKSUITE_CLI_APP_SECRET` 根本不去换令牌(网络接到只记录的代理:env 路径一次换令牌请求都没发;同一调用改给假令牌,立即收到飞书侧 99991663,说明令牌确实被送出去了)。当初的依据是 `im +messages-send --dry-run` 输出的 `context.app_id` 等于环境变量里的假 app id——dry-run 不换令牌,只证明「env 来源被选中了」,证明不了「env 来源能用」。测试里的假 lark-cli 又写成「APP_SECRET 是 fake-good-secret 就报 bot 就绪」,把这个猜想固化成了全绿的用例。
+   - 规则:① 凭据链路的可用性只能用**会真的换令牌 / 真的调接口**的证据证明:用明显无效的假值跑一次,看错误是不是来自对端(飞书 log_id、业务码),而不是本地 `token_missing`;dry-run、`auth status`、「被选中」都不算;② 假 CLI 的分支条件必须来自录制的真实行为:真实 CLI 对某个输入从不成功,假 CLI 就不能让它成功;③ 新功能上线后至少要有一次真机走通(这里是用户在 GUI 保存一次);只有单测的「已实现」要在文档里写成待真机验证,并真的去验;④ 上游缺能力时的例外要窄:这里只自己做「换令牌」一步(官方端点、只用于 bot、令牌只在内存),发消息等其余操作仍走 lark-cli,失败时绝不退回把 App Secret 塞进子进程环境。
+   - 位置:`FeishuTenantToken`、`LarkCliNotificationChannel.ResolveCredentialAsync` / `TokenEnvironment` / `VerifyAsync`、`NotifyClassifier.ClassifyTokenExchange`、`NotifyControlPlane.SetCredentialAsync`、`FeishuTenantTokenTests`、`NotifyControlPlaneTests.FakeLarkCli`(只给 App Secret 一律 token_missing)。
 
 ---
 

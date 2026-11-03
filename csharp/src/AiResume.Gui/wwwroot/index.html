@@ -453,7 +453,7 @@ dialog::backdrop{background:rgba(38,35,29,.28)}
       <label for="fsId">App ID</label><input id="fsId" type="text" autocomplete="off" spellcheck="false" placeholder="cli_…">
       <label for="fsSecret">App Secret</label><input id="fsSecret" type="password" autocomplete="off" spellcheck="false" placeholder="开放平台「凭证与基础信息」">
     </div>
-    <p class="hint">保存前用 lark-cli doctor 在线核验;经 Windows DPAPI(机器范围)加密存本机，存后界面读不回来。</p>
+    <p class="hint">保存前向飞书换取令牌、再调一次机器人接口核验;经 Windows DPAPI(机器范围)加密存本机，存后界面读不回来。</p>
     <div class="brow">
       <button class="btn" type="button" id="fsImport" hidden>导入旧版凭据</button>
       <button class="btn" type="button" id="fsClear" hidden>清除凭据</button>
@@ -712,6 +712,8 @@ const AR = (() => {
   /** 投递受阻原因:短句放进右栏值列(窄栏也放得下),完整说明进悬停。 */
   const DELIVERY_REASON = {
     keychain_unavailable: '读不到机器人凭据',
+    credential_unreadable: '凭据副本读不出',
+    token_unexpected: '换令牌应答异常',
     auth_config: '凭据或配置无效',
     permission_or_recipient: '权限或收件人有误',
     rate_limit: '被飞书限流',
@@ -723,10 +725,12 @@ const AR = (() => {
   };
   const DELIVERY_DETAIL = {
     keychain_unavailable: '后台服务读不到 lark-cli 钥匙串里的机器人凭据;在「设置…」里保存一份机器范围副本',
+    credential_unreadable: 'AI Resume 保存的机器人凭据副本解不开、已损坏或正被占用;稍后自动重试，仍不行就在「设置…」里重新保存',
+    token_unexpected: '向飞书换取令牌的应答不是预期结果(未识别的错误码，或被代理、网关拦截);稍后自动重试',
     auth_config: '飞书拒绝了机器人凭据或应用配置;在「设置…」里重新保存并验证',
     permission_or_recipient: '机器人没有发消息的权限，或收件人不在应用可见范围内',
     rate_limit: '飞书限流，稍后自动重试',
-    network: '连不上飞书开放平台，网络恢复后自动重试',
+    network: '连不上飞书开放平台，或它暂时出错;恢复后自动重试',
     network_timeout: '请求飞书超时，稍后自动重试',
     launch_failed: '找不到或无法启动 lark-cli;npm i -g @larksuite/cli',
     cli_contract: '30 分钟内两条消息因同一类参数错误被拒,多半是 lark-cli 的参数或输出格式变了，需要升级 AI Resume',
@@ -781,17 +785,21 @@ const AR = (() => {
       : onHidden.length ? `另有 ${onHidden.join('、')} 通知仍开启${where}` : '';
 
     let robot;
-    const app = channel && !channel.error ? (channel.appIdMasked ? `应用 ${channel.appIdMasked}` : 'lark-cli 默认应用') : '';
+    // 副本在却读不出时没有可说的应用:不能写「lark-cli 默认应用」——投递会拒发，不会改用钥匙串。
+    const app = channel && !channel.error ? (channel.appIdMasked ? `应用 ${channel.appIdMasked}` : channel.credentialSource === 'keychain' ? 'lark-cli 默认应用' : '') : '';
+    // 换令牌这一步失败(lark-cli 没启动)与 lark-cli 失败同名类别，悬停里标出是哪一段、细类是什么。
+    const stage = h => [h.lastErrorType === 'tenant_token' ? '换取令牌时失败' : '', h.lastErrorSubtype ? '细类 ' + h.lastErrorSubtype : ''];
     if (!channel) robot = { led: '', text: '读取中…', cls: '', title: '' };
     else if (channel.error) robot = { led: '', text: '未核实', cls: '', title: channel.error };
     else if (!channel.larkCliFound) robot = { led: 'bad', text: '未安装 lark-cli', cls: 'bad', title: 'npm i -g @larksuite/cli,再运行 lark-cli config init' };
+    else if (channel.credentialUnreadable) robot = { led: 'bad', text: DELIVERY_REASON.credential_unreadable, cls: 'bad', title: DELIVERY_DETAIL.credential_unreadable };
     else if (!channel.recipientSet) robot = { led: 'bad', text: '未设置收件人', cls: 'bad', title: '在「设置…」里识别或填写 open_id' };
     else if (worker === false) robot = { led: 'bad', text: '后台服务未运行', cls: 'bad', title: '完成通知由后台服务投递;它不在时通知只会排队。重新安装或重新登录 Windows 会拉起它' };
     else if (channel.health && channel.health.state === 'blocked') {
       const h = channel.health;
       robot = {
         led: 'bad', text: DELIVERY_REASON[h.reason] || '投递受阻', cls: 'bad',
-        title: [DELIVERY_DETAIL[h.reason] || '', h.lastErrorCode ? '错误码 ' + h.lastErrorCode : '', h.lastLogId ? 'log_id ' + h.lastLogId : ''].filter(Boolean).join(' · '),
+        title: [...stage(h), DELIVERY_DETAIL[h.reason] || '', h.lastErrorCode ? '错误码 ' + h.lastErrorCode : '', h.lastLogId ? 'log_id ' + h.lastLogId : ''].filter(Boolean).join(' · '),
       };
     } else if (worker !== true) {
       // 只有确认后台服务在跑才谈得上「可送达」:还没读到(undefined)与核验不出(null)都不能凭历史成功点绿。
@@ -803,7 +811,7 @@ const AR = (() => {
       const h = channel.health;
       robot = {
         led: 'wait', text: '最近投递失败', cls: 'wait',
-        title: [DELIVERY_DETAIL[h.lastErrorClass] || (h.lastErrorClass ? '类别 ' + h.lastErrorClass : ''), h.lastErrorCode ? '错误码 ' + h.lastErrorCode : '',
+        title: [...stage(h), DELIVERY_DETAIL[h.lastErrorClass] || (h.lastErrorClass ? '类别 ' + h.lastErrorClass : ''), h.lastErrorCode ? '错误码 ' + h.lastErrorCode : '',
           h.lastLogId ? 'log_id ' + h.lastLogId : '', num(h.lastSuccessAtUnix) ? `上次成功 ${fmtWhen(h.lastSuccessAtUnix, now)}` : ''].filter(Boolean).join(' · '),
       };
     } else if (channel.health && channel.health.state === 'healthy' && num(channel.health.lastSuccessAtUnix) && channel.settingsVerified !== true) {
@@ -1024,7 +1032,7 @@ const AR = (() => {
     return { cls: 'on', head: '监视中', sub: `已布防 ${n} 个 · ${arm.continuous ? '连续模式' : '一次性'}${done ? ` · 已完成 ${done}` : ' · 尚未被限额打断'}` };
   }
 
-  return { fmtWhen, fmtLeft, modelShort, windowTile, quotaTiles, loginModel, notifyModel, workerModel, providerOptions, rowModel, armRequest, pickSummary, beaconModel, DELIVERY_REASON };
+  return { fmtWhen, fmtLeft, modelShort, windowTile, quotaTiles, loginModel, notifyModel, workerModel, providerOptions, rowModel, armRequest, pickSummary, beaconModel, DELIVERY_REASON, DELIVERY_DETAIL };
 })();
 </script>
 
@@ -1686,16 +1694,16 @@ const AR = (() => {
   $('fsSave').addEventListener('click', () => busyButton($('fsSave'), async () => {
     const appId = $('fsId').value.trim(), appSecret = $('fsSecret').value.trim();
     if (!appId || !appSecret) { $('fsOut').innerHTML = '<span class="bad">App ID 与 App Secret 都要填</span>'; return; }
-    $('fsOut').textContent = '正在用 lark-cli doctor 在线核验…';
+    $('fsOut').textContent = '正在向飞书换取令牌并核验机器人…';
     try {
-      channel = await call('notify.credential.set', { appId, appSecret }, 60000);
+      channel = await call('notify.credential.set', { appId, appSecret }, 90000);
       $('fsOut').innerHTML = '<span class="ok">已核验并加密保存(机器范围)</span>';
     } catch (e) { $('fsOut').innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
     finally { $('fsSecret').value = ''; renderNotify(); renderFeishuDialog(); }
   }));
   $('fsImport').addEventListener('click', () => busyButton($('fsImport'), async () => {
     $('fsOut').textContent = '正在核验旧版凭据…';
-    try { channel = await call('notify.credential.import', {}, 60000); $('fsOut').innerHTML = '<span class="ok">已导入并核验</span>'; }
+    try { channel = await call('notify.credential.import', {}, 90000); $('fsOut').innerHTML = '<span class="ok">已导入并核验</span>'; }
     catch (e) { $('fsOut').innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
     finally { renderNotify(); renderFeishuDialog(); }
   }));
@@ -1733,9 +1741,9 @@ const AR = (() => {
     finally { renderNotify(); renderFeishuDialog(); }
   }));
   $('fsCheck').addEventListener('click', () => busyButton($('fsCheck'), async () => {
-    $('fsOut').textContent = '正在运行 lark-cli doctor…';
+    $('fsOut').textContent = '正在诊断通道…';
     try {
-      const r = await call('notify.check', {}, 60000);
+      const r = await call('notify.check', {}, 100000);
       $('fsOut').innerHTML = (r.problem ? `<div class="bad">${esc(r.problem)}</div>` : '') +
         (r.checks || []).map(c => `<div class="chk"><span class="led ${c.status === 'pass' ? 'ok' : c.status === 'fail' ? 'bad' : c.status === 'skip' ? '' : 'wait'}"></span><span>${esc(c.name)} · ${esc(c.message || c.status)}</span></div>`).join('') +
         `<div class="${r.botReady ? 'ok' : 'bad'}">${r.botReady ? '机器人身份就绪' : '机器人身份未就绪'} · 凭据来源 ${esc(r.credentialSource === 'env' ? 'AI Resume 机器范围副本' : r.credentialSource === 'keychain' ? 'lark-cli 钥匙串' : '无')}</div>`;

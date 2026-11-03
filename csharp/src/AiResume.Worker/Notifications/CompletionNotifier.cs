@@ -30,6 +30,9 @@ public sealed record NotifySweepResult(
 
     /// <summary>通道是否处于熔断(凭据、权限、网络等整体故障):调用方据此决定下次唤醒，而不是逐条撞墙。</summary>
     public DateTimeOffset? ChannelBlockedUntilUtc { get; init; }
+
+    /// <summary>熔断原因(失败类别);未熔断为 null。</summary>
+    public string? ChannelReason { get; init; }
 }
 
 /// <summary>
@@ -56,6 +59,12 @@ public sealed class DeliveryHealth
     public DateTimeOffset? LastAttemptUtc { get; set; }
 
     public string? LastErrorClass { get; set; }
+
+    /// <summary>失败来自哪一段:tenant_token = 换令牌(lark-cli 没启动),其余为 lark-cli 信封的 type。</summary>
+    public string? LastErrorType { get; set; }
+
+    /// <summary>失败细类(如 <c>server_error:http_502@direct</c>、<c>token_invalid</c>);不含凭据。</summary>
+    public string? LastErrorSubtype { get; set; }
 
     public long? LastErrorCode { get; set; }
 
@@ -675,6 +684,9 @@ public sealed class CompletionNotifier
                 message = BuildText(item, nowUtc, SessionNameOf(item));
             }
 
+            // 发送前记下设置指纹：一次发送(含换令牌与令牌失效重试)可能持续几十秒，期间用户改了设置，
+            // 这次的成功或熔断都属于旧设置——不能让新设置凭这次结果点绿，也不能让它被这次失败熔断。
+            string attemptFingerprint = SafeFingerprint();
             NotifySendResult result;
             try
             {
@@ -731,7 +743,7 @@ public sealed class CompletionNotifier
                 stateChanged |= attempts.Remove(item.EventId);
                 TryDelete(item.FullPath);
                 MarkHealthy(health, nowUtc);
-                health.SuccessFingerprint = SafeFingerprint();
+                health.SuccessFingerprint = attemptFingerprint;
                 if (item.IsClaudeCompletion && item.SessionId is { } sentSession && item.AtUtc is { } sentAt &&
                     (!lastSentCompletion.TryGetValue(sentSession, out DateTimeOffset previous) || sentAt > previous))
                 {
@@ -745,6 +757,8 @@ public sealed class CompletionNotifier
             }
 
             health.LastErrorClass = result.Class;
+            health.LastErrorType = result.ErrorType;
+            health.LastErrorSubtype = result.ErrorSubtype;
             health.LastErrorCode = result.ErrorCode;
             health.LastLogId = result.LogId;
 
@@ -755,7 +769,7 @@ public sealed class CompletionNotifier
                 // 已经判过「CLI 契约变了」、之后既没成功过(成功会清掉熔断)也没换设置:同类永久失败继续按通道熔断,
                 // 不再每 30 分钟放一条进死信——那只是把「全部进死信」放慢了。超过 24 小时的由 stale 兜底。
                 bool contractBroken = health.State == "blocked" && health.Reason == "cli_contract" &&
-                                      string.Equals(health.BlockFingerprint ?? string.Empty, SafeFingerprint(), StringComparison.Ordinal);
+                                      string.Equals(health.BlockFingerprint ?? string.Empty, attemptFingerprint, StringComparison.Ordinal);
                 bool repeated = contractBroken ||
                                 (health.PermanentClass == result.Class && health.PermanentSinceUtc is { } since &&
                                  nowUtc - since <= PermanentWindow && health.PermanentEventId != item.EventId);
@@ -776,7 +790,7 @@ public sealed class CompletionNotifier
 
             if (result.Scope == NotifyScope.Channel)
             {
-                Block(health, result, nowUtc);
+                Block(health, result, nowUtc, attemptFingerprint);
                 blocked = true;
                 if (result.Ambiguous)
                 {
@@ -899,6 +913,7 @@ public sealed class CompletionNotifier
             Diagnostics = diagnostics,
             Deferred = deferred,
             ChannelBlockedUntilUtc = blocked ? health.BlockedUntilUtc : null,
+            ChannelReason = blocked ? health.Reason : null,
         };
     }
 
@@ -909,15 +924,18 @@ public sealed class CompletionNotifier
         return TimeSpan.FromSeconds(seconds * (0.8 + Random.Shared.NextDouble() * 0.4));
     }
 
-    /// <summary>通道级熔断时长:按类别，连续失败加倍。凭据/权限类等人处理，设置一变即解除。</summary>
+    /// <summary>
+    /// 通道级熔断时长:按类别，连续失败加倍。凭据/权限类等人处理，设置一变即解除。副本读不出(可能只是正被占用)
+    /// 与钥匙串一样短退避;换令牌应答异常(可能是代理或网关一时拦截)与网络一样短退避——重试只是一次本地解密或一个小请求。
+    /// </summary>
     public static TimeSpan ChannelBackoff(string @class, int consecutive, int? retryAfterSeconds)
     {
         int n = Math.Max(1, consecutive);
         return @class switch
         {
-            "keychain_unavailable" => TimeSpan.FromSeconds(Math.Min(60 * Math.Pow(2, n - 1), 600)),
+            "keychain_unavailable" or "credential_unreadable" => TimeSpan.FromSeconds(Math.Min(60 * Math.Pow(2, n - 1), 600)),
             "rate_limit" => TimeSpan.FromSeconds(retryAfterSeconds ?? Math.Min(Math.Pow(2, n), 60)),
-            "network" or "network_timeout" => TimeSpan.FromSeconds(Math.Min(30 * Math.Pow(2, n - 1), 300)),
+            "network" or "network_timeout" or "token_unexpected" => TimeSpan.FromSeconds(Math.Min(30 * Math.Pow(2, n - 1), 300)),
             _ => TimeSpan.FromMinutes(30),
         };
     }
@@ -947,7 +965,7 @@ public sealed class CompletionNotifier
         }
     }
 
-    private void Block(DeliveryHealth health, NotifySendResult result, DateTimeOffset nowUtc)
+    private static void Block(DeliveryHealth health, NotifySendResult result, DateTimeOffset nowUtc, string fingerprint)
     {
         bool sameReason = health.State == "blocked" && health.Reason == result.Class;
         health.ConsecutiveChannelFailures = sameReason ? health.ConsecutiveChannelFailures + 1 : 1;
@@ -955,7 +973,7 @@ public sealed class CompletionNotifier
         health.Reason = result.Class;
         health.BlockedSinceUtc = sameReason ? health.BlockedSinceUtc ?? nowUtc : nowUtc;
         health.BlockedUntilUtc = nowUtc + ChannelBackoff(result.Class, health.ConsecutiveChannelFailures, result.RetryAfterSeconds);
-        health.BlockFingerprint = SafeFingerprint();
+        health.BlockFingerprint = fingerprint;
     }
 
     private static void MarkHealthy(DeliveryHealth health, DateTimeOffset nowUtc)
@@ -968,6 +986,8 @@ public sealed class CompletionNotifier
         health.BlockFingerprint = null;
         health.LastSuccessUtc = nowUtc;
         health.LastErrorClass = null;
+        health.LastErrorType = null;
+        health.LastErrorSubtype = null;
         health.LastErrorCode = null;
         health.LastLogId = null;
         health.PermanentClass = null;
@@ -1222,24 +1242,18 @@ public sealed class CompletionNotifier
 
     /// <summary>
     /// 用户认得出的项目名:工作目录末级。Claude 桌面端的临时工作区(<c>scratch-workspaces\…\scratch-YYYY-MM-DD-xxxxxx</c>)
-    /// 目录名对人没有意义,改用会话名,没有就写「临时会话」。
+    /// 目录名对人没有意义,改用会话名,没有就写「临时会话」。判据与控制面续跑队列共用 <see cref="ProjectNames.IsScratchWorkspace"/>。
     /// </summary>
     internal static string ProjectDisplayName(string? cwd, string? sessionName)
     {
-        string folder = string.IsNullOrWhiteSpace(cwd) ? string.Empty : Path.GetFileName(cwd.TrimEnd('\\', '/'));
-        if (IsScratchWorkspace(cwd, folder))
+        if (ProjectNames.IsScratchWorkspace(cwd))
         {
             return string.IsNullOrWhiteSpace(sessionName) ? "临时会话" : Shorten(sessionName);
         }
 
+        string folder = string.IsNullOrWhiteSpace(cwd) ? string.Empty : Path.GetFileName(cwd.TrimEnd('\\', '/'));
         return string.IsNullOrEmpty(folder) ? cwd ?? string.Empty : folder;
     }
-
-    /// <summary>末级目录形如 <c>scratch-YYYY-MM-DD-xxxxxx</c>、且上级有 <c>scratch-workspaces</c>(两样都要,用户自建的同名目录不算)。</summary>
-    private static bool IsScratchWorkspace(string? cwd, string folder) =>
-        System.Text.RegularExpressions.Regex.IsMatch(folder, @"^scratch-\d{4}-\d{2}-\d{2}-[0-9a-f]{4,}$",
-            System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant) &&
-        (cwd ?? string.Empty).Replace('/', '\\').Contains(@"\scratch-workspaces\", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>第二行的「会话名」:项目名已经就是会话名(临时工作区)时不重复。</summary>
     private static string? SessionLabel(string projectName, string? sessionName) =>
@@ -1251,14 +1265,11 @@ public sealed class CompletionNotifier
 
     /// <summary>
     /// 会话名清洗后截到 20 个字符(按文本元素,不切断表情或代理对)。自动标题来自对话内容,
-    /// 换行与控制字符换成空格,免得在飞书里伪造出单独的一行。
+    /// 换行与控制字符换成空格(<see cref="ProjectNames.Clean"/>),免得在飞书里伪造出单独的一行。
     /// </summary>
     private static string Shorten(string value)
     {
-        string cleaned = System.Text.RegularExpressions.Regex.Replace(
-            new string(value.Select(c => char.IsControl(c) ||
-                char.GetUnicodeCategory(c) is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator ? ' ' : c).ToArray()),
-            @"\s{2,}", " ").Trim();
+        string cleaned = ProjectNames.Clean(value);
         var info = new StringInfo(cleaned);
         return info.LengthInTextElements <= 20 ? cleaned : info.SubstringByTextElements(0, 19) + "…";
     }

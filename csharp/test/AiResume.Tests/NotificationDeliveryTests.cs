@@ -175,6 +175,48 @@ public sealed class NotificationDeliveryTests
     }
 
     [Fact]
+    public async Task 发送期间改了设置_这次的熔断与成功都记在旧设置名下()
+    {
+        // 一次发送(含换令牌与令牌失效重试)可能持续几十秒;用户在这期间保存了新凭据。
+        string dir = TestTemp.NewDir("notify-fingerprint-snapshot");
+        string events = Path.Combine(dir, "events");
+        WriteEvent(events, "1111111111111111", "a", Now.AddMinutes(-10));
+        int calls = 0;
+        string fingerprint = "v1";
+        bool healthy = false;
+        var notifier = new CompletionNotifier(events, Path.Combine(dir, "seen.json"),
+            (_, _, _, _) =>
+            {
+                calls++;
+                fingerprint = "v" + (calls + 1);
+                return Task.FromResult(healthy
+                    ? NotifySendResult.Delivered()
+                    : NotifySendResult.ChannelFailure("auth_config") with { ErrorType = "tenant_token", ErrorSubtype = "rejected@direct", ErrorCode = 10014 });
+            },
+            () => Now, channelFingerprint: () => fingerprint, sendSpacing: TimeSpan.Zero);
+
+        await notifier.SweepAsync("ou_test");
+
+        // 熔断记的是发送前的设置(v1):新设置(v2)不会被这次失败熔断 30 分钟。
+        DeliveryHealth health = DeliveryHealth.TryLoad(notifier.HealthPath)!;
+        Assert.Equal("blocked", health.State);
+        Assert.Equal("v1", health.BlockFingerprint);
+        Assert.Equal("tenant_token", health.LastErrorType);
+        Assert.Equal("rejected@direct", health.LastErrorSubtype);
+
+        // 下一轮:设置已变(v2 ≠ v1),熔断立即解除并重试;这次发送期间设置又变成 v3。
+        healthy = true;
+        NotifySweepResult second = await notifier.SweepAsync("ou_test");
+        Assert.Equal(1, second.Sent);
+        // 成功只证明了发送前的设置(v2):v3 还没被这次送达证明过,界面不能凭它点绿。
+        health = DeliveryHealth.TryLoad(notifier.HealthPath)!;
+        Assert.Equal("healthy", health.State);
+        Assert.Equal("v2", health.SuccessFingerprint);
+        Assert.Null(health.LastErrorType);
+        Assert.Null(health.LastErrorSubtype);
+    }
+
+    [Fact]
     public async Task 单条失败只退避这一条_新事件照常立即投递()
     {
         string dir = TestTemp.NewDir("notify-item-backoff");

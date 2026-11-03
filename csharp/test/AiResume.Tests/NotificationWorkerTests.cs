@@ -22,6 +22,12 @@ public sealed class NotificationWorkerTests
     [Theory]
     [InlineData("keychain_unavailable", 1, null, 60)]
     [InlineData("keychain_unavailable", 9, null, 600)]
+    // 副本读不出可能只是正被占用、换令牌应答异常可能是一时被拦截：都短退避(ADR-0007)。
+    [InlineData("credential_unreadable", 1, null, 60)]
+    [InlineData("credential_unreadable", 9, null, 600)]
+    [InlineData("token_unexpected", 2, null, 60)]
+    [InlineData("token_unexpected", 9, null, 300)]
+    [InlineData("cli_contract", 1, null, 1800)]
     [InlineData("rate_limit", 1, 7, 7)]
     [InlineData("network", 3, null, 120)]
     [InlineData("auth_config", 1, null, 1800)]

@@ -10,6 +10,10 @@ namespace AiResume.Worker.Notifications;
 /// 最近一次成功送达时的设置指纹与现在是否一致;null = 还没有成功记录。false = 成功之后改过凭据、收件人或 lark-cli,
 /// 那次成功不能再证明现在可送达。
 /// </param>
+/// <param name="CredentialUnreadable">
+/// 机器范围副本文件在，却解不开或格式坏了(换过机器、损坏、正被占用)。投递此时会拒发、不会改用钥匙串，
+/// 界面必须显红，不能凭历史成功显示可送达。
+/// </param>
 public sealed record NotifyChannelStatus(
     bool LarkCliFound,
     string CredentialSource,
@@ -18,37 +22,41 @@ public sealed record NotifyChannelStatus(
     bool RecipientSet,
     string? RecipientMasked,
     DeliveryHealth? Health,
-    bool? SettingsVerified = null);
+    bool? SettingsVerified = null,
+    bool CredentialUnreadable = false);
 
 /// <summary>「识别」收件人的结果:是否已按已保存机器人凭据的应用过滤。</summary>
 public sealed record RecipientCandidates(IReadOnlyList<LarkUserCandidate> Users, bool FilteredByApp);
 
 /// <summary>
-/// 投递通道的设置指纹:机器人凭据副本的写入时间 + 收件人 + lark-cli 位置,取 SHA-256 前 16 位。
+/// 投递通道的设置指纹:机器人凭据副本的写入时间 + 收件人 + lark-cli 位置与写入时间(原地升级也算变化),取 SHA-256 前 16 位。
 /// Worker 用它判断熔断是否该立即解除,控制面用它判断最近一次成功是否还作数;只用于比较,不含可读标识。
 /// </summary>
 public static class NotifyFingerprint
 {
     public static string Compute(FeishuBotCredentials credentials, string? recipient, string? larkCliPath)
     {
-        DateTime written;
+        string material = WrittenTicks(credentials.SecretPath) + "|" + NotifyRecipient.Normalize(recipient) + "|" + (larkCliPath ?? string.Empty) +
+                          "|" + (larkCliPath is null ? "0" : WrittenTicks(larkCliPath));
+        return Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(material)))[..16];
+    }
+
+    private static string WrittenTicks(string path)
+    {
         try
         {
-            written = File.Exists(credentials.SecretPath) ? File.GetLastWriteTimeUtc(credentials.SecretPath) : DateTime.MinValue;
+            return (File.Exists(path) ? File.GetLastWriteTimeUtc(path) : DateTime.MinValue).Ticks.ToString(CultureInfo.InvariantCulture);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
         {
-            written = DateTime.MinValue;
+            return "0";
         }
-
-        string material = written.Ticks.ToString(CultureInfo.InvariantCulture) + "|" + NotifyRecipient.Normalize(recipient) + "|" + (larkCliPath ?? string.Empty);
-        return Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(material)))[..16];
     }
 }
 
 /// <summary>
 /// 「完成通知 → 飞书」控制面：GUI 与 <c>notify check/test</c> 共用。
-/// 凭据只在这里经 lark-cli doctor 在线核验后才落盘;收件人只接受规整后的 open_id。
+/// 凭据只在这里经真实换令牌 + 一次只读机器人接口调用核验后才落盘(ADR-0007);收件人只接受规整后的 open_id。
 /// </summary>
 public sealed class NotifyControlPlane
 {
@@ -58,18 +66,21 @@ public sealed class NotifyControlPlane
     private readonly LarkCliNotificationChannel _channel;
     private readonly Func<string?> _resolveExecutable;
 
+    /// <param name="tokens">换令牌的客户端;null 时真实请求飞书。测试注入带桩处理器的实例。</param>
     public NotifyControlPlane(
         ProductConfigStore? configStore = null,
         string? stateRoot = null,
         FeishuBotCredentials? credentials = null,
-        Func<string?>? resolveExecutable = null)
+        Func<string?>? resolveExecutable = null,
+        FeishuTenantToken? tokens = null)
     {
         _stateRoot = stateRoot ?? ShadowPaths.Root;
         _configStore = configStore ?? new ProductConfigStore(_stateRoot);
         _credentials = credentials ?? new FeishuBotCredentials(_stateRoot);
         _resolveExecutable = resolveExecutable ?? (() => LarkCliNotificationChannel.ResolveExecutable(
             Environment.GetEnvironmentVariable("PATH"), Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)));
-        _channel = new LarkCliNotificationChannel(_credentials, _resolveExecutable);
+        _channel = new LarkCliNotificationChannel(_credentials, _resolveExecutable, tokens: tokens,
+            cliConfigDirectory: Path.Combine(_stateRoot, "lark-cli"));
     }
 
     public string EventsDirectory => Path.Combine(_stateRoot, "completion-events");
@@ -193,21 +204,31 @@ public sealed class NotifyControlPlane
         bool? settingsVerified = health?.SuccessFingerprint is { Length: > 0 } successFingerprint
             ? string.Equals(successFingerprint, NotifyFingerprint.Compute(_credentials, recipient, executable), StringComparison.Ordinal)
             : null;
+        bool copyExists = _credentials.Exists;
+        string? appIdMasked = copyExists ? _credentials.MaskedAppId() : null;
         return new NotifyChannelStatus(
             executable is not null,
-            _credentials.Exists ? "env" : "keychain",
-            _credentials.MaskedAppId(),
-            !_credentials.Exists && _credentials.LegacyExists,
+            copyExists ? "env" : "keychain",
+            appIdMasked,
+            !copyExists && _credentials.LegacyExists,
             recipientSet,
             recipientSet ? MaskOpenId(recipient) : null,
             health,
-            settingsVerified);
+            settingsVerified,
+            // 读不出时再确认文件还在(刚被清除不算坏)。
+            CredentialUnreadable: copyExists && appIdMasked is null && _credentials.Exists);
     }
 
-    /// <summary>lark-cli doctor(在线，只读):用投递实际会用的凭据来源核对机器人身份与端点。</summary>
+    /// <summary>
+    /// 诊断通道(在线，只读),用投递实际会用的凭据来源：有副本时真实换令牌并调一次机器人接口，再附 lark-cli doctor;
+    /// 没有副本时只跑 doctor(钥匙串)。
+    /// </summary>
     public Task<LarkDoctorReport> CheckAsync(CancellationToken ct) => _channel.DoctorAsync(ct);
 
-    /// <summary>保存机器人凭据：先用这组凭据跑 doctor,飞书确实换得到 bot token 才写入(LocalMachine DPAPI)。</summary>
+    /// <summary>
+    /// 保存机器人凭据：先用这组凭据真实向飞书换 tenant_access_token,再以令牌经 lark-cli 调一次只读机器人接口，
+    /// 两步都过才写入(LocalMachine DPAPI)。
+    /// </summary>
     public async Task<NotifyChannelStatus> SetCredentialAsync(string appId, string appSecret, CancellationToken ct)
     {
         appId = (appId ?? string.Empty).Trim();
@@ -222,10 +243,10 @@ public sealed class NotifyControlPlane
             throw new ArgumentException("请填写飞书 App Secret。");
         }
 
-        LarkDoctorReport report = await _channel.DoctorAsync(ct, appId, appSecret).ConfigureAwait(false);
-        if (!report.BotReady)
+        BotVerification verification = await _channel.VerifyAsync(appId, appSecret, ct).ConfigureAwait(false);
+        if (!verification.Ok)
         {
-            throw new InvalidOperationException("飞书没有接受这组凭据:" + DescribeFailure(report));
+            throw new InvalidOperationException("凭据未保存:" + verification.Problem);
         }
 
         _credentials.Save(appId, appSecret);
@@ -234,7 +255,7 @@ public sealed class NotifyControlPlane
 
     /// <summary>
     /// 从 v2.1「飞书接入」保存的旧凭据导入(CurrentUser DPAPI,只能在交互会话里解密)。
-    /// 同样先经 doctor 核验，通过才写机器范围副本;旧文件原样保留，由用户决定是否清除。
+    /// 同样先真实换令牌并调一次机器人接口，通过才写机器范围副本;旧文件原样保留，由用户决定是否清除。
     /// </summary>
     public async Task<NotifyChannelStatus> ImportLegacyAsync(CancellationToken ct)
     {
@@ -243,10 +264,10 @@ public sealed class NotifyControlPlane
             throw new InvalidOperationException("没有可导入的旧版飞书凭据(或当前 Windows 用户解不开它)。");
         }
 
-        LarkDoctorReport report = await _channel.DoctorAsync(ct, appId, appSecret).ConfigureAwait(false);
-        if (!report.BotReady)
+        BotVerification verification = await _channel.VerifyAsync(appId, appSecret, ct).ConfigureAwait(false);
+        if (!verification.Ok)
         {
-            throw new InvalidOperationException("旧版飞书凭据已不被飞书接受:" + DescribeFailure(report) + "。请在下方重新填写。");
+            throw new InvalidOperationException("旧版飞书凭据未导入:" + verification.Problem + "。请在下方重新填写。");
         }
 
         _credentials.Save(appId, appSecret);
@@ -280,6 +301,12 @@ public sealed class NotifyControlPlane
         IReadOnlyList<LarkUserCandidate> users = await _channel.ListUsersAsync(ct).ConfigureAwait(false);
         if (!_credentials.TryLoad(out string appId, out _))
         {
+            if (_credentials.Exists)
+            {
+                // 副本在却读不出：没法按应用过滤，不能把别的应用下的 open_id 当候选递出去。
+                throw new InvalidOperationException("AI Resume 保存的机器人凭据副本读不出,无法按应用筛选收件人;请先重新保存机器人凭据。");
+            }
+
             return new RecipientCandidates(users, false);
         }
 
@@ -314,10 +341,4 @@ public sealed class NotifyControlPlane
 
     public static string MaskOpenId(string openId) =>
         openId.Length <= 10 ? openId[..Math.Min(3, openId.Length)] + "…" : openId[..7] + "…" + openId[^4..];
-
-    private static string DescribeFailure(LarkDoctorReport report) =>
-        report.Problem ??
-        report.Checks.FirstOrDefault(check => check.Name == "bot_identity")?.Message ??
-        report.Checks.FirstOrDefault(check => check.Status == "fail")?.Message ??
-        "bot 身份未就绪";
 }

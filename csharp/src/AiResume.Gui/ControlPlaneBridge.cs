@@ -307,8 +307,11 @@ public sealed class ControlPlaneBridge
                 ok = true,
                 botReady = true,
                 credentialSource = "env",
+                // 副本路径:先换令牌、调机器人接口(决定就绪),再附 doctor(ADR-0007)。
                 checks = new object[]
                 {
+                    new { name = "tenant_token", status = "pass", message = "飞书已发放 tenant_access_token(App ID 与 App Secret 有效)" },
+                    new { name = "bot_api", status = "pass", message = "以该令牌经 lark-cli 调用机器人信息接口成功，机器人已启用" },
                     new { name = "app_resolved", status = "pass", message = "app: cli_a1…7f (feishu)" },
                     new { name = "bot_identity", status = "pass", message = "Bot identity: ready" },
                     new { name = "endpoint_open", status = "pass", message = "https://open.feishu.cn reachable" },
@@ -1220,6 +1223,8 @@ public sealed class ControlPlaneBridge
         recipientMasked = status.RecipientMasked,
         // 最近一次成功送达时的凭据/收件人指纹与现在是否一致;null = 还没有成功记录或无法比较。
         settingsVerified = status.SettingsVerified,
+        // 机器范围副本在却解不开:投递会拒发(不改用钥匙串),界面必须显红。
+        credentialUnreadable = status.CredentialUnreadable,
         health = status.Health is { } health
             ? new
             {
@@ -1230,6 +1235,8 @@ public sealed class ControlPlaneBridge
                 lastAttemptAtUnix = health.LastAttemptUtc?.ToUnixTimeSeconds(),
                 blockedUntilUnix = health.BlockedUntilUtc?.ToUnixTimeSeconds(),
                 lastErrorClass = health.LastErrorClass,
+                lastErrorType = health.LastErrorType,
+                lastErrorSubtype = health.LastErrorSubtype,
                 lastErrorCode = health.LastErrorCode,
                 lastLogId = health.LastLogId,
                 backlog = health.Backlog,

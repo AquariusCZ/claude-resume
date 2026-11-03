@@ -98,7 +98,7 @@ ADR-0002(RunContract)、ADR-0004 的其余约束、ADR-0005 的 B1(Codex 官方�
   「已加载」只以 OpenCode 自己的日志为证据;旧单文件插件迁移时留 `.bak`;拒绝覆盖别人的 `index.*`/`server.*`/`package.json`。
 - **投递**:直接启动 npm 包内的 `lark-cli.exe`(绝不经 cmd.exe);机器人凭据由 GUI「飞书通知设置」保存为 **LocalMachine** DPAPI 副本
   `state\secrets\feishu-bot.bin`(从创建起 ACL 只留当前用户 + SYSTEM + Administrators,临时文件核验后再替换;保存前用 `lark-cli doctor` 在线核验),Worker 经
-  `LARKSUITE_CLI_APP_ID/APP_SECRET/BRAND/STRICT_MODE` 环境变量交给 lark-cli(官方环境变量凭据提供者优先于钥匙串);没有副本时退回钥匙串。
+  `LARKSUITE_CLI_APP_ID/APP_SECRET/BRAND/STRICT_MODE` 环境变量交给 lark-cli(官方环境变量凭据提供者优先于钥匙串)〔2026-11-02 更正:env 来源只收现成令牌、不拿 App Secret 去换,这条路对任何密钥都失败;改为 AI Resume 自己换 tenant_access_token 后只注入 App ID + 令牌,保存前的 doctor 核验同步改为真实换令牌 + 机器人接口调用,见 ADR-0007〕;没有副本时退回钥匙串。
   解析 stdout/stderr 两种信封;`NotifyClassifier` 分级——单条失败只推迟这一条,凭据/网络/限流等通道故障熔断整个通道,凭据或收件人一变立即解除;
   参数类永久错误与首次尝试超过 24 小时的条目进 `completion-events\dead\`(30 分钟内跨轮两条不同事件命中同类永久错误时改判为通道级 `cli_contract`);
   发生超过 24 小时仍未送出的事件不补发(`stale`),结果不明的重发在首次不明 55 分钟后停止(飞书 uuid 只去重一小时),退出码 0 的非信封输出按已送达。
@@ -140,7 +140,7 @@ ADR-0002(RunContract)、ADR-0004 的其余约束、ADR-0005 的 B1(Codex 官方�
 - **OpenCode Desktop 2.2.3**:v2 插件 API 为 `export default { id, setup(ctx) }`,事件经 `ctx.event.subscribe`,载荷在 `data`;`session.idle` 已无人发布;
   官方自己的「完成/等你」判据与本插件一致;加载结果写 `~/.local/share/opencode/log/opencode.log`——AI Resume 按日志行里我方插件目录路径匹配
   `loading plugin` / `failed to load plugin`,只认插件写入之后的记录。
-- **lark-cli 1.0.81**:官方环境变量凭据提供者(`LARKSUITE_CLI_APP_ID/APP_SECRET/BRAND/STRICT_MODE`)优先于钥匙串(本机 dry-run 证实);
+- **lark-cli 1.0.81**:官方环境变量凭据提供者(`LARKSUITE_CLI_APP_ID/APP_SECRET/BRAND/STRICT_MODE`)优先于钥匙串(本机 dry-run 证实〔2026-11-02 更正:dry-run 不换令牌,证明不了凭据可用;env 来源只收 `LARKSUITE_CLI_TENANT_ACCESS_TOKEN`,见 ADR-0007〕);
   错误信封写 stderr(`error.code`、`log_id`、`retryable`、`retry_after_seconds`);`doctor` 在线核对 bot 身份(假凭据报 `no tat available from credential source env`);
   `auth list --json` 给出同一应用下已登录用户;npm 安装形态是 `lark-cli.cmd` 垫片 + `node_modules/@larksuite/cli/bin/lark-cli.exe`。
 - **飞书 OpenAPI**:消息发送的 uuid 幂等去重、频控错误码与 `retry_after` 语义按官方文档;只有 `--idempotency-key` 真正送达后去重才生效。
@@ -163,7 +163,7 @@ ADR-0002(RunContract)、ADR-0004 的其余约束、ADR-0005 的 B1(Codex 官方�
 
 ## 6. 验证边界
 
-- 离线:`dotnet build -c Release -warnaserror` 0 警告;`dotnet test` 全绿(数量以当次输出为准;2026-10-30 首轮 1156,10-31 交叉审查后 1195,11-02 修复轮复审后 1215,同日限额通知规则与用语修正后 1250)。逐项目续跑、送达分级、控制面、OpenCode 插件
+- 离线:`dotnet build -c Release -warnaserror` 0 警告;`dotnet test` 全绿(数量以当次输出为准;2026-10-30 首轮 1156,10-31 交叉审查后 1195,11-02 修复轮复审后 1215,同日限额通知规则与用语修正后 1250,飞书凭据副本自己换令牌(ADR-0007)后 1303)。逐项目续跑、送达分级、控制面、OpenCode 插件
   (内嵌 Node harness 21 个事件场景)、GUI 视图模型(Node 驱动)均有对真实录制形状断言的测试。
 - 截图:`AiResume.Gui.exe --screenshot`(合成数据)与无头 Edge 渲染,在 1120×760 与 900×600、150% 缩放下核对布局。
 - 真机(本轮 install 后):`notify list`、`notify check`、`notify test`,OpenCode 日志中的插件加载记录。

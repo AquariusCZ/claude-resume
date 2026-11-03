@@ -6,16 +6,20 @@ using AiResume.Secrets;
 namespace AiResume.Worker.Notifications;
 
 /// <summary>
-/// 飞书通知机器人的应用凭据(app_id + app_secret),供 S4U Worker 以环境变量交给 lark-cli。
+/// 飞书通知机器人的应用凭据(app_id + app_secret),供 S4U Worker 换成 tenant_access_token 后交给 lark-cli。
 ///
 /// **为什么要有这份副本**(2026-10-30 体检实证):Worker 跑在 S4U 计划任务的会话 0,lark-cli 1.0.81 每次
 /// <c>--as bot</c> 都要用 CurrentUser DPAPI 解密自己存在 HKCU 钥匙串里的 appSecret,这在 S4U 下间歇失败
-/// (0x8009000B),10-14 以来 96% 的投递失败都是它。lark-cli 官方的环境变量凭据提供者
-/// (<c>LARKSUITE_CLI_APP_ID/APP_SECRET</c>)优先于钥匙串，本机 dry-run 证实。所以这里存一份
-/// **LocalMachine** 范围的 DPAPI 密文(文件 ACL 收紧到当前用户 + SYSTEM + Administrators),
-/// 只在交互式 GUI 里写入(用户输入或从旧版导入，写入前经 lark-cli doctor 在线核验),Worker 只读。
+/// (0x8009000B),10-14 以来 96% 的投递失败都是它。所以这里存一份 **LocalMachine** 范围的 DPAPI 密文
+/// (文件 ACL 收紧到当前用户 + SYSTEM + Administrators),只在交互式 GUI 里写入(用户输入或从旧版导入),Worker 只读。
 ///
-/// 实值只出现在：用户输入那一刻、本类调用栈内、lark-cli 子进程环境变量。绝不进日志、应答、argv。
+/// **App Secret 不交给 lark-cli**(ADR-0007,2026-11-02 用假值实验查证):lark-cli 的 env 凭据来源只接受现成令牌
+/// (<c>LARKSUITE_CLI_TENANT_ACCESS_TOKEN</c>),给它 <c>LARKSUITE_CLI_APP_SECRET</c> 不会去换，必报
+/// <c>no tat available from credential source "env"</c>。v2.2 当初「本机 dry-run 证实」的说法不成立:dry-run 不换令牌。
+/// 现在由 <see cref="FeishuTenantToken"/> 用这份凭据换令牌，只把 App ID + 令牌注入子进程;写入前同样经
+/// 真实换令牌 + 一次只读机器人接口调用核验。
+///
+/// 实值只出现在：用户输入那一刻、本类调用栈内、发往飞书换令牌端点的请求体。绝不进日志、应答、argv、子进程环境。
 /// </summary>
 public sealed class FeishuBotCredentials
 {

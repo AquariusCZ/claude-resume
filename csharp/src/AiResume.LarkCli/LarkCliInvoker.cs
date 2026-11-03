@@ -25,7 +25,10 @@ public sealed class LarkCliInvoker
     /// <param name="wrapperArgs">启动包装参数(测试用 cmd.exe /c 脚本);生产一般为空。</param>
     /// <param name="timeout">单次调用超时;超时后终止整个进程树并抛 Timeout。</param>
     /// <param name="knownSecrets">已知机密值集合,用于输出全文置换。</param>
-    /// <param name="environment">子进程额外环境变量;值为 null 表示删除继承来的同名变量。值同时加入脱敏集合。</param>
+    /// <param name="environment">
+    /// 子进程额外环境变量;值为 null 表示删除继承来的同名变量。名字含 SECRET 或 TOKEN 的值(App Secret、注入的访问令牌)
+    /// 同时加入脱敏集合。
+    /// </param>
     public LarkCliInvoker(
         string fileName,
         string[]? wrapperArgs = null,
@@ -38,7 +41,8 @@ public sealed class LarkCliInvoker
         _timeout = timeout ?? TimeSpan.FromSeconds(15);
         _environment = environment ?? new Dictionary<string, string?>();
         _redactor = new LarkRedactor((knownSecrets ?? Array.Empty<string>())
-            .Concat(_environment.Where(pair => pair.Key.Contains("SECRET", StringComparison.OrdinalIgnoreCase) && pair.Value is { Length: > 0 })
+            .Concat(_environment.Where(pair => (pair.Key.Contains("SECRET", StringComparison.OrdinalIgnoreCase) ||
+                                                pair.Key.Contains("TOKEN", StringComparison.OrdinalIgnoreCase)) && pair.Value is { Length: > 0 })
                 .Select(pair => pair.Value!)));
     }
 

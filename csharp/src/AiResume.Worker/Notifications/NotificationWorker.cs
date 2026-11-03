@@ -102,11 +102,13 @@ public sealed class NotificationWorker : BackgroundService
                     }
                     else
                     {
+                        // errType=tenant_token 是换令牌这一步失败(lark-cli 没启动);tokenRetried=True 表示缓存的令牌先被飞书判无效、
+                        // 作废重换后又试了一次,这里记的是第二次的结果。
                         _logger.LogWarning(
-                            "worker.notify.item eventId={EventId} source={Source} outcome={Outcome} class={Class} scope={Scope} exit={Exit} errType={ErrType} errSubtype={ErrSubtype} errCode={ErrCode} logId={LogId} ambiguous={Ambiguous} attempts={Attempts} durationMs={DurationMs} credentialSource={CredentialSource}",
+                            "worker.notify.item eventId={EventId} source={Source} outcome={Outcome} class={Class} scope={Scope} exit={Exit} errType={ErrType} errSubtype={ErrSubtype} errCode={ErrCode} logId={LogId} ambiguous={Ambiguous} attempts={Attempts} durationMs={DurationMs} credentialSource={CredentialSource} tokenRetried={TokenRetried}",
                             item.EventId, item.Source ?? "unknown", item.Outcome, item.Detail ?? "unknown", attempt?.Scope,
                             attempt?.ExitCode, attempt?.ErrorType, attempt?.ErrorSubtype, attempt?.ErrorCode, attempt?.LogId,
-                            attempt?.Ambiguous, item.Attempts, attempt?.DurationMs, attempt?.CredentialSource);
+                            attempt?.Ambiguous, item.Attempts, attempt?.DurationMs, attempt?.CredentialSource, attempt?.TokenRetried);
                     }
                 }
 
@@ -115,8 +117,8 @@ public sealed class NotificationWorker : BackgroundService
                 if (!string.Equals(channelState, _lastChannelState, StringComparison.Ordinal))
                 {
                     _logger.Log(channelState == "blocked" ? LogLevel.Warning : LogLevel.Information,
-                        "worker.notify.channel state={State} until={Until} backlog={Backlog}",
-                        channelState, r.ChannelBlockedUntilUtc, r.Deferred + r.Failed);
+                        "worker.notify.channel state={State} reason={Reason} until={Until} backlog={Backlog}",
+                        channelState, r.ChannelReason, r.ChannelBlockedUntilUtc, r.Deferred + r.Failed);
                     _lastChannelState = channelState;
                 }
             }

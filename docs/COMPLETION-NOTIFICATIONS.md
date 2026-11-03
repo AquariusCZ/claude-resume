@@ -1,6 +1,6 @@
 # 完成通知协议、实现与验证手册
 
-最后验证：2026-08-20（Windows 11，AI Resume v2）；2026-10-12 v2.1 把 Codex 通知改为 hooks、收件人明文化；2026-10-30 v2.2 按 ADR-0006 重写 Claude Code 钩子（exec form，新增 `StopFailure`）、OpenCode 插件（v2 目录形态）与飞书投递链路（直接启动 `lark-cli.exe`、机器范围凭据副本、分级退避与熔断、死信、`notify check` / `notify test`）。v2.2 的离线回归结论见 ADR-0006 §6；真机验收步骤与仍待真机验证的事项见 §6。同日交叉审查后补齐：通知意图三态（`notifyIntentRecorded`）、超过 24 小时的事件不再补发、“结果不明”的重发 55 分钟封顶、永久失败跨轮升级、“可送达”还要求最近一次尝试成功且之后没改过设置。2026-11-02：会话没落盘的 Claude Code 事件不发；用量上限中断每个会话每个限额周期只提醒一次、同时被打断的会话合成一条，文案按投递那一刻的布防快照说清会不会自动续跑、何时重置；第二行加会话名，桌面端临时工作区改用会话名（§5.3 第 6、7 步，§5.7）；界面、CLI 与飞书文案改用“中文 + 业界原词”（hook、测试通知、未送达、后台服务……，§5.9）。
+最后验证：2026-08-20（Windows 11，AI Resume v2）；2026-10-12 v2.1 把 Codex 通知改为 hooks、收件人明文化；2026-10-30 v2.2 按 ADR-0006 重写 Claude Code 钩子（exec form，新增 `StopFailure`）、OpenCode 插件（v2 目录形态）与飞书投递链路（直接启动 `lark-cli.exe`、机器范围凭据副本、分级退避与熔断、死信、`notify check` / `notify test`）。v2.2 的离线回归结论见 ADR-0006 §6；真机验收步骤与仍待真机验证的事项见 §6。同日交叉审查后补齐：通知意图三态（`notifyIntentRecorded`）、超过 24 小时的事件不再补发、“结果不明”的重发 55 分钟封顶、永久失败跨轮升级、“可送达”还要求最近一次尝试成功且之后没改过设置。2026-11-02：会话没落盘的 Claude Code 事件不发；用量上限中断每个会话每个限额周期只提醒一次、同时被打断的会话合成一条，文案按投递那一刻的布防快照说清会不会自动续跑、何时重置；第二行加会话名，桌面端临时工作区改用会话名（§5.3 第 6、7 步，§5.7）；界面、CLI 与飞书文案改用“中文 + 业界原词”（hook、测试通知、未送达、后台服务……，§5.9）。同日按 ADR-0007 修正机器人凭据副本：lark-cli 的 env 来源只收现成令牌，副本改为由 AI Resume 自己换 tenant_access_token 后只注入 App ID + 令牌，保存与诊断改为“真实换令牌 + 一次只读机器人接口调用”（§5.5、§5.8）。
 
 本文是完成通知的现役真身。v2.2 起飞书在 AI Resume 里只剩这一种用途：任务完成、停下来等你、因错误中断、续跑有进展或 Claude Code 登录将到期时，经官方 `lark-cli` 以机器人身份私信一个收件人。v2.1 及之前由 cc-connect 承载的飞书聊天、会话与授权名单已于 2026-10-30 随 ADR-0006 退役，本文只在标明“历史”的地方提及。决策依据：ADR-0005 C1（Codex hooks，仍有效）与 ADR-0006 §2.E（其余部分）。
 
@@ -49,7 +49,7 @@ AiResume.Worker NotificationWorker --> CompletionNotifier --> LarkCliNotificatio
 - Qoder 的命令 Hook 同样从 stdin 接收 JSON，`Stop` 是 agent 完成响应的边界：[Qoder hooks](https://docs.qoder.com/extensions/hooks)、[Qoder CLI hooks](https://docs.qoder.com/cli/hooks)。
 - OpenCode：本机 2026-10-29 从 1.19.5 升到 Desktop 2.x（当前 opencode-cli 2.2.3）。2.x 要求插件默认导出带 `id` 与 `setup`（或 `effect`）的对象，v1 写法不再运行（日志 `failed to load plugin … Plugin must export a default definition with an id and an effect or setup function`），AI Resume 的 1.x 单文件插件从那天起一次都没被加载，OpenCode 通知全部失效。v2 事件经 `ctx.event.subscribe` 订阅，载荷在 `data` 里；`session.idle` 在 2.2.3 已标 deprecated、服务端不再发布；OpenCode 自己的 TUI/Desktop 通知判据是：完成 = `session.execution.succeeded` 且没有仍在运行的直接子会话，等你 = `permission.asked`（含子会话）与 `form.created`。插件按 `plugins/` 目录自动发现，OpenCode 监视插件源文件并热重载；加载结果写在 `~/.local/share/opencode/log/opencode.log`。依据是 OpenCode v2.2.3 源码与其仓库内的 v2 插件文档；opencode.ai 上的 plugins/config 页面描述的是 1.x 写法（`plugin` 键、`$`、`session.idle`），不适用于 2.x。
 - Cline 使用本机已安装扩展的 `TaskComplete.ps1` 契约；wrapper 必须保留用户原脚本的输入、输出和取消语义。
-- lark-cli 1.0.81：官方环境变量凭据提供者（`LARKSUITE_CLI_APP_ID`、`LARKSUITE_CLI_APP_SECRET`、`LARKSUITE_CLI_BRAND`、`LARKSUITE_CLI_STRICT_MODE`）优先于钥匙串（本机 dry-run 证实）。成功信封写 stdout，错误信封写 **stderr**（`type`、`subtype`、`code`、`message`、`log_id`、`retryable`、`retry_after_seconds`）；退出码 validation=2、authentication/authorization/config=3、network=4、api=1、policy=6、internal=5、confirmation=10：[ERROR_CONTRACT](https://github.com/larksuite/cli/blob/v1.0.81/errs/ERROR_CONTRACT.md)。`--idempotency-key` 映射为发消息请求体的 `uuid`；`doctor` 在线核对 bot 身份；`auth list --json` 列出已登录用户；npm 安装形态是 `lark-cli.cmd` 垫片加 `node_modules/@larksuite/cli/bin/lark-cli.exe`。1.0.90 起新增钥匙串缓存的 tenant access token，升级 lark-cli 前须复核投递是否重新依赖 DPAPI。
+- lark-cli 1.0.81：环境变量凭据来源（`LARKSUITE_CLI_APP_ID` + `LARKSUITE_CLI_TENANT_ACCESS_TOKEN`，及 `LARKSUITE_CLI_BRAND`、`LARKSUITE_CLI_STRICT_MODE`）优先于钥匙串，但**只接受现成令牌**：只给 `LARKSUITE_CLI_APP_SECRET` 时它不去换令牌，必报 `no tat available from credential source "env"`（2026-11-02 用假值实验查证，ADR-0007；v2.2 当初“dry-run 证实”不成立，dry-run 不换令牌）。成功信封写 stdout，错误信封写 **stderr**（`type`、`subtype`、`code`、`message`、`log_id`、`retryable`、`retry_after_seconds`）；退出码 validation=2、authentication/authorization/config=3、network=4、api=1、policy=6、internal=5、confirmation=10：[ERROR_CONTRACT](https://github.com/larksuite/cli/blob/v1.0.81/errs/ERROR_CONTRACT.md)。`--idempotency-key` 映射为发消息请求体的 `uuid`；`doctor` 在线核对 bot 身份；`auth list --json` 列出已登录用户；npm 安装形态是 `lark-cli.cmd` 垫片加 `node_modules/@larksuite/cli/bin/lark-cli.exe`。1.0.90 起新增钥匙串缓存的 tenant access token，升级 lark-cli 前须复核注入令牌时投递是否重新依赖 DPAPI。
 - 飞书发消息接口：同一 uuid 一小时内至多成功发送一条，最长 50 字符；发给同一用户 5 QPS；230020 / 99991400 为频控：[发送消息](https://open.feishu.cn/document/server-docs/im-v1/message/create)。
 - 官方替代只能部分覆盖：Claude Code Remote Control 的手机推送默认关闭，只覆盖已连接的 Claude Code 会话，完成推送由模型自行决定，覆盖不到 `StopFailure`、OpenCode 和未连接的会话，所以确定性的飞书通知仍需保留。会话连着 Remote Control 时 Hook 记 `bridged`，文案加“· 远程已连接”；两条通道可能对同一件事各提醒一次。
 
@@ -198,11 +198,13 @@ lark-cli.exe im +messages-send --as bot --user-id <open_id> --text <文案> --id
 凭据来源（取代 ADR-0005 D1 中“app_secret 只在 GUI 侧 CurrentUser DPAPI、Worker 不依赖 DPAPI”的投递设计）：
 
 - 根因：本机开机自启是 S4U 计划任务「AI Resume 续跑引擎」（`scripts/register-autostart.ps1`，需管理员；未注册时退回登录启动快捷方式，在交互会话里运行），Worker 跑在会话 0。会话 0 解 **CurrentUser** DPAPI 会间歇失败（`CryptUnprotectData` 0x8009000B，一次持续数小时；2026-09/10 两次实证）。lark-cli 1.0.81 把 appSecret 存在 HKCU 钥匙串里、用 CurrentUser DPAPI 加密，每次 `--as bot` 都要解一次；v2.1 只把 AI Resume 自己的 DPAPI 从投递路径拿掉，故障点于是移进了 lark-cli，10-14 以来 96% 的投递失败都是它（ADR-0006 §1）。
-- v2.2：GUI「飞书通知设置」保存的机器人凭据（App ID + App Secret）以 DPAPI **LocalMachine** 范围写入 `state\secrets\feishu-bot.bin`。密文先写进一个**创建时就带受限 DACL**（断开继承，只留当前用户 + SYSTEM + Administrators）的临时文件，读回核验 ACL 后才原子替换正式文件；收不紧时只丢掉临时文件、报错，上一份可用凭据原样保留，也不存在“已落盘、还没收紧”的时间窗——宁可保存失败，也不留一份本机谁都能解的密文。保存前必须先用这组凭据跑一次 `lark-cli doctor`（在线、只读），飞书确实换得到 bot token（`bot_identity` 检查为 `pass`）才写入。
-- Worker 每次投递读这份副本，只经子进程环境变量交给 lark-cli：`LARKSUITE_CLI_APP_ID`、`LARKSUITE_CLI_APP_SECRET`、`LARKSUITE_CLI_BRAND=feishu`、`LARKSUITE_CLI_STRICT_MODE=bot`。官方环境变量凭据提供者优先于钥匙串，所以会话 0 里不再碰 HKCU 钥匙串。日志与健康文件记 `credentialSource=env`。
-- 没有副本（或读不出）时退回 lark-cli 自己的钥匙串，记 `credentialSource=keychain`；S4U 下它会间歇失败，界面标琥珀“未存凭据副本”。
+- v2.2：GUI「飞书通知设置」保存的机器人凭据（App ID + App Secret）以 DPAPI **LocalMachine** 范围写入 `state\secrets\feishu-bot.bin`。密文先写进一个**创建时就带受限 DACL**（断开继承，只留当前用户 + SYSTEM + Administrators）的临时文件，读回核验 ACL 后才原子替换正式文件；收不紧时只丢掉临时文件、报错，上一份可用凭据原样保留，也不存在“已落盘、还没收紧”的时间窗——宁可保存失败，也不留一份本机谁都能解的密文。保存前必须先用这组凭据真实向飞书换到 tenant_access_token，再以该令牌经 lark-cli 调通一次只读的 `GET /open-apis/bot/v3/info`（退出码 0 即通过，应答体不解析、不记录），两步都过才写入（ADR-0007；取代 v2.2 的 doctor 核验——doctor 在 env 来源下从不换令牌，对任何密钥都报 `no tat available`）。
+- Worker 每次投递读这份副本，由 `FeishuTenantToken` 向 `POST https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal` 换令牌（官方应答字段在顶层：`{"code":0,"msg":"ok","tenant_access_token":"t-…","expire":7200}`，expire 单位秒；令牌最长 2 小时，剩余不足 30 分钟时再换才发新令牌），只经子进程环境变量交给 lark-cli：`LARKSUITE_CLI_APP_ID`、`LARKSUITE_CLI_TENANT_ACCESS_TOKEN`、`LARKSUITE_CLI_BRAND=feishu`、`LARKSUITE_CLI_STRICT_MODE=bot`，先删掉继承来的全部凭据类变量（`APP_SECRET`、`USER_ACCESS_TOKEN`、`DEFAULT_AS`、`AUTH_PROXY` 等），并用 `LARKSUITE_CLI_CONFIG_DIR` 让 lark-cli 只用私有配置目录 `state\lark-cli`。env 令牌本就优先于钥匙串（实验查证）；私有目录里没有应用配置，lark-cli 从结构上碰不到用户钥匙串，不依赖它内部的优先级实现，所以会话 0 里不再碰 HKCU 钥匙串。日志与健康文件记 `credentialSource=env`。
+- 令牌只在 Worker 进程内存里按“同一组凭据、剩余 ≥ 5 分钟”复用，不落盘、不进日志；缓存的令牌被飞书判无效时作废、重换一次再发（同一幂等键）。换令牌请求不跟随重定向，代理只认 `HTTPS_PROXY` / `NO_PROXY`（与 Go 的 ProxyFromEnvironment 一致，不读 `ALL_PROXY`；解析不出或 scheme 不支持就直连，绝不落回 WinINet 系统代理）。lark-cli 子进程里先删掉继承来的全部凭据类变量，并用 AI Resume 自有的空配置目录 `state\lark-cli\`，从结构上碰不到用户配置里引用的 CurrentUser 钥匙串。保存前的核验要求机器人信息接口调通且 `bot.activate_status` 为 2（读得到时）。
+- 换令牌失败一律通道级、结果明确（消息没发出去，不进死信），日志 `errType=tenant_token`：已知凭据错误码（10003 参数缺失、10012、10013 应用状态异常、10014 app_id 不存在或 App Secret 不对）→ `auth_config`（重新保存即解除）；网络与 5xx → `network`；超时 → `network_timeout`；429 / 99991400 → `rate_limit`；其余（未识别的错误码、9499、跳转或拦截页、读应答时的意外异常）→ `token_unexpected`（短退避）；副本存在却解不开 → `credential_unreadable`（短退避，可能只是正被占用）。细类写进 `errSubtype` 与健康文件 `lastErrorType` / `lastErrorSubtype`，界面悬停标“换取令牌时失败”。注入了令牌 lark-cli 却报 `token_missing` → `cli_contract`，不提示重新保存。设置指纹在发送前记下。这些情况都不启动 lark-cli，**绝不**退回把 App Secret 放进环境变量，也不静默改用钥匙串。
+- 没有副本时退回 lark-cli 自己的钥匙串，记 `credentialSource=keychain`；S4U 下它会间歇失败，界面标琥珀“未存凭据副本”。
 - 实值只出现在用户输入那一刻、本进程调用栈和 lark-cli 子进程的环境变量里，不进 argv、日志、RPC 回包、健康文件或截图；界面只显示遮蔽后的 App ID。
-- 历史：v2.1「飞书接入」保存的 `state\secrets\feishu-platform.bin` 是 CurrentUser DPAPI，只有交互会话能解。「飞书通知设置」在还没有新副本时提供“导入旧版凭据”，同样先过 `doctor` 再写机器范围副本；旧文件原样保留，由用户决定是否清除。
+- 历史：v2.1「飞书接入」保存的 `state\secrets\feishu-platform.bin` 是 CurrentUser DPAPI，只有交互会话能解。「飞书通知设置」在还没有新副本时提供“导入旧版凭据”，同样先真实换令牌并调通机器人接口再写机器范围副本；旧文件原样保留，由用户决定是否清除。
 
 收件人：
 
@@ -281,23 +283,23 @@ lark-cli.exe im +messages-send --as bot --user-id <open_id> --text <文案> --id
 
 ### 5.9 控制面：主界面、「飞书通知设置」与 CLI
 
-`NotifyControlPlane` 是 GUI 与 CLI 共用的控制面；每一句肯定都来自外部证据（文件、真实投递结果、`lark-cli doctor`）。
+`NotifyControlPlane` 是 GUI 与 CLI 共用的控制面；每一句肯定都来自外部证据（文件、真实投递结果、真实换令牌与机器人接口调用、`lark-cli doctor`）。
 
 主界面右栏「完成通知 → 飞书」：
 
 - Claude Code、OpenCode 两行开关（其余三个源在「视图 › 显示其他通知源」打开后才列出）。没检测到该工具时显示“未检测到”，开关不可点；`hookBroken` 时红“hook 失效”（OpenCode 行为“插件失效”；悬停看原因，关掉再打开可修复）；已启用但说明里还写着“核实”（OpenCode 尚无加载记录）时琥珀“待核实”；其余已启用的为“hook 正常”（命令指向的 `AiResume.Hook.exe` 在）——OpenCode 行为“插件已加载”，证据只来自它自己的日志。探测本身失败（配置正被改写、被占用，`notifications.list` 的 `unverified=true`）时显示“未核实”，开关画成既非开也非关的虚框（读屏为 mixed），点按只重新读取、不去改一个读不出来的配置，不说“已关闭”或“未检测到”。隐藏的源 hook 失效、读不出配置或仍启用时，下方留一句“… 的通知 hook 失效”“… 通知源状态未核实”或“另有 … 通知仍开启”，后接“ · 视图 › 其他通知源”。
-- “飞书机器人”一行按以下顺序取第一条成立的结论：读不到通道状态 → “未核实”；没装 lark-cli → 红“未安装 lark-cli”；没设收件人 → 红“未设置收件人”；后台服务（Worker）不在（`arm.get` 的 `workerRunning=false`）→ 红“后台服务未运行”，即使健康文件里有过成功记录；健康文件为 `blocked` → 红，短句取熔断原因（如“读不到机器人凭据”“凭据或配置无效”“权限或收件人有误”“被飞书限流”“网络不通”“lark-cli 无法启动”），悬停给错误码与 log_id；后台服务在不在还没读到（`arm.get` 尚未返回）→ “核验中…”；核验不出（`workerRunning` 为 `null`：进程枚举失败，或有同名进程但本用户常驻 Worker 的 Named Pipe 不应答；`arm.get` 读失败时页面也按 `null` 处理）→ “未核实”；最近一次真实尝试失败（`lastAttemptOk=false`，条目级失败如收件人跨应用、未知错误码）→ 琥珀“最近投递失败”，悬停给类别、错误码、log_id 与上次成功时间；有成功记录但那之后改过凭据、收件人或 lark-cli（`settingsVerified=false`）→ 琥珀“设置已变更”，比不出来（`settingsVerified` 为 `null`，如没有成功指纹）→ 琥珀“待核实”，都点「发送测试」核实；健康文件为 `healthy`、有成功记录且 `settingsVerified=true` → 绿“可送达”；AI Resume 没存机器范围副本、只能用 lark-cli 钥匙串 → 琥珀“未存凭据副本”（钥匙串里有没有凭据并未核实；悬停说明后台服务可能读不到，建议保存一份）；其余 → 琥珀“待核实”。`settingsVerified` 由控制面比较健康文件的 `successFingerprint` 与当前设置指纹（`NotifyFingerprint`：机器人凭据副本写入时间 + 规整后的收件人 + lark-cli 位置，SHA-256 前 16 位）；Worker 熔断时用同一指纹判断“设置一变即解除”。下方备注“发给 <遮蔽的 open_id> · 待发 N · 未送达 N”（待发取健康文件的 `backlog`，未送达是 `dead\` 里的事件数）。
+- “飞书机器人”一行按以下顺序取第一条成立的结论：读不到通道状态 → “未核实”；没装 lark-cli → 红“未安装 lark-cli”；副本在却读不出 → 红“凭据副本读不出”（压过历史成功，也不说“lark-cli 默认应用”）；没设收件人 → 红“未设置收件人”；后台服务（Worker）不在（`arm.get` 的 `workerRunning=false`）→ 红“后台服务未运行”，即使健康文件里有过成功记录；健康文件为 `blocked` → 红，短句取熔断原因（如“读不到机器人凭据”“凭据或配置无效”“权限或收件人有误”“被飞书限流”“网络不通”“lark-cli 无法启动”），悬停给错误码与 log_id；后台服务在不在还没读到（`arm.get` 尚未返回）→ “核验中…”；核验不出（`workerRunning` 为 `null`：进程枚举失败，或有同名进程但本用户常驻 Worker 的 Named Pipe 不应答；`arm.get` 读失败时页面也按 `null` 处理）→ “未核实”；最近一次真实尝试失败（`lastAttemptOk=false`，条目级失败如收件人跨应用、未知错误码）→ 琥珀“最近投递失败”，悬停给类别、错误码、log_id 与上次成功时间；有成功记录但那之后改过凭据、收件人或 lark-cli（`settingsVerified=false`）→ 琥珀“设置已变更”，比不出来（`settingsVerified` 为 `null`，如没有成功指纹）→ 琥珀“待核实”，都点「发送测试」核实；健康文件为 `healthy`、有成功记录且 `settingsVerified=true` → 绿“可送达”；AI Resume 没存机器范围副本、只能用 lark-cli 钥匙串 → 琥珀“未存凭据副本”（钥匙串里有没有凭据并未核实；悬停说明后台服务可能读不到，建议保存一份）；其余 → 琥珀“待核实”。`settingsVerified` 由控制面比较健康文件的 `successFingerprint` 与当前设置指纹（`NotifyFingerprint`：机器人凭据副本写入时间 + 规整后的收件人 + lark-cli 位置，SHA-256 前 16 位）；Worker 熔断时用同一指纹判断“设置一变即解除”。下方备注“发给 <遮蔽的 open_id> · 待发 N · 未送达 N”（待发取健康文件的 `backlog`，未送达是 `dead\` 里的事件数）。
 - “设置…”打开「飞书通知设置」；“发送测试”（与菜单「工具 › 发送测试通知」相同）先查 lark-cli、收件人与后台服务，缺一样就直接说明、不排队；排队后每 5 秒用 `notify.test.status` 问**这一条**测试通知的结局（与 `notify test` 同一判据），送达、没能送达且已停止重试（进了 `dead\`）、这一条确定失败（带类别、错误码与 log_id）或飞书投递此刻暂停（通道熔断）都如实说；失败、暂停或 90 秒没送达时用 `notify.test.withdraw` 撤回它，免得通道恢复后补发一条过时的测试通知。只有撤回成功才说“已撤回”；撤不回（后台服务正在发这一条）或撤回请求失败时再看一眼结局，如实说“已送达”“没能送达,已停止重试”或“撤回未确认，稍后仍可能收到”。
 - 页脚右侧显示“后台服务运行中 / 未运行 / 未核实”：自动续跑和完成通知都由它（`AiResume.Worker`）执行。“运行中”要有本用户常驻 Worker 的 Named Pipe 应答；同名的 `notify test`、`install` 这类 CLI 进程不开管道，只算“未核实”。
 
 「工具 › 飞书通知设置…」对话框：
 
 - 顶部一行与主界面机器人行同一结论。
-- 机器人凭据：App ID（`cli_` 开头）与 App Secret。「保存并验证」先用 `lark-cli doctor` 在线核验，再以机器范围 DPAPI 保存；存后界面读不回实值，只显示遮蔽的 App ID。有旧版 `feishu-platform.bin` 而还没有新副本时出现「导入旧版凭据」；已有副本时可「清除凭据」（二次确认，之后退回 lark-cli 钥匙串）。
+- 机器人凭据：App ID（`cli_` 开头）与 App Secret。「保存并验证」先向飞书真实换令牌、再以令牌经 lark-cli 调一次机器人接口，两步都过才以机器范围 DPAPI 保存；存后界面读不回实值，只显示遮蔽的 App ID。有旧版 `feishu-platform.bin` 而还没有新副本时出现「导入旧版凭据」；已有副本时可「清除凭据」（二次确认，之后退回 lark-cli 钥匙串）。
 - 收件人：填写 `ou_…`，或点「识别」从 `lark-cli auth list` 列出已登录用户后选用（已保存机器人凭据时只列同一应用的用户，§5.5）；「保存」只接受规整后合法的 open_id。没有可选用户时提示先运行 `lark-cli auth login` 或手动填写。
-- 「诊断通道」运行 `lark-cli doctor`，逐项显示检查结果，以及“机器人身份就绪/未就绪 · 凭据来源”。doctor 的说明文字会原样带出完整 app_id，界面与 `notify check` 一律把其中的 app_id 与 open_id 遮蔽后再显示。
+- 「诊断通道」用投递实际会用的凭据来源诊断：有副本时先真实换令牌（`tenant_token`）、调一次机器人接口（`bot_api`，两步决定“机器人身份就绪”），再附注入令牌后的 `lark-cli doctor`（没换到令牌就不跑）；没有副本时只跑 doctor。逐项显示检查结果，以及“机器人身份就绪/未就绪 · 凭据来源”。doctor 的说明文字会原样带出完整 app_id，界面与 `notify check` 一律把其中的 app_id 与 open_id 遮蔽后再显示。
 
-GUI RPC：`notify.channel`（只读状态）、`notify.check`（doctor）、`notify.credential.set` / `notify.credential.import` / `notify.credential.clear`、`notify.recipient.set` / `notify.recipient.detect`、`notify.test` / `notify.test.status` / `notify.test.withdraw`；通知源开关仍是 `notifications.list` / `notifications.setEnabled`（启用时只把 `AiResume.Hook.exe` 的绝对路径交给适配器，找不到就拒绝启用；停用不要求 Hook 文件仍在；先把意图写进配置再改客户端配置，意图写不进去就失败、开关不动，改客户端失败就把这一项意图恢复原样——意图也是投递端的来源过滤）。应答只含结论、来源与遮蔽后的标识。“显示其他通知源”等偏好只存本机 WebView2 的 `localStorage`。
+GUI RPC：`notify.channel`（只读状态）、`notify.check`（副本：换令牌 + 机器人接口 + doctor；钥匙串：doctor）、`notify.credential.set` / `notify.credential.import` / `notify.credential.clear`、`notify.recipient.set` / `notify.recipient.detect`、`notify.test` / `notify.test.status` / `notify.test.withdraw`；通知源开关仍是 `notifications.list` / `notifications.setEnabled`（启用时只把 `AiResume.Hook.exe` 的绝对路径交给适配器，找不到就拒绝启用；停用不要求 Hook 文件仍在；先把意图写进配置再改客户端配置，意图写不进去就失败、开关不动，改客户端失败就把这一项意图恢复原样——意图也是投递端的来源过滤）。应答只含结论、来源与遮蔽后的标识。“显示其他通知源”等偏好只存本机 WebView2 的 `localStorage`。
 
 CLI（`AiResume.Worker.exe notify …`）：
 
@@ -305,7 +307,7 @@ CLI（`AiResume.Worker.exe notify …`）：
 |---|---|---|
 | `list`（默认） | 五个源的 已安装 / 已启用 / 可送达 / 说明；失效时可送达列为 `False(hook 失效)`（OpenCode 为 `False(插件失效)`） | 任一已启用的源失效返回 2，否则 0 |
 | `enable <源>` / `disable <源>` | 源名为 `ClaudeCode`、`Codex`、`Cline`、`Qoder`、`OpenCode`（不分大小写）；先写意图再改客户端配置（`NotifyIntent.Apply`：改客户端失败时再探一次实际状态，只有证明没生效才恢复原意图，已部分生效或探不出时保留这次的选择）；启用时找不到 Hook 就拒绝 | 成功 0，失败 1 |
-| `check` | lark-cli 是否找到、机器人凭据来源、收件人、最近投递（健康文件：状态、原因、最近一次尝试成没成、最近成功、待发、未送达；成功之后改过设置时另起一行提醒重新核实），再跑一次 `lark-cli doctor` | lark-cli 在、收件人已设、bot 身份就绪、通道没有熔断且最近一次尝试不是失败时为 0，否则 2（doctor 只证明机器人身份，证明不了收件人可达） |
+| `check` | lark-cli 是否找到、机器人凭据来源、收件人、最近投递（健康文件：状态、原因、最近一次尝试成没成、最近成功、待发、未送达；成功之后改过设置时另起一行提醒重新核实），再做一次在线诊断（有副本：换令牌 `tenant_token` + 机器人接口 `bot_api` + 注入令牌后的 doctor；没有副本：doctor），最后打印诊断用的凭据来源 | lark-cli 在、收件人已设、bot 身份就绪、通道没有熔断且最近一次尝试不是失败时为 0，否则 2（诊断只证明机器人身份，证明不了收件人可达） |
 | `test` | 排队一条测试通知，最多等 90 秒看后台服务经 lark-cli 真实送达 | **这一条**测试通知进了已送达表（`completion-notify-seen.json`）且送达时间不早于排队时刻为 0（别的事件同时成功不算；撤回时后台服务恰好正在发这一条、随后确认送达也算）；没能送达且已停止重试（进了 `dead\`）、这一条确定失败（`TestFailure` 给出类别、错误码与 log_id）、飞书投递此刻仍暂停（通道熔断；到期了或改过设置都不算）或 90 秒超时为 2，失败、暂停与超时时撤回这条通知，免得通道恢复后补发一条过时的测试通知；撤不回时如实提示可能仍会送达 |
 
 未知子命令返回 1。
@@ -328,7 +330,8 @@ dotnet test csharp\AiResume.sln
 - 投递分级：stderr 错误信封按类别分到单条或通道、成功信封记 message_id、定位 lark-cli 只认 exe 绝不返回 cmd 垫片、`doctor` 与 `auth list` 按录制形状解析、机器人凭据存为机器范围密文且能读旧版形状、通道熔断只尝试一次且设置一变即解除、单条失败不拖累新事件、永久失败进死信且 30 分钟内跨轮同类升级为熔断、超过 24 小时的事件不补发、结果不明 55 分钟后不再重发、退出码 0 的非信封输出按已送达、最近一次失败不再显示可送达、按 `atUtc` 排序、Claude 稳定期/替代/后台暂缓（含已送出更晚完成时作废）、用户关掉的通知源不发（意图三态：从未记录不过滤，记录过的空意图全部丢弃）而 AI Resume 自己的事件照发、各类文案与模型短名（`NotificationDeliveryTests`、`NotificationWorkerTests`、`CompletionNotifierTests`）。
 - 2026-11-02 的三条规则：没落盘的会话不发（稳定期内先等，判断不了与旧事件照发）、同一周期同时撞上的会话合成一条、同一会话同一周期再撞不再发而别的会话照发、新周期再发、读不到重置时间按会话记账 5 小时且不断言是用量上限、刚到的中断先不判、事件晚于转录里的重置时间时那份证据作废、两个配置根同一时刻重置各发各的、组没攒齐先等而最早一条满 2 分钟就发、续跑句按布防快照的每个分支（含要重新布防、登录失效、监视卡住、读快照抛异常）、原生自动继续放弃并入且单独到达也按限额模板、多个会话结论不同时逐行说、会话名清洗与临时工作区判定、代表那条进死信或过期作废时同组的处理、续跑没成的提醒不露原始状态码（`LimitNotificationTests`）；`NotifyFacts` 按 2.1.309 录制形状读转录尾部（离谱的重置时间不采信、转录变了才重读）、进程登记与 `custom-title`，布防快照判出本轮已停止、要重新布防（目标无效、账号变了、额度原因）、登录失效与监视卡住，配置损坏或已布防却没有状态库时为未核实（`NotifyFactsTests`）。
 - `LarkCliInvokerTests` 用本机 lark-cli 1.0.81 录下的 stderr 信封断言，并验证含换行的 `--text` 与 `--idempotency-key` 原样到达、环境变量里的机密被脱敏。
-- 控制面：只有 `doctor` 通过的凭据才落盘、收件人规整与按应用过滤的识别、成功之后改过设置则成功记录不再作数、doctor 说明里的 app_id 与 open_id 一律遮蔽、测试通知走真实队列、登录到期按阈值各提醒一次且没收件人时不写（`NotifyControlPlaneTests`，假 lark-cli 照抄 1.0.81 的录制形状）；GUI 视图模型“通知行可证伪、隐藏的源仍启用必须提示、机器人行只认真实投递、Worker 不在或核验不出时不显示可送达、最近投递失败与设置已变更不显示绿色”（`GuiPageContractTests`）。
+- 换令牌（ADR-0007）：成功应答字段在顶层、录制的 10014 / 10003 / 9499 与 429 / 5xx / 非 JSON 分类、请求形状、缓存复用与临期重换、换凭据与作废、网络与超时、生产处理器不跟随重定向；通道只注入 App ID + 令牌、换不到令牌不启动 lark-cli、缓存令牌被拒重换一次、副本读不出不改用钥匙串（`FeishuTenantTokenTests`）。
+- 控制面：只有真实换到令牌且机器人接口调通的凭据才落盘、换不到令牌时诊断不跑 doctor、收件人规整与按应用过滤的识别、成功之后改过设置则成功记录不再作数、doctor 说明里的 app_id 与 open_id 一律遮蔽、测试通知走真实队列、登录到期按阈值各提醒一次且没收件人时不写（`NotifyControlPlaneTests`，假 lark-cli 照抄 1.0.81 的录制形状）；GUI 视图模型“通知行可证伪、隐藏的源仍启用必须提示、机器人行只认真实投递、Worker 不在或核验不出时不显示可送达、最近投递失败与设置已变更不显示绿色”（`GuiPageContractTests`）。
 - 配置合并、幂等启停、含空格路径、严格所有权、同名用户文件保护与意图对账（各 `*NotificationAdapterTests`、`NotifyIntentTests`、`HookHealthTests`）。
 
 所有自动测试只使用 `TestTemp` 临时目录和合成负载，不启动真实 AI 任务，不读写生产项目或生产会话，也不发飞书消息。
@@ -343,12 +346,14 @@ $worker = "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe"
 ```
 
 - `notify list`：已启用来源必须显示 `可送达=True` 且退出码为 0；Codex 行还必须显示信任哈希已登记（否则为 `False(hook 失效)`）。这一列只说明 hook 这一段：配置在、命令指向的程序在、没有被上游证据（Codex 信任记录、OpenCode 日志）判为断链。OpenCode 插件尚无加载记录时这一列仍为 `True`，说明里写着“等 OpenCode 下次加载后核实”。飞书这一段是否可送达，看下面两条。
-- `notify check`：确认 lark-cli 找得到、机器人凭据来源为“AI Resume 机器范围副本”、收件人已设置、`doctor` 的 `bot_identity` 为 pass、最近投递不是熔断。它在交互会话里运行：凭据来源若是 lark-cli 钥匙串，这里通过也不代表会话 0 里的 Worker 能用。
+- `notify check`：确认 lark-cli 找得到、机器人凭据来源为“AI Resume 机器范围副本”、收件人已设置、诊断里 `tenant_token` 与 `bot_api` 为 pass（副本路径；钥匙串路径看 doctor 的 `bot_identity`）、最近投递不是熔断。它在交互会话里运行：凭据来源若是 lark-cli 钥匙串，这里通过也不代表会话 0 里的 Worker 能用。
 - `notify test`：测试通知走完整的“队列 → 后台服务（Worker）→ lark-cli → 飞书”链路，等到真实送达才返回 0，会真实发出一条飞书消息，手机上应收到三行：`🧪 AI Resume 测试通知`、`AI Resume · HH:mm` 与 `能收到这条,说明飞书投递这一段是通的`。它不启动、也不修改任何 AI 会话。
 
 按来源核对 Hook 这一段（可选）：按各来源的真实协议，向安装目录的 `AiResume.Hook.exe` 的 stdin 注入带 `smoke=true` 的合成负载。例如 Claude Code 用参数 `claudecode` 与 `{"hook_event_name":"Stop","session_id":"smoke","cwd":"<某个绝对路径>","smoke":true}`；OpenCode 用参数 `opencode`，`hook_event_name` 为 `session.execution.succeeded` 并带 `event_id`。飞书应分别收到第二行为 `Claude Code · HH:mm` 与 `OpenCode · HH:mm` 的测试通知（`smoke=true` 的事件不受“会话没落盘”规则约束）。注入的来源必须是已开启的通知源，否则 Worker 按意图丢弃（`Suppressed`）。中文路径要保证 stdin 是 UTF-8（PowerShell 7 先把 `$OutputEncoding` 设为无 BOM 的 UTF-8），否则 Hook 会按非法 UTF-8 拒绝；用不含中文的临时目录更省事。
 
-### v2.2 真机验收（待真机验证）
+### v2.2 真机验收
+
+第 1 到 4 条已于 2026-11-02 走通（记录见清单后）；第 5、6 条仍待真机验证。
 
 1. `dotnet build csharp\AiResume.sln -c Release` 后运行 Release 目录的 `AiResume.Worker.exe install`，退出码 0；在 Claude Code 里用 `/hooks` 能看到 `Stop`、`StopFailure`、`Notification` 三组都指向安装目录的 `AiResume.Hook.exe`。
 2. `notify list` 退出码 0。OpenCode 下次加载后，其日志里出现本插件目录的 `loading plugin`，之后没有 `failed to load plugin`；`notify list` 的 OpenCode 说明随之变为 `已安装,OpenCode 已加载(日志 …)`。
@@ -356,6 +361,14 @@ $worker = "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe"
 4. `notify test` 返回 0，手机收到这条测试通知；Worker 日志有 `worker.notify.channel_init larkCli=exe credentialSource=env` 与这条事件的 `worker.notify.item … outcome=Sent … credentialSource=env`。注意 `install` 刚拉起的 Worker 跑在当前交互会话里；要证明会话 0 这条路径，须在 Worker 由 S4U 计划任务拉起后（例如重新登录后，`Get-Process AiResume.Worker` 的 `SessionId` 为 0）再跑一次 `notify test`。可选：发送时刻 `Microsoft-Windows-Crypto-DPAPI/Operational` 不再出现新的 8198 错误。
 5. 观察 3 到 7 天：失败率接近 0，仍有的失败在日志里带 `class` / `errCode` / `logId`。断网一次，健康文件应转为 `blocked`（`network`），恢复后第一条到期事件探测成功即转回 `healthy`。
 6. 需要真实事件、不能由测试代劳的：一次真实的 Claude Code 完成；一次用量上限中断，核实 `StopFailure` 的 `error` 是否为 `rate_limit`（官方文档没有写明 claude.ai 用量上限对应哪个值）；OpenCode 2.2.3 里一次真实任务完成；一次真实中断后的逐项目自动续跑（`resume-started` / `resume-succeeded`）；Claude Code 登录到期提醒（本机登录 2026-11-11 05:55 UTC 到期，第一条“即将到期”应在到期前 3 天内到达）。
+
+2026-11-02 实测（ADR-0007 方案 A 部署后）：全量回归 `1303/1303`，Release `-warnaserror` 0 警告，`install` 退出码 0。用户在「飞书通知设置」重新保存凭据（保存时真实换令牌、再调一次机器人接口）之后：
+
+- `notify check` 退出码 0：凭据来源为机器范围副本，`tenant_token` 与 `bot_api` 为 pass，doctor 的 `bot_identity` 为 `provided by env`，换令牌网络路径为 `direct`。`notify list` 退出码 0，已启用的 Claude Code、OpenCode 均为 `可送达=True`，OpenCode 说明为已加载。
+- 交互会话里的 Worker（`install` 拉起）：GUI「发送测试」与 `notify test` 各一条，日志均为 `outcome=Sent … credentialSource=env`，各约 0.8 秒；健康文件 `credentialSource=env`、`lastAttemptOk=true`；部署后的真实窗口里机器人行为绿色「可送达」。
+- 会话 0：按 PID 停掉 `install` 拉起的 Worker，`schtasks /Run` 让 S4U 计划任务拉起新实例（`SessionId=0`），日志 `channel_init … credentialSource=env`；`notify test` 15 秒内返回 0，`outcome=Sent … credentialSource=env`，857 ms。这是会话 0 经副本真实送达的第一条记录；当天 DPAPI 运行日志没有 8198（上一条在 10-30）。验证后已结束任务实例，并用启动垫片把 Worker 拉回交互会话。
+- 私有配置目录 `state\lark-cli` 里只有 lark-cli 自己的 `cache\remote_meta.meta.json`（只含 `last_check_at`），令牌与凭据都没有落盘。
+- 同时发现（与方案 A 无关，另行处理）：Worker 由 S4U 计划任务跑在会话 0 时，交互会话以读写方式连它的命名管道被拒（Access denied），GUI 因此显示「后台服务未核实」，机器人行随之是「未核实」；投递本身不受影响。
 
 ### 历史记录（v2，v2.1 之前）
 
@@ -399,4 +412,4 @@ $worker = "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe"
 | 重复消息 | eventId / seen / idempotency | 同一事件七天内本地去重；飞书侧同一 idempotency-key 一小时内去重；“结果不明”的重发在首次不明 55 分钟后停止，不会在去重窗口之外盲发；Claude App 推送与飞书是两条独立通道 |
 | 一条通知始终没收到，`dead\` 里有它 | 同名 `.error.txt` 的类别 | `stale`：发生超过 24 小时才轮到投递；`outcome_unknown`：结果不明且已过 55 分钟，可能其实已送达；`retry_exhausted:*`：单条重试 24 小时未成；其余为参数类永久失败 |
 | 消息只有一行、分不出来源（历史） | lark-cli 启动方式 | v2.1 经 cmd.exe 垫片截断；v2.2 直接启动 exe 后不应再出现，出现即说明启动路径回退了 |
-| 通知间歇几小时发不出（历史） | 凭据来源 | v2.1 是会话 0 里的 CurrentUser DPAPI（先是 AI Resume 自己的，10-12 后是 lark-cli 钥匙串）；v2.2 日志里的 `credentialSource` 应为 `env` |
+| 通知间歇几小时发不出（历史） | 凭据来源 | v2.1 是会话 0 里的 CurrentUser DPAPI（先是 AI Resume 自己的，10-12 后是 lark-cli 钥匙串）；v2.2 日志里的 `credentialSource` 应为 `env`；若 env 下报 `no tat available` 或熔断原因为 `auth_config` 且 `errType=tenant_token`，按 ADR-0007 核对换令牌这一步 |

@@ -49,7 +49,7 @@ GUI 是 WPF + WebView2,前端在 `csharp/src/AiResume.Gui/wwwroot/`。
 
 - **界面上每一句肯定句都必须能被外部证伪(2026-08-08 第二轮审计后的硬规则)。** 判据不得停在"我们自己那一步":
   通知源「hook 正常」要核对 hook 命令指向的可执行文件是否存在(`HookHealth`),断链时标 `hookBroken` 并显红「hook 失效」;OpenCode 的「插件已加载」只以 OpenCode 自己的日志(`~/.local/share/opencode/log/opencode.log`,数据目录跟随 `XDG_DATA_HOME`)为证据,以插件写入之后的最后一条结论为准,没有记录就是「待核实」;
-  飞书机器人「可送达」只来自投递健康文件里的**真实送达记录**,且必须确认后台 Worker 在跑(`workerRunning === true`;还没读到或核验不出都不行)、最近一次尝试成功、并核对得上那次成功之后没改过凭据/收件人/lark-cli(`settingsVerified === true`,比不出来同样只能「待核实」)——历史成功不证明现在送得到;机器人凭据只有经 `lark-cli doctor` 在线核验、飞书确实换得到 bot token 后才保存;
+  飞书机器人「可送达」只来自投递健康文件里的**真实送达记录**,且必须确认后台 Worker 在跑(`workerRunning === true`;还没读到或核验不出都不行)、最近一次尝试成功、并核对得上那次成功之后没改过凭据/收件人/lark-cli(`settingsVerified === true`,比不出来同样只能「待核实」)——历史成功不证明现在送得到;机器人凭据只有真实向飞书换到 tenant_access_token、再以该令牌经 lark-cli 调通一次只读机器人接口后才保存(ADR-0007);
   「监视中」必须同时满足 `config.Armed`、引擎进程存活、探测新鲜度(`EngineLiveness`)与本用户常驻 Worker 应答 Named Pipe:引擎不在时压过一切阶段文案显红,有同名进程却不应答显琥珀「监视状态未核实」(`WorkerUnverified`)。
   核对不出结论时一律显示「未核实」,**绝不显示「没问题」**。
 - 收进菜单的东西(Codex 额度、Codex/Cline/Qoder 通知源、供应商明细)若处于启用或故障状态,主界面必须留一句提示,隐藏不得掩盖启用态或断链。
@@ -57,7 +57,7 @@ GUI 是 WPF + WebView2,前端在 `csharp/src/AiResume.Gui/wwwroot/`。
 - Claude Code 钩子写在 `~/.claude/settings.json`(与 Claude Code 一致跟随 `CLAUDE_CONFIG_DIR`),用官方 exec form(`command` 只放 `AiResume.Hook.exe` 绝对路径,`args` 放参数),三组:`Stop`、`StopFailure`(`--kind=failure`)、`Notification`(`--kind=decision`,matcher 见 `ClaudeCodeNotificationAdapter.DecisionMatcher`);只增删我方条目,混在用户分组里的我方条目移出单独成组,不改写用户分组的 matcher。Claude Code 热加载 settings。
 - Codex 完成通知走 0.148.0 hooks(ADR-0005 C1):`~/.codex/hooks.json` 的 `hooks.Stop` 末尾追加 AI Resume 自己的分组,`config.toml` 写 `[hooks.state."<hooks.json 全路径>:stop:<g>:<h>"].trusted_hash`(与上游 canonical JSON SHA-256 一致);只增删自己的分组和哈希等于我方命令哈希的信任记录,旧 `notify` 残留只提示不改写。已打开的 Codex 会话不重载 hooks.json,新会话才生效;信任不匹配时 `notify list` 标 hookBroken 并提示在 codex `/hooks` 信任。
 - OpenCode 只支持 2.x:写官方 v2 目录形态插件 `~/.config/opencode/plugins/airesume-notify/index.ts`(配置目录跟随 `XDG_CONFIG_HOME`);拒绝覆盖别人的 `index.*`/`server.*`/`package.json`,迁移旧单文件插件时留 `.bak`。
-- **完成通知投递**:Worker(S4U 计划任务、会话 0)读 GUI 保存的**机器范围** DPAPI 机器人凭据 `state\secrets\feishu-bot.bin`(ACL 收紧到当前用户 + SYSTEM + Administrators),经环境变量 `LARKSUITE_CLI_APP_ID/APP_SECRET/BRAND/STRICT_MODE` 交给 lark-cli;没有副本时退回 lark-cli 自己的钥匙串(S4U 下会间歇失败,界面标琥珀)。S4U 会话 0 下解 **CurrentUser** DPAPI 会间歇失败数小时(0x8009000B,2026-10 两次实证),Worker 路径不得依赖任何 CurrentUser 密文——包括第三方 CLI 自己的。收件人 `open_id` 明文存 `ProductConfig.NotifyRecipientOpenId`,由「飞书通知设置」识别(`lark-cli auth list`)或填写。投递失败按 `NotifyClassifier` 分级:单条失败只推迟该条,凭据/网络/限流熔断整个通道,凭据文件或收件人一变立即解除,永久错误进 `completion-events\dead\`;日志只记类别、错误码、log_id、退出码与耗时,不记正文与凭据。Claude Code 事件:稳定期后转录仍不存在(会话没落盘,如第三方工具以 `--no-session-persistence` 拉起的 claude)不发;用量上限中断(`StopFailure` rate_limit 与 `quota_auto_resume_disabled`)按转录里服务端给的 `rateLimitType + resetsAt`(加配置根)定限额周期,每个会话每个周期只提醒一次、同一周期同时待发的会话合成一条;续跑句只按投递那一刻的布防快照(`NotifyFacts`)说,引擎已知只会一直等(要重新布防、登录失效、监视卡住)时不说「会续跑」,读不出写「未核实」;会话名只进消息不进日志(`docs/COMPLETION-NOTIFICATIONS.md` §5.3、§5.7)。
+- **完成通知投递**:Worker(S4U 计划任务、会话 0)读 GUI 保存的**机器范围** DPAPI 机器人凭据 `state\secrets\feishu-bot.bin`(ACL 收紧到当前用户 + SYSTEM + Administrators),由 `FeishuTenantToken` 向飞书换 tenant_access_token(只换令牌、只用于 bot;令牌只在进程内存按过期时间缓存),只把 `LARKSUITE_CLI_APP_ID` + `LARKSUITE_CLI_TENANT_ACCESS_TOKEN`(及 BRAND/STRICT_MODE)经环境变量交给 lark-cli(先删掉继承来的全部凭据类变量,并让它用 AI Resume 自有的空配置目录 `state\lark-cli\`,碰不到用户配置里引用的钥匙串)——lark-cli 的 env 来源只收现成令牌、不会拿 App Secret 去换(ADR-0007 实验查证);换令牌失败(已知凭据错误码被拒 `auth_config`、网络与 5xx `network`/`network_timeout`、限流、应答不是预期结果 `token_unexpected`)或副本解不开(`credential_unreadable`)时不启动 lark-cli、**绝不**退回把 App Secret 塞进环境变量;换令牌请求不跟随重定向,代理只认 `HTTPS_PROXY`/`NO_PROXY`(与 Go 一致),不落回系统代理;保存前的核验还要求机器人 `activate_status` 为启用;没有副本时退回 lark-cli 自己的钥匙串(S4U 下会间歇失败,界面标琥珀)。S4U 会话 0 下解 **CurrentUser** DPAPI 会间歇失败数小时(0x8009000B,2026-10 两次实证),Worker 路径不得依赖任何 CurrentUser 密文——包括第三方 CLI 自己的。收件人 `open_id` 明文存 `ProductConfig.NotifyRecipientOpenId`,由「飞书通知设置」识别(`lark-cli auth list`)或填写。投递失败按 `NotifyClassifier` 分级:单条失败只推迟该条,凭据/网络/限流熔断整个通道,凭据文件或收件人一变立即解除,永久错误进 `completion-events\dead\`;日志只记类别、错误码、log_id、退出码与耗时,不记正文与凭据。Claude Code 事件:稳定期后转录仍不存在(会话没落盘,如第三方工具以 `--no-session-persistence` 拉起的 claude)不发;用量上限中断(`StopFailure` rate_limit 与 `quota_auto_resume_disabled`)按转录里服务端给的 `rateLimitType + resetsAt`(加配置根)定限额周期,每个会话每个周期只提醒一次、同一周期同时待发的会话合成一条;续跑句只按投递那一刻的布防快照(`NotifyFacts`)说,引擎已知只会一直等(要重新布防、登录失效、监视卡住)时不说「会续跑」,读不出写「未核实」;会话名只进消息不进日志(`docs/COMPLETION-NOTIFICATIONS.md` §5.3、§5.7)。
 - OpenAI / DeepSeek / Claude 的绿色「可用」必须来自启动时或手动刷新的**真实外部请求证据**;API Key 已填写、CLI 命令存在只能说明“可探测”,绝不能显示成可用。对配置了 CC Switch 风格用量查询的 Sub2API provider,成功返回、账户未显式失效且余额大于 0 的 `/v1/usage` 是其 provider/account 可用证据,可直接点绿;这不等于对每一次未来推理请求作绝对保证。
 - **现役 GUI 供应商刷新使用零 token 的 `providers.catalog`。** Claude 读取 Models API 与 OAuth usage,DeepSeek 读取 Models API 与 balance(密钥来自 OpenCode),当前 Codex 第三方复用带凭据的 `/models` 与兼容 `/v1/usage`,ChatGPT 使用 `/backend-api/codex/models` 与 `/backend-api/wham/usage`。模型可列不等于额度可用;数据源失败分别降级,不保留旧绿。GUI 没有任何推理型探测。页面每块数据到了就各自绘制(额度磁贴不等最慢的供应商目录);目录在 `quota.get` 返回之后才读,Claude 行复用这一轮 1 分钟内的额度读数,一轮刷新只请求一次 usage 端点;登录状态在额度请求结束后再读一次,「被服务端拒绝」反映的是这一轮的结果。
 - **前端字号一律走 rem,1rem = 点阵字设计尺寸 12px。** 开机脚本按 `devicePixelRatio` 把 `html` 的基准挪到"乘上缩放率正好是 12 的整数倍"的值(150% → 16px);字距用 rem 折算的整数设计像素;`font-synthesis:none` 与 `-webkit-font-smoothing:none` 是点阵字清晰的前提,不得移除。布局尺寸仍用 px,不随字号缩放;窄列放不下的文案用短句 + 悬停说明,窄磁贴用容器查询换短标题。WebView2 必须关闭浏览器加速键与缩放(`AreBrowserAcceleratorKeysEnabled` / `IsZoomControlEnabled`),否则 Ctrl± 会让点阵字失去整数倍。
@@ -84,7 +84,7 @@ mock 猜错结构的结果是测试全绿、线上静默失效(已实测过两�
 - 界面证据:`AiResume.Gui.exe --screenshot <png>` 离屏截图(演示模式约 2 秒后截取)。
   要产出**公开可用**的截图必须喂合成数据,真机数据里有用户的项目名与 app_id。
 - 改了通知钩子/投递/安装流程,除单测外还要真机跑一次 `install`,核对 `AiResume.Worker.exe notify list` 的「可送达」列全为 True、退出码为 0,
-  并用 `notify check`(lark-cli doctor)与 `notify test`(冒烟事件走完整链路,等待真实送达)确认通道。
+  并用 `notify check`(副本路径:真实换令牌 + 机器人接口,再附 lark-cli doctor)与 `notify test`(冒烟事件走完整链路,等待真实送达)确认通道。
 
 ## 测试红线(真踩过的事故,绝不重犯)
 
@@ -96,7 +96,7 @@ mock 猜错结构的结果是测试全绿、线上静默失效(已实测过两�
 
 ## 安全约束
 
-- 飞书机器人凭据(app_id + app_secret)只经 GUI「飞书通知设置」进入,`lark-cli doctor` 在线核验通过后才以 DPAPI **LocalMachine** 范围存 `%LOCALAPPDATA%\AI Resume\state\secrets\feishu-bot.bin`,保存后把文件 ACL 收紧到当前用户 + SYSTEM + Administrators 并读回核验,收不紧就放弃保存;界面只回遮蔽后的 app_id,实值只出现在用户输入那一刻、本进程调用栈与 lark-cli 子进程的环境变量里,绝不进 argv、日志、RPC 回包或截图。
+- 飞书机器人凭据(app_id + app_secret)只经 GUI「飞书通知设置」进入,真实换到 tenant_access_token 并以该令牌经 lark-cli 调通一次只读机器人接口后才以 DPAPI **LocalMachine** 范围存 `%LOCALAPPDATA%\AI Resume\state\secrets\feishu-bot.bin`,保存后把文件 ACL 收紧到当前用户 + SYSTEM + Administrators 并读回核验,收不紧就放弃保存;界面只回遮蔽后的 app_id,App Secret 实值只出现在用户输入那一刻、本进程调用栈与发往飞书官方换令牌端点的请求体里,绝不进 argv、日志、RPC 回包、截图或子进程环境;换来的 tenant_access_token 只在进程内存与 lark-cli 子进程环境变量里,不落盘。
 - Claude/Codex/OpenCode 等 provider 凭据继续由各自上游认证文件或环境变量持有;AI Resume 只读,不复制、不保存。任何令牌、密码、私钥都不得进入仓库、日志、截图或测试夹具。
 - 不读取、不改写也不删除 `~/.cc-connect` 等已退役组件的配置;其中的明文密钥由用户自行清理与吊销。
 
