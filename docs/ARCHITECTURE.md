@@ -620,7 +620,7 @@ S4U 下的 DPAPI 是一部演变史。2026-08-14 实测会话 0 的 Worker 解�
 
 同一次验证发现:Worker 建命名管道时没有指定安全描述符,跑在会话 0 时交互会话以读写方式连它被拒(Access denied),GUI 的常驻 Worker 判定因此只能是「后台服务未核实」,机器人行随之显示「未核实」。投递与续跑不受影响,修复另行处理。
 
-C# 测试套件当前共 1303 项 xUnit 用例(2026-11-02,以当次 `dotnet test` 输出为准)。它们使用隔离的临时状态(只经 `TestTemp` 申请)、合成会话与注入的进程/API 运行器;不会对真实项目启动 AI 修改运行,不发付费 API 请求,不碰 `~/.claude`、`~/.codex`、`~/.qoder`、`~/.config/opencode` 与真实状态目录;mock 照抄录制下来的真实返回结构。`GuiPageContractTests` 与 `OpenCodeNotificationAdapterTests` 会启动 PATH 上的 `node` 驱动页面视图模型与插件脚本,运行环境需要装有 Node.js。
+C# 测试套件当前共 1304 项 xUnit 用例(2026-11-02,以当次 `dotnet test` 输出为准)。它们使用隔离的临时状态(只经 `TestTemp` 申请)、合成会话与注入的进程/API 运行器;不会对真实项目启动 AI 修改运行,不发付费 API 请求,不碰 `~/.claude`、`~/.codex`、`~/.qoder`、`~/.config/opencode` 与真实状态目录;mock 照抄录制下来的真实返回结构。`GuiPageContractTests` 与 `OpenCodeNotificationAdapterTests` 会启动 PATH 上的 `node` 驱动页面视图模型与插件脚本,运行环境需要装有 Node.js。
 
 相关的重点测试:
 

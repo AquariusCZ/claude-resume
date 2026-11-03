@@ -288,20 +288,25 @@ public sealed class ControlPlaneBridge
                     DemoNotification("OpenCode", "OpenCode"),
                 },
             },
-            "notify.channel" => new
-            {
-                larkCliFound = true,
-                credentialSource = "env",
-                appIdMasked = "cli_a1…7f",
-                legacyCredentialAvailable = false,
-                recipientSet = true,
-                recipientMasked = "ou_0123…cdef",
-                health = new
+            // 走真实应答的同一个投影，字段与真窗口一致;健康文件按 Worker 真实送达一条之后的样子填(MarkHealthy + LastAttemptOk)。
+            "notify.channel" => ChannelPayload(new NotifyChannelStatus(
+                LarkCliFound: true,
+                CredentialSource: "env",
+                AppIdMasked: "cli_a1…7f",
+                LegacyCredentialAvailable: false,
+                RecipientSet: true,
+                RecipientMasked: "ou_0123…cdef",
+                Health: new DeliveryHealth
                 {
-                    state = "healthy", lastSuccessAtUnix = now - 1_260, lastAttemptAtUnix = now - 1_260, backlog = 0, dead = 0,
-                    credentialSource = "env", updatedAtUnix = now - 8,
+                    State = "healthy",
+                    LastSuccessUtc = DateTimeOffset.FromUnixTimeSeconds(now - 1_260),
+                    LastAttemptUtc = DateTimeOffset.FromUnixTimeSeconds(now - 1_260),
+                    LastAttemptOk = true,
+                    CredentialSource = "env",
+                    UpdatedAtUtc = DateTimeOffset.FromUnixTimeSeconds(now - 8),
                 },
-            },
+                // 那次成功之后凭据、收件人与 lark-cli 都没改过;缺了它页面只能显示「待核实」。
+                SettingsVerified: true)),
             "notify.check" => new
             {
                 ok = true,

@@ -156,7 +156,7 @@ v2.1 及之前由直接运行的 cc-connect 承担飞书/微信聊天、会话�
 | `csharp/src/AiResume.Gui/` | WPF + WebView2 宿主与 RPC 桥 | `MainWindow`、`ControlPlaneBridge.HandleAsync`、`DemoPayload`(截图合成数据) |
 | `csharp/src/AiResume.Gui/wwwroot/index.html` | 单页前端(菜单栏、磁贴、队列、右栏、对话框) | `<script id="vm">` 的 `AR.quotaTiles/rowModel/beaconModel/notifyModel/loginModel/armRequest`、`call` |
 | `csharp/src/AiResume.Hook/Program.cs` | agent hook 入口 | `TryWriteEvent`、`ReadKind`、`ShouldSuppress`、`ComputeEventId` |
-| `csharp/test/AiResume.Tests/` | 隔离的 xUnit 回归 | 本轮 1303 项(以当次输出为准),不触碰真实会话/项目运行 |
+| `csharp/test/AiResume.Tests/` | 隔离的 xUnit 回归 | 本轮 1304 项(以当次输出为准),不触碰真实会话/项目运行 |
 
 v2.1 的 `csharp/src/AiResume.Wrapper/`(cc-connect 薄适配与安全检查)已于 2026-10-30 删除。
 
@@ -172,7 +172,7 @@ dotnet build csharp\AiResume.sln -c Release -warnaserror
 dotnet test csharp\AiResume.sln
 ```
 
-本轮完整回归 1303 项全绿(约 40 秒;用例数以当次输出为准)。测试经 `TestTemp` 申请临时目录,注入 runner/API/时钟、假 PID 与合成会话隔离生产状态,不发付费请求;`GuiPageContractTests`(Node 驱动视图模型)与 `OpenCodeNotificationAdapterTests`(内嵌 Node harness,21 个事件场景)需要 node;通知回归会启动真实 Hook 进程,但不启动 agent。
+本轮完整回归 1304 项全绿(约 40 秒;用例数以当次输出为准)。测试经 `TestTemp` 申请临时目录,注入 runner/API/时钟、假 PID 与合成会话隔离生产状态,不发付费请求;`GuiPageContractTests`(Node 驱动视图模型)与 `OpenCodeNotificationAdapterTests`(内嵌 Node harness,21 个事件场景)需要 node;通知回归会启动真实 Hook 进程,但不启动 agent。
 
 ### 4.2 部署现役副本
 

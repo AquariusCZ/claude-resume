@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Xunit;
 
@@ -279,6 +280,22 @@ public sealed class GuiPageContractTests
             """);
 
     [Fact]
+    public async Task 截图演示态的飞书机器人行显示可送达()
+    {
+        // 首页截图拍的就是演示态:把合成应答原样交给视图模型，与真实窗口走同一条判定(worker 取 arm.get 的 workerRunning)。
+        var bridge = new AiResume.Gui.ControlPlaneBridge(demoMode: true);
+        string list = await DemoPayloadJson(bridge, "notifications.list");
+        string channel = await DemoPayloadJson(bridge, "notify.channel");
+        string arm = await DemoPayloadJson(bridge, "arm.get");
+
+        RunViewModel($$"""
+            const now = Math.floor(Date.now() / 1000);
+            const robot = AR.notifyModel({{list}}, {{channel}}, {}, now, ({{arm}}).workerRunning).robot;
+            assert.equal(robot.text, '可送达'); assert.equal(robot.led, 'ok');
+            """);
+    }
+
+    [Fact]
     public void 队列每项目模型_沿用会话或手选_读不出就不能布防_布防后固定()
         => RunViewModel("""
             const now = 1800000000;
@@ -413,6 +430,14 @@ public sealed class GuiPageContractTests
             b = AR.beaconModel(armed({ engine: 'Alive', projects: [{ name: 'a', status: 'limited', category: 'failure', reason: 'quota:unknown', detail: 'model-invalid', reasonText: '模型额度无法核实 · 重新布防' }] }), null, now);
             assert.equal(b.cls, 'bad'); assert.equal(b.head, '需要重新布防');
             """);
+
+    /// <summary>演示模式下一种请求的应答 payload(JSON 原文),可直接嵌进断言脚本。</summary>
+    private static async Task<string> DemoPayloadJson(AiResume.Gui.ControlPlaneBridge bridge, string type)
+    {
+        string response = await bridge.HandleAsync($$"""{"id":"demo","type":"{{type}}"}""", CancellationToken.None);
+        using JsonDocument document = JsonDocument.Parse(response);
+        return document.RootElement.GetProperty("payload").GetRawText();
+    }
 
     /// <summary>把 script#vm 放进 Node 的隔离上下文，再执行断言脚本;任何断言失败都让进程以非 0 退出。</summary>
     private static void RunViewModel(string assertions)

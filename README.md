@@ -18,7 +18,7 @@ when a task finishes, fails or needs your call, it messages you on Feishu.
 
 ![AI Resume control panel: quota tiles, resume queue, Claude login and Feishu notifications (demo data)](docs/assets/panel.png)
 
-<p align="center"><sub>Demo data: three armed (guarded) projects. One is waiting for the Fable weekly limit, one has its session still open and resumes once it's closed, one wasn't interrupted and is just being watched. The amber on the right is the panel being honest: the Claude login expires within 3 days, and Feishu delivery can't be verified right now, so it says 待核实 (pending check). The interface and the notifications are in Simplified Chinese.</sub></p>
+<p align="center"><sub>Demo data: three armed (guarded) projects. One is waiting for the Fable weekly limit, one has its session still open and resumes once it's closed, one wasn't interrupted and is just being watched. The amber on the right is the panel being honest: the Claude login expires within 3 days. The interface and the notifications are in Simplified Chinese.</sub></p>
 
 ## Why
 
