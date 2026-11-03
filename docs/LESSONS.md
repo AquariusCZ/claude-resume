@@ -531,6 +531,12 @@ cc-connect 给 codex agent 配 provider 时会 `ensureCodexAuth` 改写 `~/.code
    - 规则:① 凭据链路的可用性只能用**会真的换令牌 / 真的调接口**的证据证明:用明显无效的假值跑一次,看错误是不是来自对端(飞书 log_id、业务码),而不是本地 `token_missing`;dry-run、`auth status`、「被选中」都不算;② 假 CLI 的分支条件必须来自录制的真实行为:真实 CLI 对某个输入从不成功,假 CLI 就不能让它成功;③ 新功能上线后至少要有一次真机走通(这里是用户在 GUI 保存一次);只有单测的「已实现」要在文档里写成待真机验证,并真的去验;④ 上游缺能力时的例外要窄:这里只自己做「换令牌」一步(官方端点、只用于 bot、令牌只在内存),发消息等其余操作仍走 lark-cli,失败时绝不退回把 App Secret 塞进子进程环境。
    - 位置:`FeishuTenantToken`、`LarkCliNotificationChannel.ResolveCredentialAsync` / `TokenEnvironment` / `VerifyAsync`、`NotifyClassifier.ClassifyTokenExchange`、`NotifyControlPlane.SetCredentialAsync`、`FeishuTenantTokenTests`、`NotifyControlPlaneTests.FakeLarkCli`(只给 App Secret 一律 token_missing)。
 
+15. **★★ 目录修改时间只在增删文件时变:拿它当「会话目录有没有新动静」的失效键,续写已有会话永远看不见(2026-11-02)**
+   - 现象:控制面队列让临时工作区显示会话名之后,一个 fork 过的临时工作区显示的是 fork 的标题和 10/29 的「最近会话」,而用户 11/02 还在原会话里干活,布防也会绑定原会话——界面点名点错了会话。本机核对:几乎每个项目目录的最新转录都比目录本身新(一个目录晚了 96 小时),从 8 月起「最近会话」时间与排序就一直是旧的,还有 4 个项目被过期索引条目藏着没出现。
+   - 根因:S7-A 的项目索引以会话目录的修改时间作命中键,命中就整条复用(哪份转录、它的时间、cwd)。NTFS 上目录修改时间只在增删改名目录项时变,往已有文件追加内容不会改它;Claude Code 续写会话正是追加。这个缺陷原来只让时间旧一点,名字一取自「发现它的那份转录」就变成了点名对象错误。另一个干扰:10/26 02:10 有外部操作批量改过 11 个老项目转录的修改时间(最后一条记录早得多),用文件修改时间当「最近会话」本身也只是近似。
+   - 规则:① 缓存键必须覆盖被缓存结论依赖的全部输入——这里结论是「最新那份转录」,依赖每个文件的修改时间,目录时间只覆盖增删;② 便宜的部分(列目录拿修改时间,列举结果自带)每次重做,只缓存贵的部分(读头部取 cwd),并按「还是不是同一份文件」复用;③ 一个原本只影响次要显示的过期值,被新功能拿去做身份或点名之前,先核对它在真机上有多旧;④ 两个会话共用一个工作区时提交只暂存自己的 hunk——这次另一个会话整文件 `git add`,把本改动改到一半的引用(缺新文件)带进提交并推送,origin/main 编译不过,直到本改动提交才恢复。
+   - 位置:`ProjectCatalog.Discover` / `LatestJsonl` / `SessionDirectoryOf`、`ProjectIndex.TryGetEntry`、`ProjectIndexTests.Appending_to_an_older_session_moves_latest_even_when_dir_mtime_is_unchanged`、`ControlPlaneBridge.BoundSessionName`。
+
 ---
 
 _维护提示:再遇到新坑,按上面的分类追加一条(现象 → 根因 → 规则 → 代码位置)。现役回归是 `dotnet test csharp\AiResume.sln`(`GuiPageContractTests` 与 `OpenCodeNotificationAdapterTests` 需要本机 node);v1 的 `node test/*.js` 回归已随 v1 运行时删除,只在 git 历史里。_

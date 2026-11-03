@@ -65,7 +65,6 @@ public interface INotifyFacts
 /// </summary>
 public sealed class NotifyFacts : INotifyFacts
 {
-    private const int TitleWindowBytes = 1 << 20;
     private const int LimitCacheSize = 256;
 
     private readonly string _configPath;
@@ -183,17 +182,12 @@ public sealed class NotifyFacts : INotifyFacts
         return facts;
     }
 
-    /// <summary>先找进程登记(<c>sessions\&lt;pid&gt;.json</c> 的 <c>name</c>),会话已关时退回转录尾部最近一条 <c>custom-title</c>。</summary>
-    public string? SessionName(string? sessionId, string? transcriptPath)
-    {
-        if (string.IsNullOrWhiteSpace(sessionId))
-        {
-            return null;
-        }
-
-        return RegistryName(sessionId, ClaudeRootOf(transcriptPath) ?? _claudeRoot) ??
-               (string.IsNullOrWhiteSpace(transcriptPath) ? null : TranscriptTitle(transcriptPath, sessionId));
-    }
+    /// <summary>
+    /// 先找进程登记(<c>sessions\&lt;pid&gt;.json</c> 的 <c>name</c>),会话已关时退回转录尾部最近一条 <c>custom-title</c>。
+    /// 读法与控制面续跑队列共用 <see cref="ProjectNames.SessionName"/>。
+    /// </summary>
+    public string? SessionName(string? sessionId, string? transcriptPath) =>
+        ProjectNames.SessionName(sessionId, transcriptPath, _claudeRoot);
 
     /// <summary>
     /// 配置读不了、损坏,或已布防但状态库读不了 → null(不能把「不知道」说成「未布防」)。
@@ -317,116 +311,5 @@ public sealed class NotifyFacts : INotifyFacts
     }
 
     /// <summary>转录路径 <c>&lt;根&gt;\projects\&lt;目录&gt;\&lt;会话&gt;.jsonl</c> → 根;形状不对返回 null。</summary>
-    internal static string? ClaudeRootOf(string? transcriptPath)
-    {
-        try
-        {
-            string? projects = string.IsNullOrWhiteSpace(transcriptPath)
-                ? null
-                : Path.GetDirectoryName(Path.GetDirectoryName(Path.GetFullPath(transcriptPath)));
-            return projects is not null && string.Equals(Path.GetFileName(projects), "projects", StringComparison.OrdinalIgnoreCase)
-                ? Path.GetDirectoryName(projects)
-                : null;
-        }
-        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or System.Security.SecurityException or IOException)
-        {
-            return null;
-        }
-    }
-
-    private static string? RegistryName(string sessionId, string claudeRoot)
-    {
-        try
-        {
-            string registry = Path.Combine(claudeRoot, "sessions");
-            if (!Directory.Exists(registry))
-            {
-                return null;
-            }
-
-            foreach (string path in Directory.EnumerateFiles(registry, "*.json"))
-            {
-                try
-                {
-                    using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                    using JsonDocument doc = JsonDocument.Parse(stream);
-                    JsonElement row = doc.RootElement;
-                    if (row.ValueKind == JsonValueKind.Object &&
-                        row.TryGetProperty("sessionId", out JsonElement id) && id.ValueKind == JsonValueKind.String &&
-                        string.Equals(id.GetString(), sessionId, StringComparison.Ordinal) &&
-                        row.TryGetProperty("name", out JsonElement name) && name.ValueKind == JsonValueKind.String &&
-                        !string.IsNullOrWhiteSpace(name.GetString()))
-                    {
-                        return name.GetString()!.Trim();
-                    }
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
-                {
-                    // 正在被改写或已删除的登记:跳过这一个。
-                }
-            }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-        }
-
-        return null;
-    }
-
-    /// <summary>转录尾部最近一条 <c>{"type":"custom-title","customTitle":…,"sessionId":…}</c>;只读这一种元数据行。</summary>
-    private static string? TranscriptTitle(string transcriptPath, string sessionId)
-    {
-        try
-        {
-            using var stream = new FileStream(transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            long start = Math.Max(0, stream.Length - TitleWindowBytes);
-            stream.Seek(start, SeekOrigin.Begin);
-            var buffer = new byte[stream.Length - start];
-            int total = 0;
-            while (total < buffer.Length)
-            {
-                int read = stream.Read(buffer, total, buffer.Length - total);
-                if (read == 0)
-                {
-                    break;
-                }
-
-                total += read;
-            }
-
-            string[] lines = Encoding.UTF8.GetString(buffer, 0, total).Split('\n');
-            for (int i = lines.Length - 1; i >= (start > 0 ? 1 : 0); i--)
-            {
-                if (!lines[i].Contains("\"custom-title\"", StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                try
-                {
-                    using JsonDocument doc = JsonDocument.Parse(lines[i]);
-                    JsonElement row = doc.RootElement;
-                    if (row.ValueKind == JsonValueKind.Object &&
-                        row.TryGetProperty("type", out JsonElement type) && type.ValueKind == JsonValueKind.String &&
-                        type.GetString() == "custom-title" &&
-                        (!row.TryGetProperty("sessionId", out JsonElement id) || id.ValueKind != JsonValueKind.String ||
-                         string.Equals(id.GetString(), sessionId, StringComparison.Ordinal)) &&
-                        row.TryGetProperty("customTitle", out JsonElement title) && title.ValueKind == JsonValueKind.String &&
-                        !string.IsNullOrWhiteSpace(title.GetString()))
-                    {
-                        return title.GetString()!.Trim();
-                    }
-                }
-                catch (JsonException)
-                {
-                    // 正在追加的半行:继续往前找。
-                }
-            }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
-        {
-        }
-
-        return null;
-    }
+    internal static string? ClaudeRootOf(string? transcriptPath) => ProjectNames.ClaudeRootOf(transcriptPath);
 }

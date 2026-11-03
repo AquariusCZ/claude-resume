@@ -210,6 +210,26 @@ public sealed class ProductCatalogTests : IDisposable
     }
 
     [Fact]
+    public void Discovered_entry_carries_the_transcript_it_came_from_custom_has_none()
+    {
+        // 队列行的会话名与「最近会话」时间取自同一份转录:会话目录里最近修改的那份。
+        string project = Path.Combine(_root, "repo-transcript");
+        string custom = Path.Combine(_root, "custom-transcript");
+        Directory.CreateDirectory(project);
+        Directory.CreateDirectory(custom);
+        AddSession("s1", project, DateTimeOffset.UtcNow.AddHours(-2));
+        string latest = Path.Combine(_discoveryRoot, "s1", "latest.jsonl");
+        File.WriteAllText(latest, "{\"type\":\"system\",\"cwd\":\"" + project.Replace("\\", "\\\\") + "\"}\n");
+
+        var catalog = new ProjectCatalog(tempDir: _fakeTemp, productionAppDir: _fakeAppDir);
+        List<ProjectEntry> list = catalog.Discover(Config(c => c.CustomProjects.Add(new ProjectRef { Path = custom })), _discoveryRoot);
+
+        Assert.Equal(latest, list.Single(e => e.Path == project).TranscriptPath);
+        Assert.Equal(File.GetLastWriteTimeUtc(latest), list.Single(e => e.Path == project).LastWriteUtc.UtcDateTime);
+        Assert.Null(list.Single(e => e.Path == custom).TranscriptPath);
+    }
+
+    [Fact]
     public void Missing_discovery_root_returns_only_custom()
     {
         string custom = Path.Combine(_root, "custom-only");

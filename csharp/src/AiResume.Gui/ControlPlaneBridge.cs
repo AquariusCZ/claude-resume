@@ -200,11 +200,14 @@ public sealed class ControlPlaneBridge
                 items = new object[]
                 {
                     new { name = "orbit-planner", path = @"D:\Demo\orbit-planner", lastUsed = "2026/8/8 09:12", isGit = true, isCustom = false },
+                    // Claude 桌面端临时工作区:队列显示会话名;没有会话名的写「临时会话」。
+                    new { name = "scratch-2026-08-08-3fa2c1", path = @"D:\Demo\Claude\scratch-workspaces\7c1e0d2a\scratch-2026-08-08-3fa2c1", lastUsed = "2026/8/8 08:47", isGit = false, isCustom = false, scratch = true, sessionName = "整理发布说明" },
                     new { name = "ledger-api", path = @"D:\Demo\ledger-api", lastUsed = "2026/8/8 01:40", isGit = true, isCustom = false },
                     new { name = "atlas-docs", path = @"D:\Demo\atlas-docs", lastUsed = "2026/8/7 23:05", isGit = true, isCustom = false },
                     new { name = "pixel-sprites", path = @"D:\Demo\pixel-sprites", lastUsed = "2026/8/7 18:31", isGit = false, isCustom = true },
                     new { name = "kettle-firmware", path = @"D:\Demo\kettle-firmware", lastUsed = "2026/8/7 11:02", isGit = true, isCustom = false },
                     new { name = "tide-charts", path = @"D:\Demo\tide-charts", lastUsed = "2026/8/6 21:44", isGit = true, isCustom = false },
+                    new { name = "scratch-2026-08-06-9b04de", path = @"D:\Demo\Claude\scratch-workspaces\7c1e0d2a\scratch-2026-08-06-9b04de", lastUsed = "2026/8/6 19:20", isGit = false, isCustom = false, scratch = true },
                 },
                 elapsedMs = 37,
                 hidden = Array.Empty<object>(),
@@ -347,14 +350,23 @@ public sealed class ControlPlaneBridge
         var sw = System.Diagnostics.Stopwatch.StartNew();
         ProductConfig config = _configFactory();
         List<ProjectEntry> entries = _catalog.Discover(config);
-        sw.Stop();
 
-        var items = entries.Select(e => new ProjectItem(
-            e.Name,
-            e.Path,
-            e.LastWriteUtc == DateTimeOffset.MinValue ? null : e.LastWriteUtc.ToLocalTime().ToString("yyyy/M/d HH:mm"),
-            Directory.Exists(Path.Combine(e.Path, ".git")),
-            e.IsCustom)).ToList();
+        // Claude 桌面端临时工作区的目录名对人没有意义:附上会话名(与飞书通知同一判据与读法),怎么显示由页面视图模型决定。
+        // 其余项目不读会话名，也不放进应答。会话登记按配置根只读一遍。
+        var registries = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+        var items = entries.Select(e =>
+        {
+            bool scratch = ProjectNames.IsScratchWorkspace(e.Path);
+            return new ProjectItem(
+                e.Name,
+                e.Path,
+                e.LastWriteUtc == DateTimeOffset.MinValue ? null : e.LastWriteUtc.ToLocalTime().ToString("yyyy/M/d HH:mm"),
+                Directory.Exists(Path.Combine(e.Path, ".git")),
+                e.IsCustom,
+                scratch,
+                scratch ? ScratchSessionName(e.TranscriptPath, registries) : null);
+        }).ToList();
+        sw.Stop();
 
         // 目录已经不在了的条目直接不列:这份名单的唯一作用是「扫描时跳过它」,
         // 而不存在的目录本来就扫不出来 —— 留着只是让「不再扫描 N」这个数字虚高,
@@ -365,6 +377,52 @@ public sealed class ControlPlaneBridge
             .ToList();
 
         return new ProjectsPayload(items, sw.ElapsedMilliseconds, hidden);
+    }
+
+    /// <summary>
+    /// 一份转录所属会话的名字(清洗后):队列行用发现它的那份转录——目录里最近修改的会话,「最近会话」时间所指的也是它;
+    /// 布防项用绑定会话自己的转录。没有转录、读不了或会话没有名字 → null,页面写「临时会话」。
+    /// 读名字出任何错都只丢这个名字，不让整个列表失败。<paramref name="registries"/> 按配置根缓存这一轮读到的会话登记。
+    /// </summary>
+    private static string? ScratchSessionName(string? transcriptPath, Dictionary<string, IReadOnlyDictionary<string, string>> registries)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(transcriptPath))
+            {
+                return null;
+            }
+
+            IReadOnlyDictionary<string, string>? registry = null;
+            if (ProjectNames.ClaudeRootOf(transcriptPath) is { } root && !registries.TryGetValue(root, out registry))
+            {
+                registry = ProjectNames.RegistryNames(root);
+                registries[root] = registry;
+            }
+
+            string? name = ProjectNames.SessionName(Path.GetFileNameWithoutExtension(transcriptPath), transcriptPath, registry: registry);
+            return name is null ? null : ProjectNames.Clean(name) is { Length: > 0 } cleaned ? cleaned : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 布防的临时工作区项目：读布防绑定的那个会话自己的名字(按会话 ID 在发现它的会话目录里找转录),
+    /// 而不是目录里最新那个会话的——布防后又 fork 出新会话时，两者不是同一个。不是临时工作区、会话 ID 无效、
+    /// 这个窗口还没发现过它 → null。
+    /// </summary>
+    private string? BoundSessionName(ProjectRef project, Dictionary<string, IReadOnlyDictionary<string, string>> registries)
+    {
+        if (!ProjectNames.IsScratchWorkspace(project.Path) || !Guid.TryParseExact(project.SessionId, "D", out _))
+        {
+            return null;
+        }
+
+        string? directory = _catalog.SessionDirectoryOf(project.Path);
+        return directory is null ? null : ScratchSessionName(Path.Combine(directory, project.SessionId + ".jsonl"), registries);
     }
 
     /// <summary>
@@ -868,7 +926,7 @@ public sealed class ControlPlaneBridge
             EngineLiveness.Describe(verdict),
             probeAge, config.ResumeTarget, currentCycle ? state.LastProbeReason : string.Empty)
         {
-            Projects = DescribeProjects(config, currentCycle ? state : null, statuses),
+            Projects = DescribeProjects(config, currentCycle ? state : null, statuses, BoundSessionName),
             WorkerRunning = residentWorker,
         };
     }
@@ -878,8 +936,10 @@ public sealed class ControlPlaneBridge
     /// 状态行已被引擎存活判定改写(如未核实)时以改写后的为准;只有 limited(待续跑)才展开等待原因。
     /// </summary>
     private static IReadOnlyList<ArmProjectItem> DescribeProjects(
-        ProductConfig config, CheckerState? state, IReadOnlyList<ProjectStatusItem> statuses)
+        ProductConfig config, CheckerState? state, IReadOnlyList<ProjectStatusItem> statuses,
+        Func<ProjectRef, Dictionary<string, IReadOnlyDictionary<string, string>>, string?> boundSessionName)
     {
+        var registries = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
         return config.Selected.Select(project =>
         {
             ProjectStatusItem? status = statuses.FirstOrDefault(item => PathEquals(item.Path, project.Path));
@@ -913,7 +973,12 @@ public sealed class ControlPlaneBridge
                 note?.Detail,
                 note?.ResetAtUnix,
                 note?.InterruptedAtUnix,
-                note?.Client);
+                note?.Client)
+            {
+                // 布防配置里的 name 仍是目录名(它会进续跑引擎日志);临时工作区另附布防绑定的那个会话的名字。
+                Scratch = ProjectNames.IsScratchWorkspace(project.Path),
+                SessionName = boundSessionName(project, registries),
+            };
         }).ToArray();
     }
 
@@ -1349,7 +1414,9 @@ public sealed class ControlPlaneBridge
         [property: JsonPropertyName("path")] string Path,
         [property: JsonPropertyName("lastUsed")] string? LastUsed,
         [property: JsonPropertyName("isGit")] bool IsGit,
-        [property: JsonPropertyName("isCustom")] bool IsCustom);
+        [property: JsonPropertyName("isCustom")] bool IsCustom,
+        [property: JsonPropertyName("scratch")] bool Scratch = false,
+        [property: JsonPropertyName("sessionName")] string? SessionName = null);
 
     private sealed record HiddenItem(
         [property: JsonPropertyName("name")] string Name,
@@ -1415,7 +1482,16 @@ public sealed class ControlPlaneBridge
         [property: JsonPropertyName("detail")] string? Detail,
         [property: JsonPropertyName("resetAtUnix")] long? ResetAtUnix,
         [property: JsonPropertyName("interruptedAtUnix")] long? InterruptedAtUnix,
-        [property: JsonPropertyName("client")] string? Client);
+        [property: JsonPropertyName("client")] string? Client)
+    {
+        /// <summary>是不是 Claude 桌面端临时工作区(判据见 <see cref="ProjectNames.IsScratchWorkspace"/>)。</summary>
+        [JsonPropertyName("scratch")]
+        public bool Scratch { get; init; }
+
+        /// <summary>临时工作区布防绑定的那个会话的名字(清洗后);读不到或不是临时工作区为 null(不写出)。</summary>
+        [JsonPropertyName("sessionName")]
+        public string? SessionName { get; init; }
+    }
 
     private sealed record ProjectStatusItem(
         [property: JsonPropertyName("path")] string Path,

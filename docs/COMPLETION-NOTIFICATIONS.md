@@ -239,7 +239,7 @@ lark-cli.exe im +messages-send --as bot --user-id <open_id> --text <文案> --id
 
 ### 5.7 文案
 
-`CompletionNotifier.BuildText` 生成两到三行：第一行说发生了什么；第二行“来源 · 模型短名 · HH:mm · 「会话名」”，模型只在事件带 `model` 时出现（如 `claude-opus-5-5` 显示为 `Opus 5.5`），会话连着 Remote Control 时末尾加“ · 远程已连接”；需要人动手时第三行写怎么做。项目名取 `cwd` 的末级目录名；Claude 桌面端的临时工作区（末级目录形如 `scratch-YYYY-MM-DD-xxxxxx`、上级又有 `scratch-workspaces`，两样都要）目录名对人没有意义，改用会话名，没有会话名写“临时会话”，此时第二行不再重复会话名。会话名只对 Claude Code 事件取：先读进程登记 `sessions\<pid>.json` 的 `name`（桌面端侧栏标题、`/rename`），会话已关时退回转录尾部最近一条 `custom-title`；换行与控制字符换成空格（自动标题来自对话内容，不能在飞书里伪造出单独一行），超过 20 个字截断加“…”，只进消息、不进日志。时间按 Worker 所在机器的本地时区。来源名为 Claude Code、Codex、Cline、Qoder、OpenCode、AI Resume。正文不含回答内容、错误详情或完整路径。
+`CompletionNotifier.BuildText` 生成两到三行：第一行说发生了什么；第二行“来源 · 模型短名 · HH:mm · 「会话名」”，模型只在事件带 `model` 时出现（如 `claude-opus-5-5` 显示为 `Opus 5.5`），会话连着 Remote Control 时末尾加“ · 远程已连接”；需要人动手时第三行写怎么做。项目名取 `cwd` 的末级目录名；Claude 桌面端的临时工作区（末级目录形如 `scratch-YYYY-MM-DD-xxxxxx`、上级又有 `scratch-workspaces`，两样都要）目录名对人没有意义，改用会话名，没有会话名写“临时会话”，此时第二行不再重复会话名。临时工作区判据、会话名读法与清洗和控制面续跑队列共用 `ProjectNames`（`IsScratchWorkspace`、`SessionName`、`Clean`），队列行据此显示同一个名字。会话名只对 Claude Code 事件取：先读进程登记 `sessions\<pid>.json` 的 `name`（桌面端侧栏标题、`/rename`），会话已关时退回转录尾部最近一条 `custom-title`；换行与控制字符换成空格（自动标题来自对话内容，不能在飞书里伪造出单独一行），超过 20 个字截断加“…”，只进消息、不进日志。时间按 Worker 所在机器的本地时区。来源名为 Claude Code、Codex、Cline、Qoder、OpenCode、AI Resume。正文不含回答内容、错误详情或完整路径。
 
 | 事件 | 第一行（括号内为第三行建议或说明） |
 |---|---|

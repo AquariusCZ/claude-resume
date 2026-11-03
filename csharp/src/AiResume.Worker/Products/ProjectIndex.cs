@@ -128,6 +128,26 @@ public sealed class ProjectIndex
     }
 
     /// <summary>
+    /// 取指定会话目录的索引条目,不看目录修改时间;命中即自动 MarkSeen。
+    /// 发现时用它:最新那份转录每次按文件修改时间重挑,索引只用来省掉重读头部取 cwd。
+    /// </summary>
+    public bool TryGetEntry(string sessionDir, out ProjectIndexEntry entry)
+    {
+        lock (_lock)
+        {
+            if (_entries.TryGetValue(sessionDir, out ProjectIndexEntry? existing))
+            {
+                entry = existing;
+                _seen.Add(sessionDir);
+                return true;
+            }
+
+            entry = null!;
+            return false;
+        }
+    }
+
+    /// <summary>
     /// 新增或更新索引条目,并标记为已见。
     /// </summary>
     public void Put(ProjectIndexEntry entry)

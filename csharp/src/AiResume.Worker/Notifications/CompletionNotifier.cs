@@ -1242,13 +1242,16 @@ public sealed class CompletionNotifier
 
     /// <summary>
     /// 用户认得出的项目名:工作目录末级。Claude 桌面端的临时工作区(<c>scratch-workspaces\…\scratch-YYYY-MM-DD-xxxxxx</c>)
-    /// 目录名对人没有意义,改用会话名,没有就写「临时会话」。判据与控制面续跑队列共用 <see cref="ProjectNames.IsScratchWorkspace"/>。
+    /// 目录名对人没有意义,改用会话名,没有就写「临时会话」。判据与控制面续跑队列共用
+    /// <see cref="AiResume.Worker.Products.ProjectNames.IsScratchWorkspace"/>。
     /// </summary>
     internal static string ProjectDisplayName(string? cwd, string? sessionName)
     {
-        if (ProjectNames.IsScratchWorkspace(cwd))
+        if (AiResume.Worker.Products.ProjectNames.IsScratchWorkspace(cwd))
         {
-            return string.IsNullOrWhiteSpace(sessionName) ? "临时会话" : Shorten(sessionName);
+            // 清洗后为空(名字只有零宽或方向控制字符)同样算没有名字。
+            string name = string.IsNullOrWhiteSpace(sessionName) ? string.Empty : Shorten(sessionName);
+            return name.Length == 0 ? "临时会话" : name;
         }
 
         string folder = string.IsNullOrWhiteSpace(cwd) ? string.Empty : Path.GetFileName(cwd.TrimEnd('\\', '/'));
@@ -1256,20 +1259,21 @@ public sealed class CompletionNotifier
     }
 
     /// <summary>第二行的「会话名」:项目名已经就是会话名(临时工作区)时不重复。</summary>
-    private static string? SessionLabel(string projectName, string? sessionName) =>
-        string.IsNullOrWhiteSpace(sessionName) || string.Equals(Shorten(sessionName), projectName, StringComparison.Ordinal)
-            ? null
-            : "「" + Shorten(sessionName) + "」";
+    private static string? SessionLabel(string projectName, string? sessionName)
+    {
+        string name = string.IsNullOrWhiteSpace(sessionName) ? string.Empty : Shorten(sessionName);
+        return name.Length == 0 || string.Equals(name, projectName, StringComparison.Ordinal) ? null : "「" + name + "」";
+    }
 
     private static string SessionSuffix(string projectName, string? sessionName) => SessionLabel(projectName, sessionName) ?? string.Empty;
 
     /// <summary>
     /// 会话名清洗后截到 20 个字符(按文本元素,不切断表情或代理对)。自动标题来自对话内容,
-    /// 换行与控制字符换成空格(<see cref="ProjectNames.Clean"/>),免得在飞书里伪造出单独的一行。
+    /// 换行与控制字符换成空格(<see cref="AiResume.Worker.Products.ProjectNames.Clean"/>),免得在飞书里伪造出单独的一行。
     /// </summary>
     private static string Shorten(string value)
     {
-        string cleaned = ProjectNames.Clean(value);
+        string cleaned = AiResume.Worker.Products.ProjectNames.Clean(value);
         var info = new StringInfo(cleaned);
         return info.LengthInTextElements <= 20 ? cleaned : info.SubstringByTextElements(0, 19) + "…";
     }

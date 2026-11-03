@@ -111,6 +111,9 @@ public sealed class ProjectIndexTests : IDisposable
         Assert.Single(second);
         Assert.Equal(first[0].Path, second[0].Path);
         Assert.Equal(first[0].LastWriteUtc, second[0].LastWriteUtc);
+        // 命中索引时同样带着发现它的那份转录(队列行据此读临时工作区的会话名)。
+        Assert.Equal(jsonl, first[0].TranscriptPath);
+        Assert.Equal(jsonl, second[0].TranscriptPath);
     }
 
     // ---- 3. 增量更新 ----
@@ -174,6 +177,59 @@ public sealed class ProjectIndexTests : IDisposable
         // 索引条目应被移除:重新加载索引,不应包含 s-b。
         var index = ProjectIndex.Load(_indexPath);
         Assert.False(index.TryGet(Path.Combine(_discoveryRoot, "s-b"), DateTimeOffset.MinValue, out _));
+    }
+
+    // ---- 4b. 续写已有会话:目录 mtime 不变 ----
+
+    [Fact]
+    public void Appending_to_an_older_session_moves_latest_even_when_dir_mtime_is_unchanged()
+    {
+        // 同一目录:先有 A,后来 fork 出 B(索引记成 B),之后又接着写 A——追加不改目录 mtime。
+        string project = Path.Combine(_root, "repo-fork");
+        Directory.CreateDirectory(project);
+        string a = AddSession("s1", project, DateTimeOffset.UtcNow.AddHours(-3));
+        string b = AddSession("s1", project, DateTimeOffset.UtcNow.AddHours(-2));
+        string sessionDir = Path.Combine(_discoveryRoot, "s1");
+        DateTimeOffset dirMtime = DateTimeOffset.UtcNow.AddHours(-2);
+        TouchDir(sessionDir, dirMtime);
+
+        var catalog = new ProjectCatalog(tempDir: _fakeTemp, productionAppDir: _fakeAppDir, indexPath: _indexPath);
+        Assert.Equal(b, Assert.Single(catalog.Discover(Config(), _discoveryRoot)).TranscriptPath);
+
+        File.AppendAllText(a, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"x\"}}\n");
+        File.SetLastWriteTimeUtc(a, DateTime.UtcNow.AddMinutes(-1));
+        TouchDir(sessionDir, dirMtime);
+
+        // 重开窗口(新实例读持久化的索引):最新那份是 A,「最近会话」时间是 A 的。
+        var reopened = new ProjectCatalog(tempDir: _fakeTemp, productionAppDir: _fakeAppDir, indexPath: _indexPath);
+        ProjectEntry entry = Assert.Single(reopened.Discover(Config(), _discoveryRoot));
+        Assert.Equal(a, entry.TranscriptPath);
+        Assert.Equal(File.GetLastWriteTimeUtc(a), entry.LastWriteUtc.UtcDateTime);
+        Assert.Equal(sessionDir, reopened.SessionDirectoryOf(project));
+    }
+
+    [Fact]
+    public void Same_latest_file_reuses_cached_cwd_but_reports_fresh_time()
+    {
+        string project = Path.Combine(_root, "repo-append");
+        Directory.CreateDirectory(project);
+        string jsonl = AddSession("s1", project, DateTimeOffset.UtcNow.AddHours(-1));
+        var catalog = new ProjectCatalog(tempDir: _fakeTemp, productionAppDir: _fakeAppDir, indexPath: _indexPath);
+        Assert.Single(catalog.Discover(Config(), _discoveryRoot));
+
+        // 内容换成读不出 cwd 的东西:还是索引里那一份就不再读头部(否则项目会消失),时间则取列目录时的新值。
+        File.WriteAllText(jsonl, "not valid json at all\n");
+        catalog.ClearCache();
+        ProjectEntry entry = Assert.Single(catalog.Discover(Config(), _discoveryRoot));
+        Assert.Equal(project, entry.Path);
+        Assert.Equal(File.GetLastWriteTimeUtc(jsonl), entry.LastWriteUtc.UtcDateTime);
+
+        // 什么都没变:索引条目不标脏,不重写索引文件。
+        DateTime written = File.GetLastWriteTimeUtc(_indexPath);
+        File.SetLastWriteTimeUtc(_indexPath, written.AddMinutes(-5));
+        catalog.ClearCache();
+        Assert.Single(catalog.Discover(Config(), _discoveryRoot));
+        Assert.Equal(written.AddMinutes(-5), File.GetLastWriteTimeUtc(_indexPath));
     }
 
     // ---- 5. 空结果缓存 ----

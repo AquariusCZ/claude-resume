@@ -363,6 +363,87 @@ public sealed class GuiPageContractTests
             """);
 
     [Fact]
+    public void 临时工作区显示会话名_没有就写临时会话_其余项目照旧用目录名()
+    {
+        // 页面接线:队列行、续跑预览都经视图模型取名字,行的第二行与读屏文本也从它来;状态灯直接用布防项自带的名字。
+        string html = File.ReadAllText(RepositoryFile("csharp", "src", "AiResume.Gui", "wwwroot", "index.html"));
+        Assert.Contains("const label = AR.rowLabel(it, ctx);", html, StringComparison.Ordinal);
+        Assert.Contains("<span class=\"nm\" title=\"${esc(label.title)}\">${esc(label.text)}", html, StringComparison.Ordinal);
+        Assert.Contains("<span class=\"pa\" title=\"${esc(label.subTitle)}\">${esc(label.sub)}</span>", html, StringComparison.Ordinal);
+        Assert.Contains("aria-label=\"选择 ${esc(label.aria)}\"", html, StringComparison.Ordinal);
+        Assert.Contains("aria-label=\"从队列移除 ${esc(label.aria)}\"", html, StringComparison.Ordinal);
+        Assert.Contains("aria-label=\"${esc(label.aria)} 的续跑模型\"", html, StringComparison.Ordinal);
+        Assert.Contains("label: AR.projectLabel(p, 20)", html, StringComparison.Ordinal);
+        Assert.Contains("label: AR.rowLabel(it, ctx, 20)", html, StringComparison.Ordinal);
+        Assert.Contains("<td title=\"${esc(r.label.title)}\">${esc(r.label.text)}</td>", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("esc(it.name)", html, StringComparison.Ordinal);
+
+        RunViewModel("""
+            const scratchPath = 'C:\\Users\\u\\AppData\\Local\\Claude-Data\\claude_x\\scratch-workspaces\\g1\\g2\\scratch-2026-10-28-f22194';
+            const named = { name: 'scratch-2026-10-28-f22194', path: scratchPath, scratch: true, sessionName: '整理发布说明' };
+            let l = AR.projectLabel(named);
+            assert.equal(l.text, '整理发布说明');
+            assert.match(l.title, /「整理发布说明」/); assert.match(l.title, /临时工作区 scratch-2026-10-28-f22194$/);
+            // 第二行写「临时工作区 <目录名>」(完整路径太长,窄列里能区分两行的目录名会被省略号截掉),完整路径进悬停;读屏文本也带目录名。
+            assert.equal(l.sub, '临时工作区 scratch-2026-10-28-f22194'); assert.equal(l.subTitle, scratchPath);
+            assert.equal(l.aria, '整理发布说明(临时工作区 scratch-2026-10-28-f22194)');
+            // 没有会话名(读不到、会话没起名、只有空白):写「临时会话」,不露目录名;悬停、第二行与读屏文本说明它是哪个目录。
+            for (const sessionName of [undefined, null, '', '   ', 42]) {
+              l = AR.projectLabel({ ...named, sessionName });
+              assert.equal(l.text, '临时会话'); assert.match(l.title, /临时工作区 scratch-2026-10-28-f22194$/); assert.doesNotMatch(l.title, /「/);
+              assert.equal(l.aria, '临时会话(临时工作区 scratch-2026-10-28-f22194)');
+            }
+            const other = AR.projectLabel({ name: 'scratch-2026-10-29-03a48e', path: scratchPath.replace('10-28-f22194', '10-29-03a48e'), scratch: true });
+            assert.notEqual(other.aria, AR.projectLabel({ ...named, sessionName: null }).aria, '两行都叫「临时会话」时读屏文本仍能区分');
+            assert.notEqual(other.sub, AR.projectLabel({ ...named, sessionName: null }).sub);
+            // 判据在后端(ProjectNames):没有 scratch 标记的一律用目录名,哪怕目录名长得像临时工作区、或带着会话名。
+            assert.equal(AR.projectLabel({ name: 'scratch-2026-10-29-03a48e', path: 'C:\\Users\\u\\scratch-2026-10-29-03a48e', sessionName: '不该用它' }).text, 'scratch-2026-10-29-03a48e');
+            l = AR.projectLabel({ name: 'ledger-api', path: 'C:\\demo\\ledger-api', scratch: false });
+            assert.deepEqual([l.text, l.title, l.sub, l.subTitle, l.aria], ['ledger-api', 'ledger-api', 'C:\\demo\\ledger-api', 'C:\\demo\\ledger-api', 'ledger-api'],
+              '普通项目与改动前逐字一致:名字与悬停是目录名,第二行是完整路径');
+            assert.equal(AR.projectLabel({ name: 'ledger-api', path: 'C:\\demo\\ledger-api' }, 4).text, 'ledger-api', '目录名不截断');
+            assert.equal(AR.projectLabel({ name: '', path: 'D:\\' }).text, 'D:\\', '目录名为空(盘符根)时退回路径');
+            // 一行还要放下原因的地方按字截断会话名:超过 20 个留 19 个加「…」,不切断表情(与飞书通知同一算法);队列行不截,样式省略、悬停看全。
+            const long = '一个非常非常长的会话名字超过了二十个字的上限';
+            assert.equal(AR.projectLabel({ ...named, sessionName: long }, 20).text, '一个非常非常长的会话名字超过了二十个字…');
+            assert.equal(AR.projectLabel({ ...named, sessionName: long }).text, long);
+            assert.match(AR.projectLabel({ ...named, sessionName: long }, 20).title, new RegExp('「' + long + '」'));
+            assert.equal(AR.projectLabel({ ...named, sessionName: '恰好二十个字的会话名字一二三四五六七八九' }, 20).text, '恰好二十个字的会话名字一二三四五六七八九');
+            const family = '\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}';
+            assert.equal(AR.projectLabel({ ...named, sessionName: family.repeat(21) }, 20).text, family.repeat(19) + '…');
+
+            // 队列行用哪个会话的名字:这一行说的是哪个会话就用哪个。已布防用布防绑定的会话(arm.get 按会话 ID 读的),
+            // 读不到就写「临时会话」,不拿目录里最新会话(可能是布防后 fork 出来的)的名字顶替;未布防用目录里最近的会话。
+            const queueRow = { ...named, sessionName: '整理发布说明 (fork)' };
+            const boundItem = { path: scratchPath, name: 'scratch-2026-10-28-f22194', scratch: true, sessionName: '整理发布说明' };
+            assert.equal(AR.rowLabel(queueRow, { armed: false, armProject: null }).text, '整理发布说明 (fork)');
+            assert.equal(AR.rowLabel(queueRow, { armed: true, armProject: boundItem }).text, '整理发布说明');
+            assert.equal(AR.rowLabel(queueRow, { armed: true, armProject: { ...boundItem, sessionName: undefined } }).text, '临时会话');
+            assert.equal(AR.rowLabel(queueRow, { armed: true, armProject: null }).text, '整理发布说明 (fork)', '不在本轮布防的行照旧');
+            assert.equal(AR.rowLabel(queueRow, { armed: true, armProject: boundItem }, 4).text, '整理发…');
+            const plain = { name: 'ledger-api', path: 'C:\\demo\\ledger-api', scratch: false };
+            assert.equal(AR.rowLabel(plain, { armed: true, armProject: { path: plain.path, name: 'ledger-api', scratch: false } }).text, 'ledger-api');
+
+            // 状态灯点名项目时用布防项自带的名字(布防绑定的那个会话,截到 20 字);不是临时工作区的照旧用目录名。
+            const now = 1800000000;
+            const target = { providerId: 'claude-subscription', agent: 'claudecode', modelId: 'claude-opus-5-5' };
+            const waiting = { armed: true, selected: [scratchPath], resumeTarget: target, phase: 'waiting', engine: 'Alive',
+              projects: [{ ...boundItem, sessionName: long, status: 'limited', reason: 'session-in-use', reasonText: '会话开着 · 关闭后续跑' }] };
+            assert.equal(AR.beaconModel(waiting, null, now).sub, '一个非常非常长的会话名字超过了二十个字… 会话开着 · 关闭后续跑');
+            const unnamed = { ...waiting, projects: [{ ...waiting.projects[0], sessionName: undefined }] };
+            assert.equal(AR.beaconModel(unnamed, null, now).sub, '临时会话 会话开着 · 关闭后续跑');
+            const unmarked = { ...waiting, projects: [{ ...waiting.projects[0], scratch: undefined }] };
+            assert.equal(AR.beaconModel(unmarked, null, now).sub, 'scratch-2026-10-28-f22194 会话开着 · 关闭后续跑', '没有临时工作区标记就照旧用目录名');
+            const running = { ...waiting, phase: 'resuming', projects: [{ ...waiting.projects[0], status: 'running', modelId: 'claude-opus-5-5' }] };
+            assert.equal(AR.beaconModel(running, null, now).sub, '一个非常非常长的会话名字超过了二十个字… · Opus 5.5');
+            const rearm = { ...waiting, projects: [{ ...waiting.projects[0], category: 'failure', reason: 'quota:provider-changed', reasonText: '账号已变化 · 重新布防' }] };
+            assert.equal(AR.beaconModel(rearm, null, now).sub, '一个非常非常长的会话名字超过了二十个字… 账号已变化 · 重新布防');
+            const unsettled = { ...waiting, projects: [{ ...waiting.projects[0], status: null, category: 'waiting', reasonText: '会话记录未核实' }] };
+            assert.equal(AR.beaconModel(unsettled, null, now).sub, '一个非常非常长的会话名字超过了二十个字… 会话记录未核实');
+            """);
+    }
+
+    [Fact]
     public void 状态灯_引擎与进程门禁压过一切_登录过期标红_等待原因逐项目说清()
         => RunViewModel("""
             const now = 1800000000;

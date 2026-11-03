@@ -547,6 +547,140 @@ public class ControlPlaneBridgeProjectsTests : IDisposable
         Assert.Contains(GetHiddenPaths(payload), h => string.Equals(h, hiddenDir, StringComparison.OrdinalIgnoreCase));
     }
 
+    /// <summary>在假 Claude 配置根下写一份会话转录:首行带 cwd,其后是给定的元数据行。返回转录路径。</summary>
+    private static string WriteTranscript(string claudeRoot, string folder, string sessionId, string cwd, params string[] lines)
+    {
+        string dir = Path.Combine(claudeRoot, "projects", folder);
+        Directory.CreateDirectory(dir);
+        string path = Path.Combine(dir, sessionId + ".jsonl");
+        string head = JsonSerializer.Serialize(new { type = "user", cwd, sessionId, message = new { role = "user", content = "x" } });
+        File.WriteAllText(path, string.Join("\n", new[] { head }.Concat(lines)) + "\n");
+        return path;
+    }
+
+    [Fact]
+    public async Task List_临时工作区附上会话名_没有名字不附_普通项目不读会话名()
+    {
+        // Arrange: 假用户目录下的 Claude 会话(测试红线:不碰真实 ~/.claude)。
+        string claudeRoot = Path.Combine(_fakeHome, ".claude");
+        string workspaces = Path.Combine(_tempRoot, "Claude-Data", "claude_x", "scratch-workspaces", "g1", "g2");
+        string named = Path.Combine(workspaces, "scratch-2026-10-28-f22194");
+        string untitled = Path.Combine(workspaces, "scratch-2026-10-29-03a48e");
+        string normal = Path.Combine(_tempRoot, "ledger-api");
+        foreach (string dir in new[] { named, untitled, normal })
+        {
+            Directory.CreateDirectory(dir);
+        }
+
+        const string namedSession = "11111111-1111-1111-1111-111111111111";
+        WriteTranscript(claudeRoot, "C--scratch-a", namedSession, named,
+            """{"type":"custom-title","customTitle":"旧标题","sessionId":"11111111-1111-1111-1111-111111111111"}""",
+            """{"type":"custom-title","customTitle":"整理\n发布说明","sessionId":"11111111-1111-1111-1111-111111111111"}""");
+        WriteTranscript(claudeRoot, "C--scratch-b", "22222222-2222-2222-2222-222222222222", untitled);
+        WriteTranscript(claudeRoot, "C--ledger-api", "33333333-3333-3333-3333-333333333333", normal,
+            """{"type":"custom-title","customTitle":"不该出现在应答里","sessionId":"33333333-3333-3333-3333-333333333333"}""");
+        var bridge = CreateBridge();
+
+        // Act
+        string response = await bridge.HandleAsync("""{"id":"n1","type":"projects.list"}""", CancellationToken.None);
+        JsonElement items = GetPayload(response).GetProperty("items");
+        JsonElement Item(string path) => items.EnumerateArray()
+            .Single(e => string.Equals(e.GetProperty("path").GetString(), path, StringComparison.OrdinalIgnoreCase));
+
+        // Assert: 后端只给事实(目录名照旧、scratch 标记、清洗后的会话名),怎么显示由页面视图模型决定。
+        Assert.Equal("scratch-2026-10-28-f22194", Item(named).GetProperty("name").GetString());
+        Assert.True(Item(named).GetProperty("scratch").GetBoolean());
+        Assert.Equal("整理 发布说明", Item(named).GetProperty("sessionName").GetString());
+        Assert.True(Item(untitled).GetProperty("scratch").GetBoolean());
+        Assert.False(Item(untitled).TryGetProperty("sessionName", out _), "没有名字时不附 sessionName,页面写「临时会话」");
+        Assert.False(Item(normal).GetProperty("scratch").GetBoolean());
+        Assert.False(Item(normal).TryGetProperty("sessionName", out _));
+        Assert.DoesNotContain("不该出现在应答里", response, StringComparison.Ordinal);
+
+        // 会话开着时进程登记里的名字(桌面端侧栏标题)优先,与飞书通知同一读法。
+        Directory.CreateDirectory(Path.Combine(claudeRoot, "sessions"));
+        File.WriteAllText(Path.Combine(claudeRoot, "sessions", "41440.json"),
+            JsonSerializer.Serialize(new { pid = 41440, sessionId = namedSession, cwd = named, name = "通知文案重做", entrypoint = "claude-desktop" }));
+        items = GetPayload(await bridge.HandleAsync("""{"id":"n2","type":"projects.list"}""", CancellationToken.None)).GetProperty("items");
+        Assert.Equal("通知文案重做", Item(named).GetProperty("sessionName").GetString());
+    }
+
+    [Fact]
+    public async Task 布防的临时工作区用绑定会话自己的名字_不拿目录里最新会话的名字顶替()
+    {
+        // Arrange: 同一个临时工作区里有原会话(布防绑定)和后来 fork 出的会话(目录里最新)。
+        string claudeRoot = Path.Combine(_fakeHome, ".claude");
+        string scratch = Path.Combine(_tempRoot, "Claude-Data", "claude_x", "scratch-workspaces", "g1", "g2", "scratch-2026-10-28-f22194");
+        string normal = Path.Combine(_tempRoot, "ledger-api");
+        Directory.CreateDirectory(scratch);
+        Directory.CreateDirectory(normal);
+        const string bound = "11111111-1111-1111-1111-111111111111";
+        string original = WriteTranscript(claudeRoot, "C--scratch", bound, scratch,
+            """{"type":"custom-title","customTitle":"整理发布说明","sessionId":"11111111-1111-1111-1111-111111111111"}""");
+        string fork = WriteTranscript(claudeRoot, "C--scratch", "22222222-2222-2222-2222-222222222222", scratch,
+            """{"type":"custom-title","customTitle":"整理发布说明 (fork)","sessionId":"22222222-2222-2222-2222-222222222222"}""");
+        WriteTranscript(claudeRoot, "C--ledger-api", "33333333-3333-3333-3333-333333333333", normal);
+        File.SetLastWriteTimeUtc(original, DateTime.UtcNow.AddHours(-2));
+        File.SetLastWriteTimeUtc(fork, DateTime.UtcNow.AddMinutes(-5));
+        new ProductConfigStore(_configDir).Save(new ProductConfig
+        {
+            Selected = new List<ProjectRef>
+            {
+                new() { Name = "scratch-2026-10-28-f22194", Path = scratch, SessionId = bound },
+                new() { Name = "ledger-api", Path = normal, SessionId = "33333333-3333-3333-3333-333333333333" },
+            },
+        });
+        var bridge = new ControlPlaneBridge(
+            catalog: new ProjectCatalog(userProfilePath: () => _fakeHome, tempDir: _systemp, productionAppDir: _prodApp, indexPath: null, shadowRoot: _shadowRoot),
+            configStore: new ProductConfigStore(_configDir),
+            stateStore: new ProductStateStore(_dbPath),
+            engineProcessDetector: () => true,
+            workerPing: () => true);
+
+        // Act: 页面先列队列(记下每个项目的会话目录),再读布防状态。
+        JsonElement items = GetPayload(await bridge.HandleAsync("""{"id":"q","type":"projects.list"}""", CancellationToken.None)).GetProperty("items");
+        JsonElement projects = GetPayload(await bridge.HandleAsync("""{"id":"a","type":"arm.get"}""", CancellationToken.None)).GetProperty("projects");
+        JsonElement Project(string path) => projects.EnumerateArray()
+            .Single(e => string.Equals(e.GetProperty("path").GetString(), path, StringComparison.OrdinalIgnoreCase));
+
+        // Assert: 队列行说的是目录里最近的会话;布防项说的是布防绑定的那个。配置里的 name 仍是目录名(它会进续跑引擎日志)。
+        Assert.Equal("整理发布说明 (fork)", items.EnumerateArray()
+            .Single(e => string.Equals(e.GetProperty("path").GetString(), scratch, StringComparison.OrdinalIgnoreCase)).GetProperty("sessionName").GetString());
+        Assert.Equal("scratch-2026-10-28-f22194", Project(scratch).GetProperty("name").GetString());
+        Assert.True(Project(scratch).GetProperty("scratch").GetBoolean());
+        Assert.Equal("整理发布说明", Project(scratch).GetProperty("sessionName").GetString());
+        Assert.False(Project(normal).GetProperty("scratch").GetBoolean());
+        Assert.False(Project(normal).TryGetProperty("sessionName", out _));
+        Assert.Equal("scratch-2026-10-28-f22194", new ProductConfigStore(_configDir).Load().Selected[0].Name);
+    }
+
+    [Fact]
+    public async Task List_会话名读不了只丢名字_不丢整行()
+    {
+        string claudeRoot = Path.Combine(_fakeHome, ".claude");
+        string scratch = Path.Combine(_tempRoot, "Claude-Data", "claude_x", "scratch-workspaces", "g1", "g2", "scratch-2026-10-28-f22194");
+        Directory.CreateDirectory(scratch);
+        string transcript = WriteTranscript(claudeRoot, "C--scratch", "11111111-1111-1111-1111-111111111111", scratch,
+            """{"type":"custom-title","customTitle":"整理发布说明","sessionId":"11111111-1111-1111-1111-111111111111"}""");
+        // 带索引:再次发现时 cwd 取自索引、不重读转录,这样行能否留下与 3 秒发现缓存是否过期无关。
+        var bridge = new ControlPlaneBridge(
+            catalog: new ProjectCatalog(userProfilePath: () => _fakeHome, tempDir: _systemp, productionAppDir: _prodApp,
+                indexPath: Path.Combine(_shadowRoot, "project-index.json"), shadowRoot: _shadowRoot),
+            configStore: new ProductConfigStore(_configDir),
+            stateStore: new ProductStateStore(_dbPath));
+        JsonElement first = GetPayload(await bridge.HandleAsync("""{"id":"r1","type":"projects.list"}""", CancellationToken.None));
+        Assert.Equal("整理发布说明", first.GetProperty("items").EnumerateArray().Single().GetProperty("sessionName").GetString());
+
+        // 转录被独占打开(读不了):再列一次,行还在、只是没有会话名(页面写「临时会话」)。
+        using (new FileStream(transcript, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            JsonElement item = GetPayload(await bridge.HandleAsync("""{"id":"r2","type":"projects.list"}""", CancellationToken.None))
+                .GetProperty("items").EnumerateArray().Single();
+            Assert.True(item.GetProperty("scratch").GetBoolean());
+            Assert.False(item.TryGetProperty("sessionName", out _));
+        }
+    }
+
     // ==================== 选目录 ====================
 
     [Fact]

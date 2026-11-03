@@ -863,6 +863,51 @@ const AR = (() => {
   };
 
   /**
+   * 按字(字素簇)截断:超过 max 个留 max - 1 个加「…」,不切断表情或代理对——与飞书通知截会话名同样按字素簇数
+   * (个别文字的连字,两边的 Unicode 版本可能差一字)。
+   */
+  function clip(text, max) {
+    const s = String(text);
+    const parts = typeof Intl === 'object' && typeof Intl.Segmenter === 'function'
+      ? Array.from(new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(s), x => x.segment)
+      : Array.from(s);
+    return parts.length <= max ? s : parts.slice(0, max - 1).join('') + '…';
+  }
+
+  /**
+   * 用户认得出的项目名,与飞书通知同一规则(判据与会话名读法在后端 ProjectNames):Claude 桌面端临时工作区
+   * (scratch-workspaces\…\scratch-YYYY-MM-DD-xxxxxx)的目录名对人没有意义,改用会话名,没有就写「临时会话」;
+   * 其余项目照旧用目录名。max 给出时会话名按字截断(状态灯这种一行还要放下原因的地方),目录名不截。
+   * 队列行第二行(sub):临时工作区写「临时工作区 <目录名>」——完整路径太长,窄列里能区分两行的目录名正好被省略号截掉,
+   * 两个都叫「临时会话」的行就分不清;完整路径进第二行的悬停(subTitle)。读屏文本(aria)同样带上目录名。
+   */
+  function projectLabel(item, max) {
+    const folder = String((item && (item.name || item.path)) || '');
+    const path = String((item && item.path) || '');
+    if (!item || item.scratch !== true) return { text: folder, title: folder, sub: path, subTitle: path, aria: folder, scratch: false };
+    const session = typeof item.sessionName === 'string' ? item.sessionName.trim() : '';
+    const name = session || '临时会话';
+    return {
+      text: max ? clip(name, max) : name,
+      title: (session ? `「${session}」 · ` : '') + `Claude 桌面端临时工作区 ${folder}`,
+      sub: `临时工作区 ${folder}`,
+      subTitle: path,
+      aria: `${name}(临时工作区 ${folder})`,
+      scratch: true,
+    };
+  }
+
+  /**
+   * 队列一行用哪个会话的名字:这一行说的是哪个会话就用哪个。已布防时是布防绑定的会话(arm.get 按会话 ID 读的名字,
+   * 读不到就写「临时会话」,不拿目录里别的会话的名字顶替——布防后又 fork 了,最新的那个不是要续跑的);
+   * 未布防时是目录里最近的会话(projects.list,与「最近会话」时间同一份,勾选后预览绑定的也是它)。
+   */
+  function rowLabel(item, ctx, max) {
+    const ap = ctx && ctx.armed ? ctx.armProject : null;
+    return projectLabel(ap ? { ...item, scratch: item.scratch === true || ap.scratch === true, sessionName: ap.sessionName } : item, max);
+  }
+
+  /**
    * 队列一行:已布防时是固定模型 + 本轮等待原因(短句 + 悬停说明);未布防时勾选的行出现模型下拉 + 会话事实,
    * 没勾选的行只显示最近会话时间。状态短句要放得进窄列:时间只补「HH:mm」,解释放进 title。
    */
@@ -966,8 +1011,12 @@ const AR = (() => {
     return `已选 ${rows.length} 个 · ` + [...counts].map(([k, v]) => `${k} ×${v}`).join(' · ');
   }
 
-  /** 状态灯:它在不在干活。后台服务与进程门禁压过一切阶段文案;登录过期且已布防时标红。 */
+  /**
+   * 状态灯:它在不在干活。后台服务与进程门禁压过一切阶段文案;登录过期且已布防时标红。
+   * 点名项目时用认得出的名字:布防项自带临时工作区标记与布防绑定那个会话的名字(arm.get),会话名截到 20 字。
+   */
   function beaconModel(arm, login, now) {
+    const label = p => projectLabel(p, 20).text;
     if (!arm) return { cls: '', head: '正在读取状态', sub: '等待布防状态核验' };
     const on = !!arm.armed;
     const n = on ? (arm.selected || []).length : 0;
@@ -1000,13 +1049,13 @@ const AR = (() => {
     const rearm = projects.filter(p => /^quota:(provider-changed|target-unbound)$/.test(String(p.reason || '')) ||
       (p.reason === 'quota:unknown' && p.detail === 'model-invalid'));
     if (rearm.length) {
-      return { cls: 'bad', head: '需要重新布防', sub: `${rearm[0].name} ${rearm[0].reasonText || ''}`.trim() };
+      return { cls: 'bad', head: '需要重新布防', sub: `${label(rearm[0])} ${rearm[0].reasonText || ''}`.trim() };
     }
     // 后台服务还没接手这一轮布防(刚布防、Worker 刚重启):还没有任何逐项目证据,不能说「监视中」。
     if (!arm.phase) return { cls: 'wait', head: '待初始化', sub: `已布防 ${n} 个 · 后台服务还没接手这一轮` };
     const running = projects.find(p => p.status === 'running');
     if (arm.phase === 'resuming' || running) {
-      return { cls: 'on', head: '正在续跑', sub: running ? `${running.name} · ${modelShort(running.modelId, running.modelName)}` : `共 ${n} 个项目` };
+      return { cls: 'on', head: '正在续跑', sub: running ? `${label(running)} · ${modelShort(running.modelId, running.modelName)}` : `共 ${n} 个项目` };
     }
     const pending = projects.filter(p => p.status === 'limited');
     if (pending.length) {
@@ -1018,13 +1067,13 @@ const AR = (() => {
       }
       // 不全是在等额度:点名第一个卡在别处的项目(会话开着、未核实…),其余计数。
       const first = pending.find(p => !String(p.reason || '').startsWith('quota:limited')) || pending[0];
-      return { cls: 'wait', head: '等待续跑', sub: `${first.name} ${first.reasonText || '待核对'}${pending.length > 1 ? ` · 共 ${pending.length} 个在等` : ''}` };
+      return { cls: 'wait', head: '等待续跑', sub: `${label(first)} ${first.reasonText || '待核对'}${pending.length > 1 ? ` · 共 ${pending.length} 个在等` : ''}` };
     }
     // 还在核对、会话记录或占用读不出的项目:后台服务不会放行它们,绿色「尚未被限额打断」在这里没有证据。
     const unsettled = projects.filter(p => !p.status && p.category === 'waiting');
     if (unsettled.length) {
       const first = unsettled[0];
-      return { cls: 'wait', head: '等待核对', sub: `${first.name} ${first.reasonText || '待核对'}${unsettled.length > 1 ? ` · 共 ${unsettled.length} 个` : ''}` };
+      return { cls: 'wait', head: '等待核对', sub: `${label(first)} ${first.reasonText || '待核对'}${unsettled.length > 1 ? ` · 共 ${unsettled.length} 个` : ''}` };
     }
     if (claudeCycle && login && login.warnBeacon) return { cls: 'wait', head: '监视中 · 登录即将到期', sub: login.value ? `Claude 登录 ${login.value.replace('至 ', '')} 到期` : login.note };
     const done = projects.filter(p => p.category === 'success').length;
@@ -1032,7 +1081,7 @@ const AR = (() => {
     return { cls: 'on', head: '监视中', sub: `已布防 ${n} 个 · ${arm.continuous ? '连续模式' : '一次性'}${done ? ` · 已完成 ${done}` : ' · 尚未被限额打断'}` };
   }
 
-  return { fmtWhen, fmtLeft, modelShort, windowTile, quotaTiles, loginModel, notifyModel, workerModel, providerOptions, rowModel, armRequest, pickSummary, beaconModel, DELIVERY_REASON, DELIVERY_DETAIL };
+  return { fmtWhen, fmtLeft, modelShort, windowTile, quotaTiles, loginModel, notifyModel, workerModel, providerOptions, projectLabel, rowLabel, rowModel, armRequest, pickSummary, beaconModel, DELIVERY_REASON, DELIVERY_DETAIL };
 })();
 </script>
 
@@ -1264,7 +1313,9 @@ const AR = (() => {
     list.innerHTML = projects.map((it, i) => {
       const key = pathKey(it.path);
       const on = picked.has(key);
-      const m = AR.rowModel(it, rowContext(it));
+      const ctx = rowContext(it);
+      const m = AR.rowModel(it, ctx);
+      const label = AR.rowLabel(it, ctx);
       const style = fresh ? ` style="--d:${Math.min(i * 24, 120)}ms"` : '';
       let model;
       if (m.mode === 'fixed') {
@@ -1275,18 +1326,18 @@ const AR = (() => {
         model = '<span class="fixed"></span>';
       } else {
         model = `<select class="model${m.inherit ? ' inherit' : ''}${on && m.needsChoice ? ' need' : ''}" data-key="${esc(key)}"
-          aria-label="${esc(it.name)} 的续跑模型" title="${m.inherit ? '沿用该会话最近一次实际使用的模型' : '布防后本轮固定'}"${armBusy || queueBusy ? ' disabled' : ''}>
+          aria-label="${esc(label.aria)} 的续跑模型" title="${m.inherit ? '沿用该会话最近一次实际使用的模型' : '布防后本轮固定'}"${armBusy || queueBusy ? ' disabled' : ''}>
           ${m.options.map(o => `<option value="${esc(o.value)}"${o.value === m.value ? ' selected' : ''}>${esc(o.label)}</option>`).join('')}
         </select>`;
       }
       return `<div class="row${on ? ' on' : ''}${armed ? ' locked' : ''}${fresh ? ' in' : ''}"${style} role="listitem" data-key="${esc(key)}" data-path="${esc(it.path)}">
-        <button class="cb" type="button" role="checkbox" aria-checked="${on}" aria-label="选择 ${esc(it.name)}"${armed ? ' disabled' : ''}></button>
+        <button class="cb" type="button" role="checkbox" aria-checked="${on}" aria-label="选择 ${esc(label.aria)}"${armed ? ' disabled' : ''}></button>
         <span class="idx">${i + 1}</span>
-        <span class="nm" title="${esc(it.name)}">${esc(it.name)}${it.isGit ? '<span class="tag">git</span>' : ''}</span>
-        <span class="pa" title="${esc(it.path)}">${esc(it.path)}</span>
+        <span class="nm" title="${esc(label.title)}">${esc(label.text)}${it.isGit ? '<span class="tag">git</span>' : ''}</span>
+        <span class="pa" title="${esc(label.subTitle)}">${esc(label.sub)}</span>
         ${model}
         <span class="st ${esc(m.status.cls)}" title="${esc(m.status.title || m.status.text)}">${esc(m.status.text)}</span>
-        <button class="rm" type="button" aria-label="从队列移除 ${esc(it.name)}" title="从队列移除(加入不再扫描名单)"${armed ? ' disabled' : ''}>×</button>
+        <button class="rm" type="button" aria-label="从队列移除 ${esc(label.aria)}" title="从队列移除(加入不再扫描名单)"${armed ? ' disabled' : ''}>×</button>
       </div>`;
     }).join('');
     if (focusKey && focusPart) {
@@ -1548,13 +1599,14 @@ const AR = (() => {
 
   function showPreview() {
     const rows = arm && arm.armed
-      ? (arm.projects || []).map(p => ({ name: p.name, model: AR.modelShort(p.modelId, p.modelName), text: p.reasonText + (p.resetAtUnix && p.category === 'waiting' ? ' · 预计 ' + AR.fmtWhen(p.resetAtUnix, nowUnix()) : '') }))
+      ? (arm.projects || []).map(p => ({ label: AR.projectLabel(p, 20), model: AR.modelShort(p.modelId, p.modelName), text: p.reasonText + (p.resetAtUnix && p.category === 'waiting' ? ' · 预计 ' + AR.fmtWhen(p.resetAtUnix, nowUnix()) : '') }))
       : projects.filter(it => picked.has(pathKey(it.path))).map(it => {
-          const m = AR.rowModel(it, rowContext(it));
-          return { name: it.name, model: m.effectiveModel ? AR.modelShort(m.effectiveModel, (currentModels().find(x => x.id === m.effectiveModel) || {}).name) : '待选', text: m.status.text };
+          const ctx = rowContext(it);
+          const m = AR.rowModel(it, ctx);
+          return { label: AR.rowLabel(it, ctx, 20), model: m.effectiveModel ? AR.modelShort(m.effectiveModel, (currentModels().find(x => x.id === m.effectiveModel) || {}).name) : '待选', text: m.status.text };
         });
     $('pvBody').innerHTML = rows.length
-      ? rows.map((r, i) => `<tr><td class="num">${i + 1}</td><td>${esc(r.name)}</td><td>${esc(r.model)}</td><td>${esc(r.text)}</td></tr>`).join('')
+      ? rows.map((r, i) => `<tr><td class="num">${i + 1}</td><td title="${esc(r.label.title)}">${esc(r.label.text)}</td><td>${esc(r.model)}</td><td>${esc(r.text)}</td></tr>`).join('')
       : '<tr><td colspan="4">没有可续跑的项目</td></tr>';
     $('dlgPreview').showModal();
   }

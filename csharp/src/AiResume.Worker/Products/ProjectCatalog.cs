@@ -6,8 +6,10 @@ using AiResume.Core;
 namespace AiResume.Worker.Products;
 
 /// <summary>发现的项目条目。<paramref name="IsCustom"/> 为真表示来自用户手动添加(customProjects),
-/// 而非会话扫描发现——这类条目没有"最近使用"时间,界面据此显示"手动添加"。</summary>
-public sealed record ProjectEntry(string Name, string Path, DateTimeOffset LastWriteUtc, bool IsCustom = false);
+/// 而非会话扫描发现——这类条目没有"最近使用"时间,界面据此显示"手动添加"。
+/// <paramref name="TranscriptPath"/> 是发现它的那份会话转录(会话目录里最近修改的一份,"最近使用"时间也取自它);
+/// 手动添加的条目没有。</summary>
+public sealed record ProjectEntry(string Name, string Path, DateTimeOffset LastWriteUtc, bool IsCustom = false, string? TranscriptPath = null);
 
 /// <summary>
 /// 项目发现(产品状态迁移 S5-A)。语义与现役 discoverProjects(feishu-runtime.js)对齐:
@@ -140,54 +142,36 @@ public sealed class ProjectCatalog
                         continue;
                     }
 
-                    string? jsonl;
-                    string? cwd;
-                    DateTimeOffset jsonlWriteUtc;
-
-                    if (index is not null && index.TryGet(sessionDir, dirWriteUtc, out ProjectIndexEntry entry))
+                    // 最新那份转录每次都按文件修改时间重挑(只列目录、不读内容):目录修改时间只在增删文件时变,
+                    // 续写已有会话不会改它——只认目录时间,「最近会话」时间、排序和临时工作区的会话名都会停在旧会话上
+                    // (2026-11 本机实测:fork 出新会话后又接着写原会话,索引一直指着 fork,目录时间比最新转录早 96 小时)。
+                    // 索引只用来省掉重读头部:挑出的仍是索引里那一份就复用 cwd(上次没读出 cwd 而文件又变了才重读)。
+                    (string Path, DateTimeOffset WriteUtc)? latest = LatestJsonl(sessionDir);
+                    ProjectIndexEntry? cached = index is not null && index.TryGetEntry(sessionDir, out ProjectIndexEntry hit) ? hit : null;
+                    string? jsonl = latest?.Path;
+                    DateTimeOffset jsonlWriteUtc = latest?.WriteUtc ?? DateTimeOffset.MinValue;
+                    string? cwd = jsonl is null
+                        ? null
+                        : cached is not null && string.Equals(cached.JsonlPath, jsonl, StringComparison.OrdinalIgnoreCase) &&
+                          (cached.Cwd is not null || cached.JsonlWriteUtc == jsonlWriteUtc)
+                            ? cached.Cwd
+                            : ExtractCwd(jsonl);
+                    if (index is not null)
                     {
-                        // 命中索引且目录未变:直接复用,零文件 I/O。
-                        jsonl = entry.JsonlPath;
-                        jsonlWriteUtc = entry.JsonlWriteUtc;
-                        cwd = entry.Cwd;
-                    }
-                    else
-                    {
-                        // 未命中或目录已变:走原有全量路径。
-                        jsonl = LatestJsonl(sessionDir);
-                        if (jsonl is null)
+                        // 没有 jsonl、cwd 为 null 也要记下,避免每次重读;条目没变就不标脏,不重写索引文件。
+                        var fresh = new ProjectIndexEntry(sessionDir, dirWriteUtc, jsonl, jsonlWriteUtc, cwd);
+                        if (fresh != cached)
                         {
-                            // 无 jsonl:缓存空结果,避免每次重试。
-                            if (index is not null)
-                            {
-                                index.Put(new ProjectIndexEntry(sessionDir, dirWriteUtc, null, DateTimeOffset.MinValue, null));
-                            }
-                            continue;
-                        }
-
-                        try
-                        {
-                            jsonlWriteUtc = File.GetLastWriteTimeUtc(jsonl);
-                        }
-                        catch (Exception)
-                        {
-                            jsonlWriteUtc = DateTimeOffset.MinValue;
-                        }
-
-                        cwd = ExtractCwd(jsonl);
-                        if (index is not null)
-                        {
-                            // cwd 为 null 也要缓存,避免每次重试。
-                            index.Put(new ProjectIndexEntry(sessionDir, dirWriteUtc, jsonl, jsonlWriteUtc, cwd));
+                            index.Put(fresh);
                         }
                     }
 
-                    if (string.IsNullOrWhiteSpace(cwd) || !Directory.Exists(cwd) || IsExcluded(cwd, config))
+                    if (jsonl is null || string.IsNullOrWhiteSpace(cwd) || !Directory.Exists(cwd) || IsExcluded(cwd, config))
                     {
                         continue;
                     }
 
-                    discovered.Add(new ProjectEntry(Path.GetFileName(cwd.TrimEnd('\\', '/')), cwd, jsonlWriteUtc));
+                    discovered.Add(new ProjectEntry(Path.GetFileName(cwd.TrimEnd('\\', '/')), cwd, jsonlWriteUtc, TranscriptPath: jsonl));
                 }
             }
         }
@@ -369,18 +353,45 @@ public sealed class ProjectCatalog
         }
     }
 
-    private static string? LatestJsonl(string sessionDir)
+    /// <summary>
+    /// 会话目录里最近修改的一份顶层 jsonl 与它的修改时间;修改时间随列目录一并取得,不另外读文件。
+    /// 没有或读不了返回 null;修改时间相同时取先列到的那份。
+    /// </summary>
+    private static (string Path, DateTimeOffset WriteUtc)? LatestJsonl(string sessionDir)
     {
         try
         {
-            return Directory.EnumerateFiles(sessionDir, "*.jsonl")
-                .OrderByDescending(File.GetLastWriteTimeUtc)
-                .FirstOrDefault();
+            FileInfo? latest = null;
+            foreach (FileInfo file in new DirectoryInfo(sessionDir).EnumerateFiles("*.jsonl"))
+            {
+                if (latest is null || file.LastWriteTimeUtc > latest.LastWriteTimeUtc)
+                {
+                    latest = file;
+                }
+            }
+
+            return latest is null ? null : (latest.FullName, latest.LastWriteTimeUtc);
         }
         catch (Exception)
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// 上一次发现里这个项目的会话目录(发现它的那份转录所在目录);还没发现过、不在结果里或是手动添加的返回 null。
+    /// 布防绑定的会话与目录里最新的会话可能不是同一个(布防后又 fork 了):调用方按会话 ID 在这个目录里找它自己的转录。
+    /// </summary>
+    public string? SessionDirectoryOf(string projectPath)
+    {
+        List<ProjectEntry>? last;
+        lock (_gate)
+        {
+            last = _cache;
+        }
+
+        string? transcript = last?.FirstOrDefault(entry => ProjectPaths.Equal(entry.Path, projectPath))?.TranscriptPath;
+        return transcript is null ? null : Path.GetDirectoryName(transcript);
     }
 
     internal static string? ExtractCwd(string jsonlPath) => ReadHeadString(jsonlPath, "cwd");
