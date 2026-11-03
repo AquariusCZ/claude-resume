@@ -522,54 +522,119 @@ public sealed class GuiPageContractTests
 
     /// <summary>把 script#vm 放进 Node 的隔离上下文，再执行断言脚本;任何断言失败都让进程以非 0 退出。</summary>
     [Fact]
-    public void 子代理预检_生效只认后端心跳判定_影子显示本来会推迟_对表偏差与覆盖率按阈值着色()
+    public void 子代理预检_生效只认后端心跳判定_设置刚更新不催人_旧版要重开单独说_卡片不露术语与版本串()
         => RunViewModel("""
             const now = 1793640000;
             assert.equal(AR.budgetModel(null, now).side.head, '读取中…');
             let m = AR.budgetModel({ error: '读不到心跳目录' }, now);
-            assert.equal(m.side.head, '未核实'); assert.equal(m.side.led, '');
-            const base = { mode: 'shadow', configVersion: 3, reasons: [], readings: [], prices: [], decisions: [], counts: {}, coverage: { total: 0 }, avoided: {}, pending: [] };
-            // 只装好、没有会话加载:不能说生效,并说清要新开会话
-            m = AR.budgetModel({ ...base, status: 'waiting', reasons: ['最近 3 分钟没有会话心跳'] }, now);
-            assert.equal(m.side.led, 'wait'); assert.match(m.side.head, /等新会话/); assert.doesNotMatch(m.side.head, /生效/);
-            assert.match(m.side.note, /新开的 Claude Code 会话/);
-            // 生效中只来自后端判定(新鲜心跳回报当前模式与配置版本);正常时不出说明行
+            assert.equal(m.side.head, '未核实'); assert.equal(m.side.led, ''); assert.equal(m.side.value, '');
+            const base = { mode: 'shadow', configVersion: 3, reasons: [], issue: '', behind: {}, readings: [], prices: [], decisions: [], counts: {}, coverage: { total: 0 }, avoided: {}, pending: [] };
+            // 卡片上任何一句都不出现内部术语、版本串或模式原名(悬停与详情里才有)
+            const plain = s => { for (const t of [s.head, s.value, s.note]) assert.doesNotMatch(t, /mod|影子|shadow|enforce|observe|v\d|\d+\.\d+/, t); };
+            // 一行「模式 · 状态」:「试运行」不用解释,悬停里说清只记录、不拦截;正常生效时不出说明行
             m = AR.budgetModel({ ...base, status: 'effective', freshSessions: 2 }, now);
-            assert.equal(m.side.led, 'ok'); assert.equal(m.side.head, '影子模式 · 生效中'); assert.equal(m.side.note, '');
-            assert.equal(m.side.value, '暂无派发'); assert.match(m.side.title, /活跃会话 2 个/);
-            // 关闭模式有心跳也不点绿;配置没跟上琥珀;未生效标红并说原因;认不出的状态一律未核实
-            m = AR.budgetModel({ ...base, mode: 'off', status: 'effective' }, now);
+            assert.equal(m.side.led, 'ok'); assert.equal(m.side.head, '试运行 · 生效中'); assert.equal(m.side.note, '');
+            assert.match(m.side.title, /只记录、不拦截/); assert.match(m.side.title, /活跃会话 2 个/);
+            // 右边的次数带单位;没有判断记录如实说「没有记录」,不说「没派发过」
+            assert.equal(m.side.value, '暂无派发记录'); assert.match(m.side.title, /最近 7 天没有子代理派发记录/); plain(m.side);
+            // 详情对话框:左边模式、右边状态(带颜色)
+            assert.deepEqual(m.dlg, { led: 'ok', head: '试运行', value: '生效中', cls: 'ok' });
+            // 只装好、没有会话加载:不能说生效,并说清要新开会话(灰色,不是故障)
+            m = AR.budgetModel({ ...base, status: 'waiting', reasons: ['最近 3 分钟没有会话在跑预检'] }, now);
+            assert.equal(m.side.led, 'wait'); assert.equal(m.side.head, '试运行 · 等新会话'); assert.equal(m.side.value, '');
+            assert.match(m.side.note, /新开的 Claude Code 会话/); assert.equal(m.side.noteCls, ''); plain(m.side);
+            // 设置刚更新、心跳还没轮到:「切换中」琥珀灯但不催人(说明行灰色,约 1 分钟内跟上),绝不点绿
+            m = AR.budgetModel({ ...base, status: 'switching', behind: { settling: 2 }, reasons: ['2 个会话还没轮到重读刚更新的设置,约 1 分钟内跟上'] }, now);
+            assert.equal(m.side.led, 'wait'); assert.equal(m.side.head, '试运行 · 切换中'); assert.equal(m.side.value, '');
+            assert.match(m.side.note, /约 1 分钟内跟上/); assert.equal(m.side.noteCls, ''); plain(m.side);
+            // 跑旧版的会话要重开才换:琥珀说明行直接说做什么;次数与版本串只在悬停里
+            const oldMod = ['4 个会话跑的是旧版 mod 0.2.0(已装 0.3.0):会话只在启动时加载 mod,重开这些会话后生效'];
+            m = AR.budgetModel({ ...base, status: 'partial', behind: { modMismatch: 4, modAllOlder: true }, reasons: oldMod, counts: { allow: 7 } }, now);
+            assert.equal(m.side.led, 'wait'); assert.equal(m.side.head, '试运行 · 部分生效'); assert.equal(m.side.value, '');
+            assert.equal(m.side.note, '4 个会话还在用旧版,重开后生效'); assert.equal(m.side.noteCls, 'warn'); plain(m.side);
+            assert.match(m.side.title, /mod 0\.2\.0/); assert.match(m.side.title, /最近 7 天判断了 7 次子代理派发,其中 0 次会被拦/);
+            // 一个都没跟上是「未跟上」;旧版与没跟上设置是两件事,分开说;认不出是不是更旧时不说「旧版」
+            m = AR.budgetModel({ ...base, status: 'stale', behind: { modMismatch: 1, modAllOlder: false, stuck: 2 }, reasons: ['…'] }, now);
+            assert.equal(m.side.head, '试运行 · 未跟上'); assert.equal(m.side.led, 'wait');
+            assert.equal(m.side.note, '1 个会话版本不同,重开后生效\n2 个会话没跟上新设置,重开试试'); plain(m.side);
+            assert.equal(m.statusText, '未跟上');
+            // 后端没给分类时不把原因原文(含版本串)搬上卡片
+            m = AR.budgetModel({ ...base, status: 'partial', behind: undefined, reasons: ['4 个会话跑的是旧版 mod 0.2.0'] }, now);
+            assert.match(m.side.note, /见「详情与模式…」/); plain(m.side);
+            // 说明行每一句都短到最窄右栏一行放得下(约 16 个汉字宽;半角字符按半个算)
+            const width = s => [...s].reduce((w, c) => w + (c.charCodeAt(0) < 0x2000 ? 0.5 : 1), 0);
+            const notes = [
+              ...AR.budgetModel({ ...base, status: 'stale', behind: { modMismatch: 12, modAllOlder: false, stuck: 10 } }, now).side.note.split('\n'),
+              ...AR.budgetModel({ ...base, status: 'partial', behind: { modMismatch: 12, modAllOlder: true } }, now).side.note.split('\n'),
+              AR.budgetModel({ ...base, status: 'partial', behind: undefined }, now).side.note,
+              AR.budgetModel({ ...base, mode: 'off', status: 'disabled', issue: 'x-new' }, now).side.note,
+            ];
+            for (const st of ['broken', 'unverified']) for (const issue of ['policy-blocked', 'policy-unknown', 'unregistered', 'wrong-path', 'mod-files', 'mod-version', 'config', 'config-mismatch', 'settings-unreadable', 'x-new']) {
+              notes.push(AR.budgetModel({ ...base, status: st, issue, reasons: ['x'] }, now).side.note);
+            }
+            for (const st of ['waiting', 'switching']) notes.push(AR.budgetModel({ ...base, status: st }, now).side.note);
+            notes.push(AR.budgetModel({ ...base, mode: 'off', status: 'disabled', issue: 'still-registered' }, now).side.note);
+            for (const n of notes) { assert.ok(n, '说明行不该是空的'); assert.ok(width(n) <= 16, n); plain({ head: '', value: '', note: n }); }
+            // 未生效标红,说清怎么修;问题码认不出时退回原因原文
+            m = AR.budgetModel({ ...base, status: 'broken', issue: 'unregistered', reasons: ['settings.json:未登记'] }, now);
+            assert.equal(m.side.led, 'bad'); assert.equal(m.side.head, '试运行 · 未生效'); assert.equal(m.side.noteCls, 'bad');
+            assert.match(m.side.note, /重新安装可修复/); assert.match(m.side.title, /settings\.json:未登记/); plain(m.side);
+            assert.match(AR.budgetModel({ ...base, status: 'broken', issue: 'policy-blocked', reasons: ['组织策略禁止旁加载 mod'] }, now).side.note, /组织策略禁止加载.*「已关闭」/);
+            // 认不出的问题码:卡片退回通用短句,原因原文(可能带 mod、路径)只进悬停与详情
+            m = AR.budgetModel({ ...base, status: 'broken', issue: 'x-new', reasons: ['mod 文件不全:缺 hooks/register.ts'] }, now);
+            assert.equal(m.side.note, '没能生效,原因见「详情与模式…」'); assert.match(m.side.title, /hooks\/register\.ts/);
+            // 读不出 settings.json:未核实,不点灯
+            m = AR.budgetModel({ ...base, status: 'unverified', issue: 'settings-unreadable', reasons: ['settings.json 读取失败:被占用'] }, now);
+            assert.equal(m.side.led, ''); assert.equal(m.side.head, '试运行 · 未核实'); assert.match(m.side.note, /settings\.json/);
+            // 认不出的状态一律未核实
+            m = AR.budgetModel({ ...base, status: '???' }, now);
+            assert.equal(m.side.head, '试运行 · 未核实'); assert.equal(m.side.led, ''); assert.equal(m.dlg.value, '未核实');
+            // 关闭模式有心跳也不点绿、不写状态与次数;仍登记着时琥珀说明怎么撤
+            m = AR.budgetModel({ ...base, mode: 'off', status: 'effective', counts: { allow: 3 } }, now);
+            assert.equal(m.side.led, ''); assert.equal(m.side.head, '已关闭'); assert.equal(m.side.value, ''); assert.equal(m.side.note, '');
+            assert.deepEqual(m.dlg, { led: '', head: '已关闭', value: '', cls: '' });
+            m = AR.budgetModel({ ...base, mode: 'off', status: 'disabled', issue: 'still-registered', reasons: ['已关闭,但 settings.json 里还登记着'] }, now);
             assert.equal(m.side.led, ''); assert.equal(m.side.head, '已关闭'); assert.equal(m.side.value, '');
-            m = AR.budgetModel({ ...base, status: 'stale', reasons: ['活跃会话回报的是 shadow/v1/mod 0.2.0'] }, now);
-            // 右栏窄列:状态用短句、不挤汇总数字,完整原因在说明行
-            assert.equal(m.side.led, 'wait'); assert.equal(m.side.head, '影子模式 · 未跟上'); assert.equal(m.side.value, '');
-            assert.match(m.side.note, /mod 0\.2\.0/); assert.equal(m.statusText, '配置未跟上');
-            m = AR.budgetModel({ ...base, status: 'broken', reasons: ['settings.json:未登记'] }, now);
-            assert.equal(m.side.led, 'bad'); assert.match(m.side.note, /未登记/); assert.match(m.side.head, /未生效/);
-            assert.match(AR.budgetModel({ ...base, status: '???' }, now).side.head, /未核实/);
-            // 只有一部分会话跟上:琥珀「部分生效」并说哪些没跟上,不说生效中
-            m = AR.budgetModel({ ...base, status: 'partial', reasons: ['1 个会话还在用旧配置或旧版 mod(shadow/v2/mod 0.2.0)'] }, now);
-            assert.equal(m.side.led, 'wait'); assert.equal(m.side.head, '影子模式 · 部分生效'); assert.match(m.side.note, /旧配置/);
-            assert.equal(m.statusText, '部分会话生效');
-            // 已关闭(后端 disabled):不点灯;仍登记着时把原因放进说明
-            m = AR.budgetModel({ ...base, mode: 'off', status: 'disabled', reasons: ['settings.json 里仍登记着 mod'] }, now);
-            assert.equal(m.side.led, ''); assert.equal(m.side.head, '已关闭'); assert.equal(m.side.value, ''); assert.match(m.side.note, /仍登记/);
+            assert.match(m.side.note, /再选一次「已关闭」/); assert.equal(m.side.noteCls, 'warn');
+            // 切换之后的页脚按回包说话:登记没撤掉、被组织策略挡住时不能报「已关闭 / 已切换」了事,和卡片说同一件事并标红
+            assert.equal(m.switchedText, '子代理预检已关闭,但登记没撤掉,再选一次「已关闭」'); assert.equal(m.switchedBad, true);
+            m = AR.budgetModel({ ...base, mode: 'enforce', status: 'broken', issue: 'policy-blocked', reasons: ['组织策略禁止旁加载 mod'] }, now);
+            assert.equal(m.switchedText, '子代理预检已切换为「拦截」,但组织策略禁止加载,可选「已关闭」'); assert.equal(m.switchedBad, true);
+            m = AR.budgetModel({ ...base, mode: 'off', status: 'disabled' }, now);
+            assert.match(m.switchedText, /^子代理预检已关闭:新开的会话不再加载/); assert.equal(m.switchedBad, false);
+            assert.equal(AR.budgetModel({ ...base, status: 'switching', behind: { settling: 1 } }, now).switchedBad, false);
+            // 只记用量模式不做判断:没有判断记录不能说成「没派发过」,也不放次数
+            m = AR.budgetModel({ ...base, mode: 'observe', status: 'effective', avoided: { shadowWouldAvoid: 2 } }, now);
+            assert.equal(m.side.head, '只记用量 · 生效中'); assert.equal(m.side.value, ''); assert.equal(m.side.note, '');
+            assert.doesNotMatch(m.side.title, /派发/); assert.equal(m.avoidedText, '');
+            // 日志太多只汇总了一部分时,「最近 7 天」的次数要说明不全
+            assert.match(AR.budgetModel({ ...base, status: 'effective', truncated: true, counts: { allow: 3 } }, now).side.title, /只统计了最近的一部分/);
             // mod 自己的报错与日志截断如实带出,不影响状态灯
             m = AR.budgetModel({ ...base, status: 'effective', lastErrors: ['beat: EACCES'], truncated: true, coverage: { total: 0 } }, now);
             assert.equal(m.side.led, 'ok'); assert.match(m.errorsText, /beat: EACCES/); assert.match(m.side.title, /beat: EACCES/);
             assert.match(m.coverageText, /只汇总了最近的一部分/);
             assert.equal(AR.budgetModel({ ...base, status: 'effective' }, now).errorsText, '');
-            // 影子模式的推迟是「本来会推迟」,启用拦截后才是「推迟」
+            // 试运行里的拦截只是「会拦」,拦截模式下才是「拦下」
             const decisions = [
               { atUnix: now - 60, kind: 'would-defer', rule: 'over-budget', model: 'opus-5-5', runId: 'wf_abc', agentIndex: 3, binding: 'five_hour', need: 8.3, margin: 4.1, deferUntilUnix: now + 3600 },
               { atUnix: now - 61, kind: 'allow', rule: 'fits', model: 'opus-5-5' },
               { atUnix: now - 62, kind: 'deferred', rule: 'prefix-closure', model: 'opus-5-5', runId: 'wf_abc', agentIndex: 4 },
             ];
             m = AR.budgetModel({ ...base, status: 'effective', decisions, counts: { allow: 1, 'would-defer': 1, deferred: 1 } }, now);
-            assert.deepEqual(m.decisionRows.map(d => d.verdict), ['本来会推迟', '放行', '推迟']);
+            assert.deepEqual(m.decisionRows.map(d => d.verdict), ['会拦', '放行', '拦下']);
             assert.equal(m.decisionRows[0].rule, '额度不够'); assert.match(m.decisionRows[0].room, /需 8\.3 点 \/ 余 4\.1 点/);
+            assert.match(m.decisionRows[0].title, /拦截模式下会推迟到/);
             assert.equal(m.decisionRows[2].rule, '同批后缀');
-            assert.equal(m.side.value, '本来会推迟 1/3'); assert.match(m.side.title, /本来会推迟 1 次/);
+            // 次数 = 判断过的派发;试运行的「会拦」连同拦截期真拦下的一起算,拦截模式只算真拦下的(试运行期的「会拦」当时照常派出去了)
+            assert.equal(m.side.value, '3 次里 2 次会拦'); assert.match(m.side.title, /最近 7 天判断了 3 次子代理派发,其中 2 次会被拦/);
+            m = AR.budgetModel({ ...base, mode: 'enforce', status: 'effective', counts: { allow: 5, deferred: 2, 'would-defer': 3 } }, now);
+            assert.equal(m.side.head, '拦截 · 生效中'); assert.equal(m.side.value, '10 次里拦下 2 次'); assert.match(m.side.title, /最近 7 天判断了 10 次子代理派发,拦下其中 2 次/);
+            m = AR.budgetModel({ ...base, status: 'effective', decisions, counts: { allow: 1, 'would-defer': 1, deferred: 1 } }, now);
+            // 模式按钮、切换后的页脚提示用同一套叫法
+            assert.deepEqual(m.modeButtons.map(b => b.label), ['已关闭', '只记用量', '试运行', '拦截']);
+            assert.ok(m.modeButtons.every(b => b.title));
+            assert.match(m.switchedText, /已切换为「试运行」.*约 1 分钟内跟上/);
+            assert.match(AR.budgetModel({ ...base, mode: 'off', status: 'disabled' }, now).switchedText, /已关闭.*新开的会话不再加载/);
             // 对表:差超过 2 点或重置时刻对不上 → 琥珀;一边没有读数如实写「未读到」
             m = AR.budgetModel({ ...base, status: 'effective', readings: [
               { kind: 'five_hour', modPercent: 63, oauthPercent: 60, delta: 3, resetMatches: true },
@@ -588,13 +653,162 @@ public sealed class GuiPageContractTests
               { window: 'five_hour', model: 'haiku-5-5', period: 'offpeak', k: 0.44, source: 'family', samples: 0 },
             ] }, now);
             assert.deepEqual(m.priceRows.map(p => p.confidence), ['高', '先验']); assert.match(m.priceRows[0].source, /高峰/);
-            // 启用拦截需要用户确认;待补派与避免的中断按模式说
+            // 打开拦截需要用户确认;待补派与避免的中断按模式说
             assert.equal(m.modeButtons.find(b => b.mode === 'enforce').needsConfirm, true);
             m = AR.budgetModel({ ...base, mode: 'enforce', status: 'effective', avoided: { enforceAvoided: 2, landingsApplied: 1 },
               pending: [{ runId: 'wf_abc', agentIndex: 3, type: 'workflow-subagent', model: 'opus-5-5', deferUntilUnix: now + 60, applied: true }] }, now);
             assert.equal(m.pendingRows[0].tag, '待补派'); assert.match(m.avoidedText, /避免中断 2 次/);
-            assert.match(AR.budgetModel({ ...base, status: 'effective', avoided: { shadowWouldAvoid: 1 } }, now).avoidedText, /影子:本可避免的中断 1 次/);
+            assert.match(AR.budgetModel({ ...base, status: 'effective', avoided: { shadowWouldAvoid: 1 } }, now).avoidedText, /试运行:本可避免中断 1 次/);
             """);
+
+    /// <summary>
+    /// 通知源状态在窗口开着时也会变(OpenCode 重新加载插件、hook 指向的程序被删):手动与自动刷新、30 秒一拍都要重读。
+    /// 这几处接线碰 DOM 与定时器,按关键语句断言;读数与开关的时序见下一个用例(真的驱动页面里那段代码)。
+    /// </summary>
+    [Fact]
+    public void 完成通知_手动与自动刷新和30秒一拍都重读通知源()
+    {
+        string html = File.ReadAllText(RepositoryFile("csharp", "src", "AiResume.Gui", "wwwroot", "index.html"));
+
+        // refreshAll 是手动刷新(按钮、F5、菜单)与定时自动刷新共用的那一轮:通知源在这一轮里读,别处不再无条件重复读。
+        Assert.Contains("await Promise.all([afterQuota, loadLogin(), loadChannel(), loadNotify()]);", html, StringComparison.Ordinal);
+        Assert.Contains("if (s <= 0 && !quotaBusy) { refreshAll(true); return; }", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("readAndApplyArm().catch(applyArmReadFailure); loadNotify();", html, StringComparison.Ordinal);
+        // 一轮刷新还没完时按 F5,refreshAll 直接返回:通知源单独补读。
+        Assert.Matches(@"if \(quotaBusy\) loadNotify\(\);\s+refreshAll\(true\);", html);
+        // 30 秒一拍里限频重读(OpenCode 的探测要读日志尾),上一轮没回来或开关操作中不读。
+        Assert.Contains("if (!notifyBusy && !notifyReading && Date.now() - notifyReadAt >= NOTIFY_POLL_MS) loadNotify();", html, StringComparison.Ordinal);
+        Match poll = Regex.Match(html, @"const NOTIFY_POLL_MS = (\d+);");
+        Assert.True(poll.Success);
+        Assert.InRange(int.Parse(poll.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture), 60000, 180000);
+        // 内容没变不重建开关行,焦点放回原来的开关。
+        Assert.Contains("if (html !== lastNotifySig) {", html, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 原样截取页面里「完成通知」那一段(读数、渲染与开关点击),配上可控的 call() 驱动时序:
+    /// 只采用最新发出的读数;开关操作之前或进行中发出、操作之后才回来的读数作废;失败重读;超时只说结果未确认、过几秒再读;
+    /// 读数失败计数归零(30 秒一拍不会卡死)并显示未核实。
+    /// </summary>
+    [Fact]
+    public void 完成通知_开关操作期间的旧读数作废_失败与超时后重读()
+        => RunNotifyBlock("""
+            (async () => {
+              const tick = () => new Promise(r => setImmediate(r));
+              const list = on => ({ items: [{ kind: 'ClaudeCode', displayName: 'Claude Code', isInstalled: true, isEnabled: on, detail: '', hookBroken: false }] });
+              const shown = () => { const l = page.list(); return l && l.error ? 'error' : l && l.items[0] ? (l.items[0].isEnabled ? 'on' : 'off') : 'none'; };
+              const sw = on => { const cls = new Set(['sw', ...(on ? ['on'] : [])]);
+                const el = { disabled: false, dataset: { kind: 'ClaudeCode' }, classList: { contains: c => cls.has(c), add: c => cls.add(c), remove: c => cls.delete(c) } };
+                el.closest = () => el; return el; };
+
+              // 两次读数交错:新的先回、旧的后回 → 旧的作废
+              page.loadNotify(); page.loadNotify(); await tick();
+              const [older, newer] = calls.splice(0);
+              newer.resolve(list(false)); await tick();
+              older.resolve(list(true)); await tick();
+              assert.equal(shown(), 'off'); assert.equal(page.state().notifyReading, 0);
+
+              // 开关操作进行中发出的读数比操作结果晚回来 → 作废,开关不被拨回去
+              let p = page.click(sw(false)); await tick();
+              const set = calls.shift();
+              assert.equal(set.type, 'notifications.setEnabled'); assert.deepEqual(set.extra, { kind: 'ClaudeCode', enabled: true }); assert.ok(set.timeoutMs >= 60000);
+              page.loadNotify(); await tick();
+              const during = calls.shift();
+              set.resolve(list(true)); await p; await tick();
+              during.resolve(list(false)); await tick();
+              assert.equal(shown(), 'on');
+              // 操作之前发出、操作之后才回来的读数同样作废;操作之后发出的照常采用
+              page.loadNotify(); await tick();
+              const before = calls.shift();
+              p = page.click(sw(true)); await tick();
+              calls.shift().resolve(list(false)); await p; await tick();
+              before.resolve(list(true)); await tick();
+              assert.equal(shown(), 'off');
+              page.loadNotify(); await tick(); calls.shift().resolve(list(true)); await tick();
+              assert.equal(shown(), 'on');
+
+              // 宿主明确回了错误:说失败,随即重读一次,让开关跟上现状
+              p = page.click(sw(true)); await tick();
+              calls.shift().reject(new Error('写不进 settings.json')); await p; await tick();
+              assert.ok(said.some(s => s.bad && /切换失败/.test(s.text)));
+              const reread = calls.shift(); assert.equal(reread && reread.type, 'notifications.list');
+              reread.resolve(list(false)); await tick();
+              assert.equal(shown(), 'off');
+
+              // 等回包超时:不说失败只说结果未确认;不立刻重读(宿主可能还在写),过几秒再读,并让 30 秒一拍下一次也重读
+              said.length = 0;
+              p = page.click(sw(false)); await tick();
+              calls.shift().reject(Object.assign(new Error('请求超时'), { timeout: true })); await p; await tick();
+              assert.ok(said.some(s => s.bad && /结果未确认/.test(s.text)) && !said.some(s => /切换失败/.test(s.text)));
+              assert.equal(calls.length, 0);
+              const later = timers.pop(); assert.ok(later && later.ms >= 1000);
+              later.fn(); await tick();
+              calls.shift().resolve(list(true)); await tick(); await tick();
+              assert.equal(shown(), 'on'); assert.equal(page.state().notifyReadAt, 0);
+
+              // 读数失败(含超时):计数归零,30 秒一拍不会卡死;显示未核实,不保留旧状态
+              page.loadNotify(); await tick();
+              calls.shift().reject(Object.assign(new Error('请求超时'), { timeout: true })); await tick();
+              assert.equal(page.state().notifyReading, 0); assert.equal(shown(), 'error');
+              assert.match(page.rows(), /未核实/);
+              globalThis.done = true;
+            })();
+            """);
+
+    /// <summary>
+    /// 把视图模型与「完成通知」那一段原样放进 Node 的隔离上下文:DOM、call()、say() 与 setTimeout 换成可控的替身。
+    /// 断言脚本可用 page(loadNotify / click / list / rows / state)、calls(挂起的请求)、said(页脚提示)、timers(登记的定时器)。
+    /// </summary>
+    private static void RunNotifyBlock(string assertions)
+    {
+        string html = RepositoryFile("csharp", "src", "AiResume.Gui", "wwwroot", "index.html");
+        string dir = TestTemp.NewDir("gui-notify");
+        string assertionsPath = Path.Combine(dir, "assertions.js");
+        File.WriteAllText(assertionsPath, assertions);
+        string script = Path.Combine(dir, "verify.cjs");
+        File.WriteAllText(script, """
+            const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
+            const source = fs.readFileSync(process.argv[2], 'utf8');
+            const vmStart = source.indexOf('<script id="vm">'), vmEnd = source.indexOf('</script>', vmStart);
+            const from = source.indexOf('  const NOTIFY_POLL_MS'), to = source.indexOf('  // 「发送测试」');
+            if (vmStart < 0 || vmEnd < 0 || from < 0 || to < from) throw new Error('页面里找不到视图模型或「完成通知」那一段');
+            const calls = [], said = [], timers = [];
+            const els = {};
+            const $ = id => els[id] || (els[id] = { id, className: '', textContent: '', title: '', hidden: false, innerHTML: '', handlers: {},
+              addEventListener(type, fn) { this.handlers[type] = fn; }, querySelector() { return null; } });
+            const context = vm.createContext({
+              assert, console, setImmediate, Date, calls, said, timers, $,
+              call: (type, extra, timeoutMs) => new Promise((resolve, reject) => calls.push({ type, extra, timeoutMs, resolve, reject })),
+              say: (text, bad) => said.push({ text, bad: !!bad }),
+              setTimeout: (fn, ms) => timers.push({ fn, ms }),
+              document: { activeElement: null }, CSS: { escape: s => s }, esc: s => String(s ?? ''),
+              prefs: { showExtraNotify: false }, nowUnix: () => 1793640000,
+            });
+            vm.runInContext(source.slice(vmStart + '<script id="vm">'.length, vmEnd) + '\n;globalThis.AR = AR;', context);
+            vm.runInContext('let notifyList = null, channel = null, arm = null, notifyBusy = false, lastNotifySig = null;\n' + source.slice(from, to) +
+              '\n;globalThis.page = { loadNotify, list: () => notifyList, rows: () => $("notifyRows").innerHTML,' +
+              ' click: el => $("notifyRows").handlers.click({ target: el }),' +
+              ' state: () => ({ notifyBusy, notifyReading, notifyReadAt, notifyReadApplied, notifyReadIssued }) };', context);
+            process.on('unhandledRejection', e => { console.error(e); process.exit(1); });
+            // 某个 await 一直等不到时事件循环会空掉、进程照样以 0 退出:没跑到最后一行就算失败。
+            process.on('beforeExit', () => { if (context.done !== true) { console.error('断言脚本没有跑完'); process.exit(1); } });
+            vm.runInContext(fs.readFileSync(process.argv[3], 'utf8'), context);
+            """);
+        var start = new ProcessStartInfo("node")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+        };
+        start.ArgumentList.Add(script);
+        start.ArgumentList.Add(html);
+        start.ArgumentList.Add(assertionsPath);
+        using Process process = Process.Start(start)!;
+        string stderr = process.StandardError.ReadToEnd();
+        Assert.True(process.WaitForExit(20_000), "完成通知时序验证超时");
+        Assert.True(process.ExitCode == 0, stderr);
+    }
 
     private static void RunViewModel(string assertions)
     {

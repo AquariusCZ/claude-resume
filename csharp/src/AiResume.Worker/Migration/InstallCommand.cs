@@ -1449,7 +1449,7 @@ public static class InstallCommand
             new ClaudePluginDirs());
 
     /// <summary>
-    /// 子代理预检 mod 的对账(ADR-0008 §F):意图(旧配置补默认影子模式)→ config.json → settings.json 里我方条目恰好指向
+    /// 子代理预检 mod 的对账(ADR-0008 §F):意图(旧配置补默认 shadow「试运行」)→ config.json → settings.json 里我方条目恰好指向
     /// 安装目录 → 读回核对。没对齐返回 false,调用方按退出码 2 处理——登记失败时新会话不会加载 mod,不能报告成功。
     /// </summary>
     private static bool ReconcileBudgetGate(string fullTarget)

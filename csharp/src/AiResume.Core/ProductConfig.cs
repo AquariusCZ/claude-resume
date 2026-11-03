@@ -120,7 +120,7 @@ public sealed class ProductConfig
     /// <summary>
     /// 子代理额度预检(ADR-0008)的意图:用户想用哪个模式,<c>off</c> / <c>observe</c> / <c>shadow</c> / <c>enforce</c>。
     ///
-    /// 空串 = 旧配置从未记录过,install 对账时按默认 <c>shadow</c> 记下;<c>enforce</c>(启用拦截)只能经界面上用户的
+    /// 空串 = 旧配置从未记录过,install 对账时按默认 <c>shadow</c> 记下;<c>enforce</c>(界面名「拦截」)只能经界面上用户的
     /// 显式操作写入,install 从不默认它。与 <see cref="NotifySources"/> 同理:意图必须自己记下来,
     /// 现状(settings.json 里登没登记、mod 在跑哪个模式)回答不了"本该是什么样"。
     /// </summary>

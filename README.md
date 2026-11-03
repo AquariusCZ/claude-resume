@@ -62,11 +62,11 @@ Claude Code · Opus 5.5 · 02:14 · 「迁移文档站」
 
 It reads: *atlas-docs was cut off by the usage limit · source, model, time and session name · the 5-hour limit is used up and resets at 04:30 · armed: AI Resume will resume it once the quota is back; while the session is open it stays out of the way, and resumes after you close it.* Once the quota is back and the session is closed, **▶️ atlas-docs 已开始自动续跑** (resume started) and **✅ atlas-docs 自动续跑完成** (resume finished) follow.
 
-### Checks the budget before spawning subagents (shadow mode by default)
+### Checks the budget before spawning subagents (trial run by default)
 
 - A small mod runs inside Claude Code: before each subagent or workflow agent starts, it weighs the current 5-hour and weekly readings and the remaining cost of agents already running, counting only up to the next reset, and decides whether this one fits.
-- After install it runs in **shadow mode**: everything still starts, and it only records what it *would* have done. The **子代理预检** (subagent budget check) block on the right and **视图 › 子代理预检…** show each decision, predicted vs. actual cost (p80 coverage) and the mod's readings next to the OAuth ones.
-- Once you have seen the evidence you can turn on **启用拦截** (enforce) yourself: agents that don't fit are deferred and you are reminded to re-dispatch after the reset; near the limit, running subagents wrap up with what they have. No pop-ups, no cap on the number of subagents.
+- After install it runs as a **试运行** (trial run, `shadow`): everything still starts, and it only records what it *would* have blocked. The **子代理预检** (subagent budget check) block on the right says in one line where things stand and, when you need to act, what to do (e.g. reopen sessions still on the old version); **视图 › 子代理预检…** shows each decision, predicted vs. actual cost (p80 coverage) and the mod's readings next to the OAuth ones.
+- Once you have seen the evidence you can turn on **拦截** (block, `enforce`) yourself: agents that don't fit are deferred and you are reminded to re-dispatch after the reset; near the limit, running subagents wrap up with what they have. No pop-ups, no cap on the number of subagents.
 - Choosing **已关闭** (off) removes that entry from `settings.json`, so new sessions no longer load the mod. If your organization's managed Claude Code policy forbids side-loaded mods, AI Resume does not register it at all (otherwise every Claude Code session would exit at start) and the panel says why.
 
 ### A control panel that tells the truth

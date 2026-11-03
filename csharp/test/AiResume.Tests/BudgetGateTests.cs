@@ -423,11 +423,12 @@ public sealed class BudgetGateTests
     private const string ModVersion = "0.3.0";
 
     private static BudgetGateInputs Inputs(Rig rig, DateTimeOffset now, string mode = "shadow", int? version = 3,
-        PluginDirsStatus? env = null, IReadOnlyList<WindowReading>? oauth = null, SideloadVerdict? policy = null, string? installed = ModVersion) =>
+        PluginDirsStatus? env = null, IReadOnlyList<WindowReading>? oauth = null, SideloadVerdict? policy = null, string? installed = ModVersion,
+        DateTimeOffset? writtenAt = null, bool modFilesOk = true, string? configMode = null) =>
         new(rig.Paths, mode, version,
             env ?? new PluginDirsStatus(true, [rig.Paths.ModDir], [], "已登记"),
             policy ?? new SideloadVerdict(false, false, "托管策略未禁止旁加载"),
-            true, string.Empty, installed, oauth ?? [], now);
+            modFilesOk, modFilesOk ? string.Empty : "mod 文件不全:缺 hooks/register.ts", installed, oauth ?? [], now, writtenAt, configMode);
 
     private static JsonObject Reading(string kind, double percent, DateTimeOffset resetsAt) =>
         new() { ["kind"] = kind, ["percentUsed"] = percent, ["resetsAt"] = resetsAt.ToString("O") };
@@ -458,33 +459,40 @@ public sealed class BudgetGateTests
     }
 
     [Fact]
-    public void 证据_没有心跳是等新会话_全部新鲜心跳一致才算生效_一部分跟上是部分生效_都没跟上是配置未跟上()
+    public void 证据_没有心跳是等新会话_全部新鲜心跳一致才算生效_一部分跟上是部分生效_都没跟上是未跟上()
     {
         Rig rig = NewRig();
         DateTimeOffset now = DateTimeOffset.UtcNow;
-        Assert.Equal("waiting", BudgetGateEvidence.Build(Inputs(rig, now)).Status);
+        BudgetGateReport waiting = BudgetGateEvidence.Build(Inputs(rig, now));
+        Assert.Equal("waiting", waiting.Status);
+        Assert.Equal(string.Empty, waiting.Issue);
 
         WriteHeartbeat(rig, "s-old", now - TimeSpan.FromMinutes(10), "shadow", 3);
         Assert.Equal("waiting", BudgetGateEvidence.Build(Inputs(rig, now)).Status);
         WriteHeartbeat(rig, "s-ended", now - TimeSpan.FromSeconds(20), "shadow", 3, ended: true);
         Assert.Equal("waiting", BudgetGateEvidence.Build(Inputs(rig, now)).Status);
 
+        // 设置的更新时刻读不出:分不清是刚更新还是没跟上,按没跟上说
         WriteHeartbeat(rig, "s-stale", now - TimeSpan.FromSeconds(30), "shadow", 2);
         BudgetGateReport stale = BudgetGateEvidence.Build(Inputs(rig, now));
         Assert.Equal("stale", stale.Status);
-        Assert.Contains(stale.Reasons, r => r.Contains("shadow/v2", StringComparison.Ordinal));
+        Assert.Equal(new BehindStats(0, 1, 0, false), stale.Behind);
+        Assert.Contains(stale.Reasons, r => r.Contains("没跟上新设置", StringComparison.Ordinal) && r.Contains("「试运行」(v2)", StringComparison.Ordinal));
 
         WriteHeartbeat(rig, "s-ok", now - TimeSpan.FromSeconds(10), "shadow", 3);
         BudgetGateReport partial = BudgetGateEvidence.Build(Inputs(rig, now));
         Assert.Equal("partial", partial.Status);
         Assert.Equal(2, partial.FreshSessions);
-        Assert.Contains(partial.Reasons, r => r.Contains("1 个会话还在用旧配置", StringComparison.Ordinal));
+        // 更新时刻读不出时原因句不断言「改了之后又报过心跳」,只说按没跟上算
+        Assert.Contains(partial.Reasons, r => r.StartsWith("1 个会话回报的是", StringComparison.Ordinal) && r.Contains("按没跟上新设置算", StringComparison.Ordinal)
+                                              && !r.Contains("之后它们又报过心跳", StringComparison.Ordinal));
 
         // 旧配置的那个会话跟上之后才是「生效中」
         WriteHeartbeat(rig, "s-stale", now - TimeSpan.FromSeconds(5), "shadow", 3);
         BudgetGateReport ok = BudgetGateEvidence.Build(Inputs(rig, now, oauth: [new WindowReading("five_hour", 62, now.AddHours(2), now)]));
         Assert.Equal("effective", ok.Status);
         Assert.Empty(ok.Reasons);
+        Assert.Equal(new BehindStats(0, 0, 0, false), ok.Behind);
         ReadingPair five = ok.Readings.Single(r => r.Kind == "five_hour");
         Assert.Equal(64, five.ModPercent);
         Assert.Equal(62, five.OAuthPercent);
@@ -496,6 +504,51 @@ public sealed class BudgetGateTests
     }
 
     [Fact]
+    public void 证据_设置刚更新心跳还没轮到是切换中_过了一个心跳周期仍回报旧设置才算没跟上()
+    {
+        // mod 每 60 秒先重读 config.json 再写心跳:设置更新之前、或更新后不到一个周期写的心跳回报旧设置是正常的,不催人。
+        Rig rig = NewRig();
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        DateTimeOffset written = now - TimeSpan.FromSeconds(20);
+        WriteHeartbeat(rig, "s-lag", now - TimeSpan.FromSeconds(40), "shadow", 2);
+        BudgetGateReport switching = BudgetGateEvidence.Build(Inputs(rig, now, writtenAt: written));
+        Assert.Equal("switching", switching.Status);
+        Assert.Equal(new BehindStats(1, 0, 0, false), switching.Behind);
+        Assert.Contains(switching.Reasons, r => r.Contains("约 1 分钟内跟上", StringComparison.Ordinal));
+
+        // 已有会话跟上、剩下的还没轮到:仍是切换中(不说部分生效,也不说生效中)
+        WriteHeartbeat(rig, "s-ok", now - TimeSpan.FromSeconds(5), "shadow", 3);
+        Assert.Equal("switching", BudgetGateEvidence.Build(Inputs(rig, now, writtenAt: written)).Status);
+
+        // 读完设置才写心跳,中间还有几步 IO:更新后 90 秒内的心跳仍算刚更新;过了才算没跟上
+        DateTimeOffset earlier = now - TimeSpan.FromSeconds(100);
+        WriteHeartbeat(rig, "s-lag", earlier + TimeSpan.FromSeconds(80), "shadow", 2);
+        Assert.Equal("switching", BudgetGateEvidence.Build(Inputs(rig, now, writtenAt: earlier)).Status);
+        WriteHeartbeat(rig, "s-lag", earlier + TimeSpan.FromSeconds(95), "shadow", 2);
+        BudgetGateReport partial = BudgetGateEvidence.Build(Inputs(rig, now, writtenAt: earlier));
+        Assert.Equal("partial", partial.Status);
+        Assert.Equal(new BehindStats(0, 1, 0, false), partial.Behind);
+
+        Assert.Contains(partial.Reasons, r => r.Contains("之后它们又报过心跳", StringComparison.Ordinal));
+
+        // 更新时刻比现在晚 1 分钟以上(时钟回拨留下的坏值)分不清,按没跟上;1 分钟以内的误差照常算刚更新
+        WriteHeartbeat(rig, "s-lag", now - TimeSpan.FromSeconds(30), "shadow", 2);
+        Assert.Equal(1, BudgetGateEvidence.Build(Inputs(rig, now, writtenAt: now.AddMinutes(10))).Behind.Stuck);
+        Assert.Equal(new BehindStats(1, 0, 0, false), BudgetGateEvidence.Build(Inputs(rig, now, writtenAt: now.AddSeconds(30))).Behind);
+
+        // mod 读不到 config.json 时心跳里没有配置版本:更新一个周期之后仍这样就是没跟上
+        WriteHeartbeat(rig, "s-lag", now - TimeSpan.FromSeconds(10), "observe", null);
+        Assert.Equal(1, BudgetGateEvidence.Build(Inputs(rig, now, writtenAt: now - TimeSpan.FromMinutes(5))).Behind.Stuck);
+
+        // 模式不同也算没跟上;跑旧版 mod 的会话归「要重开」,不算刚更新
+        WriteHeartbeat(rig, "s-lag", now - TimeSpan.FromSeconds(30), "enforce", 3);
+        WriteHeartbeat(rig, "s-oldmod", now - TimeSpan.FromSeconds(30), "shadow", 2, mod: "0.2.0");
+        BudgetGateReport mixed = BudgetGateEvidence.Build(Inputs(rig, now, writtenAt: now - TimeSpan.FromSeconds(10)));
+        Assert.Equal("partial", mixed.Status);
+        Assert.Equal(new BehindStats(1, 0, 1, true), mixed.Behind);
+    }
+
+    [Fact]
     public void 证据_settings未登记或mod不全是未生效且说原因_读不出settings是未核实()
     {
         Rig rig = NewRig();
@@ -503,14 +556,38 @@ public sealed class BudgetGateTests
         WriteHeartbeat(rig, "s-ok", now, "shadow", 3);
         BudgetGateReport broken = BudgetGateEvidence.Build(Inputs(rig, now, env: new PluginDirsStatus(false, [], [], "未登记")));
         Assert.Equal("broken", broken.Status);
+        Assert.Equal("unregistered", broken.Issue);
         Assert.Contains(broken.Reasons, r => r.Contains("未登记", StringComparison.Ordinal));
+        BudgetGateReport wrongPath = BudgetGateEvidence.Build(Inputs(rig, now, env: new PluginDirsStatus(false, [@"D:\dev\airesume-budget-gate"], [], "登记的路径不是安装目录")));
+        Assert.Equal("wrong-path", wrongPath.Issue);
         BudgetGateReport noConfig = BudgetGateEvidence.Build(Inputs(rig, now, version: null));
         Assert.Equal("broken", noConfig.Status);
+        Assert.Equal("config", noConfig.Issue);
+        BudgetGateReport noFiles = BudgetGateEvidence.Build(Inputs(rig, now, modFilesOk: false));
+        Assert.Equal("mod-files", noFiles.Issue);
         BudgetGateReport unknown = BudgetGateEvidence.Build(Inputs(rig, now, env: new PluginDirsStatus(false, [], [], "读取失败", Unverified: true)));
         Assert.Equal("unverified", unknown.Status);
-        BudgetGateReport blocked = BudgetGateEvidence.Build(Inputs(rig, now, policy: new SideloadVerdict(true, false, "组织策略禁止旁加载 mod")));
+        Assert.Equal("settings-unreadable", unknown.Issue);
+        // 策略禁止时登记会被撤下,原因不止一个:卡片说最先查到的那个(策略),详情里全列
+        BudgetGateReport blocked = BudgetGateEvidence.Build(Inputs(rig, now, env: new PluginDirsStatus(false, [], [], "未登记"),
+            policy: new SideloadVerdict(true, false, "组织策略禁止旁加载 mod")));
         Assert.Equal("broken", blocked.Status);
+        Assert.Equal("policy-blocked", blocked.Issue);
+        Assert.Equal(2, blocked.Reasons.Count);
         Assert.Contains(blocked.Reasons, r => r.Contains("组织策略", StringComparison.Ordinal));
+        Assert.Equal("policy-unknown", BudgetGateEvidence.Build(Inputs(rig, now, policy: new SideloadVerdict(false, true, "读不出托管策略"))).Issue);
+
+        // config.json 里的模式不是当前设置:会话照它走,不能说成「没跟上」劝人重开,是控制面没写对
+        BudgetGateReport mismatch = BudgetGateEvidence.Build(Inputs(rig, now, mode: "enforce", configMode: "shadow"));
+        Assert.Equal("broken", mismatch.Status);
+        Assert.Equal("config-mismatch", mismatch.Issue);
+        Assert.Contains(mismatch.Reasons, r => r.Contains("「试运行」(v3)", StringComparison.Ordinal) && r.Contains("「拦截」", StringComparison.Ordinal));
+        Assert.Equal("effective", BudgetGateEvidence.Build(Inputs(rig, now, configMode: "shadow")).Status);
+
+        // 已装 mod 的版本读不出:分不清会话跑的是不是已装版本,不能说生效
+        BudgetGateReport noVersion = BudgetGateEvidence.Build(Inputs(rig, now, installed: null));
+        Assert.Equal("unverified", noVersion.Status);
+        Assert.Equal("mod-version", noVersion.Issue);
     }
 
     [Fact]
@@ -534,21 +611,62 @@ public sealed class BudgetGateTests
     }
 
     [Fact]
-    public void 证据_旧版mod的心跳不算生效_已关闭是disabled_仍登记时说明()
+    public void 证据_旧版mod的心跳不算生效且单独计数_已关闭是disabled_仍登记时说明()
     {
         Rig rig = NewRig();
         DateTimeOffset now = DateTimeOffset.UtcNow;
-        WriteHeartbeat(rig, "s-oldmod", now, "shadow", 3, mod: "0.2.0");
-        BudgetGateReport old = BudgetGateEvidence.Build(Inputs(rig, now));
+        // 跑旧版 mod 的会话就算配置也旧,归「要重开」而不是「刚更新」:重开前它不会换版本
+        WriteHeartbeat(rig, "s-oldmod", now, "shadow", 2, mod: "0.2.0");
+        BudgetGateReport old = BudgetGateEvidence.Build(Inputs(rig, now, writtenAt: now - TimeSpan.FromSeconds(10)));
         Assert.Equal("stale", old.Status);
-        Assert.Contains(old.Reasons, r => r.Contains("mod 0.2.0", StringComparison.Ordinal) && r.Contains("重开会话", StringComparison.Ordinal));
+        Assert.Equal(new BehindStats(0, 0, 1, true), old.Behind);
+        Assert.Contains(old.Reasons, r => r.Contains("旧版 mod 0.2.0", StringComparison.Ordinal) && r.Contains("已装 0.3.0", StringComparison.Ordinal)
+                                          && r.Contains("重开这些会话后生效", StringComparison.Ordinal));
+        // 比已装的新(开发版)或认不出的版本不断言是「旧版」
+        WriteHeartbeat(rig, "s-newmod", now, "shadow", 3, mod: "0.4.0");
+        BudgetGateReport other = BudgetGateEvidence.Build(Inputs(rig, now));
+        Assert.Equal(new BehindStats(0, 0, 2, false), other.Behind);
+        Assert.Contains(other.Reasons, r => r.Contains("别的版本的 mod 0.2.0、0.4.0", StringComparison.Ordinal));
+        File.Delete(Path.Combine(rig.Paths.SessionsDir, "s-newmod.json"));
+        WriteHeartbeat(rig, "s-oldmod", now, "shadow", 3, mod: "?");
+        Assert.Equal(new BehindStats(0, 0, 1, false), BudgetGateEvidence.Build(Inputs(rig, now)).Behind);
 
         BudgetGateReport off = BudgetGateEvidence.Build(Inputs(rig, now, mode: "off", env: new PluginDirsStatus(false, [], [], "未登记")));
         Assert.Equal("disabled", off.Status);
         Assert.Empty(off.Reasons);
+        Assert.Equal(string.Empty, off.Issue);
         BudgetGateReport offStillRegistered = BudgetGateEvidence.Build(Inputs(rig, now, mode: "off"));
         Assert.Equal("disabled", offStillRegistered.Status);
-        Assert.Contains(offStillRegistered.Reasons, r => r.Contains("仍登记", StringComparison.Ordinal));
+        Assert.Equal("still-registered", offStillRegistered.Issue);
+        Assert.Contains(offStillRegistered.Reasons, r => r.Contains("还登记着", StringComparison.Ordinal));
+        // 已关闭时 settings.json 读不出:撤没撤下登记核实不了(切到已关闭时撤登记失败会被吞掉),不能只写「已关闭」
+        BudgetGateReport offUnknown = BudgetGateEvidence.Build(Inputs(rig, now, mode: "off",
+            env: new PluginDirsStatus(false, [], [], "settings.json 读取失败:被占用", Unverified: true)));
+        Assert.Equal("disabled", offUnknown.Status);
+        Assert.Equal("settings-unreadable", offUnknown.Issue);
+        Assert.Contains(offUnknown.Reasons, r => r.Contains("核实不了", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void config现状一次读出版本模式与修改时间_文件不在全为null()
+    {
+        Rig rig = NewRig();
+        Assert.Equal(new BudgetGateConfigStamp(null, null, null), rig.Control.ReadConfigStamp());
+        rig.Control.SetMode("enforce");
+        BudgetGateConfigStamp stamp = rig.Control.ReadConfigStamp();
+        Assert.Equal(1, stamp.Version);
+        Assert.Equal("enforce", stamp.Mode);
+        Assert.Equal(new DateTimeOffset(File.GetLastWriteTimeUtc(rig.Paths.ConfigFile), TimeSpan.Zero), stamp.WrittenAt);
+    }
+
+    [Fact]
+    public void mod自报的版本与plugin_json一致_否则所有会话都会被判成要重开()
+    {
+        string register = File.ReadAllText(RepositoryFile("mods", "airesume-budget-gate", "hooks", "register.ts"));
+        System.Text.RegularExpressions.Match declared = System.Text.RegularExpressions.Regex.Match(register, @"const MOD_VERSION = '([^']+)'");
+        Assert.True(declared.Success, "register.ts 里找不到 MOD_VERSION");
+        string modDir = Path.GetDirectoryName(Path.GetDirectoryName(RepositoryFile("mods", "airesume-budget-gate", ".claude-plugin", "plugin.json")))!;
+        Assert.Equal(BudgetGateControl.ModVersion(modDir), declared.Groups[1].Value);
     }
 
     [Fact]

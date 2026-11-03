@@ -210,7 +210,7 @@ v2.2 的界面只回答四个问题,其余收进菜单栏:
 - **页脚**:左侧操作反馈,右侧「后台服务运行中 / 未运行 / 未核实」(`arm.get` 的 `workerRunning`)。
 - **对话框**(原生 `<dialog>`):飞书通知设置(机器人凭据 / 收件人 / 诊断通道)、续跑预览、供应商与额度详情、不再扫描的目录、关于、使用说明。
 
-收进菜单的东西若处于启用、故障或未核实状态,主界面必须留一句提示,隐藏不得掩盖启用态、断链或读不出配置。页面每 30 秒重读 `arm.get` 与 `notify.channel`,每 `quotaRefreshMinutes` 分钟整体刷新一次,F5 立即刷新。一轮刷新里每块数据到了就各自绘制(额度磁贴不等最慢的供应商目录):`providers.catalog` 在 `quota.get` 返回之后才发,宿主让 Claude 行复用这一轮 1 分钟内的额度读数(`QuotaService.GetRecentAsync`),一轮只请求一次 usage 端点;`claude.login.status` 在额度请求结束后再读一次(只采用最后发出的那次),`serverRejected` 反映的是这一轮的结果。
+收进菜单的东西若处于启用、故障或未核实状态,主界面必须留一句提示,隐藏不得掩盖启用态、断链或读不出配置。页面每 30 秒重读 `arm.get` 与 `notify.channel`,每 `quotaRefreshMinutes` 分钟整体刷新一次,F5 立即刷新。`notifications.list`(通知源开关与 hook / 插件状态)随每一轮手动与自动刷新重读,30 秒一拍里也约每 2 分钟重读一次——OpenCode 插件在窗口开着时重新加载、hook 指向的程序被删,界面都要跟上;OpenCode 的探测要读它的日志尾(最多 4 MiB),所以不是每一拍都读。开关操作进行中发出、或比操作结果晚回来的读数一律作废,不会把开关拨回操作之前。一轮刷新里每块数据到了就各自绘制(额度磁贴不等最慢的供应商目录):`providers.catalog` 在 `quota.get` 返回之后才发,宿主让 Claude 行复用这一轮 1 分钟内的额度读数(`QuotaService.GetRecentAsync`),一轮只请求一次 usage 端点;`claude.login.status` 在额度请求结束后再读一次(只采用最后发出的那次),`serverRejected` 反映的是这一轮的结果。
 
 视图模型是 `index.html` 里 `<script id="vm">` 的纯函数 `AR.*`,由 `GuiPageContractTests` 放进 Node 隔离上下文直接驱动,断言「无证据不绿」「承接读数琥珀」「按模型满额不染红主窗口」「刷新失败不留旧绿」「隐藏的通知源仍启用必须提示」「Worker 不在时机器人行不得显示可送达」「每项目模型」等语义,不逐字断言 DOM。
 
@@ -258,7 +258,7 @@ Worker 是 Generic Host。托管服务强制串行启动(`ServicesStartConcurren
 | `notify.test` | — | 冒烟事件入队,返回 `eventId`、`enqueuedAtUnix` 与最新 `channel`。界面先查 lark-cli、收件人与后台 Worker,缺一样就不入队。 |
 | `notify.test.status` | `eventId`、`sinceUnix` | 这一条测试事件的结局 `outcome`:`delivered`(进了已送达表)/ `dead` / `failed`(这一条真实尝试过、得到确定的条目级失败,`failure` 给出类别、错误码与 log_id;结果不明的不算,Worker 会在飞书去重窗口内重试)/ `blocked`(入队之后 Worker 看过、通道此刻仍在熔断:到期了或改过设置都不算)/ `pending`,外加最新 `channel`。与 `notify test` 同一判据(`NotifyControlPlane.TestOutcome`);界面每 5 秒问一次,最多 90 秒。 |
 | `notify.test.withdraw` | `eventId` | 撤回还没送出的测试事件(失败、熔断或 90 秒没送达时),免得通道恢复后补发一条过时的测试通知;返回 `withdrawn`。Worker 发送前复查事件文件并在发送期间占住它,撤回与发送互斥:撤不回(正在发这一条)时界面再看一眼结局,如实说「已送达」或「撤回未确认,稍后仍可能收到」。事件 ID 只接受 16 位十六进制。 |
-| `budget.get` | — | 子代理预检的现状与证据(ADR-0008):`mode` / `configVersion` / `intentVersion` / `status`(`effective` 生效中、`partial` 部分会话生效、`waiting` 等新会话、`stale` 配置未跟上、`broken` 未生效、`unverified` 未核实、`disabled` 已关闭)/ `reasons`、活跃会话数与 mod/引擎版本、已装 mod 版本、`readings`(mod 与 OAuth 对表)、`prices`(校准价格)、`decisions`(最近 30 条判断,影子模式为 `would-defer`)、`counts`、`coverage`(p80 覆盖率)、`avoided`、`pending`、`lastErrors`(mod 自报的错误与 config.json 问题)、`truncated`。「生效中」只由 3 分钟内的全部心跳回报当前模式、配置版本与已装 mod 版本判定。 |
+| `budget.get` | — | 子代理预检的现状与证据(ADR-0008):`mode` / `configVersion` / `intentVersion` / `status`(`effective` 生效中、`switching` 切换中、`partial` 部分生效、`waiting` 等新会话、`stale` 未跟上、`broken` 未生效、`unverified` 未核实、`disabled` 已关闭)/ `reasons`(给详情与悬停的全文,含版本)/ `issue`(未生效、未核实、已关闭却仍登记或核实不了时的问题码:`policy-blocked`、`policy-unknown`、`unregistered`、`wrong-path`、`mod-files`、`mod-version`、`config`、`config-mismatch`、`settings-unreadable`、`still-registered`;界面据此给一句修法)/ `behind`(没跟上的会话:`settling` 设置刚更新还没轮到、`stuck` 过了一个心跳周期仍回报旧设置、`modMismatch` 跑的不是已装版本的 mod、`modAllOlder` 这些是否全是更旧的版本)、活跃会话数与 mod/引擎版本、已装 mod 版本、`readings`(mod 与 OAuth 对表)、`prices`(校准价格)、`decisions`(最近 30 条判断,试运行为 `would-defer`)、`counts`、`coverage`(p80 覆盖率)、`avoided`、`pending`、`lastErrors`(mod 自报的错误与 config.json 问题)、`truncated`。「生效中」只由 3 分钟内的全部心跳回报当前模式、配置版本与已装 mod 版本判定。 |
 | `budget.setMode` | `mode`、`confirm` | 先写意图(版本 +1)再写 `config.json`,写不进去时意图恢复原样;随后按新模式对齐登记(`off` 撤下,其它模式在组织策略允许时登记),登记失败不回滚模式、由证据显示「未生效」与原因;`enforce` 必须 `confirm=true`(界面上先勾选「我已看过下面的证据」再点一次)。返回同 `budget.get`。 |
 
 `--screenshot` 截图模式下,页面渲染所需的读请求改由进程内合成数据(`DemoPayload`)回答,其它请求一律报错,请求处理不读真实配置与状态(WebView2 用户数据与 GUI 日志仍落在状态根下,见「构建、安装与验证」)。历史:`feishu.*`、`cutover.*`、`agent.*`、`claude.token.*`、`quota.local` 已于 2026-10-30 删除,`providers.probe` 已于 v2.1 删除。
@@ -541,9 +541,10 @@ AI Resume 只与客户端落盘的原生会话打交道,不在自己这里维护
   `CLAUDE_CODE_REMOTE_SETTINGS_PATH`、注册表 `HKLM/HKCU\SOFTWARE\Policies\ClaudeCode` 的 `Settings`)里 `disableSideloadFlags` 为 true 时,
   Claude Code 只要看到 `CLAUDE_CODE_PLUGIN_DIRS` 非空就在启动时报错退出(本机二进制实证)——登记会让**所有**新会话起不来。
   `SideloadPolicy` 在登记前、界面切换模式时与 `BudgetGateJanitor` 每小时检查:禁止或任一来源读不懂都不登记、已有登记撤下,界面显示「未生效」与原因。
-- **模式**:`off`(已关闭)撤下 settings.json 里的登记,新会话不再加载 mod,这是不卸载 AI Resume 也能持久退出的办法;`observe` 只记录;
-  `shadow`(install 后默认)照常判断、一律放行,只记"如果启用会怎么做";
-  `enforce` 推迟派发、读数到收尾线时让在途子代理的工具调用不执行(软着陆,`StructuredOutput` 豁免,主会话不拦)、重置后会话空闲时以插件消息提醒补派一次、
+- **模式**(界面名:已关闭 / 只记用量 / 试运行 / 拦截;CLI、文档与提示条同一套叫法):`off`(已关闭)撤下 settings.json 里的登记,新会话不再加载 mod,
+  这是不卸载 AI Resume 也能持久退出的办法;`observe`(只记用量)只记读数与计量;
+  `shadow`(试运行,install 后默认)照常判断、一律放行,只记录、不拦截;
+  `enforce`(拦截)推迟派发、读数到收尾线时让在途子代理的工具调用不执行(软着陆,`StructuredOutput` 豁免,主会话不拦)、重置后会话空闲时以插件消息提醒补派一次、
   续跑或工作流回报那一轮在 `context` 里附预算简报。给模型看的文字只陈述事实,不写祈使句(实测子代理会把工具结果里的指令当成提示注入)。
 - **决策**:每个窗口只算到重置为止:需求 = 价格 × min(成本 p80, 速率 p80 × 距重置);余量 = 100 − 读数 − 在途 − 预留;放行 ⇔ 需求 ≤ 余量。
   判断与预留同步完成(同一 `parallel()` 批次的 spawn 在 1 毫秒内全部先到);同一工作流 run 推迟第 i 个后其后全部推迟(前缀闭合);
@@ -551,9 +552,17 @@ AI Resume 只与客户端落盘的原生会话打交道,不在自己这里维护
 - **校准**:按 窗口 × 模型 × 时段(美西工作日 05–11 点为高峰)学"百分点 / 百万等价 token";Δp 除以全机等价 token(本会话 + 其它会话心跳里的累计计量),
   样本按 窗口|重置时刻|起点|终点 跨会话去重。只有加载了 mod 的会话进账本,看不到的消耗只会让价格偏大(保守)。
 - **证据**:`budget.get` 汇总心跳与最近 7 天日志(按行的 `ts` 过滤,同一行出现在多个分段只算一次,按文件长度与修改时间增量解析,超过 64 MiB 时只汇总最近的部分并标出)。
-  状态:`effective` 要求 3 分钟内的**全部**新鲜心跳都回报当前模式、配置版本与已装 mod 版本;一部分跟上是 `partial`,都没跟上是 `stale`,
-  没有心跳是 `waiting`,登记/文件/配置/策略任一不对是 `broken`,settings.json 读不出是 `unverified`,已关闭是 `disabled`。
-  "本可避免的中断"只认 `stop_failure` 的 `rate_limit`(其它报错不算);启用后同一工作流 agent 被反复推迟只算一次。
+  状态:`effective` 要求 3 分钟内的**全部**新鲜心跳都回报当前模式、配置版本与已装 mod 版本。没跟上的会话分三种:设置刚更新、心跳还没轮到
+  (mod 每 60 秒先重读 `config.json` 再写心跳;`config.json` 修改时间之后 90 秒内的心跳回报旧设置算正常)只有这一种时是 `switching`,会自己跟上;
+  过了 90 秒仍回报旧设置算没跟上(多半读不到 `config.json`);跑的不是已装版本的 mod 要重开会话才换。后两种存在时,一部分跟上是 `partial`,
+  都没跟上是 `stale`;修改时间读不出或比现在晚 1 分钟以上(时钟回拨留下的)时分不清,按没跟上处理。没有心跳是 `waiting`,
+  登记/文件/配置/策略任一不对、或 `config.json` 里的模式不是当前设置(`config-mismatch`:跟着它的会话并没有「没跟上」)是 `broken`;
+  settings.json 读不出、或已装 mod 的版本读不出(`mod-version`:分不清会话跑的是不是已装版本)是 `unverified`;已关闭是 `disabled`
+  (已关闭时 settings.json 读不出,撤没撤下登记核实不了,带 `settings-unreadable`)。
+  右栏一块:一行写「模式 · 状态」(如「试运行 · 生效中」),正常生效时右边是最近 7 天判断过的派发次数(「35 次里 4 次会拦」,拦截模式下「拦下 N 次」;
+  放不下时折到下一行,不截断);说明行正常时不出现,只说要你做什么(琥珀 / 红,两件就各占一行,如「4 个会话还在用旧版,重开后生效」)或在等什么(灰);
+  问题码认不出时退回通用短句;内部术语与版本串只进悬停与「视图 › 子代理预检…」。切换模式后的页脚提示按回包说话,登记撤不掉、被策略挡住时标红说明。
+  "本可避免的中断"只认 `stop_failure` 的 `rate_limit`(其它报错不算);拦截模式下同一工作流 agent 被反复推迟只算一次。
   日志与心跳只记计量、读数与判断,提示与描述只留长度和加盐(`state\budget-gate\salt`,install 生成)SHA-256 前 16 位,工作目录只留加盐哈希。
 - **红线**:mod 不调用 `$.session.authorize`,不读写任何凭据;自身出错一律放行;只在 AI Resume 已建好的 `state\` 下写——Desktop 是 MSIX 包,
   它拉起的进程在 `%LOCALAPPDATA%` 下新建顶层目录会被重定向进包私有目录,包外的 AI Resume 看不到。

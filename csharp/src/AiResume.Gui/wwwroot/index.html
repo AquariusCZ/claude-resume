@@ -9,7 +9,7 @@
    1. 它现在在不在干活?            —— 铭牌上的状态灯,一灯两行;
    2. 还剩多少额度,什么时候恢复?   —— 四块等高 CRT,含义固定,不随任何选择改变;
    3. 哪些项目、用哪个模型、卡在哪? —— 续跑队列,每行自带模型与等待原因;
-   4. 登录和通知是否健康?          —— 右栏两块:Claude 登录、完成通知 → 飞书。
+   4. 登录和通知是否健康?          —— 右栏三块:Claude 登录、完成通知 → 飞书、子代理预检。
    其余(Codex、其他通知源、供应商明细、不再扫描名单、飞书设置、关于)收进菜单栏。
    原则:主界面每一句肯定句都要有证据;收进菜单的东西若处于启用或故障状态,主界面必须留一句提示。
 
@@ -237,6 +237,12 @@ button,select,input{font:inherit;color:inherit}
 .led.bad{background:var(--vermilion);border-color:var(--vermilion-deep)}
 .kv .k{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink)}
 .kv .v{white-space:nowrap;color:var(--ink-2);text-align:right}
+/* 子代理预检一行:左边「模式 · 状态」与右边次数放不下时,次数折到下一行靠右,两边都不截断 */
+.kv.fold{display:flex;flex-wrap:wrap;column-gap:8px;row-gap:2px}
+.kv.fold .led{flex:none}
+.kv.fold .k{flex:0 1 auto}
+.kv.fold .v{margin-left:auto}
+#bgNote{white-space:pre-line}
 .kv .v.ok{color:var(--ok)} .kv .v.wait{color:var(--amber-deep)} .kv .v.bad{color:var(--alert)}
 .sw{appearance:none;width:32px;height:18px;padding:0;border:1px solid var(--ctl);background:var(--sunk);position:relative;cursor:pointer;
   transition:background-color .15s var(--ease-out),border-color .15s var(--ease-out)}
@@ -443,8 +449,8 @@ dialog::backdrop{background:rgba(38,35,29,.28)}
     </section>
     <section class="blk" aria-labelledby="bgTitle">
       <h2 id="bgTitle">子代理预检<button class="lk aux" type="button" id="bgOpen">详情与模式…</button></h2>
-      <div class="kv" id="bgRow"><span class="led" id="bgLed"></span><span class="k" id="bgHead">读取中…</span><span class="v" id="bgVal"></span></div>
-      <p class="note warn" id="bgNote" hidden></p>
+      <div class="kv fold" id="bgRow"><span class="led" id="bgLed"></span><span class="k" id="bgHead">读取中…</span><span class="v" id="bgVal"></span></div>
+      <p class="note" id="bgNote" hidden></p>
     </section>
   </aside>
 </main>
@@ -510,8 +516,8 @@ dialog::backdrop{background:rgba(38,35,29,.28)}
     <p class="hint" id="bgdReasons"></p>
     <p class="hint wait" id="bgdErrors" hidden></p>
     <div class="modes" id="bgdModes" role="radiogroup" aria-label="预检模式"></div>
-    <label class="confirm" id="bgdConfirmRow" hidden><input type="checkbox" id="bgdConfirm"> 我已看过下面的证据,打开拦截(推迟派发、软着陆、重置后补派提醒)</label>
-    <p class="hint">影子模式照常判断但一律放行,只记"如果启用会怎么做";启用拦截后才真的推迟。新开的 Claude Code 会话才加载 mod,模式约 1 分钟内跟上。</p>
+    <label class="confirm" id="bgdConfirmRow" hidden><input type="checkbox" id="bgdConfirm"> 我已看过下面的证据,打开拦截(额度不够时先不派发子代理,重置后提醒补派)</label>
+    <p class="hint">试运行:照常判断,只记录、不拦截。拦截:额度不够时先不派发子代理,额度重置后提醒你补派;快用完时让在跑的子代理带着已有结论收尾。改模式后开着的会话约 1 分钟内跟上;AI Resume 升级后,开着的会话要重开才用上新版。</p>
     <h4>额度读数对表</h4>
     <table class="tbl"><thead><tr><th>窗口</th><th>mod 读数</th><th>OAuth 读数</th><th>差</th></tr></thead><tbody id="bgdReadings"></tbody></table>
     <h4>最近的判断</h4>
@@ -1114,10 +1120,38 @@ const AR = (() => {
   }
 
   // ---------- 子代理预检(ADR-0008)----------
+  // 右栏一行写「模式 · 状态」,正常生效时右边是最近 7 天的次数(带单位,放不下时折到下一行,不截断);
+  // 说明行只说一件事,正常时不出现:要你做什么(琥珀 / 红),或在等什么(灰)。详情对话框左边模式、右边状态。
   // 「生效中」是肯定句:必须所有新鲜心跳都回报当前模式、配置版本与已装 mod 版本(由后端判定 status=effective)。
-  // 只有一部分跟上是「部分生效」,只装好没有会话加载时是「等新会话」,一个都没跟上是「配置未跟上」,
-  // 已关闭是 disabled,读不出一律「未核实」,绝不显示正常。
-  const BUDGET_MODE = { off: '已关闭', observe: '只记录', shadow: '影子模式', enforce: '启用拦截' };
+  // 设置刚更新、心跳还没轮到是「切换中」(约 1 分钟内自己好,不催人);跑旧版 mod 的会话要重开才换,单独说怎么做;
+  // 有会话没跟上时一部分跟上是「部分生效」、一个都没有是「未跟上」,只装好没有会话加载是「等新会话」,
+  // 已关闭不点灯,读不出一律「未核实」,绝不显示正常。版本串只进悬停与详情,卡片上不出现。
+  const BUDGET_MODE = { off: '已关闭', observe: '只记用量', shadow: '试运行', enforce: '拦截' };
+  const BUDGET_MODE_HINT = {
+    off: '已关闭:撤下 settings.json 里的登记,新开的 Claude Code 会话不再加载预检',
+    observe: '只记用量:只记额度读数和每次请求的用量(用来学价格),不判断、不拦截',
+    shadow: '试运行:每次派发子代理照常判断,只记录、不拦截',
+    enforce: '拦截:额度不够时先不派发子代理,额度重置后提醒你补派;快用完时让在跑的子代理带着已有结论收尾',
+  };
+  // 后端状态 → [卡片与详情里的短句, 灯色]
+  const BUDGET_STATUS = {
+    effective: ['生效中', 'ok'], switching: ['切换中', 'wait'], partial: ['部分生效', 'wait'], waiting: ['等新会话', 'wait'],
+    stale: ['未跟上', 'wait'], broken: ['未生效', 'bad'], unverified: ['未核实', ''],
+  };
+  // 后端问题码 → 卡片上的一句话(说清怎么办);完整原因在悬停与详情里。
+  // 说明行的每一句都要在最窄右栏(150% 缩放、出滚动条时约 16 个汉字宽)一行放下:keep-all 只在空格处折行,折开就会拆散词组。
+  const BUDGET_ISSUE = {
+    'policy-blocked': '组织策略禁止加载,可选「已关闭」',
+    'policy-unknown': '读不出组织策略,可选「已关闭」',
+    unregistered: '还没登记,重新安装可修复',
+    'wrong-path': '登记路径不对,重新安装可修复',
+    'mod-files': '预检文件不全,重新安装可修复',
+    'mod-version': '读不出预检版本,重新安装可修复',
+    config: '预检设置读不出,重新安装可修复',
+    'config-mismatch': '设置文件没跟上,重新安装可修复',
+    'settings-unreadable': '读不出 settings.json,稍后重读',
+    'still-registered': '登记没撤掉,再选一次「已关闭」',
+  };
   const BUDGET_RULE = {
     fits: '放得下', 'guaranteed-progress': '保底放行', 'no-readings': '无读数放行', 'over-budget': '额度不够',
     'prefix-closure': '同批后缀', 'new-model-single-flight': '新模型单路', 'scoped-exhausted': '族周额度用尽', 'model-limited': '模型受限',
@@ -1126,27 +1160,24 @@ const AR = (() => {
   const BUDGET_SOURCE = { measured: '实测', seed: '种子', family: '同族先验', 'new-model': '新模型' };
 
   function budgetModel(r, now) {
-    if (!r) return { loading: true, side: { led: '', head: '读取中…', value: '', note: '', title: '' } };
+    const empty = { reasons: [], errorsText: '', readingRows: [], priceRows: [], decisionRows: [], coverageText: '', coverageCls: '',
+      avoidedText: '', pendingRows: [], modeButtons: [], switchedText: '', switchedBad: false };
+    if (!r) {
+      return { ...empty, loading: true, modeLabel: '', statusText: '', statusLed: '', side: { led: '', head: '读取中…', value: '', note: '', noteCls: '', title: '' },
+        dlg: { led: '', head: '读取中…', value: '', cls: '' } };
+    }
     if (r.error) {
-      return { loading: false, error: r.error, side: { led: '', head: '未核实', value: '', note: '读不出预检状态', title: r.error },
-        modeLabel: '未核实', statusText: '未核实', statusLed: '', reasons: [r.error], errorsText: '', readingRows: [], priceRows: [], decisionRows: [],
-        coverageText: '', coverageCls: '', avoidedText: '', pendingRows: [], modeButtons: [] };
+      return { ...empty, loading: false, error: r.error, modeLabel: '未核实', statusText: '未核实', statusLed: '', reasons: [r.error],
+        side: { led: '', head: '未核实', value: '', note: '读不出预检状态', noteCls: '', title: r.error },
+        dlg: { led: '', head: '未核实', value: '', cls: '' } };
     }
     const modeLabel = BUDGET_MODE[r.mode] || String(r.mode || '未知');
     const off = r.mode === 'off' || r.status === 'disabled';
-    let statusLed = '', statusText = '未核实';
-    switch (r.status) {
-      case 'effective': statusLed = off ? '' : 'ok'; statusText = off ? '已关闭' : '生效中'; break;
-      case 'partial': statusLed = 'wait'; statusText = '部分会话生效'; break;
-      case 'waiting': statusLed = 'wait'; statusText = '已安装 · 等新会话加载'; break;
-      case 'stale': statusLed = 'wait'; statusText = '配置未跟上'; break;
-      case 'broken': statusLed = 'bad'; statusText = '未生效'; break;
-      case 'disabled': statusLed = ''; statusText = '已关闭'; break;
-      default: statusLed = ''; statusText = '未核实';
-    }
+    // 认不出的状态一律未核实;已关闭不点灯、右边不写状态(左边已经写了「已关闭」)。
+    const [statusText, statusLed] = off ? ['', ''] : BUDGET_STATUS[r.status] || ['未核实', ''];
     const reasons = Array.isArray(r.reasons) ? r.reasons : [];
     const errors = Array.isArray(r.lastErrors) ? r.lastErrors : [];
-    const errorsText = errors.length ? 'mod 最近的报错(出错一律放行):' + errors.join(';') : '';
+    const errorsText = errors.length ? '预检自己的报错(出错一律放行,不影响派发):' + errors.join(';') : '';
     const pct = v => (v == null ? '—' : `${v}%`);
     const readingRows = (r.readings || []).map(x => {
       const off = x.delta != null && Math.abs(x.delta) > 2;
@@ -1171,7 +1202,8 @@ const AR = (() => {
       };
     });
     const decisionRows = (r.decisions || []).map(d => {
-      const verdict = d.kind === 'allow' ? ['放行', 'ok'] : d.kind === 'deferred' ? ['推迟', 'bad'] : ['本来会推迟', 'wait'];
+      // 试运行里的「会拦」只是记录;拦截模式下才真的「拦下」(推迟到额度重置后补派)。
+      const verdict = d.kind === 'allow' ? ['放行', 'ok'] : d.kind === 'deferred' ? ['拦下', 'bad'] : ['会拦', 'wait'];
       const where = d.runId ? `${d.runId.slice(0, 11)} #${d.agentIndex ?? '?'}` : '单独派发';
       const room = d.need != null && d.margin != null
         ? `需 ${Number(d.need).toFixed(1)} 点 / 余 ${Number(d.margin).toFixed(1)} 点` + (d.binding && BUDGET_WINDOW[d.binding] ? `(${BUDGET_WINDOW[d.binding]})` : '')
@@ -1179,7 +1211,7 @@ const AR = (() => {
       return {
         when: fmtWhen(d.atUnix, now), verdict: verdict[0], cls: verdict[1], rule: BUDGET_RULE[d.rule] || d.rule,
         model: d.model, where, room,
-        title: d.deferUntilUnix ? `推迟到 ${fmtWhen(d.deferUntilUnix, now)} 重置` : '',
+        title: d.deferUntilUnix ? `${d.kind === 'deferred' ? '推迟' : '拦截模式下会推迟'}到 ${fmtWhen(d.deferUntilUnix, now)} 额度重置` : '',
       };
     });
     const cov = r.coverage || {};
@@ -1189,40 +1221,69 @@ const AR = (() => {
         (cov.medianRatio != null ? ` · 实际/预测中位 ${cov.medianRatio}` : '') + (cov.total < 10 ? ' · 样本还少' : ''))
       + (r.truncated ? ' · 日志太多,只汇总了最近的一部分' : '');
     const av = r.avoided || {};
+    // 只记用量与已关闭不做判断,没有可说的统计。
     const avoidedText = r.mode === 'enforce'
-      ? `避免中断 ${av.enforceAvoided || 0} 次 · 软着陆 ${av.landingsApplied || 0} 次`
-      : `影子:本可避免的中断 ${av.shadowWouldAvoid || 0} 次 · 本来会软着陆 ${av.landingsShadow || 0} 次`;
+      ? `避免中断 ${av.enforceAvoided || 0} 次 · 让在跑的子代理提前收尾 ${av.landingsApplied || 0} 次`
+      : r.mode === 'shadow' ? `试运行:本可避免中断 ${av.shadowWouldAvoid || 0} 次 · 本会让在跑的子代理提前收尾 ${av.landingsShadow || 0} 次` : '';
     const pendingRows = (r.pending || []).map(p => ({
       when: p.deferUntilUnix ? fmtWhen(p.deferUntilUnix, now) : '额度恢复后',
       text: (p.runId ? `${p.runId.slice(0, 11)} #${p.agentIndex ?? '?'}` : p.type) + ` · ${p.model}`,
       cls: p.applied ? 'wait' : '',
-      tag: p.applied ? '待补派' : '影子',
+      tag: p.applied ? '待补派' : '试运行',
     }));
     const counts = r.counts || {};
     const total = (counts.allow || 0) + (counts.deferred || 0) + (counts['would-defer'] || 0);
-    // 右栏是窄列:状态写在左、最近 7 天的短句写在右,完整说明放悬停;说明行只在需要处理时出现。
-    const summary = total === 0 ? '暂无派发'
-      : r.mode === 'enforce' ? `推迟 ${counts.deferred || 0}/${total}`
-      : `本来会推迟 ${counts['would-defer'] || 0}/${total}`;
-    // 右栏窄:状态用短句,完整原因在说明行与悬停里。
-    const sideStatus = { effective: off ? '已关闭' : '生效中', partial: '部分生效', waiting: '等新会话', stale: '未跟上', broken: '未生效', disabled: '已关闭' }[r.status] || '未核实';
-    const note = r.status === 'waiting' ? '已装好,新开的 Claude Code 会话才会加载'
-      : ['broken', 'stale', 'partial', 'unverified', 'disabled'].includes(r.status) ? reasons.join(';') : '';
-    const sevenDay = total === 0 ? '最近 7 天还没有子代理派发'
-      : r.mode === 'enforce' ? `最近 7 天判断 ${total} 次,推迟 ${counts.deferred || 0} 次`
-      : `最近 7 天判断 ${total} 次,本来会推迟 ${counts['would-defer'] || 0} 次(影子模式只记录不拦)`;
+    // 数字一律带单位。只有试运行与拦截才做判断;只记用量模式没有判断记录,不能说成「没派发过」。
+    // 完整一句进悬停;卡片右边只在正常生效时放短的次数(放不下时折到下一行,不截断左边的状态)。
+    // 次数 = 判断过的派发(拦下的也算一次);试运行里「会拦」连同拦截期真拦下的一起算,拦截模式只算真拦下的。
+    const judging = r.mode === 'shadow' || r.mode === 'enforce';
+    const blocked = r.mode === 'enforce' ? counts.deferred || 0 : (counts['would-defer'] || 0) + (counts.deferred || 0);
+    const partialLog = r.truncated ? '(日志太多,只统计了最近的一部分)' : '';
+    const tally = !judging ? ''
+      : total === 0 ? '最近 7 天没有子代理派发记录' + partialLog
+      : r.mode === 'enforce' ? `最近 7 天判断了 ${total} 次子代理派发,拦下其中 ${blocked} 次${partialLog}`
+      : `最近 7 天判断了 ${total} 次子代理派发,其中 ${blocked} 次会被拦${partialLog}`;
+    const count = !judging || off || r.status !== 'effective' ? ''
+      : total === 0 ? '暂无派发记录'
+      : r.mode === 'enforce' ? `${total} 次里拦下 ${blocked} 次`
+      : `${total} 次里 ${blocked} 次会拦`;
+    // 要你动手的事:跑旧版的会话重开才换;过了一个心跳周期仍没跟上设置的会话也重开试试。设置刚更新的不算(会自己跟上)。
+    const behind = r.behind || {};
+    const acts = [];
+    if (behind.modMismatch > 0) acts.push(`${behind.modMismatch} 个会话${behind.modAllOlder ? '还在用旧版' : '版本不同'},重开后生效`);
+    if (behind.stuck > 0) acts.push(`${behind.stuck} 个会话没跟上新设置,重开试试`);
+    // 说明行只说一件事,正常生效时不出现:未生效 / 未核实说原因与修法,有事要做说怎么做,在等的说等什么。
+    // 认不出的问题码不把原因原文(可能带 mod、路径、版本)搬上卡片,退回通用短句;原文在悬停与详情里。
+    let note = '', noteCls = '';
+    if (r.status === 'broken') { note = BUDGET_ISSUE[r.issue] || '没能生效,原因见「详情与模式…」'; noteCls = 'bad'; }
+    else if (r.status === 'unverified') note = BUDGET_ISSUE[r.issue] || '核实不了,原因见「详情与模式…」';
+    else if (off) { note = r.issue ? BUDGET_ISSUE[r.issue] || '登记有问题,见「详情与模式…」' : ''; noteCls = note ? 'warn' : ''; }
+    // 两件要做的事各占一行(说明行按换行符分行),不挤在一句里。
+    else if (acts.length) { note = acts.join('\n'); noteCls = 'warn'; }
+    else if (r.status === 'partial' || r.status === 'stale') { note = '有会话没跟上,见「详情与模式…」'; noteCls = 'warn'; }
+    else if (r.status === 'waiting') note = '新开的 Claude Code 会话才会加载';
+    else if (r.status === 'switching') note = '设置刚更新,约 1 分钟内跟上';
     const modeButtons = ['off', 'observe', 'shadow', 'enforce'].map(m => ({
-      mode: m, label: BUDGET_MODE[m], active: r.mode === m, needsConfirm: m === 'enforce',
+      mode: m, label: BUDGET_MODE[m], title: BUDGET_MODE_HINT[m], active: r.mode === m, needsConfirm: m === 'enforce',
     }));
+    // 切换模式后页脚那一句:按回包说话。登记撤不掉、被组织策略挡住、读不出设置时(后端不回滚模式,只记下来),
+    // 不能报「已切换」了事,要和卡片说同一件事并标红;否则开着的会话每分钟重读一次设置,已关闭还要说新会话不再加载。
+    const trouble = r.status === 'broken' || r.status === 'unverified' || (off && !!r.issue);
+    const switchedText = trouble
+      ? `${r.mode === 'off' ? '子代理预检已关闭' : `子代理预检已切换为「${modeLabel}」`},但${note}`
+      : r.mode === 'off' ? '子代理预检已关闭:新开的会话不再加载,开着的会话约 1 分钟内停止判断'
+      : `子代理预检已切换为「${modeLabel}」:开着的会话约 1 分钟内跟上`;
     return {
       loading: false,
+      // 右栏一行:「模式 · 状态」+ 次数;详情对话框地方够,左边模式、右边状态(带颜色)。
       side: {
-        led: statusLed, head: off ? '已关闭' : `${modeLabel} · ${sideStatus}`,
-        value: !off && ['effective', 'partial'].includes(r.status) ? summary : '', note,
-        title: [sevenDay, ...reasons, r.freshSessions ? `活跃会话 ${r.freshSessions} 个` : '', errorsText].filter(Boolean).join('\n'),
+        led: statusLed, head: off ? '已关闭' : `${modeLabel} · ${statusText}`, value: count, note, noteCls,
+        title: [BUDGET_MODE_HINT[r.mode] || '', tally, ...reasons,
+          r.freshSessions ? `活跃会话 ${r.freshSessions} 个` : '', errorsText].filter(Boolean).join('\n'),
       },
+      dlg: { led: statusLed, head: off ? '已关闭' : modeLabel, value: statusText, cls: statusLed },
       modeLabel, statusText, statusLed, reasons, errorsText, readingRows, priceRows, decisionRows,
-      coverageText, coverageCls, avoidedText, pendingRows, modeButtons,
+      coverageText, coverageCls, avoidedText, pendingRows, modeButtons, switchedText, switchedBad: trouble,
     };
   }
 
@@ -1366,11 +1427,12 @@ const AR = (() => {
     try {
       // 各块数据到了就各自绘制:额度磁贴不等最慢的供应商目录。目录在 quota.get 之后才读(宿主让 Claude 行复用这一轮的
       // 额度读数，一轮只请求一次 usage 端点);登录在额度请求结束后再读一次,「被服务端拒绝」反映的是这一轮的结果。
+      // 通知源状态也在这里重读:自动刷新同样要让「待核实」跟上、让断掉的 hook 变红。
       const afterQuota = loadQuota(force).then(() => {
         renderMeters();
         return Promise.all([loadCatalog().then(() => { renderMeters(); renderRows(); syncArm(); }), loadLogin()]);
       });
-      await Promise.all([afterQuota, loadLogin(), loadChannel()]);
+      await Promise.all([afterQuota, loadLogin(), loadChannel(), loadNotify()]);
       renderMeters();
       renderRows();
       syncArm();
@@ -1769,9 +1831,24 @@ const AR = (() => {
   }
 
   // ───────── 完成通知 ─────────
+  // 通知源状态(hook 指向的程序还在不在、OpenCode 插件加载没有)在窗口开着时也会变:随手动与自动刷新重读,
+  // 30 秒一拍里也约每 2 分钟重读一次——否则「待核实」停在开窗那一刻,hook 断了也一直绿。
+  // OpenCode 的探测要读它的日志尾(最多 4 MiB),所以不是每一拍都读。
+  // 只采用最新发出的读数;开关操作进行中发出、或比操作结果晚回来的读数一律作废,不能把开关拨回操作之前。
+  const NOTIFY_POLL_MS = 110000;
+  let notifyReadIssued = 0, notifyReadApplied = 0, notifyMutationVersion = 0, notifyReadAt = 0, notifyReading = 0;
   async function loadNotify() {
-    try { notifyList = await call('notifications.list'); }
-    catch (e) { notifyList = { items: [], error: e.message }; }
+    const requestId = ++notifyReadIssued;
+    const mutationVersion = notifyMutationVersion;
+    notifyReadAt = Date.now();
+    notifyReading++;
+    let next;
+    try { next = await call('notifications.list'); }
+    catch (e) { next = { items: [], error: e.message }; }
+    finally { notifyReading--; }
+    if (notifyBusy || mutationVersion !== notifyMutationVersion || requestId < notifyReadApplied) return;
+    notifyReadApplied = requestId;
+    notifyList = next;
     renderNotify();
   }
   async function loadChannel() {
@@ -1813,14 +1890,25 @@ const AR = (() => {
     if (el.classList.contains('unknown')) { loadNotify(); return; }
     const kind = el.dataset.kind;
     const enabling = !el.classList.contains('on');
-    notifyBusy = true; el.classList.add('busy');
+    // 操作前后各换一次版本:操作之前或进行中发出的读数回来时一律作废(loadNotify 比对版本)。
+    notifyBusy = true; notifyMutationVersion++; el.classList.add('busy');
+    let failed = null;
     try {
-      notifyList = await call('notifications.setEnabled', { kind, enabled: enabling });
+      // 改客户端配置可能要等文件锁:多等一会儿,免得把还在执行的操作说成失败。
+      notifyList = await call('notifications.setEnabled', { kind, enabled: enabling }, 60000);
       renderNotify();
       if (kind === 'Codex' && enabling) say('Codex hook 已写入 hooks.json 并登记信任;新开的 Codex 会话生效,若 codex /hooks 显示未信任请在那里信任一次');
       else if (kind === 'OpenCode' && enabling) say('OpenCode 插件已写入,OpenCode 会自动重新加载;加载结果以它的日志为准');
-    } catch (e) { el.classList.remove('busy'); say(`通知源切换失败:${e.message}`, true); }
-    finally { notifyBusy = false; }
+    } catch (e) {
+      failed = e;
+      // 前端不再等待 ≠ 宿主没执行:超时只说结果未确认。
+      say(e.timeout ? '通知源切换结果未确认:稍后自动重读,以开关显示为准' : `通知源切换失败:${e.message}`, true);
+    }
+    finally { notifyBusy = false; notifyMutationVersion++; el.classList.remove('busy'); }
+    // 失败时开关实际停在哪不确定(改动可能已部分生效):重读一次,让开关跟上现状。超时则宿主可能还在写,
+    // 过几秒再读,并让 30 秒一拍下一次也重读(不必等满限频间隔)。
+    if (failed && failed.timeout) setTimeout(() => { loadNotify().finally(() => { notifyReadAt = 0; }); }, 3000);
+    else if (failed) loadNotify();
   });
 
   // 「发送测试」只认这一条测试通知自己的结局(与 notify test 同一判据),送不出去就撤回,
@@ -2027,7 +2115,9 @@ const AR = (() => {
   function runCommand(cmd) {
     switch (cmd) {
       case 'refresh':
-        refreshAll(true); readAndApplyArm().catch(applyArmReadFailure); loadNotify();
+        // 一轮刷新还没完时 refreshAll 直接返回:通知源单独补读一次,刚修好的 hook 不用等下一拍。
+        if (quotaBusy) loadNotify();
+        refreshAll(true); readAndApplyArm().catch(applyArmReadFailure);
         // 勾选行的会话事实(是否被打断、是否开着)也可能变了:清掉缓存重读。
         if (!(arm && arm.armed)) { previews.clear(); previewGeneration++; schedulePreview(); }
         break;
@@ -2122,24 +2212,28 @@ const AR = (() => {
     $('bgVal').textContent = m.side.value;
     $('bgRow').title = m.side.title || '';
     $('bgNote').textContent = m.side.note || '';
+    $('bgNote').className = 'note' + (m.side.noteCls ? ' ' + m.side.noteCls : '');
+    $('bgNote').title = m.side.title || '';
     $('bgNote').hidden = !m.side.note;
     if ($('dlgBudget').open) renderBudgetDialog(m);
   }
   function renderBudgetDialog(m) {
-    $('bgdLed').className = 'led' + (m.statusLed ? ' ' + m.statusLed : '');
-    $('bgdMode').textContent = m.modeLabel || '—';
-    $('bgdStatus').textContent = m.statusText || '—';
+    // 左边模式、右边状态;原因全文与版本只在这里和悬停里。
+    $('bgdLed').className = 'led' + (m.dlg.led ? ' ' + m.dlg.led : '');
+    $('bgdMode').textContent = m.dlg.head || '—';
+    $('bgdStatus').textContent = m.dlg.value || '';
+    $('bgdStatus').className = 'v' + (m.dlg.cls ? ' ' + m.dlg.cls : '');
     $('bgdReasons').textContent = (m.reasons || []).join(';');
     $('bgdErrors').textContent = m.errorsText || '';
     $('bgdErrors').hidden = !m.errorsText;
     $('bgdModes').innerHTML = (m.modeButtons || []).map(b =>
-      `<button class="btn${b.active ? ' primary' : ''}" type="button" role="radio" aria-checked="${b.active}" data-mode="${esc(b.mode)}"${budgetBusy ? ' disabled' : ''}>${esc(b.label)}</button>`).join('');
+      `<button class="btn${b.active ? ' primary' : ''}" type="button" role="radio" aria-checked="${b.active}" data-mode="${esc(b.mode)}" title="${esc(b.title || '')}"${budgetBusy ? ' disabled' : ''}>${esc(b.label)}</button>`).join('');
     $('bgdReadings').innerHTML = (m.readingRows || []).map(r =>
       `<tr title="${esc(r.title)}"><td class="nw">${esc(r.label)}</td><td>${esc(r.mod)}</td><td>${esc(r.oauth)}</td><td class="nw ${esc(r.cls)}">${esc(r.deltaText)}</td></tr>`).join('')
       || '<tr><td colspan="4">还没有读数</td></tr>';
     $('bgdDecisions').innerHTML = (m.decisionRows || []).map(d =>
       `<tr title="${esc(d.title)}"><td class="nw">${esc(d.when)}</td><td class="nw ${esc(d.cls)}">${esc(d.verdict)}</td><td class="nw">${esc(d.rule)}</td><td class="nw">${esc(d.model)}</td><td class="nw">${esc(d.where)}</td><td>${esc(d.room)}</td></tr>`).join('')
-      || '<tr><td colspan="6">最近 7 天还没有子代理派发</td></tr>';
+      || '<tr><td colspan="6">最近 7 天没有子代理派发记录</td></tr>';
     $('bgdCoverage').textContent = m.coverageText || '';
     $('bgdCoverage').className = 'hint' + (m.coverageCls ? ' ' + m.coverageCls : '');
     $('bgdAvoided').textContent = m.avoidedText || '';
@@ -2148,7 +2242,7 @@ const AR = (() => {
       || '<tr><td colspan="3">没有</td></tr>';
     $('bgdPrices').innerHTML = (m.priceRows || []).map(p =>
       `<tr><td class="nw">${esc(p.model)}</td><td class="nw">${esc(p.window)}</td><td class="nw">${esc(p.k)}</td><td>${esc(p.source)}</td><td class="nw ${esc(p.cls)}">${esc(p.confidence)}(${p.samples})</td></tr>`).join('')
-      || '<tr><td colspan="5">还没有价格(影子或启用拦截时才计算)</td></tr>';
+      || '<tr><td colspan="5">还没有价格(试运行或拦截时才计算)</td></tr>';
   }
   function showBudget() {
     $('bgdConfirm').checked = false;
@@ -2162,7 +2256,7 @@ const AR = (() => {
     const el = ev.target.closest('button[data-mode]');
     if (!el || budgetBusy) return;
     const mode = el.dataset.mode;
-    // 启用拦截要两步:先勾选「我已看过证据」,再点一次。两步都是用户自己的动作,不弹窗。
+    // 打开拦截要两步:先勾选「我已看过下面的证据」,再点一次。两步都是用户自己的动作,不弹窗。
     if (mode === 'enforce' && !$('bgdConfirm').checked) {
       $('bgdConfirmRow').hidden = false;
       $('bgdConfirm').focus();
@@ -2172,7 +2266,8 @@ const AR = (() => {
     ++budgetSeq;
     try {
       budget = await call('budget.setMode', { mode, confirm: mode === 'enforce' }, 20000);
-      say(`子代理预检已切换为「${AR.budgetModel(budget, nowUnix()).modeLabel}」,新会话约 1 分钟内跟上`);
+      const m = AR.budgetModel(budget, nowUnix());
+      say(m.switchedText, m.switchedBad);
     } catch (e) {
       say('子代理预检模式切换失败:' + ((e && e.message) || e), true);
     } finally {
@@ -2186,7 +2281,6 @@ const AR = (() => {
   async function load() {
     renderMeters();
     refreshAll(false);
-    loadNotify();
     loadBudget();
     try { renderProjects(await call('projects.list')); }
     catch (e) { $('rows').innerHTML = `<div class="empty-q" style="color:var(--alert)">项目发现失败:${esc(e.message)}</div>`; say('项目发现失败', true); }
@@ -2204,11 +2298,13 @@ const AR = (() => {
 
   // 额度按配置周期自动刷新(由 tick 按 nextRefreshAt 触发);布防状态 30 秒一拍(引擎可能在面板开着时被杀掉,
   // 那正是它最该变红的时刻)。布防/队列操作进行中时跳过这一拍,免得和操作结果交错。
+  // 通知源状态在这一拍里约每 2 分钟重读一次(上一次读数还没回来、或开关操作进行中时不读)。
   setInterval(tick, 15000);
   setInterval(() => {
     if (armBusy || queueBusy) return;
     readAndApplyArm().catch(applyArmReadFailure);
     loadChannel();
+    if (!notifyBusy && !notifyReading && Date.now() - notifyReadAt >= NOTIFY_POLL_MS) loadNotify();
   }, 30000);
   // 预检证据要读心跳与日志:一分钟一次足够(心跳本身一分钟一拍)。
   setInterval(loadBudget, 60000);

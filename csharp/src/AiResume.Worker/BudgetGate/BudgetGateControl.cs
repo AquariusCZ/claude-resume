@@ -12,7 +12,7 @@ namespace AiResume.Worker.BudgetGate;
 ///
 /// 意图持久化在 <see cref="ProductConfig.BudgetGateMode"/>(空串 = 旧配置从未记录,install 按默认 shadow 记下),
 /// <see cref="ProductConfig.BudgetGateConfigVersion"/> 每次变更递增并写进 config.json;mod 在心跳里回报它读到的版本,
-/// 界面据此判断"真的生效"——安装成功不等于生效。enforce(启用拦截)只能经界面上用户的显式操作写入,install 从不默认它。
+/// 界面据此判断"真的生效"——安装成功不等于生效。enforce(拦截)只能经界面上用户的显式操作写入,install 从不默认它。
 /// 「已关闭」即撤下 settings.json 里的登记(新会话不再加载 mod),这是不卸载 AI Resume 也能持久退出的办法。
 /// 组织策略禁止旁加载、或策略读不出时一律不登记(<see cref="SideloadPolicy"/>)。
 /// </summary>
@@ -200,12 +200,13 @@ public sealed class BudgetGateControl
         return !policy.CanRegister && _env.Inspect(_paths.ModDir).Ours.Any() && _env.Apply(_paths.ModDir, enable: false);
     }
 
+    /// <summary>界面、CLI 与文档共用的模式名(与 index.html 的 <c>BUDGET_MODE</c> 一致)。</summary>
     public static string ModeLabel(string mode) => mode switch
     {
         "off" => "已关闭",
-        "observe" => "只记录",
-        "shadow" => "影子模式",
-        "enforce" => "启用拦截",
+        "observe" => "只记用量",
+        "shadow" => "试运行",
+        "enforce" => "拦截",
         _ => mode,
     };
 
@@ -264,6 +265,40 @@ public sealed class BudgetGateControl
     /// <summary>读 config.json 里的版本;不存在或读不出为 null。</summary>
     public int? ReadConfigVersion() => ReadConfigState().Version;
 
+    /// <summary>
+    /// 证据汇总用的 config.json 现状:版本、模式与最近一次被改写的时刻(取文件修改时间:mod 也是按修改时间决定要不要重读),
+    /// 用来分清「设置刚更新、心跳还没轮到」与「过了一个心跳周期仍没跟上」,并核对文件里的模式是不是当前设置。
+    /// 读的前后修改时间不一样(读到一半被替换)就再读一次,免得拼出对不上的一组。不存在或读不出的字段为 null。
+    /// </summary>
+    public BudgetGateConfigStamp ReadConfigStamp()
+    {
+        DateTimeOffset? before = ConfigWrittenAt();
+        (int? version, string? mode) = ReadConfigState();
+        DateTimeOffset? after = ConfigWrittenAt();
+        if (before != after)
+        {
+            // 读到一半被替换:再读一次;还对不上就不给修改时间(证据按「分不清」处理,不会因此说成生效中)。
+            before = after;
+            (version, mode) = ReadConfigState();
+            after = ConfigWrittenAt();
+        }
+
+        return new BudgetGateConfigStamp(version, mode, before == after ? after : null);
+    }
+
+    private DateTimeOffset? ConfigWrittenAt()
+    {
+        try
+        {
+            var file = new FileInfo(_paths.ConfigFile);
+            return file.Exists ? new DateTimeOffset(file.LastWriteTimeUtc, TimeSpan.Zero) : null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>读 config.json 里的版本与模式;不存在或读不出的字段为 null。</summary>
     public (int? Version, string? Mode) ReadConfigState()
     {
@@ -315,3 +350,6 @@ public sealed class BudgetGateControl
 }
 
 public sealed record BudgetGateReconcile(bool Ok, string Detail);
+
+/// <summary>config.json 的版本、模式与修改时间(同一次读出);读不出的字段为 null。</summary>
+public sealed record BudgetGateConfigStamp(int? Version, string? Mode, DateTimeOffset? WrittenAt);

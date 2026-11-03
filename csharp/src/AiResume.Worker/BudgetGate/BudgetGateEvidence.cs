@@ -10,13 +10,21 @@ namespace AiResume.Worker.BudgetGate;
 /// 校准价格、最近判断、预测与实际(p80 覆盖率)、避免掉的中断、待补派。
 ///
 /// 「生效中」是一句肯定句,必须能被外部证伪:settings.json 里恰好登记了安装目录、mod 文件齐全、组织策略允许旁加载、
-/// 所有 3 分钟内的新鲜心跳都回报当前模式、配置版本与已装的 mod 版本;只有一部分跟上是「部分生效」,一个都没有是
-/// 「配置未跟上」,没有心跳是「等新会话」,读不出就是「未核实」。日志只读不改;半行、坏行、未知字段一律跳过。
+/// 所有 3 分钟内的新鲜心跳都回报当前模式、配置版本与已装的 mod 版本。没跟上的会话分三种,界面分开说:
+/// 设置刚更新、心跳还没轮到(mod 每分钟重读一次 config.json,会自己跟上)是「切换中」;设置更新一个心跳周期之后仍回报旧设置
+/// 是没跟上;跑的不是已装版本的 mod 要重开会话才换。有会话没跟上或跑旧版时,一部分跟上是「部分生效」,一个都没有是「未跟上」;
+/// 没有心跳是「等新会话」,读不出就是「未核实」。日志只读不改;半行、坏行、未知字段一律跳过。
 /// 日志按文件增量解析(mod 每段不超过 512 KiB,只有变了的文件才重读),同一行出现在多个文件里只算一次。
 /// </summary>
 public static class BudgetGateEvidence
 {
     public static readonly TimeSpan FreshBeat = TimeSpan.FromMinutes(3);
+
+    /// <summary>
+    /// 设置更新后多久还回报旧设置才算没跟上:mod 每 60 秒先重读 config.json 再写心跳,读与写之间还有几步 IO,
+    /// 留一个心跳周期再加余量;在这之前写的心跳回报旧设置是正常的。
+    /// </summary>
+    public static readonly TimeSpan ConfigFollowGrace = TimeSpan.FromSeconds(90);
     public static readonly TimeSpan HeartbeatWindow = TimeSpan.FromHours(24);
     public static readonly TimeSpan LogWindow = TimeSpan.FromDays(7);
     private const int DecisionRows = 30;
@@ -31,7 +39,7 @@ public static class BudgetGateEvidence
         List<Heartbeat> fresh = beats.Where(b => !b.Ended && now - b.BeatAt <= FreshBeat).ToList();
         (LogDigest logs, bool truncated) = ReadLogs(input.Paths.LogsDir, now);
 
-        (string status, List<string> reasons) = Judge(input, fresh);
+        Judgement judged = Judge(input, fresh);
 
         var readingPairs = new List<ReadingPair>();
         foreach (string kind in new[] { "five_hour", "seven_day" })
@@ -53,8 +61,10 @@ public static class BudgetGateEvidence
         return new BudgetGateReport(
             Mode: input.Mode,
             ConfigVersion: input.ConfigVersion,
-            Status: status,
-            Reasons: reasons,
+            Status: judged.Status,
+            Reasons: judged.Reasons,
+            Issue: judged.Issue,
+            Behind: judged.Behind,
             FreshSessions: fresh.Count,
             ModVersions: fresh.Select(b => b.ModVersion).Distinct().OrderBy(v => v, StringComparer.Ordinal).ToList(),
             EngineVersions: fresh.Select(b => b.EngineVersion).Distinct().OrderBy(v => v, StringComparer.Ordinal).ToList(),
@@ -71,52 +81,115 @@ public static class BudgetGateEvidence
             GeneratedAt: now);
     }
 
-    private static (string Status, List<string> Reasons) Judge(BudgetGateInputs input, List<Heartbeat> fresh)
+    /// <summary>判定结果:状态、给详情看的原因、卡片用的问题码(未生效、未核实、已关闭却仍登记时)与没跟上的会话分类。</summary>
+    private sealed record Judgement(string Status, List<string> Reasons, string Issue, BehindStats Behind);
+
+    private static readonly BehindStats NoneBehind = new(0, 0, 0, false);
+
+    private static Judgement Judge(BudgetGateInputs input, List<Heartbeat> fresh)
     {
         var reasons = new List<string>();
         if (input.Mode == "off")
         {
-            if (input.PluginDirs.Ours.Count > 0)
-                reasons.Add("settings.json 里仍登记着 mod:新会话仍会加载它(只写心跳);再切一次「已关闭」或重新 install 会撤下");
-            return ("disabled", reasons);
+            // settings.json 读不出时撤没撤下登记核实不了(切到已关闭时撤登记失败会被吞掉),不能只写「已关闭」了事。
+            if (input.PluginDirs.Unverified)
+            {
+                reasons.Add($"已关闭,但{input.PluginDirs.Detail}:登记撤没撤下核实不了");
+                return new("disabled", reasons, "settings-unreadable", NoneBehind);
+            }
+            if (input.PluginDirs.Ours.Count == 0)
+                return new("disabled", reasons, string.Empty, NoneBehind);
+            reasons.Add("已关闭,但 settings.json 里还登记着:新开的会话仍会加载它(只写心跳、不判断);再选一次「已关闭」或重新安装会撤下");
+            return new("disabled", reasons, "still-registered", NoneBehind);
         }
         if (input.PluginDirs.Unverified)
         {
             reasons.Add(input.PluginDirs.Detail);
-            return ("unverified", reasons);
+            return new("unverified", reasons, "settings-unreadable", NoneBehind);
         }
+
+        // 未生效的原因可能不止一个:卡片只说第一个(按排查顺序),详情里全列。
+        string issue = string.Empty;
+        void Problem(string code, string text)
+        {
+            if (issue.Length == 0)
+                issue = code;
+            reasons.Add(text);
+        }
+
         if (!input.Policy.CanRegister)
-            reasons.Add(input.Policy.Detail);
+            Problem(input.Policy.Blocked ? "policy-blocked" : "policy-unknown", input.Policy.Detail);
         if (!input.PluginDirs.IsExact)
-            reasons.Add($"settings.json:{input.PluginDirs.Detail}");
+            Problem(input.PluginDirs.Ours.Count == 0 ? "unregistered" : "wrong-path", $"settings.json:{input.PluginDirs.Detail}");
         if (!input.ModFilesOk)
-            reasons.Add(input.ModFilesDetail);
+            Problem("mod-files", input.ModFilesDetail);
         if (input.ConfigVersion is null)
-            reasons.Add("config.json 不存在或读不出");
+            Problem("config", "config.json 不存在或读不出");
+        else if (input.ConfigMode is not null && input.ConfigMode != input.Mode)
+        {
+            // 会话照 config.json 走:它和当前设置不一致时,跟着它的会话并没有「没跟上」,重开也没用。
+            Problem("config-mismatch", $"config.json 里是{Setting(input.ConfigMode, input.ConfigVersion)},当前设置是「{BudgetGateControl.ModeLabel(input.Mode)}」:" +
+                                       "会话照 config.json 走;重新安装会按当前设置重写");
+        }
         if (reasons.Count > 0)
-            return ("broken", reasons);
+            return new("broken", reasons, issue, NoneBehind);
+        // 已装 mod 的版本读不出(plugin.json 坏了,或正在覆盖安装时读到半截):分不清会话跑的是不是已装版本,不能说生效。
+        if (input.InstalledModVersion is null)
+        {
+            reasons.Add("读不出已装 mod 的版本(plugin.json):分不清会话跑的是不是已装版本;正在安装时稍后会好,否则重新安装可修复");
+            return new("unverified", reasons, "mod-version", NoneBehind);
+        }
         if (fresh.Count == 0)
         {
-            reasons.Add("最近 3 分钟没有会话心跳:mod 只在新启动的 Claude Code 会话里加载");
-            return ("waiting", reasons);
+            reasons.Add("最近 3 分钟没有会话在跑预检:只有新开的 Claude Code 会话才会加载它");
+            return new("waiting", reasons, string.Empty, NoneBehind);
         }
 
-        bool Matches(Heartbeat b) => b.Mode == input.Mode && b.ConfigVersion == input.ConfigVersion &&
-            (input.InstalledModVersion is null || b.ModVersion == input.InstalledModVersion);
-        List<Heartbeat> matching = fresh.Where(Matches).ToList();
-        List<Heartbeat> behind = fresh.Where(b => !Matches(b)).ToList();
-        if (behind.Count > 0)
+        bool ModOk(Heartbeat b) => b.ModVersion == input.InstalledModVersion;
+        bool ConfigOk(Heartbeat b) => b.Mode == input.Mode && b.ConfigVersion == input.ConfigVersion;
+        // 设置刚更新、这个会话还没轮到重读:更新之后不到一个心跳周期写的心跳回报旧设置是正常的,会自己跟上。
+        // 更新时刻读不出(或在未来,时钟回拨留下的)时分不清是哪种,按没跟上处理。
+        DateTimeOffset? writtenAt = input.ConfigWrittenAt is { } at && at <= input.Now + TimeSpan.FromMinutes(1) ? at : null;
+        bool Settling(Heartbeat b) => writtenAt is { } w && b.BeatAt - w <= ConfigFollowGrace;
+
+        List<Heartbeat> otherMod = fresh.Where(b => !ModOk(b)).ToList();
+        List<Heartbeat> settling = fresh.Where(b => ModOk(b) && !ConfigOk(b) && Settling(b)).ToList();
+        List<Heartbeat> stuck = fresh.Where(b => ModOk(b) && !ConfigOk(b) && !Settling(b)).ToList();
+        int matching = fresh.Count - otherMod.Count - settling.Count - stuck.Count;
+        bool allOlder = otherMod.Count > 0 && otherMod.All(b => IsOlder(b.ModVersion, input.InstalledModVersion));
+
+        if (otherMod.Count > 0)
         {
-            string seen = string.Join("、", behind.Select(b => $"{b.Mode}/v{b.ConfigVersion?.ToString(CultureInfo.InvariantCulture) ?? "?"}/mod {b.ModVersion}").Distinct());
-            reasons.Add(matching.Count == 0
-                ? $"活跃会话回报的是 {seen},不是当前配置(v{input.ConfigVersion})与已装 mod({input.InstalledModVersion ?? "?"});配置约 1 分钟内跟上,旧版 mod 要重开会话"
-                : $"{behind.Count} 个会话还在用旧配置或旧版 mod({seen});配置约 1 分钟内跟上,旧版 mod 要重开会话");
+            string versions = string.Join("、", otherMod.Select(b => b.ModVersion).Distinct().OrderBy(v => v, StringComparer.Ordinal));
+            reasons.Add($"{otherMod.Count} 个会话跑的是{(allOlder ? "旧版" : "别的版本的")} mod {versions}(已装 {input.InstalledModVersion}):" +
+                        "会话只在启动时加载 mod,重开这些会话后生效");
         }
+        if (stuck.Count > 0)
+        {
+            string seen = string.Join("、", stuck.Select(b => Setting(b.Mode, b.ConfigVersion)).Distinct());
+            string target = Setting(input.Mode, input.ConfigVersion);
+            reasons.Add(writtenAt is null
+                ? $"{stuck.Count} 个会话回报的是{seen},当前设置是{target}:读不出设置的更新时刻,分不清是不是刚改的,按没跟上新设置算;重开这些会话试试"
+                : $"{stuck.Count} 个会话没跟上新设置:设置改成{target}之后它们又报过心跳,仍是{seen};" +
+                  "可能读不到 config.json(见下方 mod 报错),重开这些会话试试");
+        }
+        if (settling.Count > 0)
+            reasons.Add($"{settling.Count} 个会话还没轮到重读刚更新的设置,约 1 分钟内跟上");
 
-        return matching.Count == 0 ? ("stale", reasons)
-            : behind.Count > 0 ? ("partial", reasons)
-            : ("effective", reasons);
+        string status = otherMod.Count + stuck.Count + settling.Count == 0 ? "effective"
+            : otherMod.Count + stuck.Count == 0 ? "switching"
+            : matching > 0 ? "partial"
+            : "stale";
+        return new(status, reasons, string.Empty, new BehindStats(settling.Count, stuck.Count, otherMod.Count, allOlder));
     }
+
+    /// <summary>「试运行」(v3) 这样的说法:模式用界面上的名字,读不出的版本写 ?。</summary>
+    private static string Setting(string mode, int? version) =>
+        $"「{BudgetGateControl.ModeLabel(mode)}」(v{version?.ToString(CultureInfo.InvariantCulture) ?? "?"})";
+
+    /// <summary>心跳里的 mod 版本是否比已装的旧;任一边认不出就不算(卡片说「版本不同」,不断言是旧版)。</summary>
+    private static bool IsOlder(string running, string? installed) =>
+        installed is not null && Version.TryParse(running, out Version? r) && Version.TryParse(installed, out Version? i) && r < i;
 
     /// <summary>对表用的 mod 读数,只看 30 分钟内观测到的。</summary>
     public static readonly TimeSpan ReadingWindow = TimeSpan.FromMinutes(30);
@@ -257,7 +330,7 @@ public static class BudgetGateEvidence
         }
 
         /// <summary>
-        /// 避免掉的中断。影子:本来会推迟的 agent 后来真的被限额拒绝(有 stop_failure rate_limit 为证);
+        /// 避免掉的中断。试运行(shadow):本来会推迟的 agent 后来真的被限额拒绝(有 stop_failure rate_limit 为证);
         /// 启用:真推迟的 agent(同一工作流 agent 多次被拒只算一次),其卡住的窗口在推迟期内读数到过 ≥ 99%,加上真执行的软着陆。
         /// </summary>
         public AvoidedStats Avoided()
@@ -481,7 +554,15 @@ public sealed record BudgetGateInputs(
     string ModFilesDetail,
     string? InstalledModVersion,
     IReadOnlyList<WindowReading> OAuthWindows,
-    DateTimeOffset Now);
+    DateTimeOffset Now,
+    DateTimeOffset? ConfigWrittenAt = null,
+    string? ConfigMode = null);
+
+/// <summary>
+/// 没跟上当前设置的新鲜心跳:<c>Settling</c> 设置刚更新、还没轮到重读(约 1 分钟内自己跟上);<c>Stuck</c> 更新一个心跳周期之后仍回报旧设置;
+/// <c>ModMismatch</c> 跑的不是已装版本的 mod(重开会话才换),<c>ModAllOlder</c> 为这些全是更旧的版本。
+/// </summary>
+public sealed record BehindStats(int Settling, int Stuck, int ModMismatch, bool ModAllOlder);
 
 public sealed record WindowReading(string Kind, double PercentUsed, DateTimeOffset? ResetsAt, DateTimeOffset? ObservedAt);
 
@@ -504,7 +585,7 @@ public sealed record CoverageStats(int Total, int Covered, double? Ratio, double
 public sealed record AvoidedStats(int ShadowWouldAvoid, int EnforceAvoided, int LandingsApplied, int LandingsShadow);
 
 public sealed record BudgetGateReport(
-    string Mode, int? ConfigVersion, string Status, IReadOnlyList<string> Reasons, int FreshSessions,
+    string Mode, int? ConfigVersion, string Status, IReadOnlyList<string> Reasons, string Issue, BehindStats Behind, int FreshSessions,
     IReadOnlyList<string> ModVersions, IReadOnlyList<string> EngineVersions, IReadOnlyList<ReadingPair> Readings,
     IReadOnlyList<PriceRow> Prices, DateTimeOffset? PricesAt, IReadOnlyList<DecisionRow> Decisions,
     IReadOnlyDictionary<string, int> DecisionCounts, CoverageStats Coverage, AvoidedStats Avoided,

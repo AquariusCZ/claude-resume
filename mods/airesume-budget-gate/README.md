@@ -2,7 +2,7 @@
 
 AI Resume 的子代理额度预检 mod(决策见 AI Resume 仓库 `docs/adr/0008-subagent-budget-preflight.md`)。
 它运行在 Claude Code 进程里,逐个看到 Agent 工具、队友与工作流里的每个 `agent()` 派发,逐次计量每个模型请求,
-在线校准"每百万等价 token 值多少额度百分点",并按模式记录、影子判断或推迟派发。mod 自身出错一律放行。
+在线校准"每百万等价 token 值多少额度百分点",并按模式只记用量、试运行(照常判断、只记录不拦截)或拦截(推迟派发)。mod 自身出错一律放行。
 
 - 由 AI Resume 的 `install` 安装:文件复制到 `%LOCALAPPDATA%\AI Resume\mods\airesume-budget-gate\`,
   用户级 `~/.claude/settings.json` 的 `env.CLAUDE_CODE_PLUGIN_DIRS` 里加一条指向它的路径;`uninstall` 移除这条路径。

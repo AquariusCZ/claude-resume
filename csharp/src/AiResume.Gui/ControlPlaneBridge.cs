@@ -343,7 +343,7 @@ public sealed class ControlPlaneBridge
         };
     }
 
-    /// <summary>子代理预检的合成数据(截图与演示用):影子模式生效中,判断里有放行也有"本来会推迟"。</summary>
+    /// <summary>子代理预检的合成数据(截图与演示用):「试运行」(shadow)生效中,判断里有放行也有"会拦"。</summary>
     private static object DemoBudget(long now) => new
     {
         mode = "shadow",
@@ -351,6 +351,8 @@ public sealed class ControlPlaneBridge
         intentVersion = 3,
         status = "effective",
         reasons = Array.Empty<string>(),
+        issue = string.Empty,
+        behind = new { settling = 0, stuck = 0, modMismatch = 0, modAllOlder = false },
         freshSessions = 2,
         modVersions = new[] { "0.3.0" },
         engineVersions = new[] { "2.1.309" },
@@ -396,17 +398,20 @@ public sealed class ControlPlaneBridge
         (string mode, int intentVersion, _) = _budget.Intent();
         string missing = BudgetGateControl.MissingModFiles(paths.ModDir);
         string? installedModVersion = BudgetGateControl.ModVersion(paths.ModDir);
+        BudgetGateConfigStamp config = _budget.ReadConfigStamp();
         BudgetGateReport report = BudgetGateEvidence.Build(new BudgetGateInputs(
             paths,
             Mode: mode,
-            ConfigVersion: _budget.ReadConfigVersion(),
+            ConfigVersion: config.Version,
             PluginDirs: _budget.Env.Inspect(paths.ModDir),
             Policy: _budget.Policy(),
             ModFilesOk: missing.Length == 0,
             ModFilesDetail: missing.Length == 0 ? string.Empty : $"mod 文件不全:缺 {missing}",
             InstalledModVersion: installedModVersion,
             OAuthWindows: BudgetGateSnapshotExporter.ReadWindows(paths.SnapshotFile),
-            Now: DateTimeOffset.UtcNow));
+            Now: DateTimeOffset.UtcNow,
+            ConfigWrittenAt: config.WrittenAt,
+            ConfigMode: config.Mode));
         static long? Unix(DateTimeOffset? t) => t?.ToUnixTimeSeconds();
         return new
         {
@@ -415,6 +420,14 @@ public sealed class ControlPlaneBridge
             intentVersion,
             status = report.Status,
             reasons = report.Reasons,
+            issue = report.Issue,
+            behind = new
+            {
+                settling = report.Behind.Settling,
+                stuck = report.Behind.Stuck,
+                modMismatch = report.Behind.ModMismatch,
+                modAllOlder = report.Behind.ModAllOlder,
+            },
             freshSessions = report.FreshSessions,
             modVersions = report.ModVersions,
             engineVersions = report.EngineVersions,
@@ -475,7 +488,7 @@ public sealed class ControlPlaneBridge
 
     /// <summary>
     /// 切换预检模式:先写意图(版本 +1)再写 config.json,mod 约 1 分钟内跟上。
-    /// 启用拦截(enforce)必须带 <c>confirm=true</c>——界面上要用户先勾选确认再点一次,两步都是用户自己的动作。
+    /// 打开拦截(enforce)必须带 <c>confirm=true</c>——界面上要用户先勾选确认再点一次,两步都是用户自己的动作。
     /// </summary>
     private object SetBudgetMode(JsonElement root)
     {
@@ -483,7 +496,7 @@ public sealed class ControlPlaneBridge
         bool confirmed = root.TryGetProperty("confirm", out JsonElement confirm) && confirm.ValueKind == JsonValueKind.True;
         if (mode == "enforce" && !confirmed)
         {
-            throw new InvalidOperationException("启用拦截需要先勾选「我已看过证据」再确认");
+            throw new InvalidOperationException("打开拦截要先勾选「我已看过下面的证据」,再点一次「拦截」");
         }
 
         _budget.SetMode(mode);
