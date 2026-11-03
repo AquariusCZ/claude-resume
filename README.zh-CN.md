@@ -62,6 +62,13 @@ Claude Code · Opus 5.5 · 02:14 · 「迁移文档站」
 
 等额度恢复、会话也关掉，还会陆续收到「▶️ atlas-docs 已开始自动续跑」和「✅ atlas-docs 自动续跑完成」。
 
+### 派发子代理前先看额度（默认影子模式）
+
+- 在 Claude Code 里装一个小 mod：每次派发子代理或工作流里的 agent 之前，按当前 5 小时与周额度读数、在途 agent 的剩余成本，只算到额度重置为止，判断这一个放不放得下。
+- 安装后默认**影子模式**：照常放行，只记录"如果启用会怎么做"。右栏「子代理预检」与「视图 › 子代理预检…」里能看到每次判断、预测与实际成本（p80 覆盖率）、mod 与 OAuth 读数对表。
+- 看过证据后可以亲手打开「启用拦截」：放不下的 agent 推迟，额度重置后提醒补派；额度将尽时让在途子代理带着已有结论收尾。不弹窗，也不限制子代理数量。
+- 选「已关闭」就从 `settings.json` 撤下这一条，新开的会话不再加载它。公司的 Claude Code 托管策略若禁止旁加载 mod，AI Resume 不会登记它（否则 Claude Code 会一启动就退出），界面显示「未生效」并说明原因。
+
 ### 一个说实话的控制面
 
 - **额度磁贴**：Claude 5 小时、7 天、按模型的周额度，以及 OpenCode 所用 DeepSeek 账户的余额。
@@ -149,6 +156,7 @@ $w = "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe"
 - **其他工具的凭据一律只读。** Codex 的 `auth.json`、OpenCode 的 DeepSeek 密钥同样只读不写；AI Resume 不保存任何 DeepSeek 密钥。
 - **飞书机器人凭据：核验过才存，存了就锁紧。** App ID 和 App Secret 只能从「飞书通知设置」录入。保存前，AI Resume 先向飞书真实换一次 tenant_access_token，再用这个令牌经 lark-cli 调通一次机器人信息接口，两步都过才用 Windows DPAPI（机器范围）加密成 `state\secrets\feishu-bot.bin`；文件只允许你本人、SYSTEM 和 Administrators 访问，做不到就不保存。机器范围加密意味着本机管理员也能解开它。投递时 App Secret 只出现在发给飞书换令牌接口的请求里，lark-cli 拿到的只是 App ID 和短期令牌，令牌只留在内存；凭据不进命令行参数、日志、界面或截图，界面只显示遮蔽后的 App ID。卸载会保留这份凭据，要删掉就在「飞书通知设置」里点「清除凭据」。
 - **没有云端服务，没有遥测。** 对外请求只有三类：用本机各客户端已有的凭据查询额度和模型目录（Anthropic，以及你给 Claude Code 配置的 API 端点；装了 Codex、OpenCode 时还有对应的 OpenAI、DeepSeek 和 Codex 里配置的第三方供应商）；向飞书官方接口换取机器人令牌；经 lark-cli 发送飞书消息、诊断通道。面板刷新不调用任何模型，一个 token 都不花。令牌和凭据不进日志，通知日志也不记消息正文。
+- **预检 mod 不碰凭据。** 它只用 Claude Code 自己给出的额度读数，不读、不写、不刷新任何令牌；日志只记 token 计量、读数和判断，提示正文一律不记。`install` 只在 `~/.claude/settings.json` 的 `env.CLAUDE_CODE_PLUGIN_DIRS` 里加一条指向它的路径，`uninstall` 删掉这一条。
 
 ## 常见问题
 

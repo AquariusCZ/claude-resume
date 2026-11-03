@@ -1,0 +1,7 @@
+{"ts":"2026-11-02T16:51:15.628Z","sid":"a0000002-0000-4000-8000-000000000002","ev":"load","schema":1,"mod":"0.1.0","engine":"2.1.309","base":"2.1.309","surface":null,"interactive":false,"mode":"observe","cfg":null,"project":"000000000002","dir":"ok"}
+{"ts":"2026-11-02T16:51:15.734Z","sid":"a0000002-0000-4000-8000-000000000002","ev":"prompt","origin":"sdk","plugin":null,"meta":false,"wait":false,"cmd":false,"len":31,"limitLike":false,"running":false,"ctx":0}
+{"ts":"2026-11-02T16:51:16.733Z","sid":"a0000002-0000-4000-8000-000000000002","ev":"measure","changed":["context","rateLimits","cost"],"ctx":{"tokens":37105,"window":1000000,"pct":4},"usd":0.007422799999999999}
+{"ts":"2026-11-02T16:51:16.733Z","sid":"a0000002-0000-4000-8000-000000000002","ev":"rl","src":"measure","rl":[{"k":"five_hour","p":75,"r":"2026-11-02T19:00:00.000Z","d":0},{"k":"seven_day","p":8,"r":"2026-11-09T14:00:00.000Z","d":0}]}
+{"ts":"2026-11-02T16:51:16.736Z","sid":"a0000002-0000-4000-8000-000000000002","ev":"step","agent":null,"turn":"4a71e3b5-4afa-48bc-a98a-121b887e1ddc","idx":0,"req":"claude-haiku-5-5","model":"claude-haiku-5-5","u":{"in":2,"out":4,"cr":0,"cw":37103},"eq":46401,"stop":"end_turn","ms":981}
+{"ts":"2026-11-02T16:51:17.556Z","sid":"a0000002-0000-4000-8000-000000000002","ev":"turn_end","agent":null,"turn":"4a71e3b5-4afa-48bc-a98a-121b887e1ddc","reason":"answer","aborted":false,"ms":1914,"model":"claude-haiku-5-5","u":{"in":2,"out":4,"cr":0,"cw":37103},"eq":46401}
+{"ts":"2026-11-02T16:51:17.568Z","sid":"a0000002-0000-4000-8000-000000000002","ev":"end","reason":"other"}

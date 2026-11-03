@@ -298,6 +298,9 @@ dialog::backdrop{background:rgba(38,35,29,.28)}
 .tbl td.nw{white-space:nowrap}
 .tbl td.ok{color:var(--ok)} .tbl td.wait{color:var(--amber-deep)} .tbl td.bad{color:var(--alert)}
 #dlgProviders{max-width:min(760px,calc(100vw - 40px))}
+#dlgBudget{max-width:min(860px,calc(100vw - 40px))}
+#dlgBudget .modes{display:flex;gap:8px;flex-wrap:wrap}
+#dlgBudget .confirm{display:flex;align-items:center;gap:8px;color:var(--ink-2)}
 .chk{display:grid;grid-template-columns:8px minmax(0,1fr);gap:8px;align-items:center}
 .list{max-height:300px;overflow:auto;border:1px solid var(--line);background:var(--panel)}
 .list .it{display:flex;align-items:center;gap:8px;padding:4px 8px;border-bottom:1px dashed var(--line)}
@@ -362,6 +365,7 @@ dialog::backdrop{background:rgba(38,35,29,.28)}
         <button type="button" role="menuitemcheckbox" aria-checked="false" data-pref="showExtraNotify">显示其他通知源(Codex / Cline / Qoder)</button>
         <hr>
         <button type="button" role="menuitem" data-cmd="providers">供应商与额度详情…</button>
+        <button type="button" role="menuitem" data-cmd="budget">子代理预检…</button>
         <button type="button" role="menuitem" data-cmd="hidden">不再扫描的目录(<span id="hidCount">0</span>)…</button>
       </div>
     </div>
@@ -437,6 +441,11 @@ dialog::backdrop{background:rgba(38,35,29,.28)}
       <p class="note warn" id="extraHint" hidden></p>
       <div class="links"><button class="lk" type="button" id="fsOpen">设置…</button><button class="lk" type="button" id="fsTest">发送测试</button></div>
     </section>
+    <section class="blk" aria-labelledby="bgTitle">
+      <h2 id="bgTitle">子代理预检<button class="lk aux" type="button" id="bgOpen">详情与模式…</button></h2>
+      <div class="kv" id="bgRow"><span class="led" id="bgLed"></span><span class="k" id="bgHead">读取中…</span><span class="v" id="bgVal"></span></div>
+      <p class="note warn" id="bgNote" hidden></p>
+    </section>
   </aside>
 </main>
 
@@ -490,6 +499,29 @@ dialog::backdrop{background:rgba(38,35,29,.28)}
     <h3 id="prTitle">供应商与额度详情</h3>
     <table class="tbl"><thead><tr><th>供应商</th><th>状态</th><th>额度或余额</th><th>模型数</th></tr></thead><tbody id="prBody"></tbody></table>
     <p class="hint" id="prNote"></p>
+    <div class="brow"><button class="btn" value="close">关闭</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlgBudget" aria-labelledby="bgdTitle">
+  <form class="dlg" method="dialog">
+    <h3 id="bgdTitle">子代理预检</h3>
+    <div class="kv"><span class="led" id="bgdLed"></span><span class="k" id="bgdMode">—</span><span class="v" id="bgdStatus">—</span></div>
+    <p class="hint" id="bgdReasons"></p>
+    <p class="hint wait" id="bgdErrors" hidden></p>
+    <div class="modes" id="bgdModes" role="radiogroup" aria-label="预检模式"></div>
+    <label class="confirm" id="bgdConfirmRow" hidden><input type="checkbox" id="bgdConfirm"> 我已看过下面的证据,打开拦截(推迟派发、软着陆、重置后补派提醒)</label>
+    <p class="hint">影子模式照常判断但一律放行,只记"如果启用会怎么做";启用拦截后才真的推迟。新开的 Claude Code 会话才加载 mod,模式约 1 分钟内跟上。</p>
+    <h4>额度读数对表</h4>
+    <table class="tbl"><thead><tr><th>窗口</th><th>mod 读数</th><th>OAuth 读数</th><th>差</th></tr></thead><tbody id="bgdReadings"></tbody></table>
+    <h4>最近的判断</h4>
+    <table class="tbl"><thead><tr><th>时间</th><th>判断</th><th>原因</th><th>模型</th><th>工作流</th><th>需求 / 余量</th></tr></thead><tbody id="bgdDecisions"></tbody></table>
+    <p class="hint" id="bgdCoverage"></p>
+    <p class="hint" id="bgdAvoided"></p>
+    <h4>待补派</h4>
+    <table class="tbl"><thead><tr><th>何时</th><th>工作</th><th></th></tr></thead><tbody id="bgdPending"></tbody></table>
+    <h4>校准价格(百分点 / 百万等价 token)</h4>
+    <table class="tbl"><thead><tr><th>模型</th><th>窗口</th><th>价格</th><th>来源</th><th>置信</th></tr></thead><tbody id="bgdPrices"></tbody></table>
     <div class="brow"><button class="btn" value="close">关闭</button></div>
   </form>
 </dialog>
@@ -1081,7 +1113,120 @@ const AR = (() => {
     return { cls: 'on', head: '监视中', sub: `已布防 ${n} 个 · ${arm.continuous ? '连续模式' : '一次性'}${done ? ` · 已完成 ${done}` : ' · 尚未被限额打断'}` };
   }
 
-  return { fmtWhen, fmtLeft, modelShort, windowTile, quotaTiles, loginModel, notifyModel, workerModel, providerOptions, projectLabel, rowLabel, rowModel, armRequest, pickSummary, beaconModel, DELIVERY_REASON, DELIVERY_DETAIL };
+  // ---------- 子代理预检(ADR-0008)----------
+  // 「生效中」是肯定句:必须所有新鲜心跳都回报当前模式、配置版本与已装 mod 版本(由后端判定 status=effective)。
+  // 只有一部分跟上是「部分生效」,只装好没有会话加载时是「等新会话」,一个都没跟上是「配置未跟上」,
+  // 已关闭是 disabled,读不出一律「未核实」,绝不显示正常。
+  const BUDGET_MODE = { off: '已关闭', observe: '只记录', shadow: '影子模式', enforce: '启用拦截' };
+  const BUDGET_RULE = {
+    fits: '放得下', 'guaranteed-progress': '保底放行', 'no-readings': '无读数放行', 'over-budget': '额度不够',
+    'prefix-closure': '同批后缀', 'new-model-single-flight': '新模型单路', 'scoped-exhausted': '族周额度用尽', 'model-limited': '模型受限',
+  };
+  const BUDGET_WINDOW = { five_hour: '5 小时', seven_day: '周' };
+  const BUDGET_SOURCE = { measured: '实测', seed: '种子', family: '同族先验', 'new-model': '新模型' };
+
+  function budgetModel(r, now) {
+    if (!r) return { loading: true, side: { led: '', head: '读取中…', value: '', note: '', title: '' } };
+    if (r.error) {
+      return { loading: false, error: r.error, side: { led: '', head: '未核实', value: '', note: '读不出预检状态', title: r.error },
+        modeLabel: '未核实', statusText: '未核实', statusLed: '', reasons: [r.error], errorsText: '', readingRows: [], priceRows: [], decisionRows: [],
+        coverageText: '', coverageCls: '', avoidedText: '', pendingRows: [], modeButtons: [] };
+    }
+    const modeLabel = BUDGET_MODE[r.mode] || String(r.mode || '未知');
+    const off = r.mode === 'off' || r.status === 'disabled';
+    let statusLed = '', statusText = '未核实';
+    switch (r.status) {
+      case 'effective': statusLed = off ? '' : 'ok'; statusText = off ? '已关闭' : '生效中'; break;
+      case 'partial': statusLed = 'wait'; statusText = '部分会话生效'; break;
+      case 'waiting': statusLed = 'wait'; statusText = '已安装 · 等新会话加载'; break;
+      case 'stale': statusLed = 'wait'; statusText = '配置未跟上'; break;
+      case 'broken': statusLed = 'bad'; statusText = '未生效'; break;
+      case 'disabled': statusLed = ''; statusText = '已关闭'; break;
+      default: statusLed = ''; statusText = '未核实';
+    }
+    const reasons = Array.isArray(r.reasons) ? r.reasons : [];
+    const errors = Array.isArray(r.lastErrors) ? r.lastErrors : [];
+    const errorsText = errors.length ? 'mod 最近的报错(出错一律放行):' + errors.join(';') : '';
+    const pct = v => (v == null ? '—' : `${v}%`);
+    const readingRows = (r.readings || []).map(x => {
+      const off = x.delta != null && Math.abs(x.delta) > 2;
+      const resetOff = x.resetMatches === false;
+      return {
+        label: BUDGET_WINDOW[x.kind] || x.kind,
+        mod: x.modPercent == null ? '未读到' : `${pct(x.modPercent)}${x.modObservedAtUnix ? ' · ' + fmtWhen(x.modObservedAtUnix, now) : ''}`,
+        oauth: x.oauthPercent == null ? '未读到' : `${pct(x.oauthPercent)}${x.oauthObservedAtUnix ? ' · ' + fmtWhen(x.oauthObservedAtUnix, now) : ''}`,
+        deltaText: x.delta == null ? '—' : (x.delta > 0 ? '+' : '') + x.delta,
+        cls: off || resetOff ? 'wait' : x.delta == null ? '' : 'ok',
+        title: resetOff ? '两边的重置时刻对不上(差超过 2 分钟)' : off ? '两边相差超过 2 点(取整与读取时刻不同,持续偏大时以较高者为准)' : '',
+      };
+    });
+    const priceRows = (r.prices || []).map(p => {
+      const confidence = p.source === 'measured' ? (p.samples >= 4 && (p.spread == null || p.spread <= 0.5) ? '高' : '低') : '先验';
+      return {
+        model: p.model, window: BUDGET_WINDOW[p.window] || p.window,
+        k: p.k != null ? Number(p.k).toFixed(p.k < 1 ? 3 : 2) : '—',
+        source: (BUDGET_SOURCE[p.source] || p.source) + (p.period === 'peak' && p.window === 'five_hour' ? ' · 高峰' : ''),
+        confidence, samples: p.samples || 0,
+        cls: confidence === '高' ? 'ok' : confidence === '低' ? 'wait' : '',
+      };
+    });
+    const decisionRows = (r.decisions || []).map(d => {
+      const verdict = d.kind === 'allow' ? ['放行', 'ok'] : d.kind === 'deferred' ? ['推迟', 'bad'] : ['本来会推迟', 'wait'];
+      const where = d.runId ? `${d.runId.slice(0, 11)} #${d.agentIndex ?? '?'}` : '单独派发';
+      const room = d.need != null && d.margin != null
+        ? `需 ${Number(d.need).toFixed(1)} 点 / 余 ${Number(d.margin).toFixed(1)} 点` + (d.binding && BUDGET_WINDOW[d.binding] ? `(${BUDGET_WINDOW[d.binding]})` : '')
+        : '';
+      return {
+        when: fmtWhen(d.atUnix, now), verdict: verdict[0], cls: verdict[1], rule: BUDGET_RULE[d.rule] || d.rule,
+        model: d.model, where, room,
+        title: d.deferUntilUnix ? `推迟到 ${fmtWhen(d.deferUntilUnix, now)} 重置` : '',
+      };
+    });
+    const cov = r.coverage || {};
+    const coverageCls = cov.total >= 10 && cov.ratio != null ? (cov.ratio >= 0.75 && cov.ratio <= 0.85 ? 'ok' : 'wait') : '';
+    const coverageText = (!cov.total ? '还没有跑完的子代理可复盘'
+      : `p80 覆盖率 ${Math.round((cov.ratio || 0) * 100)}%(${cov.covered}/${cov.total},目标 75–85%)` +
+        (cov.medianRatio != null ? ` · 实际/预测中位 ${cov.medianRatio}` : '') + (cov.total < 10 ? ' · 样本还少' : ''))
+      + (r.truncated ? ' · 日志太多,只汇总了最近的一部分' : '');
+    const av = r.avoided || {};
+    const avoidedText = r.mode === 'enforce'
+      ? `避免中断 ${av.enforceAvoided || 0} 次 · 软着陆 ${av.landingsApplied || 0} 次`
+      : `影子:本可避免的中断 ${av.shadowWouldAvoid || 0} 次 · 本来会软着陆 ${av.landingsShadow || 0} 次`;
+    const pendingRows = (r.pending || []).map(p => ({
+      when: p.deferUntilUnix ? fmtWhen(p.deferUntilUnix, now) : '额度恢复后',
+      text: (p.runId ? `${p.runId.slice(0, 11)} #${p.agentIndex ?? '?'}` : p.type) + ` · ${p.model}`,
+      cls: p.applied ? 'wait' : '',
+      tag: p.applied ? '待补派' : '影子',
+    }));
+    const counts = r.counts || {};
+    const total = (counts.allow || 0) + (counts.deferred || 0) + (counts['would-defer'] || 0);
+    // 右栏是窄列:状态写在左、最近 7 天的短句写在右,完整说明放悬停;说明行只在需要处理时出现。
+    const summary = total === 0 ? '暂无派发'
+      : r.mode === 'enforce' ? `推迟 ${counts.deferred || 0}/${total}`
+      : `本来会推迟 ${counts['would-defer'] || 0}/${total}`;
+    // 右栏窄:状态用短句,完整原因在说明行与悬停里。
+    const sideStatus = { effective: off ? '已关闭' : '生效中', partial: '部分生效', waiting: '等新会话', stale: '未跟上', broken: '未生效', disabled: '已关闭' }[r.status] || '未核实';
+    const note = r.status === 'waiting' ? '已装好,新开的 Claude Code 会话才会加载'
+      : ['broken', 'stale', 'partial', 'unverified', 'disabled'].includes(r.status) ? reasons.join(';') : '';
+    const sevenDay = total === 0 ? '最近 7 天还没有子代理派发'
+      : r.mode === 'enforce' ? `最近 7 天判断 ${total} 次,推迟 ${counts.deferred || 0} 次`
+      : `最近 7 天判断 ${total} 次,本来会推迟 ${counts['would-defer'] || 0} 次(影子模式只记录不拦)`;
+    const modeButtons = ['off', 'observe', 'shadow', 'enforce'].map(m => ({
+      mode: m, label: BUDGET_MODE[m], active: r.mode === m, needsConfirm: m === 'enforce',
+    }));
+    return {
+      loading: false,
+      side: {
+        led: statusLed, head: off ? '已关闭' : `${modeLabel} · ${sideStatus}`,
+        value: !off && ['effective', 'partial'].includes(r.status) ? summary : '', note,
+        title: [sevenDay, ...reasons, r.freshSessions ? `活跃会话 ${r.freshSessions} 个` : '', errorsText].filter(Boolean).join('\n'),
+      },
+      modeLabel, statusText, statusLed, reasons, errorsText, readingRows, priceRows, decisionRows,
+      coverageText, coverageCls, avoidedText, pendingRows, modeButtons,
+    };
+  }
+
+  return { fmtWhen, fmtLeft, modelShort, windowTile, quotaTiles, loginModel, notifyModel, workerModel, providerOptions, projectLabel, rowLabel, rowModel, armRequest, pickSummary, beaconModel, DELIVERY_REASON, DELIVERY_DETAIL, budgetModel };
 })();
 </script>
 
@@ -1890,6 +2035,7 @@ const AR = (() => {
       case 'feishu': openFeishu(); break;
       case 'test': sendTest(); break;
       case 'providers': showProviders(); break;
+      case 'budget': showBudget(); break;
       case 'hidden': renderHiddenDialog(); $('dlgHidden').showModal(); break;
       case 'about': $('dlgAbout').showModal(); break;
       case 'help': $('dlgHelp').showModal(); break;
@@ -1951,10 +2097,97 @@ const AR = (() => {
     renderRows(); schedulePreview();
   });
 
+  // ---------- 子代理预检(ADR-0008)----------
+  let budget = null;
+  let budgetBusy = false;
+  // 每次请求取一个序号,只采用最新那次的回包:定时刷新与打开弹窗的刷新可能交错,旧回包不得盖掉新的(含刚切换的模式)。
+  let budgetSeq = 0;
+  async function loadBudget() {
+    if (budgetBusy) return;
+    const seq = ++budgetSeq;
+    let r;
+    try {
+      r = await call('budget.get', {}, 20000);
+    } catch (e) {
+      r = { error: String((e && e.message) || e) };
+    }
+    if (seq !== budgetSeq) return;
+    budget = r;
+    renderBudget();
+  }
+  function renderBudget() {
+    const m = AR.budgetModel(budget, nowUnix());
+    $('bgLed').className = 'led' + (m.side.led ? ' ' + m.side.led : '');
+    $('bgHead').textContent = m.side.head;
+    $('bgVal').textContent = m.side.value;
+    $('bgRow').title = m.side.title || '';
+    $('bgNote').textContent = m.side.note || '';
+    $('bgNote').hidden = !m.side.note;
+    if ($('dlgBudget').open) renderBudgetDialog(m);
+  }
+  function renderBudgetDialog(m) {
+    $('bgdLed').className = 'led' + (m.statusLed ? ' ' + m.statusLed : '');
+    $('bgdMode').textContent = m.modeLabel || '—';
+    $('bgdStatus').textContent = m.statusText || '—';
+    $('bgdReasons').textContent = (m.reasons || []).join(';');
+    $('bgdErrors').textContent = m.errorsText || '';
+    $('bgdErrors').hidden = !m.errorsText;
+    $('bgdModes').innerHTML = (m.modeButtons || []).map(b =>
+      `<button class="btn${b.active ? ' primary' : ''}" type="button" role="radio" aria-checked="${b.active}" data-mode="${esc(b.mode)}"${budgetBusy ? ' disabled' : ''}>${esc(b.label)}</button>`).join('');
+    $('bgdReadings').innerHTML = (m.readingRows || []).map(r =>
+      `<tr title="${esc(r.title)}"><td class="nw">${esc(r.label)}</td><td>${esc(r.mod)}</td><td>${esc(r.oauth)}</td><td class="nw ${esc(r.cls)}">${esc(r.deltaText)}</td></tr>`).join('')
+      || '<tr><td colspan="4">还没有读数</td></tr>';
+    $('bgdDecisions').innerHTML = (m.decisionRows || []).map(d =>
+      `<tr title="${esc(d.title)}"><td class="nw">${esc(d.when)}</td><td class="nw ${esc(d.cls)}">${esc(d.verdict)}</td><td class="nw">${esc(d.rule)}</td><td class="nw">${esc(d.model)}</td><td class="nw">${esc(d.where)}</td><td>${esc(d.room)}</td></tr>`).join('')
+      || '<tr><td colspan="6">最近 7 天还没有子代理派发</td></tr>';
+    $('bgdCoverage').textContent = m.coverageText || '';
+    $('bgdCoverage').className = 'hint' + (m.coverageCls ? ' ' + m.coverageCls : '');
+    $('bgdAvoided').textContent = m.avoidedText || '';
+    $('bgdPending').innerHTML = (m.pendingRows || []).map(p =>
+      `<tr><td class="nw">${esc(p.when)}</td><td>${esc(p.text)}</td><td class="nw ${esc(p.cls)}">${esc(p.tag)}</td></tr>`).join('')
+      || '<tr><td colspan="3">没有</td></tr>';
+    $('bgdPrices').innerHTML = (m.priceRows || []).map(p =>
+      `<tr><td class="nw">${esc(p.model)}</td><td class="nw">${esc(p.window)}</td><td class="nw">${esc(p.k)}</td><td>${esc(p.source)}</td><td class="nw ${esc(p.cls)}">${esc(p.confidence)}(${p.samples})</td></tr>`).join('')
+      || '<tr><td colspan="5">还没有价格(影子或启用拦截时才计算)</td></tr>';
+  }
+  function showBudget() {
+    $('bgdConfirm').checked = false;
+    $('bgdConfirmRow').hidden = true;
+    renderBudgetDialog(AR.budgetModel(budget, nowUnix()));
+    $('dlgBudget').showModal();
+    loadBudget();
+  }
+  $('bgOpen').addEventListener('click', showBudget);
+  $('bgdModes').addEventListener('click', async (ev) => {
+    const el = ev.target.closest('button[data-mode]');
+    if (!el || budgetBusy) return;
+    const mode = el.dataset.mode;
+    // 启用拦截要两步:先勾选「我已看过证据」,再点一次。两步都是用户自己的动作,不弹窗。
+    if (mode === 'enforce' && !$('bgdConfirm').checked) {
+      $('bgdConfirmRow').hidden = false;
+      $('bgdConfirm').focus();
+      return;
+    }
+    budgetBusy = true;
+    ++budgetSeq;
+    try {
+      budget = await call('budget.setMode', { mode, confirm: mode === 'enforce' }, 20000);
+      say(`子代理预检已切换为「${AR.budgetModel(budget, nowUnix()).modeLabel}」,新会话约 1 分钟内跟上`);
+    } catch (e) {
+      say('子代理预检模式切换失败:' + ((e && e.message) || e), true);
+    } finally {
+      budgetBusy = false;
+    }
+    $('bgdConfirmRow').hidden = true;
+    $('bgdConfirm').checked = false;
+    renderBudget();
+  });
+
   async function load() {
     renderMeters();
     refreshAll(false);
     loadNotify();
+    loadBudget();
     try { renderProjects(await call('projects.list')); }
     catch (e) { $('rows').innerHTML = `<div class="empty-q" style="color:var(--alert)">项目发现失败:${esc(e.message)}</div>`; say('项目发现失败', true); }
     try { await readAndApplyArm(); } catch { applyArmReadFailure(); }
@@ -1977,6 +2210,8 @@ const AR = (() => {
     readAndApplyArm().catch(applyArmReadFailure);
     loadChannel();
   }, 30000);
+  // 预检证据要读心跳与日志:一分钟一次足够(心跳本身一分钟一拍)。
+  setInterval(loadBudget, 60000);
   syncMenuChecks();
   load();
 })();

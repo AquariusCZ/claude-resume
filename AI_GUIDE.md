@@ -1,4 +1,4 @@
-<!-- project-tour · generated 2026-11-02 · v2.2.0 + 限额通知规则与界面用语 + 飞书凭据副本自己换令牌(ADR-0007) + 队列里临时工作区显示会话名 -->
+<!-- project-tour · generated 2026-11-02 · v2.2.0 + 限额通知规则与界面用语 + 飞书凭据副本自己换令牌(ADR-0007) + 队列里临时工作区显示会话名 + 子代理额度预检(ADR-0008) -->
 # AI Resume — AI 导览(AI_GUIDE.md)
 
 > 一句话:AI Resume 是 Windows 本地控制面:Claude Code 会话被用量上限打断后,按每个项目自己的模型与实时额度证据自动续跑原会话,并把 Claude Code / OpenCode 的完成、中断与「等你」事件经官方 lark-cli 私信到飞书。
@@ -11,7 +11,7 @@
 - **当前版本**:v2.2.0;版本真身是 `csharp/Directory.Build.props` 的 `<Version>`。
 - **现役实现**:`csharp/` 下的 .NET 10 C#(9 个产品项目 + 1 个测试项目)。v1 PowerShell + Node 已于 2026-08-08 从工作树删除,只能通过 Git 历史查阅。
 - **技术栈**:.NET 10、C#、WPF + WebView2、SQLite/WAL、Windows Named Pipe、DPAPI、官方 lark-cli(飞书)、Tomlyn(解析与校验 Codex TOML);Node 只在两组测试里用到。
-- **产品边界**:AI Resume 只做四件事:① 限额后逐项目续跑编排;② 动态项目发现;③ 本地完成通知(通知源注册表 + 飞书投递);④ Windows 控制面 GUI。会话、聊天与手机远程归各客户端和 Claude Code 官方能力,AI Resume 只读它们公开落盘的产物(会话转录、会话登记、日志)。
+- **产品边界**:AI Resume 只做五件事:① 限额后逐项目续跑编排;② 动态项目发现;③ 本地完成通知(通知源注册表 + 飞书投递);④ Windows 控制面 GUI;⑤ 子代理发起前的额度预检(ADR-0008,判断在 Claude Code 进程内的 mod 里)。会话、聊天与手机远程归各客户端和 Claude Code 官方能力,AI Resume 只读它们公开落盘的产物(会话转录、会话登记、日志)。
 - **核心原则**:适配上游而不是重写上游;界面上的肯定句必须有外部可验证证据;任何「未知」只导致等待,绝不放行。
 - **v2.2(2026-10-30)要点**(决策与上游证据见 [ADR-0006](docs/adr/0006-retire-cc-connect-per-project-resume.md)):cc-connect 整体退役,飞书只剩完成通知,手机远程改用 Claude Code Remote Control;Claude 凭据只读 Claude Code 自己的登录(setup-token 长期令牌删除),账号指纹改用全局配置里的 `oauthAccount`;续跑逐项目化(每个项目自己的模型,逐项目判定义务/额度/占用,未启动不锁周期),scoped 额度按模型族;完成通知投递修复(直接启动 lark-cli.exe、机器范围凭据副本经环境变量、stderr 信封、分级退避/熔断/死信、`notify check/test`);Claude Code 钩子改 exec form 并新增 `StopFailure`;OpenCode 2.x 官方 v2 插件;DeepSeek 只读 OpenCode 的密钥且只展示;GUI 重排为菜单栏 + 逐项目模型队列。
 - **仍有效的 v2.1 决策**([ADR-0005](docs/adr/0005-owned-credentials-official-codex-and-hooks.md)):Codex 固定官方 ChatGPT/OpenAI 账号(B1)、Codex 完成通知走 hooks `Stop`(C1)、通知收件人明文存配置(D1 的这一半)。
@@ -55,6 +55,7 @@ AiResume.Gui(WPF + WebView2)── postMessage JSON RPC ──▶ ControlPlaneBr
 - `ObservationWorker`:观察持久 run 与进程存活。
 - `NotificationWorker`:每 15 秒消费 `completion-events\` 并投递(§2.5)。
 - `ClaudeLoginReminder`:每 30 分钟检查 Claude Code 登录到期(§2.6)。
+- `BudgetGateJanitor`:每小时清理子代理预检 mod 的过期日志与心跳,`config.json` 丢了按意图重写(§2.8)。
 - `ResumeEngine`:每 30 秒一拍驱动布防周期(§2.3)。
 - `DailyJsonFileLoggerProvider`:`logs\worker-yyyyMMdd.log`(GUI 写 `gui-yyyyMMdd.log`),每行一个脱敏 JSON。
 - 自启:默认 Startup 快捷方式「AI Resume 续跑引擎.lnk」→ `AiResume.Launcher.exe` 无窗口拉起 Worker;可选 `scripts/register-autostart.ps1`(需管理员)升级为 S4U 计划任务「AI Resume 续跑引擎」(会话 0、失败自动重启)。
@@ -135,6 +136,21 @@ ResumeEngine 每拍:进程门禁(PendingCancellation / ActiveRunId)→ 周期初
 
 v2.1 及之前由直接运行的 cc-connect 承担飞书/微信聊天、会话与 cron,AI Resume 负责生成、校验、激活它的配置(`cc-connect-apply`、单消费者预检、`allow_from`/`admin_from`)。这些已于 2026-10-30 随 ADR-0006 整体退役:`AiResume.Wrapper` 项目、相关命令、RPC 与 14 个测试文件已删除;AI Resume 不再读取、改写或删除 `~/.cc-connect`。历史细节见 ADR-0003 与 [docs/history/FEISHU-BOT-GUIDE.md](docs/history/FEISHU-BOT-GUIDE.md)。
 
+### 2.8 子代理额度预检(ADR-0008)
+
+- **在哪判断**:Claude Code 进程内的 mod `mods/airesume-budget-gate/`(TypeScript):`agent.spawn` 逐个看到 Agent 工具与工作流里每个 `agent()`,
+  `turn.step` 逐次计量,`tool.call` 可让在途子代理的工具调用不执行。判断核心是纯函数(`core/decide.ts`、`calibrate.ts`、`cost.ts`)加状态机 `core/engine.ts`,
+  适配层 `hooks/register.ts` 只做 IO;离线回放 `core/replay.ts` 与线上调用同一组引擎方法。
+- **模式**:`off`(已关闭:撤下 settings.json 里的登记)/ `observe`(只记录)/ `shadow`(install 后默认,照常判断一律放行)/ `enforce`(推迟派发、软着陆、重置后补派提醒、续跑简报;只能由用户在界面勾选确认后打开)。
+- **AI Resume 做什么**:install 经 Worker csproj 把 mod 带进 payload,在 `settings.json` 的 `env.CLAUDE_CODE_PLUGIN_DIRS` 只增删我方条目(没对齐返回 2;uninstall 最先撤下);
+  `ProductConfig.BudgetGateMode` / `BudgetGateConfigVersion` 写 `state\budget-gate\config.json`;`QuotaService` 拿到 OAuth 读数时导出不含凭据的
+  `quota-snapshot.json`;`BudgetGateEvidence` 汇总心跳与日志给 GUI(右栏一块 + 「视图 › 子代理预检…」)。
+- **组织策略**:托管设置 `disableSideloadFlags` 为 true 时,`CLAUDE_CODE_PLUGIN_DIRS` 非空会让所有新启动的 Claude Code 会话直接退出;
+  `SideloadPolicy` 在登记前与 Worker 每小时检查,禁止或读不出就不登记、已有的撤下。
+- **生效判据**:3 分钟内的全部新鲜心跳都回报当前模式、配置版本与已装 mod 版本才是「生效中」;一部分跟上是「部分生效」;只装好没有会话加载是「等新会话」;mod 只在新启动的会话里加载。
+- **红线**:mod 不调用 `$.session.authorize`、不读写凭据;出错一律放行;日志只记计量、读数与判断(提示只留长度与加盐哈希);
+  只往已存在的 `state\` 里写(Desktop 是 MSIX 包,新建 `%LOCALAPPDATA%` 顶层目录会被重定向进包私有目录)。
+
 ## 3. 模块职责(路径 → 职责 → 关键函数/入口)
 
 | 路径 | 一句话职责 | 关键函数 / 入口 |
@@ -143,6 +159,8 @@ v2.1 及之前由直接运行的 cc-connect 承担飞书/微信聊天、会话�
 | `csharp/src/AiResume.Storage/` | SQLite/WAL 持久化(schema v6) | `StorageDatabase.Migrate`、`RunStore`、`ProductStateStore`(严格读取)、`OutboxStore`(目前无生产调用方) |
 | `csharp/src/AiResume.Ipc/` | Named Pipe 帧与客户端/服务端 | `NamedPipeTransport`、`PipeFraming`、`PipeProtocol` |
 | `csharp/src/AiResume.Secrets/` | DPAPI 与脱敏 | `DpapiSecretStore`(LocalMachine 存机器人凭据并收紧 ACL;CurrentUser 只用于导入旧版)、`SecretRedactor` |
+| `csharp/src/AiResume.Worker/BudgetGate/` | 子代理额度预检的控制面(ADR-0008) | `ClaudePluginDirs`(settings.json 我方条目)、`SideloadPolicy`(组织策略是否禁止旁加载)、`BudgetGateControl`(意图、config.json、install 对账、`SetMode`、`EnforcePolicy`)、`BudgetGateSnapshotExporter`、`BudgetGateEvidence`(生效判定与证据汇总)、`BudgetGateJanitor` |
+| `mods/airesume-budget-gate/` | Claude Code mod 本体(TypeScript,随 payload 安装) | `hooks/register.ts`(适配层)、`core/engine.ts`(`BudgetEngine`)、`core/decide.ts`(`decide`)、`core/calibrate.ts`(`priceOf` / `advanceSegment`) |
 | `csharp/src/AiResume.LarkCli/` | lark-cli 结构化进程适配 | `LarkCliInvoker`(环境注入、UTF-8、stdout/stderr 信封、耗时)、`LarkEnvelope`、`LarkRedactor` |
 | `csharp/src/AiResume.Launcher/` | 开机自启的无窗口垫片 | `Program.Main`(无控制台窗口拉起同目录 Worker) |
 | `csharp/src/AiResume.Worker/Program.cs` | 命令分派与 Host 装配 | `install/uninstall/shortcuts/notify`、`internal-agent-run`、常驻 Host |
@@ -156,7 +174,7 @@ v2.1 及之前由直接运行的 cc-connect 承担飞书/微信聊天、会话�
 | `csharp/src/AiResume.Gui/` | WPF + WebView2 宿主与 RPC 桥 | `MainWindow`、`ControlPlaneBridge.HandleAsync`、`DemoPayload`(截图合成数据) |
 | `csharp/src/AiResume.Gui/wwwroot/index.html` | 单页前端(菜单栏、磁贴、队列、右栏、对话框) | `<script id="vm">` 的 `AR.quotaTiles/rowModel/beaconModel/notifyModel/loginModel/armRequest`、`call` |
 | `csharp/src/AiResume.Hook/Program.cs` | agent hook 入口 | `TryWriteEvent`、`ReadKind`、`ShouldSuppress`、`ComputeEventId` |
-| `csharp/test/AiResume.Tests/` | 隔离的 xUnit 回归 | 本轮 1329 项(以当次输出为准),不触碰真实会话/项目运行 |
+| `csharp/test/AiResume.Tests/` | 隔离的 xUnit 回归 | 本轮 1361 项(以当次输出为准),不触碰真实会话/项目运行 |
 
 v2.1 的 `csharp/src/AiResume.Wrapper/`(cc-connect 薄适配与安全检查)已于 2026-10-30 删除。
 
@@ -172,7 +190,7 @@ dotnet build csharp\AiResume.sln -c Release -warnaserror
 dotnet test csharp\AiResume.sln
 ```
 
-本轮完整回归 1329 项全绿(约 40 秒;用例数以当次输出为准)。测试经 `TestTemp` 申请临时目录,注入 runner/API/时钟、假 PID 与合成会话隔离生产状态,不发付费请求;`GuiPageContractTests`(Node 驱动视图模型)与 `OpenCodeNotificationAdapterTests`(内嵌 Node harness,21 个事件场景)需要 node;通知回归会启动真实 Hook 进程,但不启动 agent。
+本轮完整回归 1361 项全绿(约 40 秒;用例数以当次输出为准;其中一项用 Node 跑 `mods/tests` 的 60 个 mod 用例)。测试经 `TestTemp` 申请临时目录,注入 runner/API/时钟、假 PID 与合成会话隔离生产状态,不发付费请求;`GuiPageContractTests`(Node 驱动视图模型)与 `OpenCodeNotificationAdapterTests`(内嵌 Node harness,21 个事件场景)需要 node;通知回归会启动真实 Hook 进程,但不启动 agent。
 
 ### 4.2 部署现役副本
 
@@ -204,12 +222,13 @@ notify test                    入队一条冒烟事件,最多等 90 秒看后�
 - 通知源:`ClaudeCodeNotificationAdapterTests`、`OpenCodeNotificationAdapterTests`、`CodexHooksNotificationAdapterTests`、`ClineNotificationAdapterTests`、`QoderNotificationAdapterTests`、`HookHandlerTests`、`HookCommandTests`、`HookHealthTests`、`NotifyIntentTests`、`NotificationHookProcessTests`、`NotificationMarkerIdentityTests`。
 - 投递与通道:`CompletionNotifierTests`、`NotificationDeliveryTests`、`NotificationWorkerTests`、`NotifyControlPlaneTests`、`NotifyRecipientTests`、`LarkCliInvokerTests`、`ControlPlaneBridgeNotificationTests`。
 - GUI:`GuiPageContractTests`、`ControlPlaneBridgeArmTests`、`ControlPlaneBridgeDemoTests`、`ControlPlaneBridgeProjectsTests`、`ControlPlaneBridgeQuotaTests`。
+- 子代理预检:`BudgetGateTests`(env 条目增删、意图与对账、快照不含凭据、证据与生效判定、清理、payload 带 mod、并运行 `mods/tests` 的 Node 测试);视图模型断言在 `GuiPageContractTests`。
 - 供应商:`OpenCodeCredentialsTests`、`DeepSeekProbeTests`、`CodexAuthProbeTests`、`CodexOfficialProviderTests`、`CodexBalanceProbeTests`。
 - 进程与恢复:`PowerLossRecoveryTests`、`ProcessVerifierTests`、`ReconcilerTests`、`SupervisionProcessTests`;安装:`InstallUninstallTests`、`InstallTargetSafetyTests`、`InstallWorkerLauncherTests`、`WorkerAutostartTests`。
 
 ### 4.5 真机核验
 
-- install 后核对:`notify list` 的「可送达」列、`notify check` 退出码 0、`notify test` 真实送达、`opencode.log` 出现新插件的 `loading plugin` 且其后没有 `failed to load plugin`。本轮(2026-10-30)记录:Release 构建 0 警告、1156 项全绿、install 退出码 0 并删除旧令牌文件、`notify list` 显示 OpenCode 插件已被加载、`notify disable` 关闭 Codex/Cline/Qoder(意图只留 ClaudeCode 与 OpenCode)、`notify check` doctor 就绪、`notify test` 真实送达(当时凭据来源为 keychain)。两轮交叉审查修正后(2026-10-31 本地时间 00:10 前后)复核:Release 构建 0 警告、1195 项全绿、仓库 secrets 门禁 0 命中、install 退出码 0(Claude Code 钩子按新 matcher 重写)、`notify list` 退出码 0 且 OpenCode 已加载、`notify check` 退出码 0、`notify test` 真实送达、`--screenshot` 真实 WebView2 渲染正常;凭据来源仍是 keychain(机器人凭据尚未在「飞书通知设置」里保存成机器范围副本)。修复轮复审修正后(2026-11-02 本地时间 08:50 前后)复核:Release `-warnaserror` 无增量重建 0 警告、1215 项全绿、install 退出码 0、`notify list` 退出码 0(Claude Code 与 OpenCode 可送达=True,OpenCode 已加载)、`notify check` 退出码 0、`notify test` 真实送达;部署后的真实窗口:四块额度磁贴读出实时读数(不再停在「读取中」)、Claude 登录「有效」、两个通知源「钩子正常」、飞书机器人「可送达」、页脚「后台服务运行中」,项目发现多出一个此前因会话首行超 64 KiB 读不出目录的项目。凭据来源仍是 keychain。限额通知规则与界面用语修正后(2026-11-02 本地时间 11:45 前后)复核:Release `-warnaserror` 无增量重建 0 警告、1250 项全绿、install 退出码 0、`notify list` 退出码 0(Claude Code 与 OpenCode 可送达=True)、`notify check` 退出码 0、`notify test` 真实送达(Worker 日志 `outcome=Sent`);部署后的真实窗口:两个通知源「hook 正常」「插件已加载」、飞书机器人「可送达」、页脚「后台服务运行中」、布防栏「预览…」。凭据来源仍是 keychain(界面显示「未存凭据副本」的前提是还没有真实投递记录)。飞书凭据副本自己换令牌(ADR-0007)后(2026-11-02 本地时间 16:50 前后)复核:Release `-warnaserror` 0 警告、1303 项全绿、install 退出码 0;用户在「飞书通知设置」重新保存凭据(保存时真实换令牌并调一次机器人接口)后,`notify check` 退出码 0(`tenant_token`、`bot_api` 为 pass)、`notify list` 退出码 0、`notify test` 真实送达且 Worker 日志为 `credentialSource=env`;按 PID 停掉交互会话里的 Worker、由 S4U 计划任务拉到会话 0 后再跑 `notify test`,同样真实送达(`credentialSource=env`),之后已把 Worker 恢复到交互会话;部署后的真实窗口:飞书机器人「可送达」。Worker 在会话 0 时 GUI 连不上它的命名管道,显示「后台服务未核实」(既有问题,另行处理)。队列里临时工作区显示会话名后(2026-11-02 本地时间 17:40 前后)复核:两路只读审查修正后,Release `-warnaserror --no-incremental` 0 警告、1328 项全绿(变基到 7e1f562 之后 1329 项全绿)、install 退出码 0、`notify list` 退出码 0(Claude Code 与 OpenCode 可送达=True);合成数据截图与部署后的真实窗口:临时工作区行显示会话名,第二行「临时工作区 scratch-…」,悬停给出完整会话名与目录名,「预览…」里会话名截到 20 字;项目发现改为每次按文件修改时间重挑最新转录后,fork 过的临时工作区改显示原会话及其 11/02 的时间,本机发现的项目由 16 个变为 20 个(原先被过期索引条目藏掉);10/26 02:10 有外部操作批量改过 11 个老项目转录的修改时间,这些项目现在显示「最近会话 10/26 02:10」。
+- install 后核对:`notify list` 的「可送达」列、`notify check` 退出码 0、`notify test` 真实送达、`opencode.log` 出现新插件的 `loading plugin` 且其后没有 `failed to load plugin`。本轮(2026-10-30)记录:Release 构建 0 警告、1156 项全绿、install 退出码 0 并删除旧令牌文件、`notify list` 显示 OpenCode 插件已被加载、`notify disable` 关闭 Codex/Cline/Qoder(意图只留 ClaudeCode 与 OpenCode)、`notify check` doctor 就绪、`notify test` 真实送达(当时凭据来源为 keychain)。两轮交叉审查修正后(2026-10-31 本地时间 00:10 前后)复核:Release 构建 0 警告、1195 项全绿、仓库 secrets 门禁 0 命中、install 退出码 0(Claude Code 钩子按新 matcher 重写)、`notify list` 退出码 0 且 OpenCode 已加载、`notify check` 退出码 0、`notify test` 真实送达、`--screenshot` 真实 WebView2 渲染正常;凭据来源仍是 keychain(机器人凭据尚未在「飞书通知设置」里保存成机器范围副本)。修复轮复审修正后(2026-11-02 本地时间 08:50 前后)复核:Release `-warnaserror` 无增量重建 0 警告、1215 项全绿、install 退出码 0、`notify list` 退出码 0(Claude Code 与 OpenCode 可送达=True,OpenCode 已加载)、`notify check` 退出码 0、`notify test` 真实送达;部署后的真实窗口:四块额度磁贴读出实时读数(不再停在「读取中」)、Claude 登录「有效」、两个通知源「钩子正常」、飞书机器人「可送达」、页脚「后台服务运行中」,项目发现多出一个此前因会话首行超 64 KiB 读不出目录的项目。凭据来源仍是 keychain。限额通知规则与界面用语修正后(2026-11-02 本地时间 11:45 前后)复核:Release `-warnaserror` 无增量重建 0 警告、1250 项全绿、install 退出码 0、`notify list` 退出码 0(Claude Code 与 OpenCode 可送达=True)、`notify check` 退出码 0、`notify test` 真实送达(Worker 日志 `outcome=Sent`);部署后的真实窗口:两个通知源「hook 正常」「插件已加载」、飞书机器人「可送达」、页脚「后台服务运行中」、布防栏「预览…」。凭据来源仍是 keychain(界面显示「未存凭据副本」的前提是还没有真实投递记录)。飞书凭据副本自己换令牌(ADR-0007)后(2026-11-02 本地时间 16:50 前后)复核:Release `-warnaserror` 0 警告、1303 项全绿、install 退出码 0;用户在「飞书通知设置」重新保存凭据(保存时真实换令牌并调一次机器人接口)后,`notify check` 退出码 0(`tenant_token`、`bot_api` 为 pass)、`notify list` 退出码 0、`notify test` 真实送达且 Worker 日志为 `credentialSource=env`;按 PID 停掉交互会话里的 Worker、由 S4U 计划任务拉到会话 0 后再跑 `notify test`,同样真实送达(`credentialSource=env`),之后已把 Worker 恢复到交互会话;部署后的真实窗口:飞书机器人「可送达」。Worker 在会话 0 时 GUI 连不上它的命名管道,显示「后台服务未核实」(既有问题,另行处理)。队列里临时工作区显示会话名后(2026-11-02 本地时间 17:40 前后)复核:两路只读审查修正后,Release `-warnaserror --no-incremental` 0 警告、1328 项全绿(变基到 7e1f562 之后 1329 项全绿)、install 退出码 0、`notify list` 退出码 0(Claude Code 与 OpenCode 可送达=True);合成数据截图与部署后的真实窗口:临时工作区行显示会话名,第二行「临时工作区 scratch-…」,悬停给出完整会话名与目录名,「预览…」里会话名截到 20 字;项目发现改为每次按文件修改时间重挑最新转录后,fork 过的临时工作区改显示原会话及其 11/02 的时间,本机发现的项目由 16 个变为 20 个(原先被过期索引条目藏掉);10/26 02:10 有外部操作批量改过 11 个老项目转录的修改时间,这些项目现在显示「最近会话 10/26 02:10」。子代理额度预检(ADR-0008)进仓库后(2026-11-02 本地时间 19:25 前后)复核:mod 与 C# 控制面两路只读审查修正后,Release `-warnaserror` 0 警告、1361 项全绿、install 退出码 0(`settings.json` 的 `CLAUDE_CODE_PLUGIN_DIRS` 由开发目录换成安装目录、`config.json` 为影子 v1、盐已生成)、`notify list` 退出码 0(Claude Code 与 OpenCode 可送达=True);临时目录的 haiku `-p` 会话(不加载用户级钩子、不落盘)加载安装版 mod 0.3.0,给出一次真实影子判断(5 小时 72%、放行);部署后的真实窗口:右栏「影子模式 · 未跟上」(开着的会话还跑着开发版 mod 0.2.0,重开后才算生效),详情里 5 小时 mod 73% 对 OAuth 74%、周 24% 对 25%,最近判断就是那次放行;合成数据截图右栏为「影子模式 · 生效中 · 本来会推迟 4/35」。
 - **待真机验证**:一次真实的用量上限中断后的逐项目自动续跑端到端;OpenCode 里一次真实任务完成时发出通知;Claude Code 登录到期提醒。
 - 界面证据:`$env:AIRESUME_SHADOW_DIR=<临时目录>; AiResume.Gui.exe --screenshot <png>`(演示模式只用合成数据,约 2 秒后截取;加 `--screenshot-unarmed` 为未布防态)。不设 `AIRESUME_SHADOW_DIR` 会在真实状态目录下生成 webview2 缓存与日志。
 
@@ -228,6 +247,8 @@ notify test                    入队一条冒烟事件,最多等 90 秒看后�
   webview2\                                WebView2 用户数据
   secrets\feishu-bot.bin                   飞书机器人凭据(DPAPI LocalMachine,ACL 收紧)
   secrets\feishu-platform.bin              v2.1 及之前「飞书接入」凭据(CurrentUser),只用于一键导入
+  budget-gate\config.json / quota-snapshot.json / calibration.json   子代理预检的模式、OAuth 只读快照、价格样本与历史
+  budget-gate\sessions\<会话>.json / logs\*.jsonl                  mod 心跳与日志(Worker 按 7 天 / 30 天清理)
 ```
 
 - `config.json`(camelCase):`armed`、`armCycleId`、`continuous`、`selected[]`(`name/path/sessionId/modelId/modelName/modelSource`;`modelSource` = `session` 跟随会话 / `user` 手选 / `default` 会话模型读不到或不在目录时用目标默认 / 空 = v2.1 旧配置,沿用 `resumeTarget.modelId`)、`resumeTarget`(`providerId/providerIdentity/providerName/agent/modelId/modelName/boundAtUtc`,只存身份指纹)、`resumeModel`(目标默认模型)、`resumePrompt`(默认 `continue`)、`skipPermissions`(默认 false)、`probeIntervalMinutes` / `quotaRefreshMinutes`(默认 15)、`customProjects`、`hiddenProjects`、`notifySources`(意图)、`notifyRecipientOpenId`(明文 `ou_…`)。不含任何凭据;旧 `ccConnectAgent` 字段读时忽略、写回时消失。
@@ -282,6 +303,7 @@ AI Resume 只读的外部文件:
 - **Q:一个项目续跑失败后,为什么这一轮都停了?** — A:进入进程登记/启动之后的失败(撞限前已有写操作 `limited-side-effects`,界面「撞限前已有操作」;未确认完成 `exit-null`;启动/登记/监控错误)可能已有副作用或结果未知,按 ADR-0002 一律不自动重放:状态灯显示「N 个续跑未确认完成 / 本轮已停止」(副标题「不会再自动续跑,检查后解除并重新布防」),检查会话结果后解除并重新布防。只有 spawn 之前的失败(`not-started:*`)才会跳过本轮、自动重试。
 - **Q:绿灯的依据是什么?** — A:都来自外部证据:额度磁贴绿 = 本次实时服务端读数且未满(承接读数琥珀、没有百分比不绿);「hook 正常」= 配置里有我方条目且 `AiResume.Hook.exe` 存在(OpenCode 行是「插件已加载」,要它自己的日志证明);飞书机器人「可送达」= 健康文件里有真实送达记录、最近一次尝试成功、核对得上那次成功之后没改过设置(`settingsVerified === true`),且确认后台服务(Worker)在跑(`workerRunning === true`);「监视中」= 布防、后台服务进程在、探测新鲜且常驻 Worker 应答管道;DeepSeek 绿 = 余额接口成功且大于 0;Sub2API 第三方余额按 CC Switch 语义判定。核对不出一律「未核实」,刷新失败不保留旧绿。
 - **Q:测试会不会碰真实会话或项目?** — A:不会。测试只用 `TestTemp` 临时目录、假 PID/runner、合成会话与录制的真实形状,禁止 resume 真实会话或对真实仓库启动修改运行;公开截图必须设 `AIRESUME_SHADOW_DIR` 并用 `--screenshot` 的合成数据。
+- **Q:子代理预检装了却显示「等新会话」,或者模式切了还是旧的?** — A:mod 只在**新启动**的 Claude Code 会话里加载(env 在会话启动时读),已开着的会话要关掉重开;它每分钟重读一次 `config.json` 并在心跳里回报版本,界面「生效中」只认 3 分钟内的心跳。影子模式只记"本来会推迟",要真的推迟需在「视图 › 子代理预检…」里先勾选「我已看过下面的证据」再点「启用拦截」。临时撤掉:切到「已关闭」;彻底移除:`uninstall`(只删 settings.json 里我方那条)。
 
 ## 7. 术语表(中英 / 缩写对照)
 
@@ -330,6 +352,7 @@ AI Resume 只读的外部文件:
 - [docs/CLAUDE-QUOTA-ACQUISITION.md](docs/CLAUDE-QUOTA-ACQUISITION.md):Claude OAuth 额度协议、Claude 登录与账号指纹、稀疏合并、SQLite 并发、按模型族门禁与真机验证手册。
 - [docs/COMPLETION-NOTIFICATIONS.md](docs/COMPLETION-NOTIFICATIONS.md):各客户端完成边界、钩子/插件形态、飞书投递、去重与故障排查。
 - [docs/adr/0007-feishu-tenant-token-exchange.md](docs/adr/0007-feishu-tenant-token-exchange.md):飞书机器人凭据副本自己换 tenant_access_token(lark-cli 的 env 来源只收现成令牌;实验证据、边界与「不手写飞书请求」规则的例外)
+- [docs/adr/0008-subagent-budget-preflight.md](docs/adr/0008-subagent-budget-preflight.md):子代理发起前的额度预检(第五件事):mod 与控制面分工、数据契约、决策策略、上线节奏(影子默认,拦截由用户打开)、实证与已知缺口
 - [docs/adr/0006-retire-cc-connect-per-project-resume.md](docs/adr/0006-retire-cc-connect-per-project-resume.md):v2.2:cc-connect 退役、Claude 登录与账号指纹、逐项目续跑、按模型族门禁、完成通知送达修复、DeepSeek 只展示与 GUI 重排的决策和上游证据。
 - [docs/adr/0005-owned-credentials-official-codex-and-hooks.md](docs/adr/0005-owned-credentials-official-codex-and-hooks.md):v2.1:Codex 官方账号与放行规则(B1)、Codex hooks 通知(C1)仍有效;A1(setup-token)与 D1 的 Worker 投递设计已被 ADR-0006 取代。
 - [docs/adr/0004-provider-bound-resume.md](docs/adr/0004-provider-bound-resume.md):供应商实时目录、固定调用 ID、不换供应商重放与 Codex 执行计划;「全队列一个模型」已被 ADR-0006 改为逐项目。

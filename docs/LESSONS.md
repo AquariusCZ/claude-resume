@@ -537,6 +537,37 @@ cc-connect 给 codex agent 配 provider 时会 `ensureCodexAuth` 改写 `~/.code
    - 规则:① 缓存键必须覆盖被缓存结论依赖的全部输入——这里结论是「最新那份转录」,依赖每个文件的修改时间,目录时间只覆盖增删;② 便宜的部分(列目录拿修改时间,列举结果自带)每次重做,只缓存贵的部分(读头部取 cwd),并按「还是不是同一份文件」复用;③ 一个原本只影响次要显示的过期值,被新功能拿去做身份或点名之前,先核对它在真机上有多旧;④ 两个会话共用一个工作区时提交只暂存自己的 hunk——这次另一个会话整文件 `git add`,把本改动改到一半的引用(缺新文件)带进提交并推送,origin/main 编译不过,直到本改动提交才恢复。
    - 位置:`ProjectCatalog.Discover` / `LatestJsonl` / `SessionDirectoryOf`、`ProjectIndex.TryGetEntry`、`ProjectIndexTests.Appending_to_an_older_session_moves_latest_even_when_dir_mtime_is_unchanged`、`ControlPlaneBridge.BoundSessionName`。
 
+
+## 十五、子代理额度预检(ADR-0008)挖出来的教训(2026-11-02)
+
+1. **★★ Desktop 是 MSIX 包:它拉起的进程在 `%LOCALAPPDATA%` 下新建的顶层目录,包外进程看不到**
+   - 现象:在 Desktop 会话里建的开发目录 `%LOCALAPPDATA%\AI Resume Dev\…`,tsc 报出的真实路径却是 `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\AI Resume Dev\…`;
+     那里还留着 8 月从会话里运行 install 产生的 `.airesume-install-*` / `.airesume-backup-*`。
+   - 根因:MSIX 文件系统写虚拟化。包内进程(Claude Code、它的 Bash/PowerShell 工具、从会话里跑的任何程序)新建 `%LOCALAPPDATA%` 的直接子目录时被重定向进包私有区,
+     合并视图只有包内看得到;写进已存在的真实目录(`AI Resume\`、`Programs\`)则落在真实位置(两次探针实测)。
+   - 规则:① 包内进程要给包外进程看的文件,只能写进包外已经建好的真实目录——mod 只往 AI Resume 建好的 `state\` 里写,绝不自己创建 `AI Resume`;
+     ② 开发与测试目录不要放在 `%LOCALAPPDATA%` 顶层(放 `Programs\` 下或仓库外的真实目录);③ 从会话里运行 install 时 staging/backup 会进包私有区,出问题时到 LocalCache 里找。
+   - 位置:`mods/airesume-budget-gate/hooks/register.ts` `resolveDataDir`、`BudgetGatePaths`、ADR-0008 §4。
+
+2. **★★ 子代理把工具结果里的"指令"当成提示注入,拒绝执行**
+   - 现象:软着陆第一版在工具结果里写"不要再调用工具,把结论写成部分完成",haiku 子代理回答:这条指令来自工具输出、与用户请求不符,我忽略了。
+   - 根因:模型对工具输出里的祈使句有注入防御;插件的拒绝理由正是以工具结果的身份出现的。
+   - 规则:给模型看的拒绝理由与简报只陈述事实(为什么没执行、什么时候恢复、与工具本身无关),收尾方式交给模型自己;改成事实陈述后子代理只调用 1 次工具就如实收尾。
+     测试里用正则卡住"不要/请/立即/必须/务必"。
+   - 位置:`core/messages.ts`、`mods/tests/messages.test.ts`。
+
+3. **★ 同一批并行派发几乎同时到达闸门:判断与预留必须在同一步**
+   - 现象:真实工作流日志里,同一 `parallel()` 批次的 3 个 `agent.spawn` 在 1 毫秒内全部先触发,之后才逐个启动(第 2 个起还要等第 1 个写好提示缓存约 2.6 秒)。
+   - 根因:只在 agent 启动后才计入在途,批内后到的候选全部对着同一个"空在途"判断,一批 8 个会全部放行。
+   - 规则:放行即同步预留,判断与预留之间不得有任何 await;启动落定时把预留换成真实跟踪,被下游拒绝就撤销。
+   - 位置:`BudgetEngine.judgeSpawn` / `beginSpawn` / `spawnSettled`、`mods/tests/engine.test.ts`「并行批次」。
+
+4. **全新会话的第一次派发拿不到读数**
+   - 现象:`-p` 会话第一轮里的工作流派发时 `$.session.usage()` 仍为空,判断落到 no-readings。
+   - 根因:读数来自本进程处理完的 API 响应,派发发生在第一个响应还没处理完的时候。
+   - 规则:读数来源链是本会话 → 3 分钟内其它会话心跳 → 30 分钟内的 OAuth 快照;都没有才按现状放行,并在日志里留 `no-readings`。
+   - 位置:`BudgetEngine.effectiveWindows`、`BudgetGateSnapshotExporter`。
+
 ---
 
 _维护提示:再遇到新坑,按上面的分类追加一条(现象 → 根因 → 规则 → 代码位置)。现役回归是 `dotnet test csharp\AiResume.sln`(`GuiPageContractTests` 与 `OpenCodeNotificationAdapterTests` 需要本机 node);v1 的 `node test/*.js` 回归已随 v1 运行时删除,只在 git 历史里。_

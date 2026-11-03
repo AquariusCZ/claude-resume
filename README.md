@@ -62,6 +62,13 @@ Claude Code · Opus 5.5 · 02:14 · 「迁移文档站」
 
 It reads: *atlas-docs was cut off by the usage limit · source, model, time and session name · the 5-hour limit is used up and resets at 04:30 · armed: AI Resume will resume it once the quota is back; while the session is open it stays out of the way, and resumes after you close it.* Once the quota is back and the session is closed, **▶️ atlas-docs 已开始自动续跑** (resume started) and **✅ atlas-docs 自动续跑完成** (resume finished) follow.
 
+### Checks the budget before spawning subagents (shadow mode by default)
+
+- A small mod runs inside Claude Code: before each subagent or workflow agent starts, it weighs the current 5-hour and weekly readings and the remaining cost of agents already running, counting only up to the next reset, and decides whether this one fits.
+- After install it runs in **shadow mode**: everything still starts, and it only records what it *would* have done. The **子代理预检** (subagent budget check) block on the right and **视图 › 子代理预检…** show each decision, predicted vs. actual cost (p80 coverage) and the mod's readings next to the OAuth ones.
+- Once you have seen the evidence you can turn on **启用拦截** (enforce) yourself: agents that don't fit are deferred and you are reminded to re-dispatch after the reset; near the limit, running subagents wrap up with what they have. No pop-ups, no cap on the number of subagents.
+- Choosing **已关闭** (off) removes that entry from `settings.json`, so new sessions no longer load the mod. If your organization's managed Claude Code policy forbids side-loaded mods, AI Resume does not register it at all (otherwise every Claude Code session would exit at start) and the panel says why.
+
 ### A control panel that tells the truth
 
 - **Quota tiles**: Claude 5-hour, 7-day and per-model weekly limits, plus the balance of the DeepSeek account OpenCode uses.
@@ -149,6 +156,7 @@ When the panel footer reads **后台服务运行中** (background service runnin
 - **Other tools' credentials are read-only.** Codex's `auth.json` and OpenCode's DeepSeek key are read, never written; AI Resume stores no DeepSeek key.
 - **Feishu bot credential: verified before it's saved, locked down once it is.** The App ID and App Secret only come in through **飞书通知设置**. Before saving, AI Resume really exchanges them with Feishu for a tenant_access_token, then uses that token to call the bot info endpoint once through lark-cli; only when both succeed is the pair encrypted with Windows DPAPI (machine scope) into `state\secrets\feishu-bot.bin`. Only you, SYSTEM and Administrators can access the file; if that can't be guaranteed, nothing is saved. Machine scope means an administrator on this PC can decrypt it. At delivery the App Secret only appears in the request to Feishu's token endpoint, and lark-cli receives just the App ID and a short-lived token, which stays in memory. Credentials never reach the command line, logs, the interface or screenshots; the interface only shows a masked App ID. Uninstalling keeps the credential; to remove it, press **清除凭据** (clear credential) in **飞书通知设置**.
 - **No cloud service, no telemetry.** Outbound requests are of three kinds: quota and model-catalog queries made with the credentials your clients already have (Anthropic, and any API endpoint you configured for Claude Code; with Codex or OpenCode installed, also OpenAI, DeepSeek and any third-party provider configured in Codex); the bot-token exchange with Feishu's official endpoint; and Feishu messages and channel diagnostics through lark-cli. Refreshing the panel calls no model and spends no tokens. Tokens and credentials never go into logs, and notification logs don't record message text.
+- **The budget mod never touches credentials.** It only uses the usage readings Claude Code itself reports and never reads, writes or refreshes a token; its logs hold token counts, readings and decisions, never prompt text. `install` adds a single path to `env.CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json` and `uninstall` removes that one entry.
 
 ## FAQ
 

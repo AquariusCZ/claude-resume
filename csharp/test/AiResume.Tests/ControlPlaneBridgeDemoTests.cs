@@ -18,6 +18,8 @@ public sealed class ControlPlaneBridgeDemoTests
     [InlineData("notify.check")]
     [InlineData("notify.recipient.detect")]
     [InlineData("app.info")]
+    [InlineData("budget.get")]
+    [InlineData("budget.setMode")]
     public async Task 截图模式只返回合成数据(string type)
     {
         var bridge = new ControlPlaneBridge(demoMode: true);

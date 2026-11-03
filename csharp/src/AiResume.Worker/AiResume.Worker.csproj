@@ -11,6 +11,8 @@
   <ItemGroup>
     <!-- 随产物拷出:创建快捷方式时要指向它 -->
     <None Include="icon.ico" CopyToOutputDirectory="PreserveNewest" />
+    <!-- ADR-0008:子代理额度预检 mod 随安装 payload 走(清单、SHA-256 冻结、备份、卸载退役与其它运行文件同一套) -->
+    <None Include="..\..\..\mods\airesume-budget-gate\**\*" LinkBase="mods\airesume-budget-gate" CopyToOutputDirectory="PreserveNewest" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.10" />
     <PackageReference Include="Tomlyn" Version="2.10.1" />
   </ItemGroup>

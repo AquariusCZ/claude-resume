@@ -117,6 +117,21 @@ public sealed class ProductConfig
     /// </summary>
     public string NotifyRecipientOpenId { get; set; } = string.Empty;
 
+    /// <summary>
+    /// 子代理额度预检(ADR-0008)的意图:用户想用哪个模式,<c>off</c> / <c>observe</c> / <c>shadow</c> / <c>enforce</c>。
+    ///
+    /// 空串 = 旧配置从未记录过,install 对账时按默认 <c>shadow</c> 记下;<c>enforce</c>(启用拦截)只能经界面上用户的
+    /// 显式操作写入,install 从不默认它。与 <see cref="NotifySources"/> 同理:意图必须自己记下来,
+    /// 现状(settings.json 里登没登记、mod 在跑哪个模式)回答不了"本该是什么样"。
+    /// </summary>
+    public string BudgetGateMode { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 预检配置版本:每次模式变更递增,写进 <c>state\budget-gate\config.json</c>;mod 在心跳里回报它读到的版本,
+    /// 界面据此判断配置是否真的生效——写成功不等于生效。
+    /// </summary>
+    public int BudgetGateConfigVersion { get; set; }
+
     public string DirtyGuard { get; set; } = "stash";
 
     public static ProductConfig CreateDefault() => new();

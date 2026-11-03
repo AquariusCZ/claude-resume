@@ -131,6 +131,8 @@ builder.Services.AddSingleton<IClaudeResumeRunner>(sp =>
 builder.Services.AddSingleton<IResumeNotices>(_ => new ResumeNoticeWriter(Path.Combine(ShadowPaths.Root, "completion-events")));
 // Claude Code 登录(refresh token)到期前提醒:额度只靠它读取，过期后无法自动续跑。
 builder.Services.AddHostedService<ClaudeLoginReminder>();
+// ADR-0008:子代理预检 mod 的数据看护(清理过期心跳与日志,config.json 丢了按意图重写)。
+builder.Services.AddHostedService<AiResume.Worker.BudgetGate.BudgetGateJanitor>();
 builder.Services.AddSingleton<ResumeEngine>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ResumeEngine>());
 builder.Services.Configure<ObservationOptions>(

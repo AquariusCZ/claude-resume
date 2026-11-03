@@ -1,0 +1,90 @@
+{
+ "schema": 1,
+ "mod": "0.1.0",
+ "engine": "2.1.309",
+ "sessionId": "a0000003-0000-4000-8000-000000000003",
+ "nonce": "f49af6",
+ "surface": null,
+ "interactive": false,
+ "mode": "observe",
+ "configVersion": null,
+ "projectKey": "000000000003",
+ "startedAt": "2026-11-02T16:52:31.717Z",
+ "beatAt": "2026-11-02T16:52:45.584Z",
+ "ended": true,
+ "endReason": "other",
+ "readings": [
+  {
+   "kind": "five_hour",
+   "percentUsed": 75,
+   "resetsAt": "2026-11-02T19:00:00.000Z"
+  },
+  {
+   "kind": "seven_day",
+   "percentUsed": 8,
+   "resetsAt": "2026-11-09T14:00:00.000Z"
+  }
+ ],
+ "readingsAt": "2026-11-02T16:52:45.575Z",
+ "agents": [
+  {
+   "agentId": "ae949d3c0fa451050",
+   "type": "workflow-subagent",
+   "model": "claude-haiku-5-5",
+   "startedAt": "2026-11-02T16:52:34.553Z",
+   "endedAt": "2026-11-02T16:52:37.187Z",
+   "steps": 1,
+   "eq": 34921,
+   "wf": {
+    "runId": "wf_ea7ce8a3-df4",
+    "agentIndex": 1
+   }
+  },
+  {
+   "agentId": "ae800bcd5ad54c52b",
+   "type": "workflow-subagent",
+   "model": "claude-haiku-5-5",
+   "startedAt": "2026-11-02T16:52:37.134Z",
+   "endedAt": "2026-11-02T16:52:39.158Z",
+   "steps": 1,
+   "eq": 7990,
+   "wf": {
+    "runId": "wf_ea7ce8a3-df4",
+    "agentIndex": 3
+   }
+  },
+  {
+   "agentId": "a5b97d53bc01693d6",
+   "type": "workflow-subagent",
+   "model": "claude-haiku-5-5",
+   "startedAt": "2026-11-02T16:52:39.178Z",
+   "endedAt": "2026-11-02T16:52:40.372Z",
+   "steps": 1,
+   "eq": 7990,
+   "wf": {
+    "runId": "wf_ea7ce8a3-df4",
+    "agentIndex": 5
+   }
+  }
+ ],
+ "spentByModel": {
+  "claude-haiku-5-5": {
+   "in": 14,
+   "out": 875,
+   "cr": 152350,
+   "cw": 47992,
+   "eq": 79614,
+   "steps": 6
+  }
+ },
+ "counters": {
+  "steps": 6,
+  "spawns": 5,
+  "measures": 3,
+  "prompts": 2,
+  "errors": 0,
+  "dropped": 0
+ },
+ "lastError": null,
+ "logFile": "<本机日志路径已脱敏>"
+}

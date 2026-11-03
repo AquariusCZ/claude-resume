@@ -6,6 +6,7 @@ using AiResume.Core;
 using AiResume.Secrets;
 using AiResume.Storage;
 using AiResume.Worker;
+using AiResume.Worker.BudgetGate;
 using AiResume.Worker.Migration;
 using AiResume.Worker.Notifications;
 using AiResume.Worker.Probes;
@@ -50,6 +51,7 @@ public sealed class ControlPlaneBridge
     private readonly Func<string, string, IReadOnlyList<string>, IReadOnlyDictionary<string, string>, ProductConfig, CancellationToken, Task<BoundResumeSelection>> _resumeBinding;
     private readonly Func<string, IReadOnlyList<string>, IReadOnlyList<ProjectPreview>> _resumePreview;
     private readonly NotifyControlPlane _notify;
+    private readonly BudgetGateControl _budget;
 
     public ControlPlaneBridge(
         ProjectCatalog? catalog = null,
@@ -70,7 +72,8 @@ public sealed class ControlPlaneBridge
         Func<string, string, IReadOnlyList<string>, IReadOnlyDictionary<string, string>, ProductConfig, CancellationToken, Task<BoundResumeSelection>>? resumeBinding = null,
         Func<string, IReadOnlyList<string>, IReadOnlyList<ProjectPreview>>? resumePreview = null,
         NotifyControlPlane? notifyControl = null,
-        Func<bool>? workerPing = null)
+        Func<bool>? workerPing = null,
+        BudgetGateControl? budgetGate = null)
     {
         _demoMode = demoMode;
         // 选目录必须回到 UI 线程弹原生对话框,由宿主窗口注入;测试注入替身,不弹窗。
@@ -108,6 +111,8 @@ public sealed class ControlPlaneBridge
         _notificationRegistry = notificationRegistry ?? new NotificationRegistry();
         // 飞书通知通道与 Worker 共用同一 shadow 根(凭据副本、投递健康文件、事件队列)。
         _notify = notifyControl ?? new NotifyControlPlane(_configStore);
+        // 子代理预检(ADR-0008):mod 在本程序目录下(安装后即安装目录),数据与 Worker 共用同一状态根。
+        _budget = budgetGate ?? new BudgetGateControl(_configStore, BudgetGatePaths.Default, new ClaudePluginDirs());
     }
 
     /// <summary>
@@ -169,6 +174,9 @@ public sealed class ControlPlaneBridge
                     };
                 }, cancellationToken).ConfigureAwait(false),
                 "notify.test.withdraw" => await Task.Run(() => new { withdrawn = _notify.WithdrawTest(ReadString(root, "eventId")) }, cancellationToken).ConfigureAwait(false),
+                // 子代理预检(ADR-0008):读心跳与日志、读写 settings.json/config.json,都在线程池里做。
+                "budget.get" => await Task.Run(() => BudgetPayload(), cancellationToken).ConfigureAwait(false),
+                "budget.setMode" => await Task.Run(() => SetBudgetMode(root), cancellationToken).ConfigureAwait(false),
                 _ => throw new NotSupportedException($"未知请求类型:{type}"),
             };
 
@@ -330,8 +338,156 @@ public sealed class ControlPlaneBridge
                 items = new object[] { new { openId = "ou_0123456789abcdef0123456789abcdef", userName = "演示用户", tokenStatus = "valid" } },
             },
             "app.info" => new { version = typeof(ControlPlaneBridge).Assembly.GetName().Version?.ToString(3) ?? "dev", shadowRoot = @"D:\Demo\AI Resume\state", quotaRefreshMinutes = 15 },
+            "budget.get" or "budget.setMode" => DemoBudget(now),
             _ => throw new NotSupportedException($"截图合成模式不支持请求:{type}"),
         };
+    }
+
+    /// <summary>子代理预检的合成数据(截图与演示用):影子模式生效中,判断里有放行也有"本来会推迟"。</summary>
+    private static object DemoBudget(long now) => new
+    {
+        mode = "shadow",
+        configVersion = 3,
+        intentVersion = 3,
+        status = "effective",
+        reasons = Array.Empty<string>(),
+        freshSessions = 2,
+        modVersions = new[] { "0.3.0" },
+        engineVersions = new[] { "2.1.309" },
+        installedModVersion = "0.3.0",
+        truncated = false,
+        readings = new object[]
+        {
+            new { kind = "five_hour", modPercent = 63, modResetsAtUnix = now + 7_800, modObservedAtUnix = now - 40, oauthPercent = 62, oauthResetsAtUnix = now + 7_800, oauthObservedAtUnix = now - 540, delta = 1, resetMatches = true },
+            new { kind = "seven_day", modPercent = 41, modResetsAtUnix = now + 300_000, modObservedAtUnix = now - 40, oauthPercent = 41, oauthResetsAtUnix = now + 300_000, oauthObservedAtUnix = now - 540, delta = 0, resetMatches = true },
+        },
+        prices = new object[]
+        {
+            new { window = "five_hour", model = "opus-5-5", period = "offpeak", k = 1.21, source = "measured", samples = 6, spread = 0.31 },
+            new { window = "seven_day", model = "opus-5-5", period = "offpeak", k = 0.18, source = "measured", samples = 6, spread = 0.27 },
+            new { window = "five_hour", model = "haiku-5-5", period = "offpeak", k = 0.4, source = "family", samples = 0 },
+        },
+        pricesAtUnix = now - 40,
+        decisions = new object[]
+        {
+            new { atUnix = now - 420, kind = "would-defer", mode = "shadow", rule = "prefix-closure", model = "opus-5-5", type = "workflow-subagent", runId = "wf_8f2c1d0a-7b1", agentIndex = 6, binding = "five_hour", deferUntilUnix = now + 7_800 },
+            new { atUnix = now - 421, kind = "would-defer", mode = "shadow", rule = "over-budget", model = "opus-5-5", type = "workflow-subagent", runId = "wf_8f2c1d0a-7b1", agentIndex = 5, binding = "five_hour", need = 8.3, margin = 4.1, percent = 58, deferUntilUnix = now + 7_800 },
+            new { atUnix = now - 422, kind = "allow", mode = "shadow", rule = "fits", model = "opus-5-5", type = "workflow-subagent", runId = "wf_8f2c1d0a-7b1", agentIndex = 4, need = 8.3, margin = 12.4, percent = 58 },
+            new { atUnix = now - 423, kind = "allow", mode = "shadow", rule = "fits", model = "opus-5-5", type = "workflow-subagent", runId = "wf_8f2c1d0a-7b1", agentIndex = 1, need = 8.3, margin = 37.2, percent = 58 },
+            new { atUnix = now - 3_900, kind = "allow", mode = "shadow", rule = "fits", model = "opus-5-5", type = "general-purpose", need = 6.1, margin = 51.8, percent = 31 },
+        },
+        counts = new Dictionary<string, int> { ["allow"] = 31, ["would-defer"] = 4 },
+        coverage = new { total = 22, covered = 18, ratio = 0.818, medianRatio = 0.94 },
+        avoided = new { shadowWouldAvoid = 1, enforceAvoided = 0, landingsApplied = 0, landingsShadow = 0 },
+        pending = new object[]
+        {
+            new { runId = "wf_8f2c1d0a-7b1", agentIndex = 5, type = "workflow-subagent", model = "opus-5-5", rule = "over-budget", deferUntilUnix = now + 7_800, applied = false },
+        },
+        lastErrors = Array.Empty<string>(),
+    };
+
+    /// <summary>
+    /// 子代理预检的现状与证据(ADR-0008 §F):意图模式、settings.json 登记、mod 文件、config.json 版本,
+    /// 加上 mod 心跳与日志汇总出的对表、判断、复盘。「生效中」只由新鲜心跳回报当前模式与配置版本判定。
+    /// </summary>
+    private object BudgetPayload()
+    {
+        BudgetGatePaths paths = _budget.Paths;
+        (string mode, int intentVersion, _) = _budget.Intent();
+        string missing = BudgetGateControl.MissingModFiles(paths.ModDir);
+        string? installedModVersion = BudgetGateControl.ModVersion(paths.ModDir);
+        BudgetGateReport report = BudgetGateEvidence.Build(new BudgetGateInputs(
+            paths,
+            Mode: mode,
+            ConfigVersion: _budget.ReadConfigVersion(),
+            PluginDirs: _budget.Env.Inspect(paths.ModDir),
+            Policy: _budget.Policy(),
+            ModFilesOk: missing.Length == 0,
+            ModFilesDetail: missing.Length == 0 ? string.Empty : $"mod 文件不全:缺 {missing}",
+            InstalledModVersion: installedModVersion,
+            OAuthWindows: BudgetGateSnapshotExporter.ReadWindows(paths.SnapshotFile),
+            Now: DateTimeOffset.UtcNow));
+        static long? Unix(DateTimeOffset? t) => t?.ToUnixTimeSeconds();
+        return new
+        {
+            mode,
+            configVersion = report.ConfigVersion,
+            intentVersion,
+            status = report.Status,
+            reasons = report.Reasons,
+            freshSessions = report.FreshSessions,
+            modVersions = report.ModVersions,
+            engineVersions = report.EngineVersions,
+            installedModVersion,
+            truncated = report.Truncated,
+            readings = report.Readings.Select(r => new
+            {
+                kind = r.Kind,
+                modPercent = r.ModPercent,
+                modResetsAtUnix = Unix(r.ModResetsAt),
+                modObservedAtUnix = Unix(r.ModObservedAt),
+                oauthPercent = r.OAuthPercent,
+                oauthResetsAtUnix = Unix(r.OAuthResetsAt),
+                oauthObservedAtUnix = Unix(r.OAuthObservedAt),
+                delta = r.Delta,
+                resetMatches = r.ResetMatches,
+            }),
+            prices = report.Prices.Select(p => new { window = p.Window, model = p.Model, period = p.Period, k = p.K, source = p.Source, samples = p.Samples, spread = p.Spread }),
+            pricesAtUnix = Unix(report.PricesAt),
+            decisions = report.Decisions.Select(d => new
+            {
+                atUnix = d.At.ToUnixTimeSeconds(),
+                kind = d.Kind,
+                mode = d.Mode,
+                rule = d.Rule,
+                model = d.Model,
+                type = d.Type,
+                runId = d.RunId,
+                agentIndex = d.AgentIndex,
+                binding = d.Binding,
+                need = d.Need,
+                margin = d.Margin,
+                percent = d.Percent,
+                deferUntilUnix = Unix(d.DeferUntil),
+            }),
+            counts = report.DecisionCounts,
+            coverage = new { total = report.Coverage.Total, covered = report.Coverage.Covered, ratio = report.Coverage.Ratio, medianRatio = report.Coverage.MedianActualOverPredicted },
+            avoided = new
+            {
+                shadowWouldAvoid = report.Avoided.ShadowWouldAvoid,
+                enforceAvoided = report.Avoided.EnforceAvoided,
+                landingsApplied = report.Avoided.LandingsApplied,
+                landingsShadow = report.Avoided.LandingsShadow,
+            },
+            pending = report.Pending.Select(p => new
+            {
+                runId = p.RunId,
+                agentIndex = p.AgentIndex,
+                type = p.Type,
+                model = p.Model,
+                rule = p.Rule,
+                deferUntilUnix = Unix(p.DeferUntil),
+                applied = p.Applied,
+            }),
+            lastErrors = report.LastErrors,
+        };
+    }
+
+    /// <summary>
+    /// 切换预检模式:先写意图(版本 +1)再写 config.json,mod 约 1 分钟内跟上。
+    /// 启用拦截(enforce)必须带 <c>confirm=true</c>——界面上要用户先勾选确认再点一次,两步都是用户自己的动作。
+    /// </summary>
+    private object SetBudgetMode(JsonElement root)
+    {
+        string mode = ReadString(root, "mode");
+        bool confirmed = root.TryGetProperty("confirm", out JsonElement confirm) && confirm.ValueKind == JsonValueKind.True;
+        if (mode == "enforce" && !confirmed)
+        {
+            throw new InvalidOperationException("启用拦截需要先勾选「我已看过证据」再确认");
+        }
+
+        _budget.SetMode(mode);
+        return BudgetPayload();
     }
 
     private static object DemoNotification(string kind, string displayName, bool enabled = true) => new

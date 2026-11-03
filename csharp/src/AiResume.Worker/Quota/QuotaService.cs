@@ -22,6 +22,7 @@ public sealed class QuotaService
     private readonly Func<CancellationToken, Task<OAuthUsageResult>>? _oauthProbe;
     private readonly Func<DateTimeOffset> _clock;
     private readonly QuotaSnapshotStore? _authoritativeStore;
+    private readonly Action<UsageSnapshot>? _oauthSnapshotSink;
     private readonly bool _allowCliFallback;
     private readonly SemaphoreSlim _gate = new(1, 1);
 
@@ -36,7 +37,8 @@ public sealed class QuotaService
         Func<DateTimeOffset>? clock = null,
         Func<CancellationToken, Task<OAuthUsageResult>>? oauthProbe = null,
         QuotaSnapshotStore? authoritativeStore = null,
-        bool? allowCliFallback = null)
+        bool? allowCliFallback = null,
+        Action<UsageSnapshot>? oauthSnapshotSink = null)
     {
         _probe = probe ?? DefaultProbeAsync;
         // 现役生产刷新只读取元数据。显式注入的探针保留诊断/隔离测试兼容。
@@ -47,7 +49,15 @@ public sealed class QuotaService
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
         _authoritativeStore = authoritativeStore ??
             (probe is null && oauthProbe is null ? new QuotaSnapshotStore(ShadowPaths.RunDatabasePath) : null);
+        // ADR-0008:每次拿到真实 OAuth 读数,顺手导出预检 mod 读的只读快照(不含凭据与账号标识)。
+        // 与 _authoritativeStore 同理只在生产构造时默认挂上,注入探针的测试不会写真实 state。
+        _oauthSnapshotSink = oauthSnapshotSink ??
+            (probe is null && oauthProbe is null ? DefaultBudgetGateSink : null);
     }
+
+    private static void DefaultBudgetGateSink(UsageSnapshot snapshot) =>
+        BudgetGate.BudgetGateSnapshotExporter.TryExport(
+            snapshot, BudgetGate.BudgetGatePaths.Default.SnapshotFile, DateTimeOffset.UtcNow);
 
     /// <summary>额度实时结果可用但跨窗口持久化退化时的脱敏诊断。</summary>
     public string? StorageWarning => Volatile.Read(ref _storageWarning);
@@ -130,6 +140,14 @@ public sealed class QuotaService
                     snapshot = snapshot with { CredentialFingerprint = oauth.CredentialFingerprint };
                     _lastAuthoritative = snapshot;
                     _lastAuthoritativeFingerprint = oauth.CredentialFingerprint;
+                    try
+                    {
+                        _oauthSnapshotSink?.Invoke(snapshot);
+                    }
+                    catch (Exception)
+                    {
+                        // 导出只是旁路:任何失败都不得影响额度主流程。
+                    }
                 }
                 else if (_allowCliFallback)
                 {

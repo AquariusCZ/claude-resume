@@ -1,0 +1,117 @@
+{
+ "schema": 1,
+ "mod": "0.2.0",
+ "engine": "2.1.309",
+ "sessionId": "a0000004-0000-4000-8000-000000000004",
+ "nonce": "e76d8e",
+ "surface": null,
+ "interactive": false,
+ "mode": "shadow",
+ "configVersion": 1,
+ "configProblems": [],
+ "projectKey": "000000000004",
+ "startedAt": "2026-11-02T17:11:41.829Z",
+ "beatAt": "2026-11-02T17:11:55.965Z",
+ "ended": true,
+ "endReason": "other",
+ "readings": [
+  {
+   "kind": "five_hour",
+   "percentUsed": 82,
+   "resetsAt": "2026-11-02T19:00:00.000Z"
+  },
+  {
+   "kind": "seven_day",
+   "percentUsed": 9,
+   "resetsAt": "2026-11-09T14:00:00.000Z"
+  }
+ ],
+ "readingsAt": "2026-11-02T17:11:55.955Z",
+ "inflight": [],
+ "reserved": 0,
+ "spent": {
+  "haiku-5-5": 79072
+ },
+ "mainEqPerMinute": {
+  "haiku-5-5": 1879.5333333333333
+ },
+ "pending": [
+  {
+   "seq": 3,
+   "runId": "wf_3d58a0c9-39d",
+   "agentIndex": 3,
+   "type": "workflow-subagent",
+   "model": "haiku-5-5",
+   "rule": "over-budget",
+   "deferUntilMs": 1793646000000,
+   "atMs": 1793639504811,
+   "applied": false,
+   "at": "2026-11-02T17:11:44.811Z",
+   "deferUntil": "2026-11-02T19:00:00.000Z"
+  },
+  {
+   "seq": 4,
+   "runId": "wf_3d58a0c9-39d",
+   "agentIndex": 4,
+   "type": "workflow-subagent",
+   "model": "haiku-5-5",
+   "rule": "prefix-closure",
+   "deferUntilMs": 1793646000000,
+   "atMs": 1793639508374,
+   "applied": false,
+   "at": "2026-11-02T17:11:48.374Z",
+   "deferUntil": "2026-11-02T19:00:00.000Z"
+  },
+  {
+   "seq": 5,
+   "runId": "wf_3d58a0c9-39d",
+   "agentIndex": 5,
+   "type": "workflow-subagent",
+   "model": "haiku-5-5",
+   "rule": "prefix-closure",
+   "deferUntilMs": 1793646000000,
+   "atMs": 1793639508377,
+   "applied": false,
+   "at": "2026-11-02T17:11:48.377Z",
+   "deferUntil": "2026-11-02T19:00:00.000Z"
+  }
+ ],
+ "landing": [],
+ "prices": [
+  {
+   "window": "five_hour",
+   "model": "haiku-5-5",
+   "period": "peak",
+   "k": 1.0171,
+   "source": "family",
+   "samples": 0,
+   "spread": null
+  },
+  {
+   "window": "seven_day",
+   "model": "haiku-5-5",
+   "period": "peak",
+   "k": 0.0627,
+   "source": "family",
+   "samples": 0,
+   "spread": null
+  }
+ ],
+ "counters": {
+  "steps": 6,
+  "spawns": 5,
+  "measures": 3,
+  "prompts": 2,
+  "errors": 0,
+  "allow": 2,
+  "defer": 3,
+  "deniedApplied": 0,
+  "landings": 0,
+  "landingsApplied": 0,
+  "redispatches": 0,
+  "briefs": 1,
+  "dropped": 0
+ },
+ "lastError": null,
+ "logFile": "<本机日志路径已脱敏>"
+}

@@ -521,6 +521,81 @@ public sealed class GuiPageContractTests
     }
 
     /// <summary>把 script#vm 放进 Node 的隔离上下文，再执行断言脚本;任何断言失败都让进程以非 0 退出。</summary>
+    [Fact]
+    public void 子代理预检_生效只认后端心跳判定_影子显示本来会推迟_对表偏差与覆盖率按阈值着色()
+        => RunViewModel("""
+            const now = 1793640000;
+            assert.equal(AR.budgetModel(null, now).side.head, '读取中…');
+            let m = AR.budgetModel({ error: '读不到心跳目录' }, now);
+            assert.equal(m.side.head, '未核实'); assert.equal(m.side.led, '');
+            const base = { mode: 'shadow', configVersion: 3, reasons: [], readings: [], prices: [], decisions: [], counts: {}, coverage: { total: 0 }, avoided: {}, pending: [] };
+            // 只装好、没有会话加载:不能说生效,并说清要新开会话
+            m = AR.budgetModel({ ...base, status: 'waiting', reasons: ['最近 3 分钟没有会话心跳'] }, now);
+            assert.equal(m.side.led, 'wait'); assert.match(m.side.head, /等新会话/); assert.doesNotMatch(m.side.head, /生效/);
+            assert.match(m.side.note, /新开的 Claude Code 会话/);
+            // 生效中只来自后端判定(新鲜心跳回报当前模式与配置版本);正常时不出说明行
+            m = AR.budgetModel({ ...base, status: 'effective', freshSessions: 2 }, now);
+            assert.equal(m.side.led, 'ok'); assert.equal(m.side.head, '影子模式 · 生效中'); assert.equal(m.side.note, '');
+            assert.equal(m.side.value, '暂无派发'); assert.match(m.side.title, /活跃会话 2 个/);
+            // 关闭模式有心跳也不点绿;配置没跟上琥珀;未生效标红并说原因;认不出的状态一律未核实
+            m = AR.budgetModel({ ...base, mode: 'off', status: 'effective' }, now);
+            assert.equal(m.side.led, ''); assert.equal(m.side.head, '已关闭'); assert.equal(m.side.value, '');
+            m = AR.budgetModel({ ...base, status: 'stale', reasons: ['活跃会话回报的是 shadow/v1/mod 0.2.0'] }, now);
+            // 右栏窄列:状态用短句、不挤汇总数字,完整原因在说明行
+            assert.equal(m.side.led, 'wait'); assert.equal(m.side.head, '影子模式 · 未跟上'); assert.equal(m.side.value, '');
+            assert.match(m.side.note, /mod 0\.2\.0/); assert.equal(m.statusText, '配置未跟上');
+            m = AR.budgetModel({ ...base, status: 'broken', reasons: ['settings.json:未登记'] }, now);
+            assert.equal(m.side.led, 'bad'); assert.match(m.side.note, /未登记/); assert.match(m.side.head, /未生效/);
+            assert.match(AR.budgetModel({ ...base, status: '???' }, now).side.head, /未核实/);
+            // 只有一部分会话跟上:琥珀「部分生效」并说哪些没跟上,不说生效中
+            m = AR.budgetModel({ ...base, status: 'partial', reasons: ['1 个会话还在用旧配置或旧版 mod(shadow/v2/mod 0.2.0)'] }, now);
+            assert.equal(m.side.led, 'wait'); assert.equal(m.side.head, '影子模式 · 部分生效'); assert.match(m.side.note, /旧配置/);
+            assert.equal(m.statusText, '部分会话生效');
+            // 已关闭(后端 disabled):不点灯;仍登记着时把原因放进说明
+            m = AR.budgetModel({ ...base, mode: 'off', status: 'disabled', reasons: ['settings.json 里仍登记着 mod'] }, now);
+            assert.equal(m.side.led, ''); assert.equal(m.side.head, '已关闭'); assert.equal(m.side.value, ''); assert.match(m.side.note, /仍登记/);
+            // mod 自己的报错与日志截断如实带出,不影响状态灯
+            m = AR.budgetModel({ ...base, status: 'effective', lastErrors: ['beat: EACCES'], truncated: true, coverage: { total: 0 } }, now);
+            assert.equal(m.side.led, 'ok'); assert.match(m.errorsText, /beat: EACCES/); assert.match(m.side.title, /beat: EACCES/);
+            assert.match(m.coverageText, /只汇总了最近的一部分/);
+            assert.equal(AR.budgetModel({ ...base, status: 'effective' }, now).errorsText, '');
+            // 影子模式的推迟是「本来会推迟」,启用拦截后才是「推迟」
+            const decisions = [
+              { atUnix: now - 60, kind: 'would-defer', rule: 'over-budget', model: 'opus-5-5', runId: 'wf_abc', agentIndex: 3, binding: 'five_hour', need: 8.3, margin: 4.1, deferUntilUnix: now + 3600 },
+              { atUnix: now - 61, kind: 'allow', rule: 'fits', model: 'opus-5-5' },
+              { atUnix: now - 62, kind: 'deferred', rule: 'prefix-closure', model: 'opus-5-5', runId: 'wf_abc', agentIndex: 4 },
+            ];
+            m = AR.budgetModel({ ...base, status: 'effective', decisions, counts: { allow: 1, 'would-defer': 1, deferred: 1 } }, now);
+            assert.deepEqual(m.decisionRows.map(d => d.verdict), ['本来会推迟', '放行', '推迟']);
+            assert.equal(m.decisionRows[0].rule, '额度不够'); assert.match(m.decisionRows[0].room, /需 8\.3 点 \/ 余 4\.1 点/);
+            assert.equal(m.decisionRows[2].rule, '同批后缀');
+            assert.equal(m.side.value, '本来会推迟 1/3'); assert.match(m.side.title, /本来会推迟 1 次/);
+            // 对表:差超过 2 点或重置时刻对不上 → 琥珀;一边没有读数如实写「未读到」
+            m = AR.budgetModel({ ...base, status: 'effective', readings: [
+              { kind: 'five_hour', modPercent: 63, oauthPercent: 60, delta: 3, resetMatches: true },
+              { kind: 'seven_day', modPercent: 41, oauthPercent: 41, delta: 0, resetMatches: false },
+              { kind: 'five_hour', oauthPercent: 40 },
+            ] }, now);
+            assert.deepEqual(m.readingRows.map(r => r.cls), ['wait', 'wait', '']);
+            assert.equal(m.readingRows[2].mod, '未读到');
+            // p80 覆盖率:样本 ≥ 10 且落在 75–85% 才绿
+            assert.equal(AR.budgetModel({ ...base, status: 'effective', coverage: { total: 20, covered: 16, ratio: 0.8 } }, now).coverageCls, 'ok');
+            assert.equal(AR.budgetModel({ ...base, status: 'effective', coverage: { total: 20, covered: 19, ratio: 0.95 } }, now).coverageCls, 'wait');
+            assert.equal(AR.budgetModel({ ...base, status: 'effective', coverage: { total: 4, covered: 4, ratio: 1 } }, now).coverageCls, '');
+            // 价格置信:实测 ≥ 4 段且离散 ≤ 0.5 才算高;先验永远不冒充实测
+            m = AR.budgetModel({ ...base, status: 'effective', prices: [
+              { window: 'five_hour', model: 'opus-5-5', period: 'peak', k: 2.9, source: 'measured', samples: 6, spread: 0.3 },
+              { window: 'five_hour', model: 'haiku-5-5', period: 'offpeak', k: 0.44, source: 'family', samples: 0 },
+            ] }, now);
+            assert.deepEqual(m.priceRows.map(p => p.confidence), ['高', '先验']); assert.match(m.priceRows[0].source, /高峰/);
+            // 启用拦截需要用户确认;待补派与避免的中断按模式说
+            assert.equal(m.modeButtons.find(b => b.mode === 'enforce').needsConfirm, true);
+            m = AR.budgetModel({ ...base, mode: 'enforce', status: 'effective', avoided: { enforceAvoided: 2, landingsApplied: 1 },
+              pending: [{ runId: 'wf_abc', agentIndex: 3, type: 'workflow-subagent', model: 'opus-5-5', deferUntilUnix: now + 60, applied: true }] }, now);
+            assert.equal(m.pendingRows[0].tag, '待补派'); assert.match(m.avoidedText, /避免中断 2 次/);
+            assert.match(AR.budgetModel({ ...base, status: 'effective', avoided: { shadowWouldAvoid: 1 } }, now).avoidedText, /影子:本可避免的中断 1 次/);
+            """);
+
     private static void RunViewModel(string assertions)
     {
         string html = RepositoryFile("csharp", "src", "AiResume.Gui", "wwwroot", "index.html");

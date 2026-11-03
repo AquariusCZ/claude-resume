@@ -8,12 +8,13 @@
 
 ## 产品边界
 
-AI Resume 只负责四件事:
+AI Resume 只负责五件事:
 
 1. 原生会话被用量上限打断后,按供应商证据**逐项目**排队,额度恢复后用原会话续跑;
 2. 发现并索引本地项目;
 3. 接收本地 AI 客户端的完成钩子/插件事件,经官方 `lark-cli` 以飞书机器人身份私信投递;
-4. 提供 Windows 控制面(WPF + WebView2)。
+4. 提供 Windows 控制面(WPF + WebView2);
+5. 子代理发起前的额度预检(ADR-0008):判断与拦截在 Claude Code 进程内的 mod 里,AI Resume 负责安装登记、模式与参数、只读额度快照导出和证据可视化。
 
 它不实现聊天通道、agent 回合、cron 或供应商切换状态机,也不镜像 Claude Code / OpenCode 内部的会话状态机,只读它们公开落盘的产物(会话登记、转录、日志)。手机上的远程交互交给 Claude Code 官方 Remote Control:连接由 Claude Code 自己建立,AI Resume 不参与,只在钩子事件表明会话连着 Remote Control 时在通知文案里加「· 远程已连接」。飞书只剩「完成通知」一种用途,所有飞书调用都经官方 `lark-cli`。
 
@@ -108,6 +109,12 @@ AI Resume 自己的持久状态放在单独的子目录,卸载时可以保留:
   logs\gui-yyyyMMdd.log             GUI 日志
   logs\launcher.log                 Launcher 启动失败的痕迹
   webview2\                         WebView2 用户数据目录
+  budget-gate\config.json           子代理预检的模式与配置版本(GUI / install 写,mod 读;ADR-0008)
+  budget-gate\quota-snapshot.json   OAuth 额度只读快照:5h/7d 与按模型族周额度(QuotaService 写,mod 读;不含凭据与账号标识)
+  budget-gate\sessions\<会话>.json  mod 心跳:版本、模式与配置版本、读数、在途 agent、累计计量、待补派、价格表(mod 写,GUI 与其它会话读)
+  budget-gate\logs\*.jsonl          mod 日志:读数、逐次请求计量、派发与判断、结束复盘、软着陆、补派(不含提示正文;Worker 30 天后清理)
+  budget-gate\calibration.json      价格样本与子代理历史(各会话合并写)
+  budget-gate\salt                  日志里项目键与提示哈希的盐(install 生成;无凭据含义,只防按常见路径或短提示反推)
 ```
 
 v2.1 的 `secrets\claude-oauth-token.bin` 与 `claude-oauth-token.bin.rejected.json`(setup-token 长期令牌及其拒绝标记)已无读者,`install` 激活成功后由 `InstallCommand.RetireLegacyClaudeToken` 从实际状态根(`ShadowPaths.Root`)删除,自定义 `--target` 时安装目录旁的 `state\` 也清一遍;删不掉只打印完整路径提示手动删除,不影响安装结果。删除本地文件不等于吊销:setup-token 签发的令牌在服务端约一年有效,需要彻底作废时在 Claude 账号的授权管理里撤销。
@@ -126,6 +133,7 @@ AI Resume 读取(少数场合写入)的外部文件,所有权都在各自的客�
 | `<配置根>\sessions\<pid>.json` | 运行中会话登记(占用判定) | 从不写 |
 | `<配置根>\settings.json` | `env`(`claude-api` 供应商行) | 从不写 |
 | `<配置根>\settings.json`(与 Claude Code 一致跟随 `CLAUDE_CONFIG_DIR`,未设置时 `%USERPROFILE%\.claude`) | 我方 hooks 条目是否完整 | 只增删 AI Resume 自己的 hooks 条目 |
+| 同上 `settings.json` 的 `env.CLAUDE_CODE_PLUGIN_DIRS`(多值,`;` 分隔) | 我方条目是否恰好一条且指向安装目录下的 mod | 只增删末级目录名为 `airesume-budget-gate` 的条目(ADR-0008);别人的条目与其它 `env` 键原样保留 |
 | `%USERPROFILE%\.codex\`(或 `AI_RESUME_CODEX_HOME` / `CODEX_HOME`) | `auth.json`、`config.toml`、`sessions\` | `hooks.json` 我方分组与 `config.toml` 的 `hooks.state` 信任记录(ADR-0005 C1) |
 | OpenCode 2.x:配置目录 `OPENCODE_CONFIG_DIR`(未设置时 `%XDG_CONFIG_HOME%\opencode`,再未设置时 `%USERPROFILE%\.config\opencode`)下的 `opencode.json` / `opencode.jsonc`,`OPENCODE_CONFIG` 指定的文件,`OPENCODE_CONFIG_CONTENT` 内联配置,`%ProgramData%\opencode` 托管层(1.x 的 `config.json` 不读);数据目录 `%XDG_DATA_HOME%\opencode`(未设置时 `%USERPROFILE%\.local\share\opencode`)下的凭据库(`OPENCODE_DB`,默认 `opencode.db`,只读 `credential` 表)、`auth.json` 与 `log\opencode.log` | DeepSeek 密钥(只展示余额)、插件加载证据 | 配置目录下 `plugins\airesume-notify\` 我方插件 |
 | Cline / Qoder 的 hooks 配置(见「完成通知」) | 我方条目是否完整 | 只增删 AI Resume 自己的条目 |
@@ -152,6 +160,8 @@ AI Resume 读取(少数场合写入)的外部文件,所有权都在各自的客�
 | `notifySources[]` | 用户想开着的完成通知源(意图,不是现状)。 |
 | `notifyIntentRecorded` | `notifySources` 是否被记录过(界面开关、`notify enable/disable`、`install` / `uninstall` 写意图时置 true)。false 且列表为空 = 更早的旧配置，投递端不按来源过滤;true 时空列表 = 用户把通知源全关了，残留链路的事件一律丢弃(`ai-resume` 事件总是放行)。 |
 | `notifyRecipientOpenId` | 飞书收件人 `open_id` 明文,唯一真身。 |
+| `budgetGateMode` | 子代理预检(ADR-0008)的模式意图:`off` / `observe` / `shadow` / `enforce`;空串 = 从未记录,install 补默认 `shadow`。`enforce` 只能经界面上用户勾选确认后写入,install 从不默认它,也不把用户选的模式改回。 |
+| `budgetGateConfigVersion` | 预检配置版本,每次模式变更递增并写进 `state\budget-gate\config.json`;mod 在心跳里回报读到的版本,界面据此判断配置是否真的生效。 |
 | `probeModel` / `dirtyGuard` | 兼容保留,现役代码不读取。 |
 
 `ProjectRef` 字段:`name`、`path`、`sessionId`(布防时固定的原生会话 UUID),以及 v2.2 新增的逐项目模型:
@@ -213,6 +223,7 @@ Worker 是 Generic Host。托管服务强制串行启动(`ServicesStartConcurren
 - `ObservationWorker`:持久化运行/进程的观测;
 - `NotificationWorker`:每 15 秒扫一轮完成通知队列;
 - `ClaudeLoginReminder`:每 30 分钟检查一次 Claude Code 登录到期;
+- `BudgetGateJanitor`:每小时清理子代理预检 mod 的过期日志(30 天)、心跳(7 天)与进程中途退出留下的临时文件(1 小时),`config.json` 丢了或落后于意图时按意图重写(只补不降),组织策略开始禁止旁加载时撤下登记(ADR-0008);
 - `ResumeEngine`:每 30 秒一拍,驱动布防周期与逐项目续跑。
 
 无法识别的子命令在构造 Host 之前就被拦下(否则 `--help` 之类的笔误会悄悄起第二个常驻 Worker):帮助请求打印用法返回 0,不带前导横线的未知首参打印用法返回 2;带横线的首参仍作为宿主配置(如 `--Observation:IntervalSeconds=00:00:15`)。
@@ -247,6 +258,8 @@ Worker 是 Generic Host。托管服务强制串行启动(`ServicesStartConcurren
 | `notify.test` | — | 冒烟事件入队,返回 `eventId`、`enqueuedAtUnix` 与最新 `channel`。界面先查 lark-cli、收件人与后台 Worker,缺一样就不入队。 |
 | `notify.test.status` | `eventId`、`sinceUnix` | 这一条测试事件的结局 `outcome`:`delivered`(进了已送达表)/ `dead` / `failed`(这一条真实尝试过、得到确定的条目级失败,`failure` 给出类别、错误码与 log_id;结果不明的不算,Worker 会在飞书去重窗口内重试)/ `blocked`(入队之后 Worker 看过、通道此刻仍在熔断:到期了或改过设置都不算)/ `pending`,外加最新 `channel`。与 `notify test` 同一判据(`NotifyControlPlane.TestOutcome`);界面每 5 秒问一次,最多 90 秒。 |
 | `notify.test.withdraw` | `eventId` | 撤回还没送出的测试事件(失败、熔断或 90 秒没送达时),免得通道恢复后补发一条过时的测试通知;返回 `withdrawn`。Worker 发送前复查事件文件并在发送期间占住它,撤回与发送互斥:撤不回(正在发这一条)时界面再看一眼结局,如实说「已送达」或「撤回未确认,稍后仍可能收到」。事件 ID 只接受 16 位十六进制。 |
+| `budget.get` | — | 子代理预检的现状与证据(ADR-0008):`mode` / `configVersion` / `intentVersion` / `status`(`effective` 生效中、`partial` 部分会话生效、`waiting` 等新会话、`stale` 配置未跟上、`broken` 未生效、`unverified` 未核实、`disabled` 已关闭)/ `reasons`、活跃会话数与 mod/引擎版本、已装 mod 版本、`readings`(mod 与 OAuth 对表)、`prices`(校准价格)、`decisions`(最近 30 条判断,影子模式为 `would-defer`)、`counts`、`coverage`(p80 覆盖率)、`avoided`、`pending`、`lastErrors`(mod 自报的错误与 config.json 问题)、`truncated`。「生效中」只由 3 分钟内的全部心跳回报当前模式、配置版本与已装 mod 版本判定。 |
+| `budget.setMode` | `mode`、`confirm` | 先写意图(版本 +1)再写 `config.json`,写不进去时意图恢复原样;随后按新模式对齐登记(`off` 撤下,其它模式在组织策略允许时登记),登记失败不回滚模式、由证据显示「未生效」与原因;`enforce` 必须 `confirm=true`(界面上先勾选「我已看过下面的证据」再点一次)。返回同 `budget.get`。 |
 
 `--screenshot` 截图模式下,页面渲染所需的读请求改由进程内合成数据(`DemoPayload`)回答,其它请求一律报错,请求处理不读真实配置与状态(WebView2 用户数据与 GUI 日志仍落在状态根下,见「构建、安装与验证」)。历史:`feishu.*`、`cutover.*`、`agent.*`、`claude.token.*`、`quota.local` 已于 2026-10-30 删除,`providers.probe` 已于 v2.1 删除。
 
@@ -255,7 +268,7 @@ Worker 是 Generic Host。托管服务强制串行启动(`ServicesStartConcurren
 | 命令 | 作用 | 退出码 |
 |---|---|---|
 | (不带子命令) | 以常驻服务启动;可带 `--Section:Key=Value` 形式的宿主配置。 | — |
-| `install [--target <目录>] [--from <构建根>]` | 安装或升级(见「构建、安装与验证」)。 | 0 成功;1 失败;2 通知源未能对齐;3 新 Worker 未就绪(已回滚);4 回滚不完整;快捷方式失败时返回其退出码。 |
+| `install [--target <目录>] [--from <构建根>]` | 安装或升级(见「构建、安装与验证」)。 | 0 成功;1 失败;2 通知源或子代理预检登记未能对齐;3 新 Worker 未就绪(已回滚);4 回滚不完整;快捷方式失败时返回其退出码。 |
 | `uninstall [--target <目录>]` | 卸载,保留 `state\` 与未知文件。 | 0 成功;异常 1;移除快捷方式失败时返回其退出码;从安装目录执行而临时卸载 Worker 60 秒内未返回时 4。失败时 stderr 给出恢复材料的绝对路径。 |
 | `shortcuts [install\|uninstall] [--gui …] [--worker …] [--icon …]` | 创建或移除开始菜单、桌面与登录自启入口(`install` / `uninstall` 内部调用)。 | 0 成功,失败非 0。 |
 | `notify` / `notify list` | 列出 5 个通知源及「已安装 / 已启用 / 可送达」。 | 任一源已启用但 hook 失效(可送达列 `False(hook 失效)`,OpenCode 为 `False(插件失效)`)时 2,否则 0。 |
@@ -515,6 +528,38 @@ AI Resume 只与客户端落盘的原生会话打交道,不在自己这里维护
 
 历史:v2.1 及之前本节描述 cc-connect v1.4.1 的会话语义(切换 agent 后 `sessions.InvalidateForAgent` 清空旧原生会话、`Session.ActiveProvider` 不随之清空、`/provider switch` 与 `/new` 的用法、当前会话受删除保护)。这些随 cc-connect 于 2026-10-30 退役,不再适用于本产品。
 
+## 子代理额度预检(ADR-0008)
+
+判断与拦截在 Claude Code 进程内的 mod `mods/airesume-budget-gate/`(TypeScript)里:只有它能逐个看到 Agent 工具、队友与工作流里每个
+`agent()` 的派发(`agent.spawn`)、逐次计量每个请求(`turn.step`)、拦下在途子代理的工具调用(`tool.call`)。AI Resume 在进程外做控制面与证据。
+
+- **安装**:mod 经 Worker csproj 进安装 payload(`%LOCALAPPDATA%\AI Resume\mods\airesume-budget-gate\`);install 在激活之后与通知源一起对账:
+  记下模式意图(旧配置补 `shadow`)→ 写 `state\budget-gate\config.json` → 用户级 `settings.json` 的 `env.CLAUDE_CODE_PLUGIN_DIRS`
+  只留一条我方条目指向安装目录 → 读回核对,没对齐返回 2。uninstall 在拆快捷方式、停进程之前先撤下登记(撤不下就中止卸载,什么都不动;
+  后续步骤失败中止时按意图恢复登记),意图与 state 保留。只影响新启动的会话。
+- **组织策略**:托管设置(`%ProgramFiles%\ClaudeCode\managed-settings.json`、`managed-settings.d\*.json`、配置根下的 `remote-settings.json`、
+  `CLAUDE_CODE_REMOTE_SETTINGS_PATH`、注册表 `HKLM/HKCU\SOFTWARE\Policies\ClaudeCode` 的 `Settings`)里 `disableSideloadFlags` 为 true 时,
+  Claude Code 只要看到 `CLAUDE_CODE_PLUGIN_DIRS` 非空就在启动时报错退出(本机二进制实证)——登记会让**所有**新会话起不来。
+  `SideloadPolicy` 在登记前、界面切换模式时与 `BudgetGateJanitor` 每小时检查:禁止或任一来源读不懂都不登记、已有登记撤下,界面显示「未生效」与原因。
+- **模式**:`off`(已关闭)撤下 settings.json 里的登记,新会话不再加载 mod,这是不卸载 AI Resume 也能持久退出的办法;`observe` 只记录;
+  `shadow`(install 后默认)照常判断、一律放行,只记"如果启用会怎么做";
+  `enforce` 推迟派发、读数到收尾线时让在途子代理的工具调用不执行(软着陆,`StructuredOutput` 豁免,主会话不拦)、重置后会话空闲时以插件消息提醒补派一次、
+  续跑或工作流回报那一轮在 `context` 里附预算简报。给模型看的文字只陈述事实,不写祈使句(实测子代理会把工具结果里的指令当成提示注入)。
+- **决策**:每个窗口只算到重置为止:需求 = 价格 × min(成本 p80, 速率 p80 × 距重置);余量 = 100 − 读数 − 在途 − 预留;放行 ⇔ 需求 ≤ 余量。
+  判断与预留同步完成(同一 `parallel()` 批次的 spawn 在 1 毫秒内全部先到);同一工作流 run 推迟第 i 个后其后全部推迟(前缀闭合);
+  本会话没有在途时保底放行一个;读数来源链是本会话 → 3 分钟内其它会话心跳 → 30 分钟内的 OAuth 快照,都没有就放行。
+- **校准**:按 窗口 × 模型 × 时段(美西工作日 05–11 点为高峰)学"百分点 / 百万等价 token";Δp 除以全机等价 token(本会话 + 其它会话心跳里的累计计量),
+  样本按 窗口|重置时刻|起点|终点 跨会话去重。只有加载了 mod 的会话进账本,看不到的消耗只会让价格偏大(保守)。
+- **证据**:`budget.get` 汇总心跳与最近 7 天日志(按行的 `ts` 过滤,同一行出现在多个分段只算一次,按文件长度与修改时间增量解析,超过 64 MiB 时只汇总最近的部分并标出)。
+  状态:`effective` 要求 3 分钟内的**全部**新鲜心跳都回报当前模式、配置版本与已装 mod 版本;一部分跟上是 `partial`,都没跟上是 `stale`,
+  没有心跳是 `waiting`,登记/文件/配置/策略任一不对是 `broken`,settings.json 读不出是 `unverified`,已关闭是 `disabled`。
+  "本可避免的中断"只认 `stop_failure` 的 `rate_limit`(其它报错不算);启用后同一工作流 agent 被反复推迟只算一次。
+  日志与心跳只记计量、读数与判断,提示与描述只留长度和加盐(`state\budget-gate\salt`,install 生成)SHA-256 前 16 位,工作目录只留加盐哈希。
+- **红线**:mod 不调用 `$.session.authorize`,不读写任何凭据;自身出错一律放行;只在 AI Resume 已建好的 `state\` 下写——Desktop 是 MSIX 包,
+  它拉起的进程在 `%LOCALAPPDATA%` 下新建顶层目录会被重定向进包私有目录,包外的 AI Resume 看不到。
+- **测试**:`mods/tests/*.test.ts`(Node 直接跑 TypeScript,fixture 为 2.1.309 真实录制)由 `dotnet test` 的 `BudgetGateTests` 一并执行;
+  `mods/tools/replay.mts` 把数据目录里的日志按会话离线回放,输出各规则的判断次数与 p80 覆盖率。
+
 ## 完成通知
 
 ### 通知源
@@ -600,7 +645,7 @@ dotnet test csharp\AiResume.sln
 csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe install
 ```
 
-`install` 把 Gui / Worker / Hook / Launcher 的产物合并暂存到 `%LOCALAPPDATA%\AI Resume\` 旁边并校验,写入 payload 清单,备份将被替换或退役的文件,冻结逐文件 SHA-256,只复制这份快照并逐项复核安装后的字节,再删除上一份清单里已过时的文件,然后才重建快捷方式/自启入口并按通知意图对账完成通知钩子。同一规范化目标目录的安装事务由目标哈希命名的互斥体跨进程串行化。新 Worker 经分离的 shell 路径启动,不会继承安装器被重定向的 stdout/stderr 句柄;它必须存活,并以刚启动的精确 PID 应答当前 Named Pipe 协议。失败时恢复被替换与退役的文件,回滚不完整时保留恢复目录。对账按 `NotifyIntent.Targets`(意图 ∪ 现状 ∩ 本机已装)对每个目标源原位重新启用:旧的 Claude Code shell form 钩子在这里被认领并改写为 exec form,旧的 OpenCode 单文件插件在这里迁移为目录插件。这次探测失败(`Unverified`,开没开不知道)的源不在目标里、不改写它读不出的配置,意图原样保留,并按「未对齐」如实返回;`uninstall` 记录现状时同样保留这类源的原意图。激活成功后删除 v2.1 遗留的 Claude 长期令牌文件(见「持久化位置」)。**通知源未能对齐返回 2,Worker 未就绪返回 3,回滚不完整返回 4,均不得当成功处理。** 已打开的 GUI 不会热更新,部署后关掉重开。`--screenshot <png>` 一律使用进程内合成数据桥与带缓存参数的本地页面 URL(`--screenshot-unarmed` 截未布防态),所以公开截图不会暴露真实项目、凭据、用户名或本机路径;公开截图前另把 `AIRESUME_SHADOW_DIR` 指向临时目录。
+`install` 把 Gui / Worker / Hook / Launcher 的产物合并暂存到 `%LOCALAPPDATA%\AI Resume\` 旁边并校验,写入 payload 清单,备份将被替换或退役的文件,冻结逐文件 SHA-256,只复制这份快照并逐项复核安装后的字节,再删除上一份清单里已过时的文件,然后才重建快捷方式/自启入口并按通知意图对账完成通知钩子。同一规范化目标目录的安装事务由目标哈希命名的互斥体跨进程串行化。新 Worker 经分离的 shell 路径启动,不会继承安装器被重定向的 stdout/stderr 句柄;它必须存活,并以刚启动的精确 PID 应答当前 Named Pipe 协议。失败时恢复被替换与退役的文件,回滚不完整时保留恢复目录。对账按 `NotifyIntent.Targets`(意图 ∪ 现状 ∩ 本机已装)对每个目标源原位重新启用:旧的 Claude Code shell form 钩子在这里被认领并改写为 exec form,旧的 OpenCode 单文件插件在这里迁移为目录插件。这次探测失败(`Unverified`,开没开不知道)的源不在目标里、不改写它读不出的配置,意图原样保留,并按「未对齐」如实返回;`uninstall` 记录现状时同样保留这类源的原意图。激活成功后删除 v2.1 遗留的 Claude 长期令牌文件(见「持久化位置」)。**通知源或子代理预检登记未能对齐返回 2,Worker 未就绪返回 3,回滚不完整返回 4,均不得当成功处理。** 已打开的 GUI 不会热更新,部署后关掉重开。`--screenshot <png>` 一律使用进程内合成数据桥与带缓存参数的本地页面 URL(`--screenshot-unarmed` 截未布防态),所以公开截图不会暴露真实项目、凭据、用户名或本机路径;公开截图前另把 `AIRESUME_SHADOW_DIR` 指向临时目录。
 
 <a id="logon-autostart"></a>
 

@@ -1,3 +1,4 @@
+using AiResume.Worker.BudgetGate;
 using AiResume.Worker.Notifications;
 using AiResume.Worker.Products;
 using AiResume.Ipc;
@@ -130,12 +131,21 @@ public static class InstallCommand
                 throw new InvalidOperationException("安装目录里缺少 GUI、Worker 或 Hook,拒绝继续创建入口。");
             }
 
+            // 通知源与子代理预检 mod(ADR-0008)同属"外部入口",都只在新 Worker 就绪、快捷方式提交之后对账;
+            // 两者各自记结果,任何一个没对齐都返回 2,提示语分开说。
+            bool notifyOk = true;
+            bool budgetOk = true;
             ActivationResult activation = ActivateInstalledVersion(
                 () => StartInstalledWorker(workerExe, fullTarget),
                 () => ShortcutCommand.Run([
                     "shortcuts", "--gui", guiExe, "--worker", workerExe,
                     "--icon", Path.Combine(fullTarget, "icon.ico")]),
-                () => ReconcileHooks(hookExe));
+                () =>
+                {
+                    notifyOk = ReconcileHooks(hookExe);
+                    budgetOk = ReconcileBudgetGate(fullTarget);
+                    return notifyOk && budgetOk;
+                });
             if (!activation.WorkerReady)
             {
                 Console.Error.WriteLine("注意:后台服务(Worker)未通过 Named Pipe 就绪核验;正在恢复旧运行版本。");
@@ -179,9 +189,14 @@ public static class InstallCommand
 
             // 通知源没对齐就**不要报告成功**。退出码 0 加一句"入口已全部指向安装目录"
             // 正是审计 B3 里那条骗人的输出:命令说成功,五个通知源全是关的。
-            if (!hooksOk)
+            if (!notifyOk)
             {
                 Console.Error.WriteLine("注意:部分通知源未能启用(见上方警告),完成通知可能收不到。");
+            }
+
+            if (!budgetOk)
+            {
+                Console.Error.WriteLine("注意:子代理预检 mod 未能登记(见上方警告),新会话不会加载它;重新运行 install 再试。");
             }
 
             if (!hooksOk)
@@ -869,12 +884,29 @@ public static class InstallCommand
         var registry = new NotificationRegistry();
         IReadOnlyList<NotificationProviderStatus> before = registry.ProbeAll();
         SaveIntent(NotifyIntent.FromProbe(before, LoadIntent()));
+
+        // ADR-0008:最先从 settings.json 撤下预检 mod 的登记——必须早于删除 payload(否则新会话指向空目录),
+        // 也早于拆快捷方式与停进程:撤不下(settings.json 正被改写、读不懂却含我方条目)就抛出,卸载在什么都没动时中止。
+        // 模式意图留在 state 里,重装时原样恢复。
+        BudgetGateControl budgetGate = BudgetGateFor(target);
+        bool budgetRetired = budgetGate.Retire();
+        if (budgetRetired)
+        {
+            Console.WriteLine("已从 settings.json 移除子代理预检 mod 的登记");
+        }
+
         int preamble = RunUninstallPreamble(
             target,
             () => ShortcutCommand.Run(["shortcuts", "uninstall"]),
             path => StopRunningIn(path, protectedProcessId));
         if (preamble != 0)
         {
+            // 卸载中止、程序仍在:把刚撤下的登记按意图恢复,恢复不了就如实说,下次 install 会再对账。
+            if (budgetRetired && !budgetGate.Reconcile(budgetGate.Paths.ModDir).Ok)
+            {
+                Console.Error.WriteLine("子代理预检 mod 的登记未能恢复;重新运行 install 会再对账。");
+            }
+
             return preamble;
         }
 
@@ -1408,6 +1440,40 @@ public static class InstallCommand
         }
 
         return allOk;
+    }
+
+    /// <summary>安装目标对应的子代理预检控制面(ADR-0008):mod 在安装目录下,数据在状态根下。</summary>
+    private static BudgetGateControl BudgetGateFor(string target) =>
+        new(new ProductConfigStore(ShadowPaths.EnsureRoot()),
+            new BudgetGatePaths(BudgetGatePaths.ModDirUnder(target), BudgetGatePaths.DataDirUnder(ShadowPaths.Root)),
+            new ClaudePluginDirs());
+
+    /// <summary>
+    /// 子代理预检 mod 的对账(ADR-0008 §F):意图(旧配置补默认影子模式)→ config.json → settings.json 里我方条目恰好指向
+    /// 安装目录 → 读回核对。没对齐返回 false,调用方按退出码 2 处理——登记失败时新会话不会加载 mod,不能报告成功。
+    /// </summary>
+    private static bool ReconcileBudgetGate(string fullTarget)
+    {
+        try
+        {
+            BudgetGateControl control = BudgetGateFor(fullTarget);
+            BudgetGateReconcile result = control.Reconcile(control.Paths.ModDir);
+            if (result.Ok)
+            {
+                Console.WriteLine(result.Detail);
+            }
+            else
+            {
+                Console.Error.WriteLine($"警告:{result.Detail}");
+            }
+
+            return result.Ok;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"警告:子代理预检对账失败({ex.Message})");
+            return false;
+        }
     }
 
     /// <summary>读回持久化的通知意图;读不出来当作空(不阻断安装)。</summary>
