@@ -1,29 +1,106 @@
+<div align="center">
+
 # AI Resume
 
-**English** | [简体中文](README.zh-CN.md)
+**Hit a Claude Code usage limit? Go to bed.**
 
-[![Platform](https://img.shields.io/badge/platform-Windows-2F8A56)](#install)
-[![.NET](https://img.shields.io/badge/.NET-10-512BD4)](https://dotnet.microsoft.com/)
-[![License](https://img.shields.io/badge/license-MIT-6B665B)](LICENSE)
+When the quota comes back, AI Resume picks up the sessions you already closed, right where they stopped;<br>
+when a task finishes, fails or needs your call, it messages you on Feishu.
 
-> Your AI coding agent hits a usage limit at 2am. AI Resume queues the work, waits for the reset, and picks it up without you.
+[![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-2F8A56)](#requirements)
+[![.NET 10](https://img.shields.io/badge/.NET-10-512BD4)](https://dotnet.microsoft.com/)
+[![Version](https://img.shields.io/badge/dynamic/xml?url=https%3A%2F%2Fraw.githubusercontent.com%2FAquariusCZ%2Fclaude-resume%2Fmain%2Fcsharp%2FDirectory.Build.props&query=%2F%2FVersion&label=version&color=E2512B)](csharp/Directory.Build.props)
+[![License: MIT](https://img.shields.io/badge/license-MIT-6B665B)](LICENSE)
 
-A local Windows control plane for Claude Code and OpenCode: it resumes Claude Code sessions that a usage limit cut off, and sends you a Feishu message when a task finishes, stops on an error or waits for you. No cloud backend of its own — the GUI, queue, state and hooks all stay on your machine, and Feishu only delivers the notifications. Codex, Cline and Qoder support stays available behind the **视图** (View) menu.
+**English** · [简体中文](README.zh-CN.md)
 
-![AI Resume control panel](docs/assets/panel.png)
+</div>
+
+![AI Resume control panel: quota tiles, resume queue, Claude login and Feishu notifications (demo data)](docs/assets/panel.png)
+
+<p align="center"><sub>Demo data: three armed (guarded) projects. One is waiting for the Fable weekly limit, one has its session still open and resumes once it's closed, one wasn't interrupted and is just being watched. The amber on the right is the panel being honest: the Claude login expires within 3 days, and Feishu delivery can't be verified right now, so it says 待核实 (pending check). The interface and the notifications are in Simplified Chinese.</sub></p>
+
+## Why
+
+Claude Code's built-in auto-continue (`autoContinueAtUsageLimit`, on by default since 2.1.234; the Desktop app has its own switch) only looks after interactive sessions that are **still open**. Close the session and the process exits, taking the wait with it; a Remote Control session on your phone (手机远程 in the interface and messages), or a weekly limit that won't reset for more than a day, isn't waited for either. Leave a long task running overnight, hit the limit, and in the morning you often find a session stopped halfway.
+
+That gap is what AI Resume fills. The two split the work and never step on each other:
+
+| Situation | Claude Code's built-in auto-continue | AI Resume (armed projects) |
+|---|---|---|
+| Session still open (terminal, Desktop, VS Code) | Waits in place and continues after the reset | Stays out of it; if the session still hasn't continued 10 minutes after the quota is back, you get one Feishu reminder |
+| Session already closed | Nothing (the process exited, and the wait with it) | Once the quota has really recovered, resumes the same session with `claude --resume` |
+| Remote Control session on your phone | Doesn't wait | Stays out of it while it's open; if it still hasn't continued 10 minutes after the quota is back, reminds you to continue from the phone |
+| Weekly limit that won't reset for more than a day | Doesn't wait | A closed session waits as long as it takes, then resumes |
+
+> [!NOTE]
+> An unattended night has two preconditions. First, the PC must not sleep: AI Resume runs locally and does nothing while it's asleep. Second, someone has to keep the login token fresh: AI Resume never refreshes tokens, the access token expires after about 8 hours, and only a running Claude Code renews it. With every Claude Code closed, resuming waits once the token expires, until you open Claude Code again; to be safe, keep one Claude Code process running, for example `claude remote-control` in another folder.
 
 ## What it does
 
-| | |
+### Resumes after a usage limit
+
+- **Real quota, not a timer.** Readings come from Anthropic's official OAuth usage endpoint, using Claude Code's own login. A project goes ahead only when this round's live reading shows its limits below full.
+- **Per project, each with its own model.** Every project looks only at the limits that apply to its model: a full Fable weekly limit doesn't hold back a project on Opus.
+- **The same session, not a new one.** It runs `claude --resume <session-id>`, so the context is intact: no new session, no rewritten transcript. Each interruption is resumed at most once.
+- **When in doubt, it waits.** Session just opened, token about to expire, configuration just changed: that project waits for the next round. If something goes wrong after the resume process has started, the round stops for you to check, and it won't resume that project on its own again.
+
+### Feishu messages: finished, failed or waiting for you
+
+- Three kinds of events from Claude Code and OpenCode: finished, stopped by an error, and waiting for you (permission, confirmation, input).
+- When a usage limit hits, each session is reported once per limit window; sessions cut off together share one message, which says whether AI Resume will resume them, based on what's armed when it's sent.
+- Sent by your own Feishu bot through the official lark-cli. A failed message only delays itself; a problem that affects every message (a rejected credential, no network, Feishu rate limiting) pauses Feishu delivery for a while, then it retries on its own.
+
+A message looks like this (synthetic example, in the Chinese you actually receive):
+
+```text
+⏸️ atlas-docs 被用量上限打断
+Claude Code · Opus 5.5 · 02:14 · 「迁移文档站」
+5 小时额度已用完,预计 04:30 重置
+已布防:额度恢复后 AI Resume 会续跑它;会话还开着的话 AI Resume 不插手,关掉后才续
+```
+
+It reads: *atlas-docs was cut off by the usage limit · source, model, time and session name · the 5-hour limit is used up and resets at 04:30 · armed: AI Resume will resume it once the quota is back; while the session is open it stays out of the way, and resumes after you close it.* Once the quota is back and the session is closed, **▶️ atlas-docs 已开始自动续跑** (resume started) and **✅ atlas-docs 自动续跑完成** (resume finished) follow.
+
+### A control panel that tells the truth
+
+- **Quota tiles**: Claude 5-hour, 7-day and per-model weekly limits, plus the balance of the DeepSeek account OpenCode uses.
+- **Resume queue**: projects are discovered from Claude Code's session history, so there's no list to maintain; you can also **+ 添加项目** (add a project) or move folders you don't care about into **不再扫描的目录** (no longer scanned). Each project's model and what it is waiting for, at a glance; **预览…** (Preview) shows every verdict without running anything.
+- **Claude login**: how long the login has left, with Feishu reminders to `/login` starting 3 days before it expires.
+- **Green needs evidence.** An installed CLI or a filled-in key doesn't count: a provider needs a real request that succeeded, Feishu needs a real delivery, and **hook 正常** (hook OK) means the program the hook points to really exists. Anything that can't be checked says **未核实** (unverified) or **待核实** (pending check), never "all good".
+
+## How it works
+
+```mermaid
+flowchart TB
+    accTitle: How AI Resume resumes a session
+    accDescr: When an armed project's session hits the usage limit, an open session is left to Claude Code's built-in auto-continue; a closed one is checked by AI Resume project by project and, only when every check passes, resumed with claude --resume, with Feishu messages along the way.
+    hit(["⏸️ An armed session<br/>hits the usage limit"]) --> open{"Still open?"}
+    open -- "open" --> native["Claude Code's built-in<br/>auto-continue handles it"]
+    native -. "not continued<br/>10 min later" .-> remind(["📱 Feishu reminder"])
+    native -. "you close it" .-> gate
+    open -- "closed" --> gate["AI Resume checks<br/>each project<br/>① not yet resumed<br/>② quota back for its model<br/>③ session not open"]
+    gate --> ok{"All pass?"}
+    ok -- "yes" --> run["claude --resume<br/>the same session,<br/>one project at a time"]
+    run --> done(["📱 Feishu message<br/>▶️ resume started<br/>✅ resume finished"])
+    ok -- "no, or can't verify" --> wait["wait for the next round"]
+    wait --> gate
+```
+
+Notifications take a separate path: Claude Code's hooks and OpenCode's plugin write events to a local queue, and the background service delivers them to Feishu through lark-cli. The interface, queue and state all stay on your machine; AI Resume has no cloud service. For the mechanics, see the [architecture](docs/ARCHITECTURE.md); the detailed documents are written in Chinese.
+
+## Requirements
+
+| Needs | Notes |
 |---|---|
-| **Resumes after a limit** | When a usage limit cuts off a Claude Code session, it resumes that same session once the reset is proven — judged per project, each with its own model, one at a time. |
-| **Finds your projects** | Lists projects from Claude Code's session history; add or hide folders by hand. No hand-maintained list. |
-| **Tells you when it matters** | One Feishu message when a task finishes, stops on an error, or waits for your decision — from Claude Code and OpenCode. |
-| **Shows real evidence** | Quota, login, queue and delivery — green only after a request or a delivery actually succeeded. |
+| Windows 10 / 11 | The interface runs on WebView2: built into Windows 11; on Windows 10, install the [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) if it's missing |
+| [.NET 10 SDK](https://dotnet.microsoft.com/download) | Built from source for now |
+| [Claude Code](https://claude.com/claude-code) 2.1.139 or newer | `claude.exe` on `PATH`, logged in with your Claude account |
+| Node.js and the official [lark-cli](https://github.com/larksuite/cli) | For Feishu notifications: `npm i -g @larksuite/cli` (verified against 1.0.81), plus a Feishu custom app with its bot enabled. Feishu only for now; Lark (the international edition) isn't supported |
+
+Optional: OpenCode 2.x for its notifications and DeepSeek balance; Codex CLI for Codex quota and resume (hidden by default).
 
 ## Install
-
-Windows 10/11, the [.NET 10 SDK](https://dotnet.microsoft.com/download), and [Claude Code](https://claude.com/claude-code) 2.1.139 or newer with `claude.exe` on `PATH`, logged in with your Claude account. Feishu notifications also need Node.js and the official [lark-cli](https://github.com/larksuite/cli) (`npm i -g @larksuite/cli`; verified against 1.0.81).
 
 ```powershell
 git clone https://github.com/AquariusCZ/claude-resume.git
@@ -32,125 +109,180 @@ dotnet build csharp\AiResume.sln -c Release
 csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe install
 ```
 
-Open **AI Resume** from the Desktop or Start menu, then set up the two blocks on the right: **Claude 登录** ([Claude Code login](#claude-code-login)) and **完成通知 → 飞书** ([Feishu notification settings](#feishu-notification-settings)). Secondary options live in the menu bar — **视图** / **工具** / **帮助** (View / Tools / Help; Alt+V/T/H, F10), and F5 refreshes quota and status.
+`install` deploys to `%LOCALAPPDATA%\AI Resume\`, creates the Desktop, Start-menu and logon entries (the autostart opens no console window), and re-points the notification sources you had turned on at the installed copy; a first install turns none on, see Quick start below. Only exit code 0 means everything is in place: 2 means some notification sources weren't set up, 3 that the new background service did not come up (the previous version was restored), 4 that the rollback was incomplete (the recovery material is left in place; don't delete it yet).
 
-`install` is the deploy step: the runtime is the installed copy under `%LOCALAPPDATA%\AI Resume\`, not `bin\Release`, so re-run it after every rebuild and reopen the panel — an open window does not hot-reload. It stages and verifies the payload, waits for the new Worker to answer on its pipe before touching any entry point, re-applies the notification sources you had enabled, and keeps recovery material if a rollback is incomplete. Exit code 0 means everything is in place; 2 means some notification sources could not be aligned, 3 that the new Worker did not come up (the previous version was restored), 4 that the rollback was incomplete. It also registers a logon autostart that starts the engine **without a console window** — see [autostart](docs/ARCHITECTURE.md#logon-autostart) for the elevated scheduled-task upgrade (`scripts\register-autostart.ps1`) that adds restart-on-failure.
+What runs is the installed copy, so re-run `install` after every rebuild, then close the old window and reopen it.
 
-Uninstall removes the shortcuts and AI Resume's own hook entries, and keeps your settings and state, including the saved Feishu bot credential:
+To have the background service restarted if it ever dies, switch the autostart to a scheduled task: from an elevated PowerShell in the repository root, run `powershell -ExecutionPolicy Bypass -File .\scripts\register-autostart.ps1`; add `-Revert` to switch back (see [logon autostart](docs/ARCHITECTURE.md#logon-autostart)). Known issue: run this way, the background service lives in session 0 and the interface can't reach it yet, so the footer and the **飞书机器人** (Feishu bot) row say 未核实 (unverified); delivery and resuming are unaffected.
+
+Uninstalling removes the program, the shortcuts and AI Resume's own hook entries. Your settings, run history and Feishu bot credential in `%LOCALAPPDATA%\AI Resume\state\` are kept for the next install. If you registered the scheduled task, remove it with `-Revert` first.
 
 ```powershell
 & "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe" uninstall
 ```
 
-Optional: OpenCode 2.x for its notifications and DeepSeek balance; Codex CLI for Codex quota and resume.
+## Quick start
 
-## Claude Code login
+1. **Check the Claude login.** Open **AI Resume** from the Desktop or Start menu. **Claude 登录** (Claude login) on the right should read **有效** (valid). It uses Claude Code's own login, so there's nothing to fill in.
+2. **Turn on notification sources.** Under **完成通知 → 飞书** (completion notifications → Feishu) on the right, switch on Claude Code (and OpenCode if you use it) until it reads **hook 正常** (hook OK). OpenCode shows **插件已加载** (plugin loaded) instead; if it stays at 待核实, restart OpenCode once.
+3. **Connect Feishu** (optional, but worth it):
+   - In the Feishu developer console, create a custom app with the bot capability and permission to send messages, publish a version so the bot is enabled, and make sure you are within the app's availability.
+   - Open **工具 › 飞书通知设置…** (Tools › Feishu notification settings), enter the App ID (`cli_…`) and App Secret, and press **保存并验证** (save and verify).
+   - Recipient: press **识别** (detect) to pick yourself from the users logged in to lark-cli (if the list is empty, run `lark-cli auth login` for this app first), or paste your `ou_…` open_id and press **保存** (save). An open_id belongs to one app, so it must come from the bot's own app.
+   - Close the dialog and press **发送测试** (send test) on the right. **🧪 AI Resume 测试通知** should arrive on your phone. If it doesn't, press **诊断通道** (diagnose) in the dialog, or run `notify check` below.
+4. **Arm**, that is, hand projects over to AI Resume. Tick the projects to guard in the resume queue. Each one follows the model its session last used (**沿用会话**) unless you pick another. Press **预览…** to see each project's current verdict, then **布防** (Arm). Arming pins each project to its most recent session at that moment, so arm after the work has started; a session you start in that project later isn't covered until you disarm and arm again. Arming is one-shot by default and disarms once every project is done; to resume after every interruption, turn on **工具 › 连续模式** (Tools › Continuous mode), which applies from the next arm.
 
-AI Resume holds no Claude credential of its own. It reads Claude Code's login — `%USERPROFILE%\.claude\.credentials.json`, or the same file under `CLAUDE_CONFIG_DIR` — to query quota, and **never refreshes or writes it back**: the refresh token is single-use, so a refresh by any other process would log Claude Code out. The account identity comes from `oauthAccount` in Claude Code's global config (normally `%USERPROFILE%\.claude.json`), so it no longer drifts when the access token rotates.
+To double-check the setup:
 
-The access token lasts about 8 hours, and Claude Code renews it whenever it runs — a terminal, Desktop or VS Code session, or a Remote Control connection. The login behind it lasts about 30 days, and only `/login` renews it. **Claude 登录** tells you where you stand:
+```powershell
+$w = "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe"
+& $w notify list    # sources you turned on show 已启用 (enabled) and 可送达 (deliverable) True, exit code 0
+& $w notify check   # last line: 结论: 飞书通知通道就绪 (channel ready)
+& $w notify test    # really delivered within 90 seconds, exit code 0
+```
+
+When the panel footer reads **后台服务运行中** (background service running), **Claude 登录** reads **有效**, the Claude Code row reads **hook 正常** and **飞书机器人** reads **可送达**, you're all set.
+
+## Security and privacy
+
+- **It won't log you out.** AI Resume holds no Claude credential of its own. It only reads Claude Code's login file (`%USERPROFILE%\.claude\.credentials.json`, or the same file under `CLAUDE_CONFIG_DIR`) and **never refreshes or writes back an OAuth token**. The refresh token can be used only once, so one refresh by any other program logs Claude Code out. The running Claude Code rotates its own tokens; the login lasts about 30 days, and only your own `/login` renews it.
+- **Other tools' credentials are read-only.** Codex's `auth.json` and OpenCode's DeepSeek key are read, never written; AI Resume stores no DeepSeek key.
+- **Feishu bot credential: verified before it's saved, locked down once it is.** The App ID and App Secret only come in through **飞书通知设置**. Before saving, AI Resume really exchanges them with Feishu for a tenant_access_token, then uses that token to call the bot info endpoint once through lark-cli; only when both succeed is the pair encrypted with Windows DPAPI (machine scope) into `state\secrets\feishu-bot.bin`. Only you, SYSTEM and Administrators can access the file; if that can't be guaranteed, nothing is saved. Machine scope means an administrator on this PC can decrypt it. At delivery the App Secret only appears in the request to Feishu's token endpoint, and lark-cli receives just the App ID and a short-lived token, which stays in memory. Credentials never reach the command line, logs, the interface or screenshots; the interface only shows a masked App ID. Uninstalling keeps the credential; to remove it, press **清除凭据** (clear credential) in **飞书通知设置**.
+- **No cloud service, no telemetry.** Outbound requests are of three kinds: quota and model-catalog queries made with the credentials your clients already have (Anthropic, and any API endpoint you configured for Claude Code; with Codex or OpenCode installed, also OpenAI, DeepSeek and any third-party provider configured in Codex); the bot-token exchange with Feishu's official endpoint; and Feishu messages and channel diagnostics through lark-cli. Refreshing the panel calls no model and spends no tokens. Tokens and credentials never go into logs, and notification logs don't record message text.
+
+## FAQ
+
+<details>
+<summary><b>Doesn't Claude Code already continue on its own?</b></summary>
+
+It does, but only for interactive sessions that are still open, and it doesn't wait for Remote Control sessions or weekly limits that won't reset for more than a day. AI Resume only resumes closed sessions. It never touches an open one (Remote Control included); for an armed project, if the session still hasn't continued 10 minutes after the quota is back, it sends one Feishu reminder, so you can carry on yourself or close the session and hand it over. See the [table above](#why).
+
+</details>
+
+<details>
+<summary><b>Will it log my Claude Code out?</b></summary>
+
+No. AI Resume only reads Claude Code's login file. It never refreshes or writes back a token.
+
+</details>
+
+<details>
+<summary><b>Will resuming quietly eat my quota?</b></summary>
+
+Resuming continues your original session on your subscription, exactly as if you came back and typed `continue`, and each interruption is resumed at most once. Beyond that, AI Resume calls no model: refreshing the panel only reads the quota and model-catalog endpoints, at zero tokens.
+
+</details>
+
+<details>
+<summary><b>What happens when a resume fails?</b></summary>
+
+It depends on when. Anything that stops a resume before it starts (session just opened, token about to expire, configuration just changed) only skips this round, and the next round judges again. If something goes wrong after the resume process has started, the round stops and that project isn't resumed on its own again until you check, disarm and arm again. A project that hits the limit again right after resuming goes back to waiting instead of hogging the queue.
+
+</details>
+
+<details>
+<summary><b>What if the resumed run needs a permission approval?</b></summary>
+
+Nobody is there to approve it. The resume runs unattended in the background (`claude -p`) with your own Claude Code permission settings; AI Resume neither raises nor lowers them, so anything that needs on-the-spot approval can't be approved. For long unattended runs, allow what the task needs in Claude Code's permission settings beforehand. Open the session afterwards to see what it did.
+
+</details>
+
+<details>
+<summary><b>Can I use it without Feishu?</b></summary>
+
+Yes. Resuming doesn't depend on Feishu; without it you just don't get the completion notifications, the resume notices and the login-expiry reminders.
+
+</details>
+
+<details>
+<summary><b>How do I keep working from my phone?</b></summary>
+
+Use Claude Code's official [Remote Control](https://code.claude.com/docs/en/remote-control) (`claude remote-control`). It needs a Claude subscription login, and the local `claude` process has to keep running, which also keeps the login token renewed. The session still runs on this machine, so hooks fire and notifications go out as usual. While a Remote Control session is open, AI Resume stays out of it, and Claude Code doesn't auto-continue it after a limit either; for an armed project, the Feishu reminder 10 minutes after the quota is back is your cue to continue from the phone. AI Resume itself is not a chat bot.
+
+</details>
+
+<details>
+<summary><b>What about Codex, OpenCode, Cline and Qoder?</b></summary>
+
+- **OpenCode 2.x**: completion notifications, plus the balance of the DeepSeek account it uses (display only, never used to resume).
+- **Codex**: hidden by default. **视图 › 显示 Codex** (View › Show Codex) adds its quota tile and offers it as the resume provider. It uses your official ChatGPT/OpenAI login from `%USERPROFILE%\.codex\auth.json`. Resuming requires exactly Codex 0.148.0 and a `managed_config.toml` in the Codex configuration folder, both checked when you arm. Codex's session records carry no structured rate-limit evidence, so a project is queued when its model is observed limited, and resumes when every account window is below 100%.
+- **Codex, Cline and Qoder completion notifications**: "finished" only, hidden by default; turn them on under **视图 › 显示其他通知源** (View › Show other notification sources). Codex needs you to trust the hook once with `/hooks` inside Codex, and only new sessions pick it up.
+- When quota can't be verified, it waits; it never switches providers to rerun.
+
+</details>
+
+<details>
+<summary><b>Does it run on macOS or Linux?</b></summary>
+
+No. It relies on a WPF + WebView2 interface, Windows DPAPI and scheduled tasks, and supports Windows 10/11 only.
+
+</details>
+
+<details>
+<summary><b>Why do I see 未核实 and 待核实 so often?</b></summary>
+
+On purpose. Every positive conclusion, such as "OK" or "deliverable", needs outside evidence: quota needs this round's live reading; **可送达** (deliverable) needs the latest real delivery, with no settings changed since; **hook 正常** (hook OK) means the program the hook points to really exists; OpenCode's **插件已加载** (plugin loaded) trusts only OpenCode's own log. What can't be checked is said plainly, never painted green.
+
+</details>
+
+<details>
+<summary><b>Is it stable?</b></summary>
+
+The core decisions are covered by more than 1,300 automated tests across the repository, all on synthetic sessions and temporary folders, never a real session. Installation and Feishu delivery have been verified on the author's machine, including the background service running as a scheduled task in session 0. Still waiting on real-world events: an end-to-end automatic resume after a real usage limit, a real OpenCode task completion notification, and the Claude Code login-expiry reminders. Verification records: [Completion notifications · verification](docs/COMPLETION-NOTIFICATIONS.md#6-验证层级).
+
+</details>
+
+## Reference
+
+<details>
+<summary><b>Claude login states</b></summary>
+
+The access token rotates about every 8 hours, and Claude Code renews it whenever it runs (a terminal, Desktop or VS Code session, or a connected Remote Control). The login behind it lasts about 30 days, and only `/login` renews it. A resume run starts only while the access token has at least 45 minutes left; otherwise that project waits for Claude Code to renew it.
 
 | Panel | Meaning | What to do |
 |---|---|---|
 | **有效** | Logged in, access token valid | — |
-| **有效 · 账号未核实** | No consistent `oauthAccount` yet; resume waits | Open Claude Code once |
+| **有效 · 账号未核实** | No consistent account record yet; resume waits | Open Claude Code once so it writes the account record |
 | **令牌待续期** | Access token expired, login still valid | Open Claude Code once, or keep Remote Control connected |
 | **即将到期** | Login expires within 3 days | Run `claude`, then `/login` |
 | **已过期** / **未登录** | Login expired or cleared, or no login at all | Run `claude`, then `/login` |
-| **凭据位置变化** | Claude Code moved its login into Windows Credential Manager (`CLAUDE_CODE_FORCE_WINDOWS_CREDMAN=1` or a server-side rollout), which AI Resume cannot read | Quota stays unverified |
+| **被服务端拒绝** | The quota endpoint rejected this machine's login (password changed, removed from the organization, or logged out elsewhere) | Run `claude`, then `/login` |
+| **凭据位置变化** | Claude Code moved its login into Windows Credential Manager, which AI Resume cannot read | Quota stays unverified and resume keeps waiting |
+| **未核实** | The login file exists but couldn't be read this time (most likely Claude Code was rewriting it) | Nothing; it's re-read shortly |
 
-With a Feishu recipient set, the Worker reminds you 3 days, 2 days, 1 day and 12 hours before the login expires, and once more when it has. A resume run starts only while the access token has at least 45 minutes left; otherwise that project waits for Claude Code to renew it.
+With a Feishu recipient set, the background service reminds you 3 days, 2 days, 1 day and 12 hours before the login expires, and once more when it has; if Claude Code clears the login, it reminds you once a day until the login is back.
 
-The `claude setup-token` long-lived token of v2.1 is gone: the usage endpoint rejects it (its scope covers inference only), so it never read quota. `install` deletes the leftover `state\secrets\claude-oauth-token.bin`.
+</details>
 
-## Feishu notification settings
+<details>
+<summary><b>When does it resume?</b></summary>
 
-Feishu does one thing now: your bot sends you a direct message through the official lark-cli. There is no Feishu chat, session or allow-list anymore.
+While armed, each project is judged on its own, and anything that can't be verified means wait, never go:
 
-1. Install lark-cli: `npm i -g @larksuite/cli`. AI Resume starts the `lark-cli.exe` inside the npm package directly, never through `cmd.exe`, which cut multi-line messages at the first line break.
-2. In the Feishu developer console, use a self-built app with the bot capability and permission to send messages. The recipient — you — must be within the app's availability.
-3. **工具 › 飞书通知设置…** (or **设置…** under **完成通知 → 飞书**): enter the App ID (`cli_…`) and App Secret, then **保存并验证**. AI Resume runs `lark-cli doctor` online with exactly that pair and saves it only if Feishu issues a bot token. It is kept as a machine-scope DPAPI copy in `state\secrets\feishu-bot.bin` (readable by you, SYSTEM and Administrators) and handed to lark-cli through its official `LARKSUITE_CLI_*` environment variables, because the background Worker can run in session 0, where lark-cli's own keychain is not reliably readable. Without this copy, delivery falls back to that keychain, and until a delivery succeeds the panel says **未存凭据副本**. Upgrading from v2.1? **导入旧版凭据** imports the credential saved by the old **飞书接入** section after the same check.
-4. Recipient: paste your `ou_…` open_id and **保存**, or **识别** to pick from the users logged in to lark-cli (`lark-cli auth list`). An open_id belongs to one app, so once a bot credential is saved, **识别** lists only users of that same app.
-5. **诊断通道** runs `lark-cli doctor` with the credential delivery will use; **发送测试** (also **工具 › 发送测试通知**) queues a test message through the full path.
+- **Interrupted?** The session transcript must end in a usage-limit interruption that hasn't been resumed yet. A session you already continued yourself in a client counts as done (**已在客户端继续**).
+- **Quota back for its model?** This round's live reading must show the 5-hour and 7-day windows below 100%, and no full weekly limit that applies to this model. A per-model weekly limit applies to its own model family (an unrecognised family is assumed to apply).
+- **Session free?** If the session is open in any client (terminal, Desktop, VS Code or Remote Control), or another session in the same folder is busy, the project waits.
 
-**飞书机器人** shows **可送达** only while the latest real delivery succeeded and nothing has changed since: **后台服务未运行** when the Worker is down, the reason when delivery is blocked — credential, permission or recipient, rate limit, network — **最近投递失败** when the last attempt failed, and **设置已变更** when you changed the credential or recipient after the last success (press **发送测试** to re-check). A failed message is retried on its own backoff without delaying the others. A channel-wide failure pauses the whole channel for a backoff, and the pause lifts at once when you change the credential or the recipient. A message that can never be sent, that happened more than 24 hours ago, or whose outcome stayed unknown for 55 minutes (Feishu only de-duplicates for an hour) moves to `state\completion-events\dead\` with an `.error.txt` beside it.
+Projects resume one at a time in queue order, each with `claude --resume <session-id> -p continue --model <model> …` in its own folder, and each is re-checked right before it starts. Projects sharing a model share one quota reading. Hover a row's status for the full reason and when it expects to start. Full rules: [architecture · quota and resume flow](docs/ARCHITECTURE.md#额度与续跑流程).
 
-## Notifications
+</details>
 
-Three kinds, because they are not equally urgent. **Finished** can wait; **stopped** and **waiting for you** are time you are losing right now.
+<details>
+<summary><b>Which events notify you?</b></summary>
 
 | Source | Finished | Stopped by an error | Waiting for you |
 |---|---|---|---|
-| Claude Code | `Stop` hook | `StopFailure` — usage limit (once per session per limit window), login expired, billing… | `Notification` — permission prompt, MCP elicitation dialog, agent needs input, auto-continue after a limit stalled |
-| OpenCode 2.x | top-level `session.execution.succeeded` with no sub-session still running | top-level `session.execution.failed` not retried within a grace period | `permission.asked`, `form.created` (a question) |
+| Claude Code | `Stop` hook | `StopFailure`: usage limit (once per session per limit window), login expired, billing… | `Notification`: permission prompt, MCP confirmation dialog, input needed, auto-continue stalled after the reset |
+| OpenCode 2.x | A top-level session succeeded with no sub-session still running | A top-level session failed and wasn't retried within a grace period | Permission request, a question for you |
 
-Claude Code hooks go into `%USERPROFILE%\.claude\settings.json` in the official exec form — `command` is the absolute path of `AiResume.Hook.exe`, `args` carries the switches — which needs Claude Code 2.1.139+. Claude Code reloads the file itself, so no new session is needed. The OpenCode plugin is an official v2 directory plugin at `%USERPROFILE%\.config\opencode\plugins\airesume-notify\index.ts`; an older single-file plugin is migrated and a `.bak` kept. The OpenCode row stays **待核实** until OpenCode's own log (`%USERPROFILE%\.local\share\opencode\log\opencode.log`) shows the plugin loaded, and turns red if OpenCode rejected it (the latest log entry wins, so a later successful load clears an earlier failure); restart OpenCode if it stays pending. Both paths follow the clients' own settings: `CLAUDE_CONFIG_DIR` for Claude Code, `XDG_CONFIG_HOME` / `XDG_DATA_HOME` for OpenCode.
+AI Resume's own resume runs are marked internal, so they never trigger the notifications above; AI Resume sends its own instead: resume started; resume finished, not confirmed or aborted; a resume that keeps failing to start; quota back but the session still open; quota unreadable (token expired, login invalid and so on); account changed; login expiring or expired. Messages from a session connected through Remote Control carry **· 远程已连接** (remote connected). A session that saves no transcript (for example a third-party tool running `claude --no-session-persistence`) never notifies.
 
-Adapters merge into your existing configuration and remove only entries they can prove they own. AI Resume's own resume runs are marked internal, so their hooks never notify you; AI Resume posts its own notices instead — resume started, finished or not confirmed; quota back but the session still open; Claude token expired; account changed; login expiring or expired. Messages from a Claude Code session connected through Remote Control carry **· 远程已连接**, and Claude Code messages name the session (its desktop sidebar title or `/rename`). A usage limit is reported once per session per limit window: sessions cut off together share one message that names the window, the expected reset and — from the arm state at that moment — whether AI Resume will resume each of them. A session that never reaches disk (for example a third-party tool running `claude --no-session-persistence`) never notifies.
+Claude Code hooks go into `%USERPROFILE%\.claude\settings.json` in the official exec form, and Claude Code reloads the file itself, so no new session is needed; the OpenCode plugin lives in `%USERPROFILE%\.config\opencode\plugins\airesume-notify\`. Both follow the clients' own configuration-directory settings (`CLAUDE_CONFIG_DIR`, `XDG_CONFIG_HOME`), and only AI Resume's own entries are ever added or removed. **未送达 N** (undelivered) on the right counts messages that stopped retrying; the reason is in an `.error.txt` of the same name under `state\completion-events\dead\`. Protocol and verification: [Completion notifications](docs/COMPLETION-NOTIFICATIONS.md).
 
-Codex (`Stop` hook in `hooks.json`), Cline (`TaskComplete`) and Qoder (`hooks.Stop`) remain available — finished only — and are hidden by default: **视图 › 显示其他通知源**, or `notify enable <源>`. A hidden source that is still on or broken leaves a one-line hint on the main panel. Codex sessions that were already open do not reload `hooks.json`; start a new session, and if `/hooks` inside Codex lists the AI Resume hook as untrusted, trust it there once. Protocol and test procedure: [Completion notifications](docs/COMPLETION-NOTIFICATIONS.md).
+</details>
 
-## Quota and resume
-
-Quota comes from Anthropic's OAuth usage endpoint, using Claude Code's real request shape and Claude Code's own login. Responses are sparse, so a missing field is not treated as a deletion. A carried-over value is shown amber as a *recent server reading*, never green. Reset-only data uses an indeterminate scan instead of inventing a percentage. The tiles are fixed: Claude 5 hours, Claude 7 days, Claude per model (the fullest weekly per-model limit, with an **N 项在等** badge when armed projects wait on it) and DeepSeek balance. The balance uses OpenCode's DeepSeek key (its config, then OpenCode 2.x's own credential store `opencode.db`, then the legacy `auth.json`, else `DEEPSEEK_API_KEY`) and is display-only: AI Resume stores no DeepSeek key and never resumes with it. If OpenCode's merged config (later layers override earlier ones) points DeepSeek at a custom endpoint, no balance request is sent. When a refresh fails but earlier readings are carried over, the header says **部分更新** and the tile tooltip names the reason.
-
-Tick the projects to guard. Each ticked row gets a model menu: the default **沿用会话:<model>** follows the model that session last used (shown as ↺ once armed), or pick another per project — several projects can share a model, and then share one quota reading. **预览…** shows each project's current verdict without running anything. **布防** (Arm) pins the provider and account, each project's model ID from the provider's live catalog, and the exact native session; catalog changes apply at the next arm. An open session only produces a warning; a session whose model is not in the catalog needs a manual pick.
-
-While armed, each project is judged on its own, and anything unverified means wait, never go:
-
-- **Interrupted?** The session transcript must end in a usage-limit interruption. Each interruption is resumed at most once; a session you already continued yourself counts as done (**已在客户端继续**).
-- **Quota back for its model?** A live reading must show the 5-hour and 7-day windows below 100% and no blocked limit that applies to that model. A weekly per-model limit applies to its own model family (any version; an unrecognised family is assumed to apply), so a full Fable weekly limit no longer holds back an Opus project.
-- **Session free?** If the session is open in a client — terminal, Desktop, VS Code or Remote Control — or another session in the same folder is busy, the project waits. Claude Code's own auto-continue handles open interactive sessions; if one is still open and has not continued 10 minutes after the reset, you get one Feishu reminder.
-
-Projects resume one at a time in queue order, each with `claude --resume <session-id> -p continue --model <model> …` in its own folder, and each is re-checked right before it starts. A project that could not start — session just opened, access token under 45 minutes, configuration changed — is skipped and retried next round instead of stopping the cycle. A failure after the process started is never replayed: the cycle stops until you disarm and arm again. One-shot (the default) disarms once every project is done; **工具 › 连续模式** resumes after every interruption and takes effect at the next arm. Hover a row's status for the full reason and the expected start time.
-
-Codex is hidden until **视图 › 显示 Codex**, which adds its tile and offers it as the resume provider. It uses your official ChatGPT or OpenAI login from `~/.codex/auth.json` — a local bridge configured in Codex is not used. Codex has no transcript check: a project is queued when its model is observed limited, and resumes when every account window is below 100%, no additional limit or spend control is hit, and the target model is not marked unavailable. Other configured providers (a non-local third-party Codex provider, or Claude Code pointed at an API endpoint) need a verified positive balance. Missing quota data stays unverified, a provider is never switched automatically, and a fixed model ID does not freeze a provider's backend revision. See [provider-bound resume](docs/adr/0004-provider-bound-resume.md) and [ADR-0006](docs/adr/0006-retire-cc-connect-per-project-resume.md).
-
-## From your phone
-
-AI Resume no longer has a Feishu chat bot: cc-connect was retired in v2.2 ([ADR-0006](docs/adr/0006-retire-cc-connect-per-project-resume.md)), and Feishu carries notifications only. To keep working from your phone, use Claude Code's official [Remote Control](https://code.claude.com/docs/en/remote-control) (`claude remote-control`); it needs a Claude subscription login, and the local `claude` process has to keep running. The session still runs on this machine, so the hooks fire as usual. While a Remote Control session is open, AI Resume treats it like any open session and does not resume underneath it — and Claude Code does not auto-continue Remote Control sessions after a limit, so the 10-minute reminder above is your cue to continue from the phone.
-
-Driving OpenCode or Codex from the phone is no longer covered. If you need that, you can run cc-connect yourself; AI Resume no longer generates, starts or checks its configuration.
-
-## How it fits together
-
-```text
-Claude Code / OpenCode          (Codex · Cline · Qoder: hidden by default)
-       |  hooks / plugin
-       v
- AiResume.Hook ----------> state\completion-events\
-                                     |
-                                     v
-AiResume.Gui <---- state dir ----> AiResume.Worker ----> lark-cli ----> Feishu bot message
-   WPF + WebView2                  resume engine, quota,
-                                   notification delivery,
-                                   login reminders, supervision
-                                     |
-                                     v
-                      claude --resume <session>  (one project at a time)
-```
-
-```text
-%LOCALAPPDATA%\AI Resume\          installed copy: Gui, Worker, Hook, Launcher
-  state\                           kept by uninstall
-    config.json                    queue, arm, per-project models, notification sources, recipient open_id
-    runs.db                        SQLite/WAL: resume cycle, process registry, quota snapshots
-    project-index.json             project discovery cache
-    secrets\feishu-bot.bin         Feishu bot credential (machine-scope DPAPI)
-    completion-events\             notification queue; dead\ holds undeliverable messages
-    completion-notify-*.json       dedupe, per-message retry state, channel health
-    logs\                          daily JSON logs, e.g. worker-yyyyMMdd.log
-    webview2\                      WebView2 user data
-```
-
-Rules the code holds itself to:
-
-- **Green means verified.** An installed CLI, a filled-in key or a written hook is not proof — a request or a delivery has to have succeeded.
-- **Unknown means wait.** Anything that cannot be verified holds that project back; it never counts as a pass.
-- **Other tools' logins are read-only.** Claude Code's login, Codex's `auth.json` and OpenCode's DeepSeek key are read, never refreshed or written.
-- **No PID-only termination.** Identity, start time and command signature must all match before a process is reclaimed.
-
-## Commands
+<details>
+<summary><b>Command line</b></summary>
 
 Run them from the installed copy, so any hook path they write points there:
 
@@ -161,36 +293,29 @@ $w = "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe"
 
 | Command | What it does | Exit code |
 |---|---|---|
-| `install` | Deploy, recreate entry points, re-apply notification sources | 0 ok · 1 error · 2 sources not aligned · 3 Worker not up · 4 rollback incomplete |
+| `install` | Deploy, recreate entry points, re-apply the notification sources you chose | 0 ok · 1 error · 2 sources not aligned · 3 background service not up · 4 rollback incomplete |
 | `uninstall` | Remove the installed copy, shortcuts and own hook entries; keep `state\` | |
 | `shortcuts` | Recreate the Desktop, Start-menu and logon entries (`shortcuts uninstall` removes them); `install` does this for you | |
-| `notify` · `notify list` | Per source: installed, enabled, 可送达 | 2 if an enabled hook is broken |
-| `notify enable <源>` · `notify disable <源>` | Turn `ClaudeCode`, `OpenCode`, `Codex`, `Cline` or `Qoder` on or off, and remember it for the next install | 1 on failure |
-| `notify check` | lark-cli, credential source, recipient, last real delivery, then `lark-cli doctor` | 0 ready · 2 not ready |
-| `notify test` | Queue a test message and wait up to 90 seconds for the Worker to deliver it | 0 delivered · 2 not delivered |
+| `notify` · `notify list` | Per source: installed, enabled, 可送达 (deliverable) | 2 if an enabled hook is broken |
+| `notify enable <source>` · `notify disable <source>` | Turn `ClaudeCode`, `OpenCode`, `Codex`, `Cline` or `Qoder` on or off, and remember it for the next install | 1 on failure |
+| `notify check` | Check lark-cli, the credential source, the recipient and the last real delivery, then diagnose online: with a saved credential copy it first really exchanges a token and calls the bot endpoint, then adds `lark-cli doctor` | 0 ready · 2 not ready |
+| `notify test` | Queue a test notification and wait up to 90 seconds for the background service to really deliver it | 0 delivered · 2 not delivered |
 
-Without a subcommand the Worker runs as the background service, which is what the logon entry starts. An unknown subcommand prints the list and returns 2.
+Without a subcommand, `AiResume.Worker.exe` runs as the background service, which is how the logon entry starts it; an unknown subcommand prints the list and returns 2. Every resume decision is logged per project as `resume.probe.evaluated` in `state\logs\worker-yyyyMMdd.log`.
 
-## Verify on your machine
+</details>
 
-After `install`:
-
-1. `& $w notify list` — 可送达 is True for every enabled source and the exit code is 0. For OpenCode, the detail should read `OpenCode 已加载(日志 …)`, not `等 OpenCode 下次加载后核实`.
-2. `& $w notify check` — ends with `结论: 飞书通知通道就绪`, exit code 0.
-3. `& $w notify test` — exit code 0 within 90 seconds, and **🧪 AI Resume 测试通知** arrives on your phone. On exit code 2 it says why: the blocking reason with its error code and `log_id`, or that nothing was delivered within 90 seconds — then check that the background service (the Worker) is running and run `notify check`.
-4. The panel footer shows **后台服务运行中**, **Claude 登录** shows **有效**, and **飞书机器人** shows **可送达**.
-5. Every resume decision is logged per project as `resume.probe.evaluated` (`name=model|quota|session|evidence|reason`) in `state\logs\worker-yyyyMMdd.log`.
-
-Pending real-machine verification for 2.2.0 (as of 2026-10-30): an automatic per-project resume after a real usage-limit interruption; OpenCode 2.x loading the new plugin and notifying; delivery by the session-0 Worker through the machine-scope credential once you save or import it; the login-expiry reminders.
-
-## Upgrading from v2.1
+<details>
+<summary><b>Upgrading from v2.1</b></summary>
 
 - Run `install` from the new build. It rewrites the Claude Code hooks into exec form with `StopFailure`, moves an enabled OpenCode notification to the 2.x directory plugin, and deletes the unused `claude-oauth-token.bin`.
-- Open **飞书通知设置**: **导入旧版凭据**, or enter the bot credential again. The recipient already in `config.json` carries over.
-- Disarm and arm again. The Claude account identity now comes from Claude Code's account record instead of the rotating access token, so a v2.1 arm no longer matches (an interrupted project shows **账号已变化 · 重新布防**); re-arming also pins each project's model.
-- AI Resume no longer manages cc-connect and leaves its scheduled task, npm package and `%USERPROFILE%\.cc-connect\` untouched. If you are done with it, remove them yourself — that folder holds plaintext secrets, so rotate those too.
+- Open **飞书通知设置** and press **导入旧版凭据** (import the old credential), or enter the bot credential again. The recipient already in `config.json` carries over.
+- Disarm and arm again. The Claude account identity now comes from Claude Code's account record instead of the rotating access token, so a v2.1 arm no longer matches (an interrupted project shows **账号已变化 · 重新布防**, account changed, re-arm); re-arming also pins each project's model.
+- AI Resume no longer manages cc-connect and leaves its scheduled task, npm package and `%USERPROFILE%\.cc-connect\` untouched. If you're done with it, remove them yourself; that folder holds plaintext secrets, so rotate those too.
 - The Codex, Cline and Qoder notification switches moved to **视图 › 显示其他通知源**; sources you had on stay on.
-- The DeepSeek tile now shows the account behind OpenCode's DeepSeek key; `DEEPSEEK_API_KEY` is only a fallback.
+- The DeepSeek tile now shows the account behind OpenCode's DeepSeek key; `DEEPSEEK_API_KEY` is only a fallback when OpenCode has none.
+
+</details>
 
 ## Development
 
@@ -199,12 +324,12 @@ dotnet test csharp\AiResume.sln
 dotnet build csharp\AiResume.sln -c Release --no-restore -warnaserror
 ```
 
-The suite uses temporary state, synthetic sessions and injected runners. It never resumes a real session, modifies a real project or makes a paid model call. It needs Node.js on `PATH`: the panel's view model and the OpenCode plugin are exercised in Node. `AiResume.Gui.exe --screenshot <png>` renders the panel with synthetic data (add `--screenshot-unarmed` for the unarmed state); point `AIRESUME_SHADOW_DIR` at a temporary folder first so the run leaves your real state alone.
+The tests use only temporary state, synthetic sessions and injected runners: they never resume a real session, modify a real project or make a paid model call. Some of them need Node.js on `PATH` to drive the panel's view model and the OpenCode plugin. `AiResume.Gui.exe --screenshot <png>` renders the panel off-screen with synthetic data (add `--screenshot-unarmed` for the unarmed state); point `AIRESUME_SHADOW_DIR` at a temporary folder first so the run leaves your real state alone.
 
 ## Documentation
 
-[Architecture](docs/ARCHITECTURE.md) · [Quota acquisition](docs/CLAUDE-QUOTA-ACQUISITION.md) · [Notification protocol](docs/COMPLETION-NOTIFICATIONS.md) · [Run contract](docs/RUN-CONTRACT.md) · [Decisions (ADR)](docs/adr/) · [v2.2 decision (ADR-0006)](docs/adr/0006-retire-cc-connect-per-project-resume.md) · [Engineering lessons](docs/LESSONS.md) · [AI guide](AI_GUIDE.md) · [History](docs/history/)
+[Architecture](docs/ARCHITECTURE.md) · [Quota acquisition](docs/CLAUDE-QUOTA-ACQUISITION.md) · [Completion notifications](docs/COMPLETION-NOTIFICATIONS.md) · [Run contract](docs/RUN-CONTRACT.md) · [Decisions (ADR)](docs/adr/) · [Engineering lessons](docs/LESSONS.md) · [AI guide](AI_GUIDE.md) · [History](docs/history/)
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The interface uses [Ark Pixel Font](https://github.com/TakWolf/ark-pixel-font) under SIL OFL 1.1 ([OFL.txt](csharp/src/AiResume.Gui/wwwroot/fonts/OFL.txt)).
+MIT, see [LICENSE](LICENSE). The interface uses [Ark Pixel Font](https://github.com/TakWolf/ark-pixel-font) under SIL OFL 1.1 ([OFL.txt](csharp/src/AiResume.Gui/wwwroot/fonts/OFL.txt)).

@@ -1,29 +1,106 @@
+<div align="center">
+
 # AI Resume
 
-[English](README.md) | **简体中文**
+**Claude Code 撞上用量上限，你可以先去睡了。**
 
-[![Platform](https://img.shields.io/badge/platform-Windows-2F8A56)](#安装)
-[![.NET](https://img.shields.io/badge/.NET-10-512BD4)](https://dotnet.microsoft.com/)
-[![License](https://img.shields.io/badge/license-MIT-6B665B)](LICENSE)
+额度一恢复，AI Resume 就把你已经关掉的会话接着跑下去；<br>
+任务跑完、出错或者等你拍板时，飞书私信告诉你。
 
-> 凌晨两点，AI 撞上额度上限停住了。AI Resume 把活儿排进队列，等额度恢复后自己接着跑，不用你守着。
+[![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-2F8A56)](#系统要求)
+[![.NET 10](https://img.shields.io/badge/.NET-10-512BD4)](https://dotnet.microsoft.com/)
+[![Version](https://img.shields.io/badge/dynamic/xml?url=https%3A%2F%2Fraw.githubusercontent.com%2FAquariusCZ%2Fclaude-resume%2Fmain%2Fcsharp%2FDirectory.Build.props&query=%2F%2FVersion&label=version&color=E2512B)](csharp/Directory.Build.props)
+[![License: MIT](https://img.shields.io/badge/license-MIT-6B665B)](LICENSE)
 
-面向 Claude Code 和 OpenCode 的本地 Windows 控制面：Claude Code 会话被用量上限打断后自动续跑；任务跑完、因错误中断或停下来等你时，给你发一条飞书消息。没有自己的云端后台——界面、队列、状态和钩子全部留在你的机器上，飞书只用来送通知。Codex、Cline、Qoder 的支持仍在，收在**视图**菜单里。
+[English](README.md) · **简体中文**
 
-![AI Resume 控制面](docs/assets/panel.png)
+</div>
 
-## 它做什么
+![AI Resume 控制面：额度磁贴、续跑队列、Claude 登录与飞书通知（演示数据）](docs/assets/panel.png)
 
-| | |
+<p align="center"><sub>演示数据：三个项目已布防，一个在等 Fable 周额度，一个会话还开着、关掉后才续，一个没被打断、只是监视着。右栏的琥珀色是如实相告：Claude 登录 3 天内到期，飞书投递暂时核对不了，所以写「待核实」。</sub></p>
+
+## 为什么需要它
+
+Claude Code 自带的自动继续（`autoContinueAtUsageLimit`，2.1.234 起默认开启，桌面端另有自己的开关）只照顾**还开着**的交互会话。会话一关，进程退出，等待也就跟着没了；手机上的 Remote Control 会话（界面和消息里叫「手机远程」）、要等一天以上才重置的周额度，它也不会替你等。夜里跑长任务撞了限，第二天早上看到的往往是一个停在半路的会话。
+
+AI Resume 补的就是这一块。两边各管一摊，互不抢活：
+
+| 场景 | Claude Code 自带的自动继续 | AI Resume（已布防的项目） |
+|---|---|---|
+| 会话还开着（终端、桌面端、VS Code） | 原地等，重置后自动接上 | 不插手；额度恢复 10 分钟后还没接上，飞书提醒你一次 |
+| 会话已经关掉 | 不管（进程退出，等待随之结束） | 额度真的恢复后，用 `claude --resume` 把原会话接着跑 |
+| 手机上的 Remote Control 会话 | 不自动等 | 开着时同样不插手；额度恢复 10 分钟后还没接上，提醒你在手机上继续 |
+| 周额度要等一天以上才重置 | 不自动等 | 关掉的会话照样等到恢复再续 |
+
+> [!NOTE]
+> 过夜无人值守有两个前提。一是电脑不能睡眠：AI Resume 跑在本机，睡着时什么也做不了。二是登录令牌得有人续期：AI Resume 从不刷新令牌，访问令牌约 8 小时过期，只有运行中的 Claude Code 会续期。Claude Code 全关掉的话，令牌一过期，续跑就会一直等到你再打开它；想稳妥，就留一个 Claude Code 进程开着，比如在别的目录开一个 `claude remote-control`。
+
+## 它能做什么
+
+### 限额后自动续跑
+
+- **看真实额度，不靠定时器瞎试。** 读数来自 Anthropic 官方的 OAuth usage 接口，用的是 Claude Code 自己的登录；只有本次实时读数显示额度窗口没满，才会放行。
+- **逐项目判定，各用各的模型。** 每个项目只看和它的模型相关的额度：Fable 周额度用完，不会挡住用 Opus 的项目。
+- **续的是原会话。** 执行 `claude --resume <会话 ID>`，上下文原样保留，不新开会话，也不改写会话记录；同一次中断最多续一次。
+- **核实不了就等，绝不硬闯。** 会话刚被打开、令牌快过期、配置刚改过，这个项目就等下一轮；续跑进程起来以后出了问题，这一轮就停住等你检查，不会再自动续跑。
+
+### 飞书私信：跑完、出错、等你，都会告诉你
+
+- 覆盖 Claude Code 和 OpenCode 的三类事件：跑完了、因错误中断、停下来等你（授权、确认、输入）。
+- 撞上用量上限时，同一个会话在一个限额周期里只提醒一次；同时被打断的几个会话合成一条，并按发出那一刻的布防状态说清 AI Resume 会不会续跑它们。
+- 经官方 lark-cli 用你自己的飞书机器人发送。单条失败只推迟这一条；凭据失效、断网、被飞书限流这类影响所有消息的问题，会让飞书投递暂停一阵，之后自动重试。
+
+收到的消息长这样（合成示例）：
+
+```text
+⏸️ atlas-docs 被用量上限打断
+Claude Code · Opus 5.5 · 02:14 · 「迁移文档站」
+5 小时额度已用完,预计 04:30 重置
+已布防:额度恢复后 AI Resume 会续跑它;会话还开着的话 AI Resume 不插手,关掉后才续
+```
+
+等额度恢复、会话也关掉，还会陆续收到「▶️ atlas-docs 已开始自动续跑」和「✅ atlas-docs 自动续跑完成」。
+
+### 一个说实话的控制面
+
+- **额度磁贴**：Claude 5 小时、7 天、按模型的周额度，以及 OpenCode 所用 DeepSeek 账户的余额。
+- **续跑队列**：自动从 Claude Code 的会话历史里发现项目，不用手工维护清单；也可以「+ 添加项目」，或把不想看到的目录放进「不再扫描的目录」。每个项目用哪个模型、此刻在等什么，一眼看清；「预览…」只看判定，什么都不执行。
+- **Claude 登录**：登录还剩几天到期；到期前 3 天起，飞书提醒你 `/login`。
+- **绿灯必须有证据**：CLI 装了、key 填了都不算数，供应商要有一次真实请求成功，飞书要有一次真实送达；「hook 正常」也要核对 hook 指向的程序确实存在。核对不出来的一律写「未核实」或「待核实」，绝不显示「没问题」。
+
+## 工作原理
+
+```mermaid
+flowchart TB
+    accTitle: AI Resume 的续跑流程
+    accDescr: 已布防项目的会话撞上用量上限后，开着的交给 Claude Code 自带的自动继续；关掉的由 AI Resume 逐项目核对，全部通过才用 claude --resume 续跑原会话，并经飞书私信告诉你。
+    hit(["⏸️ 已布防项目的会话<br/>被用量上限打断"]) --> open{"会话还开着？"}
+    open -- "开着" --> native["Claude Code 自带的<br/>自动继续接手"]
+    native -. "10 分钟后还没接上" .-> remind(["📱 飞书提醒你"])
+    native -. "你把会话关了" .-> gate
+    open -- "已关闭" --> gate["AI Resume 逐项目核对<br/>① 这次中断还没续过<br/>② 该模型实时额度已恢复<br/>③ 没有客户端开着它"]
+    gate --> ok{"全部通过？"}
+    ok -- "是" --> run["claude --resume 原会话<br/>项目排队，一次一个"]
+    run --> done(["📱 飞书私信<br/>▶️ 已开始自动续跑<br/>✅ 自动续跑完成"])
+    ok -- "否，或核实不了" --> wait["等下一轮"]
+    wait --> gate
+```
+
+完成通知走另一条路：Claude Code 的 hook 和 OpenCode 的插件把事件写进本地队列，后台服务再经 lark-cli 发到你的飞书。界面、队列和状态都留在你自己的电脑上，AI Resume 没有云端服务。机制细节见[架构文档](docs/ARCHITECTURE.md)。
+
+## 系统要求
+
+| 需要 | 说明 |
 |---|---|
-| **限额后自动续跑** | Claude Code 会话被用量上限打断后，等额度恢复被证实，再接着跑原来那个会话——逐项目判定、各用各的模型、一次一个。 |
-| **自己找项目** | 从 Claude Code 的会话历史里列出项目；也可以手动添加或隐藏目录，不用手工维护清单。 |
-| **该打扰你时才打扰** | 任务跑完、因错误中断、停下来等你决定时，各发一条飞书消息——覆盖 Claude Code 和 OpenCode。 |
-| **只说能被证伪的话** | 额度、登录、队列和投递——只有真请求或真投递成功过才点绿。 |
+| Windows 10 / 11 | 界面基于 WebView2：Windows 11 自带；Windows 10 若没有，装一下 [WebView2 运行时](https://developer.microsoft.com/microsoft-edge/webview2/) |
+| [.NET 10 SDK](https://dotnet.microsoft.com/download) | 目前从源码构建 |
+| [Claude Code](https://claude.com/claude-code) 2.1.139 或更新 | `claude.exe` 在 `PATH` 上，并已用你的 Claude 账号登录 |
+| Node.js 与官方 [lark-cli](https://github.com/larksuite/cli) | 飞书通知用：`npm i -g @larksuite/cli`（已对 1.0.81 核对），另需一个启用了机器人的飞书自建应用。目前只支持飞书，不支持 Lark 国际版 |
+
+可选：OpenCode 2.x，用于它的完成通知和 DeepSeek 余额；Codex CLI，用于 Codex 额度与续跑（默认隐藏）。
 
 ## 安装
-
-需要 Windows 10/11、[.NET 10 SDK](https://dotnet.microsoft.com/download)，以及 2.1.139 或更新版本的 [Claude Code](https://claude.com/claude-code)（`claude.exe` 在 `PATH` 上，并已用你的 Claude 账号登录）。飞书通知另需 Node.js 和官方 [lark-cli](https://github.com/larksuite/cli)（`npm i -g @larksuite/cli`，已对 1.0.81 核对）。
 
 ```powershell
 git clone https://github.com/AquariusCZ/claude-resume.git
@@ -32,127 +109,182 @@ dotnet build csharp\AiResume.sln -c Release
 csharp\src\AiResume.Worker\bin\Release\net10.0-windows\AiResume.Worker.exe install
 ```
 
-从桌面或开始菜单打开 **AI Resume**，再把右栏两块配好：**Claude 登录**（见 [Claude Code 登录](#claude-code-登录)）和**完成通知 → 飞书**（见[飞书通知设置](#飞书通知设置)）。次要功能收在菜单栏里——**视图** / **工具** / **帮助**（Alt+V/T/H、F10），F5 刷新额度与状态。
+`install` 把程序部署到 `%LOCALAPPDATA%\AI Resume\`，建好桌面、开始菜单和开机自启入口（自启不弹控制台窗口），并把你之前开过的通知源重新指向安装目录；首次安装不会替你打开任何通知源，见下面的快速上手。退出码 0 才表示全部就位：2 表示有通知源没接好，3 表示新的后台服务没起来（已恢复旧版本），4 表示回滚不完整（恢复材料会留在原处，先别删）。
 
-`install` 就是部署这一步：真正运行的是 `%LOCALAPPDATA%\AI Resume\` 下的副本而不是 `bin\Release`，所以每次重新构建后都要再跑一次，并重开控制面——已打开的窗口不会热更新。它会暂存并校验产物，等新 Worker 在管道上应答之后才去改任何入口，按你之前开着的通知源重新对齐钩子；回滚不完整时保留恢复材料。退出码 0 表示全部就位；2 表示有通知源没对齐，3 表示新 Worker 没起来（已恢复旧版本），4 表示回滚不完整。它同时装好登录自启，**不会弹控制台窗口**——想再要"挂了自动重启"，见[开机自启](docs/ARCHITECTURE.md#logon-autostart)里那个需要提权一次的计划任务升级（`scripts\register-autostart.ps1`）。
+真正运行的是安装目录里的副本：以后每次重新构建都要再跑一次 `install`，并关掉旧窗口重开。
 
-卸载会移除快捷方式和 AI Resume 自己的钩子条目，保留你的设置和数据，包括已保存的飞书机器人凭据：
+想让后台服务挂了能自动重启，可以把开机自启改成计划任务：在管理员 PowerShell 里于仓库根目录运行 `powershell -ExecutionPolicy Bypass -File .\scripts\register-autostart.ps1`，加 `-Revert` 可以改回去（见[开机自启说明](docs/ARCHITECTURE.md#logon-autostart)）。已知问题：这样运行时后台服务在会话 0，界面暂时连不上它，页脚和「飞书机器人」一行会显示「未核实」，投递和续跑不受影响。
+
+卸载会移除程序、快捷方式和 AI Resume 自己的 hook 条目；`%LOCALAPPDATA%\AI Resume\state\` 里的设置、运行记录和飞书机器人凭据都会保留，重装后接着用。注册过计划任务的话，先用 `-Revert` 把它撤掉。
 
 ```powershell
 & "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe" uninstall
 ```
 
-可选：OpenCode 2.x，用于它的完成通知和 DeepSeek 余额；Codex CLI，用于 Codex 额度与续跑。
+## 快速上手
 
-## Claude Code 登录
+1. **确认 Claude 登录。** 从桌面或开始菜单打开 **AI Resume**，右栏「Claude 登录」显示「有效」就行。它读的是 Claude Code 自己的登录，你什么都不用填。
+2. **打开通知源。** 在右栏「完成通知 → 飞书」里打开 Claude Code 的开关（用 OpenCode 的话也打开），等它显示「hook 正常」。OpenCode 显示的是「插件已加载」，一直「待核实」的话，重启一次 OpenCode。
+3. **接上飞书**（可选，但很值得）：
+   - 在飞书开放平台建一个自建应用，开启机器人能力和发消息权限，发布应用版本、让机器人处于启用状态，并确认你自己在应用的可用范围内。
+   - 打开「工具 › 飞书通知设置…」，填 App ID（`cli_…`）和 App Secret，点「保存并验证」。
+   - 收件人：点「识别」从已登录 lark-cli 的用户里挑自己（列表是空的，就先用这个应用运行一次 `lark-cli auth login`），或者粘贴你的 `ou_…` open_id 后点「保存」。open_id 按应用区分，必须取自这个机器人所在的应用。
+   - 关掉对话框，点右栏的「发送测试」，手机上应该收到「🧪 AI Resume 测试通知」。没收到就回对话框点「诊断通道」，或者运行下面的 `notify check`。
+4. **布防**，也就是把项目交给 AI Resume 守着。在续跑队列里勾选要守护的项目，每个项目默认「沿用会话」最近用的模型，也可以单独换。先点「预览…」看看每个项目现在的判定，再点「布防」。布防会把每个项目绑定到它此刻最近的那个会话，所以先开始干活再布防；之后在同一项目里新开的会话，要解除后重新布防才算数。默认是一次性的：所有项目都续完就自动解除；想每次被打断都续，打开「工具 › 连续模式」（下次布防时生效）。
 
-AI Resume 自己不持有任何 Claude 凭据。它读 Claude Code 自己的登录——`%USERPROFILE%\.claude\.credentials.json`，或 `CLAUDE_CONFIG_DIR` 下的同名文件——来查额度，**只读、绝不刷新、绝不写回**：refresh token 是一次性的，别的进程刷新一次就会把 Claude Code 登出。账号身份取自 Claude Code 全局配置（通常是 `%USERPROFILE%\.claude.json`）里的 `oauthAccount`，不再随访问令牌轮换而漂移。
+装好后想核对一遍，可以跑这三条：
 
-访问令牌约 8 小时一换，只要 Claude Code 在运行——终端、桌面端或 VS Code 里的会话，或手机远程连接——它就会自己续期；令牌背后的登录约 30 天，只有 `/login` 能续。**Claude 登录**这一栏告诉你现在处在哪一步：
+```powershell
+$w = "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe"
+& $w notify list    # 打开过的通知源「已启用」「可送达」都是 True，退出码 0
+& $w notify check   # 最后一行是「结论: 飞书通知通道就绪」
+& $w notify test    # 90 秒内真实送达，退出码 0
+```
+
+控制面页脚显示「后台服务运行中」，「Claude 登录」显示「有效」，Claude Code 一行显示「hook 正常」，「飞书机器人」显示「可送达」，就说明一切就位。
+
+## 安全与隐私
+
+- **不会把你登出。** AI Resume 自己不存任何 Claude 凭据，只读 Claude Code 的登录文件（`%USERPROFILE%\.claude\.credentials.json`，或 `CLAUDE_CONFIG_DIR` 下的同名文件），**绝不刷新、绝不写回 OAuth 令牌**。刷新令牌（refresh token）只能用一次，任何外部程序刷新一次，Claude Code 就会被登出。令牌由正在运行的 Claude Code 自己轮换；登录约 30 天到期，只有你自己 `/login` 能续。
+- **其他工具的凭据一律只读。** Codex 的 `auth.json`、OpenCode 的 DeepSeek 密钥同样只读不写；AI Resume 不保存任何 DeepSeek 密钥。
+- **飞书机器人凭据：核验过才存，存了就锁紧。** App ID 和 App Secret 只能从「飞书通知设置」录入。保存前，AI Resume 先向飞书真实换一次 tenant_access_token，再用这个令牌经 lark-cli 调通一次机器人信息接口，两步都过才用 Windows DPAPI（机器范围）加密成 `state\secrets\feishu-bot.bin`；文件只允许你本人、SYSTEM 和 Administrators 访问，做不到就不保存。机器范围加密意味着本机管理员也能解开它。投递时 App Secret 只出现在发给飞书换令牌接口的请求里，lark-cli 拿到的只是 App ID 和短期令牌，令牌只留在内存；凭据不进命令行参数、日志、界面或截图，界面只显示遮蔽后的 App ID。卸载会保留这份凭据，要删掉就在「飞书通知设置」里点「清除凭据」。
+- **没有云端服务，没有遥测。** 对外请求只有三类：用本机各客户端已有的凭据查询额度和模型目录（Anthropic，以及你给 Claude Code 配置的 API 端点；装了 Codex、OpenCode 时还有对应的 OpenAI、DeepSeek 和 Codex 里配置的第三方供应商）；向飞书官方接口换取机器人令牌；经 lark-cli 发送飞书消息、诊断通道。面板刷新不调用任何模型，一个 token 都不花。令牌和凭据不进日志，通知日志也不记消息正文。
+
+## 常见问题
+
+<details>
+<summary><b>Claude Code 自己不是会自动继续吗？</b></summary>
+
+会，但只管还开着的交互会话，Remote Control 会话和要等一天以上才重置的周额度它也不等。AI Resume 只续已经关掉的会话；开着的会话（包括 Remote Control）它一律不插手，项目已布防的话，额度恢复 10 分钟后还没接上就飞书提醒你，你可以就地继续，也可以关掉会话交给它。见上面的[分工表](#为什么需要它)。
+
+</details>
+
+<details>
+<summary><b>会不会把我的 Claude Code 登出？</b></summary>
+
+不会。AI Resume 只读 Claude Code 的登录文件，从不刷新，也从不写回令牌。
+
+</details>
+
+<details>
+<summary><b>续跑会不会偷偷花掉我的额度？</b></summary>
+
+续跑就是用你的订阅把原来那个会话接着跑下去，和你自己回来输入 `continue` 一样耗额度；同一次中断最多续一次。除此之外 AI Resume 不调用任何模型：面板刷新只读额度和模型目录接口，零 token。
+
+</details>
+
+<details>
+<summary><b>续跑失败了会怎样？</b></summary>
+
+分两种。还没启动就被拦下的（会话刚被打开、令牌快过期、配置刚改过），只跳过这一轮，下一轮重新判定；续跑进程起来以后出了问题，这一轮就停住，不会再自动续跑，等你检查后解除并重新布防。刚续上又撞了限，这个项目回到等待，不会一直占着队列。
+
+</details>
+
+<details>
+<summary><b>续跑时遇到要批准的操作怎么办？</b></summary>
+
+没人能批。续跑在后台无人值守地运行（`claude -p`），权限按你自己的 Claude Code 设置，AI Resume 既不提权也不降权，需要当场点批准的操作没法批准。要长时间无人值守，事先在 Claude Code 的权限设置里放行它需要的操作。跑完后打开原会话，就能看到它做了什么。
+
+</details>
+
+<details>
+<summary><b>不用飞书可以吗？</b></summary>
+
+可以。续跑不依赖飞书；不配飞书只是收不到完成通知、续跑提醒和登录到期提醒。
+
+</details>
+
+<details>
+<summary><b>人不在电脑前，怎么在手机上接着干？</b></summary>
+
+用 Claude Code 官方的 [Remote Control](https://code.claude.com/docs/en/remote-control)（`claude remote-control`）。它需要 Claude 订阅登录，本机的 `claude` 进程也要一直开着，这个进程还会顺带续期登录令牌。会话仍跑在这台电脑上，所以 hook 照常触发、通知照常发。Remote Control 会话开着时 AI Resume 不插手，Claude Code 也不会在撞限后自动继续它；项目已布防的话，额度恢复 10 分钟后那条飞书提醒，就是你该在手机上接着干的信号。AI Resume 自己不做聊天机器人。
+
+</details>
+
+<details>
+<summary><b>支持 Codex、OpenCode、Cline、Qoder 吗？</b></summary>
+
+- **OpenCode 2.x**：完成通知，外加它所用 DeepSeek 账户的余额（只展示，不参与续跑）。
+- **Codex**：默认隐藏，打开「视图 › 显示 Codex」后出现额度磁贴，也可选为续跑供应商。它用 `%USERPROFILE%\.codex\auth.json` 里的官方 ChatGPT/OpenAI 登录；续跑要求本机 Codex 恰好是 0.148.0，而且 Codex 配置目录里有 `managed_config.toml`，布防时就会检查。Codex 的会话记录里没有结构化的限流证据，所以观测到模型受限才排队，账号各窗口都低于 100% 才续。
+- **Codex、Cline、Qoder 的完成通知**：只发「跑完了」，默认隐藏，在「视图 › 显示其他通知源」里打开。Codex 的 hook 要在 Codex 里用 `/hooks` 信任一次，新开的会话才生效。
+- 额度核实不了就等着，绝不自动换供应商重跑。
+
+</details>
+
+<details>
+<summary><b>能在 macOS 或 Linux 上用吗？</b></summary>
+
+不能。它依赖 WPF + WebView2 界面、Windows DPAPI 和计划任务，只支持 Windows 10/11。
+
+</details>
+
+<details>
+<summary><b>界面上为什么常有「未核实」「待核实」？</b></summary>
+
+这是故意的。每一个「正常」「可送达」这样的肯定结论，都要有外部证据：额度要有本次的实时读数；「可送达」要有最近一次真实送达，而且之后没改过设置；「hook 正常」要核对 hook 指向的程序确实存在；OpenCode 的「插件已加载」只认 OpenCode 自己的日志。核对不出来就如实说，绝不凭印象点绿。
+
+</details>
+
+<details>
+<summary><b>现在稳定吗？</b></summary>
+
+核心判定由全仓 1300 多项自动化测试覆盖，全部用合成会话和临时目录，绝不碰真实会话。安装和飞书投递已在作者本机真机走通，包括以计划任务在会话 0 运行的后台服务。还在等真实事件验证的有三项：一次真实撞限后的端到端自动续跑、OpenCode 里真实任务的完成通知、Claude Code 登录到期提醒。验证记录见[完成通知 · 验证层级](docs/COMPLETION-NOTIFICATIONS.md#6-验证层级)。
+
+</details>
+
+## 参考
+
+<details>
+<summary><b>Claude 登录的几种状态</b></summary>
+
+访问令牌约 8 小时一换，只要 Claude Code 在运行（终端、桌面端、VS Code，或手机 Remote Control 连着），它就会自己续期；令牌背后的登录约 30 天，只有 `/login` 能续。访问令牌剩余不足 45 分钟时不启动续跑，这个项目会等 Claude Code 续期后再说。
 
 | 界面 | 含义 | 怎么办 |
 |---|---|---|
-| **有效** | 已登录，访问令牌有效 | — |
-| **有效 · 账号未核实** | 还没有一致的 `oauthAccount`，续跑等待 | 打开一次 Claude Code |
-| **令牌待续期** | 访问令牌已过期，登录仍有效 | 打开一次 Claude Code，或保持手机远程连接 |
-| **即将到期** | 登录 3 天内到期 | 终端里运行 `claude` 后执行 `/login` |
-| **已过期** / **未登录** | 登录到期或被清空，或根本没登录 | 终端里运行 `claude` 后执行 `/login` |
-| **凭据位置变化** | Claude Code 把登录挪进了 Windows 凭据管理器（`CLAUDE_CODE_FORCE_WINDOWS_CREDMAN=1` 或服务端灰度），AI Resume 读不到 | 额度保持未核实 |
+| 有效 | 已登录，访问令牌有效 | — |
+| 有效 · 账号未核实 | 还读不到一致的账号信息，续跑等待 | 打开一次 Claude Code，让它写入账号信息 |
+| 令牌待续期 | 访问令牌过期，登录仍有效 | 打开一次 Claude Code，或保持 Remote Control 连着 |
+| 即将到期 | 登录 3 天内到期 | 终端里运行 `claude` 后执行 `/login` |
+| 已过期 / 未登录 | 登录到期、被清空，或根本没登录 | 终端里运行 `claude` 后执行 `/login` |
+| 被服务端拒绝 | 额度接口拒绝了本机的登录（改过密码、被移出组织或在别处登出） | 终端里运行 `claude` 后执行 `/login` |
+| 凭据位置变化 | Claude Code 把登录挪进了 Windows 凭据管理器，AI Resume 读不到 | 额度保持未核实，续跑一直等待 |
+| 未核实 | 登录文件在，但这次没读出来（多半正被 Claude Code 改写） | 不用管，稍后自动重读 |
 
-设置了飞书收件人后，Worker 会在登录到期前 3 天、2 天、1 天、12 小时各提醒一次，过期时再提醒一次。访问令牌剩余不足 45 分钟时不启动续跑，该项目等 Claude Code 续期后再说。
+设置了飞书收件人后，后台服务会在登录到期前 3 天、2 天、1 天、12 小时各提醒一次，过期时再提醒一次；登录被 Claude Code 清空的话，每天提醒一次，直到恢复。
 
-v2.1 的 `claude setup-token` 长期令牌已删除：usage 接口不接受它（作用域只覆盖推理），它从来读不到额度。`install` 会删掉残留的 `state\secrets\claude-oauth-token.bin`。
+</details>
 
-## 飞书通知设置
+<details>
+<summary><b>什么时候会续跑</b></summary>
 
-飞书现在只做一件事：你的机器人经官方 lark-cli 给你发私信。不再有飞书聊天、会话和授权名单。
+布防后，每个项目各自判定，任何一项核实不了都只等待、绝不放行：
 
-1. 安装 lark-cli：`npm i -g @larksuite/cli`。AI Resume 直接启动 npm 包里的 `lark-cli.exe`，绝不经 `cmd.exe`——那条路会把多行消息截在第一个换行处。
-2. 在飞书开放平台准备一个自建应用：开启机器人能力，并有发消息的权限。收件人（也就是你）要在应用的可用范围内。
-3. **工具 › 飞书通知设置…**（或**完成通知 → 飞书**下的**设置…**）：填 App ID（`cli_…`）和 App Secret，点**保存并验证**。AI Resume 先用这组凭据在线跑一次 `lark-cli doctor`，飞书确实换得到机器人令牌才保存。凭据以机器范围 DPAPI 副本存在 `state\secrets\feishu-bot.bin`（只有你、SYSTEM 和 Administrators 可读），投递时经 lark-cli 官方的 `LARKSUITE_CLI_*` 环境变量交给它——后台 Worker 可能跑在会话 0，那里 lark-cli 自己的钥匙串时常读不出来。没有这份副本时退回钥匙串，真实投递成功之前界面显示**未存凭据副本**。从 v2.1 升级？**导入旧版凭据**会把旧版「飞书接入」区保存的凭据经同样的核验后导入。
-4. 收件人：粘贴你的 `ou_…` open_id 后点**保存**，或点**识别**从已登录 lark-cli 的用户里挑（`lark-cli auth list`）。open_id 按应用隔离，必须取自机器人所在的那个应用；保存过机器人凭据后，**识别**只列出同一应用的用户。
-5. **诊断通道**用投递实际会用的凭据跑 `lark-cli doctor`；**发送测试**（也在**工具 › 发送测试通知**）往队列放一条测试消息，走完整条链路。
+- **被打断了吗？** 会话记录的结尾必须是一次用量上限中断，而且这次中断还没续过。你已经自己在客户端里接着干了的，算完成（「已在客户端继续」）。
+- **它的模型额度恢复了吗？** 本次实时读数要显示 5 小时和 7 天窗口都低于 100%，而且约束这个模型的周额度没满。按模型的周额度只约束同一模型族（认不出模型族的按「有约束」处理）。
+- **会话空着吗？** 会话开在任何客户端里（终端、桌面端、VS Code 或 Remote Control），或者同目录另一个会话正在跑，这个项目就等。
 
-**飞书机器人**这一行只有最近一次真实投递成功、且之后没改过设置时才显示**可送达**；后台服务不在时显示**后台服务未运行**；投递受阻时直接写出原因——凭据、权限或收件人、限流、网络；最近一次尝试失败时显示**最近投递失败**；成功之后改过凭据或收件人时显示**设置已变更**（点**发送测试**重新核实）。一条消息失败只按它自己的退避重试，不拖慢别的。通道级故障会让整条通道暂停一段退避时间，你一改凭据或收件人就立即解除。永远发不出去的、发生超过 24 小时还没送出的、或者结果不明已过 55 分钟的消息（飞书只在一小时内去重，再发可能重复）移进 `state\completion-events\dead\`，旁边附一份 `.error.txt`。
+项目按队列顺序一次一个续跑，在各自目录里执行 `claude --resume <会话 ID> -p continue --model <模型> …`，每个启动前都重新核对一遍。共用同一模型的项目共享一份额度读数。把鼠标停在某一行的状态上，能看到完整原因和预计几点开始续跑。完整规则见[架构 · 额度与续跑流程](docs/ARCHITECTURE.md#额度与续跑流程)。
 
-## 通知
+</details>
 
-分三类，因为它们的紧迫程度根本不同。**跑完了**可以晚点看；**中断了**和**在等你**是此刻正在白白流走的时间。
+<details>
+<summary><b>会通知哪些事件</b></summary>
 
 | 来源 | 跑完了 | 因错误中断 | 在等你 |
 |---|---|---|---|
-| Claude Code | `Stop` hook | `StopFailure`——用量上限（每个会话每个限额周期只提醒一次）、登录失效、账单问题等 | `Notification`——等你授权、MCP 确认框（elicitation）、需要你输入、额度恢复后没能自动接上 |
-| OpenCode 2.x | 顶层会话的 `session.execution.succeeded`，且没有仍在运行的子会话 | 顶层会话的 `session.execution.failed`，宽限期内没被自动续跑 | `permission.asked`、`form.created`（AI 提问） |
+| Claude Code | `Stop` hook | `StopFailure`：用量上限（每个会话每个限额周期一次）、登录失效、账单问题等 | `Notification`：等你授权、MCP 确认框、需要你输入、额度恢复后没能自动接上 |
+| OpenCode 2.x | 顶层会话执行成功，且没有仍在运行的子会话 | 顶层会话执行失败，宽限期内没被自动重试 | 等你授权、AI 向你提问 |
 
-Claude Code 的钩子以官方 exec form 写进 `%USERPROFILE%\.claude\settings.json`——`command` 是 `AiResume.Hook.exe` 的绝对路径，`args` 放开关——需要 Claude Code 2.1.139 以上。Claude Code 会自己重新加载这个文件，不用新开会话。OpenCode 插件是官方 v2 目录形态，位于 `%USERPROFILE%\.config\opencode\plugins\airesume-notify\index.ts`；旧的单文件插件会被迁移并留一份 `.bak`。直到 OpenCode 自己的日志（`%USERPROFILE%\.local\share\opencode\log\opencode.log`）显示插件已加载，OpenCode 这一行都显示**待核实**；OpenCode 拒绝加载时标红（以日志里最后一条结论为准，之后成功加载会覆盖先前的失败）。一直待核实就重启一次 OpenCode。两处路径都跟随客户端自己的设置：Claude Code 跟随 `CLAUDE_CONFIG_DIR`，OpenCode 跟随 `XDG_CONFIG_HOME` / `XDG_DATA_HOME`。
+AI Resume 自己的续跑运行带内部标记，不会触发上面这些通知；它另外发自己的提醒：开始续跑，续跑完成、未确认完成或已中止，一直没能开始续跑，额度已恢复但会话还开着，读不到额度（令牌过期、登录失效等），账号变了，登录即将到期或已过期。经 Remote Control 连着的会话，消息里会带「· 远程已连接」。没有保存会话记录的会话（例如第三方工具用 `claude --no-session-persistence` 拉起的进程）不发通知。
 
-适配器合并进你已有的配置，且只移除能证明属于自己的条目。AI Resume 自己的续跑运行带内部标记，它们的钩子不会通知你；取而代之的是 AI Resume 自己发的提醒：开始续跑，续跑完成或未确认完成；额度已恢复但会话仍开着；Claude 登录令牌过期；账号已变化；登录即将到期或已过期。经手机远程连接的 Claude Code 会话，通知里会带「· 远程已连接」；Claude Code 的通知还会写上会话名（桌面端侧栏标题或 `/rename`）。用量上限每个会话每个限额周期只提醒一次：同时被打断的会话合成一条，写明哪个额度用完、预计何时重置，并按发出那一刻的布防状态说清 AI Resume 会不会续跑它们。没有落盘的会话（例如第三方工具以 `claude --no-session-persistence` 拉起的进程）不发通知。
+Claude Code 的 hook 以官方 exec form 写进 `%USERPROFILE%\.claude\settings.json`，Claude Code 会自己重新加载，不用新开会话；OpenCode 插件放在 `%USERPROFILE%\.config\opencode\plugins\airesume-notify\`。两处都跟随客户端自己的配置目录设置（`CLAUDE_CONFIG_DIR`、`XDG_CONFIG_HOME`），只增删 AI Resume 自己的条目。右栏的「未送达 N」是已经停止重试的消息，原因写在 `state\completion-events\dead\` 里同名的 `.error.txt` 中。协议与验证见[完成通知](docs/COMPLETION-NOTIFICATIONS.md)。
 
-Codex（`hooks.json` 里的 `Stop` hook）、Cline（`TaskComplete`）和 Qoder（`hooks.Stop`）仍可用，只发"跑完了"，默认隐藏：**视图 › 显示其他通知源**，或 `notify enable <源>`。隐藏的源若仍开着或 hook 失效，主界面会留一句提示。安装前已经打开的 Codex 会话不会重载 `hooks.json`，请新开会话；若 Codex 里 `/hooks` 显示 AI Resume 的 hook 未信任，在那里信任一次即可。协议与测试步骤见[完成通知](docs/COMPLETION-NOTIFICATIONS.md)。
+</details>
 
-## 额度与续跑
+<details>
+<summary><b>命令行</b></summary>
 
-额度取自 Anthropic 的 OAuth usage 接口，复用 Claude Code 的真实请求形状和 Claude Code 自己的登录。响应是稀疏的，所以缺字段不等于被删除。承接下来的旧值显示为琥珀色的*最近服务端读数*，绝不点绿；只有重置时间没有百分比时用不确定态扫描，而不是编一个数字出来。额度屏含义固定：Claude 5 小时、Claude 7 天、Claude 按模型（已用最高或已满的那条按模型周额度；有布防项目卡在它上面时带「N 项在等」角标）、DeepSeek 余额。余额用 OpenCode 的 DeepSeek 密钥查询（先看 OpenCode 配置，再看 OpenCode 2.x 自己的凭据库 `opencode.db`，然后是旧的 `auth.json`，都没有才用 `DEEPSEEK_API_KEY`），只展示：AI Resume 不保存任何 DeepSeek 密钥，也不用它续跑。OpenCode 合并后的配置把 DeepSeek 指到自定义端点时，不发余额请求。刷新失败而沿用旧读数时，页头写**部分更新**，磁贴悬停说明写出失败原因。
-
-勾选要守护的项目。勾选的行会出现模型下拉：默认的「沿用会话:<模型>」跟随该会话最近实际用的模型（布防后显示为 ↺），也可以逐个改选——多个项目可以共用一个模型，共用的项目共享同一份额度读数。**预览…**只显示每个项目当前的判定，什么都不执行。**布防**会固定本轮的供应商和账号、每个项目从供应商实时目录里选定的模型 ID，以及精确的原生会话；模型目录更新在下次布防采用。会话正开着只给警告；会话模型不在目录里时需要手动选一个。
-
-布防后每个项目各自判定，任何一项核实不了都只等待，绝不放行：
-
-- **被打断了吗？** 会话记录的结尾必须是一次用量上限中断。同一次中断最多续一次；你已经自己续上的会话算完成（「已在客户端继续」）。
-- **它的模型额度恢复了吗？** 必须有实时读数显示 5 小时和 7 天窗口都低于 100%，且没有约束该模型的额度被打满。按模型的周额度只约束同一模型族（任何版本都算；认不出模型族的按"有约束"处理），所以 Fable 周额度用尽不再挡住 Opus 项目。
-- **会话空着吗？** 会话开在某个客户端里——终端、桌面端、VS Code 或手机远程——或者同目录另一个会话正在跑，这个项目就等。开着的交互会话交给 Claude Code 自己的自动继续；额度恢复 10 分钟后会话仍开着且没有继续，飞书提醒你一次。
-
-项目按队列顺序一次一个续跑，在各自目录里执行 `claude --resume <会话 ID> -p continue --model <模型> …`，每个启动前都重新核验一遍。没能启动的项目——会话刚被打开、访问令牌不足 45 分钟、配置刚变化——本轮跳过、下一轮重试，不再锁死整轮。进程启动后的失败绝不自动重放：本轮停住，等你解除后重新布防。一次性模式（默认）在所有项目都完成后自动解除；**工具 › 连续模式**每次被打断都续跑，下次布防时生效。把鼠标停在某行状态上，可以看到完整原因和预计起续时间。
-
-Codex 默认隐藏，**视图 › 显示 Codex** 之后才出现它的额度屏，并可选为续跑供应商。它使用 `~/.codex/auth.json` 里的官方 ChatGPT/OpenAI 登录——Codex 里配置的本机中转不会被使用。Codex 没有会话记录核对：观测到项目的模型受限时排进队列，账号各窗口都低于 100%、没有附加限额或消费上限命中、目标模型未被标为不可用时才续跑。其它已配置的供应商（非本机的第三方 Codex provider，或指向 API 端点的 Claude Code）需要已核实的正余额。没有额度数据就显示“未核实”；不会自动换供应商；固定模型 ID 不等于冻结供应商同名 ID 的后端版本。详见[供应商与固定目标续跑](docs/adr/0004-provider-bound-resume.md)和 [ADR-0006](docs/adr/0006-retire-cc-connect-per-project-resume.md)。
-
-## 用手机远程
-
-AI Resume 不再带飞书聊天机器人：cc-connect 已在 v2.2 退役（[ADR-0006](docs/adr/0006-retire-cc-connect-per-project-resume.md)），飞书只送通知。想在手机上继续干活，请用 Claude Code 官方的 [Remote Control](https://code.claude.com/docs/en/remote-control)（`claude remote-control`）；它需要 Claude 订阅登录，本机的 `claude` 进程也得一直开着。会话仍在这台机器上跑，所以钩子照常触发。远程会话开着时，AI Resume 把它当成普通的打开中会话，不会在它底下续跑——而 Claude Code 不会在用量上限后自动继续远程会话，所以上面那条"10 分钟后提醒"就是你该在手机上接着干的信号。
-
-用手机驱动 OpenCode 或 Codex 的能力随之放弃。确实需要时可以自己运行 cc-connect；AI Resume 不再生成、启动或检查它的配置。
-
-## 结构
-
-```text
-Claude Code / OpenCode          （Codex · Cline · Qoder 默认隐藏）
-       |  钩子 / 插件
-       v
- AiResume.Hook ----------> state\completion-events\
-                                     |
-                                     v
-AiResume.Gui <--- 共享状态目录 --> AiResume.Worker ----> lark-cli ----> 飞书机器人私信
-   WPF + WebView2                  续跑引擎、额度、
-                                   通知投递、登录提醒、
-                                   进程监督
-                                     |
-                                     v
-                      claude --resume <会话>（一次一个项目）
-```
-
-```text
-%LOCALAPPDATA%\AI Resume\          安装副本：Gui、Worker、Hook、Launcher
-  state\                           卸载时保留
-    config.json                    队列、布防、逐项目模型、通知源、收件人 open_id
-    runs.db                        SQLite/WAL：续跑周期、进程登记、额度快照
-    project-index.json             项目发现缓存
-    secrets\feishu-bot.bin         飞书机器人凭据（机器范围 DPAPI）
-    completion-events\             通知队列；dead\ 存放发不出去的消息
-    completion-notify-*.json       去重、逐条重试状态、通道健康
-    logs\                          按日滚动的 JSON 日志，如 worker-yyyyMMdd.log
-    webview2\                      WebView2 用户数据
-```
-
-代码给自己定的硬规矩：
-
-- **绿色代表已验证。** CLI 装着、key 填了、钩子写进去了都不算证据——必须有一次请求或投递真的成功过。
-- **未知就等待。** 任何一项核实不了，都只让那个项目等着，绝不算放行。
-- **别人的登录只读。** Claude Code 的登录、Codex 的 `auth.json`、OpenCode 的 DeepSeek 密钥只读，绝不刷新、绝不写回。
-- **不靠 PID 杀进程。** 身份、启动时间和命令签名全部对上才允许回收。
-
-## 命令
-
-从安装副本运行，这样写进配置的钩子路径才会指向安装目录：
+从安装副本运行，写进配置的 hook 路径才会指向安装目录：
 
 ```powershell
 $w = "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe"
@@ -161,36 +293,29 @@ $w = "$env:LOCALAPPDATA\AI Resume\AiResume.Worker.exe"
 
 | 命令 | 作用 | 退出码 |
 |---|---|---|
-| `install` | 部署、重建入口、按意图对齐通知源 | 0 成功 · 1 出错 · 2 通知源未对齐 · 3 Worker 未起来 · 4 回滚不完整 |
-| `uninstall` | 移除安装副本、快捷方式和自己的钩子条目；保留 `state\` | |
+| `install` | 部署、重建入口、按记住的意图对齐通知源 | 0 成功 · 1 出错 · 2 通知源未对齐 · 3 后台服务没起来 · 4 回滚不完整 |
+| `uninstall` | 移除安装副本、快捷方式和自己的 hook 条目；保留 `state\` | |
 | `shortcuts` | 重建桌面、开始菜单和开机自启入口（`shortcuts uninstall` 移除）；`install` 会替你做 | |
 | `notify` · `notify list` | 每个通知源：已安装、已启用、可送达 | 有已启用的源 hook 失效时为 2 |
 | `notify enable <源>` · `notify disable <源>` | 开关 `ClaudeCode`、`OpenCode`、`Codex`、`Cline`、`Qoder`，并记住意图供下次安装恢复 | 失败为 1 |
-| `notify check` | lark-cli、凭据来源、收件人、最近一次真实投递，再跑 `lark-cli doctor` | 0 就绪 · 2 未就绪 |
-| `notify test` | 往队列放一条测试消息，最多等 90 秒看 Worker 是否送达 | 0 已送达 · 2 未送达 |
+| `notify check` | 检查 lark-cli、凭据来源、收件人和最近一次真实投递，再在线诊断：有凭据副本时先真实换令牌、调一次机器人接口，再附 `lark-cli doctor` | 0 就绪 · 2 未就绪 |
+| `notify test` | 往队列放一条测试通知，最多等 90 秒看后台服务是否真实送达 | 0 已送达 · 2 未送达 |
 
-不带子命令运行时，Worker 以常驻服务启动，开机自启入口就是这样拉起它的；未知子命令会打印命令列表并返回 2。
+不带子命令运行时，`AiResume.Worker.exe` 以后台服务方式常驻，开机自启入口就是这样拉起它的；未知子命令会打印命令列表并返回 2。每次续跑判定都逐项目记在 `state\logs\worker-yyyyMMdd.log` 的 `resume.probe.evaluated` 里。
 
-## 真机验证
+</details>
 
-`install` 之后：
+<details>
+<summary><b>从 v2.1 升级</b></summary>
 
-1. `& $w notify list`——每个已启用的源「可送达」都是 True，退出码 0。OpenCode 那一行的说明应是 `OpenCode 已加载(日志 …)`，而不是 `等 OpenCode 下次加载后核实`。
-2. `& $w notify check`——最后一行是 `结论: 飞书通知通道就绪`，退出码 0。
-3. `& $w notify test`——90 秒内退出码 0，手机上收到「🧪 AI Resume 测试通知」。退出码 2 时会说明原因：飞书投递暂停的原因及其错误码和 `log_id`，或 90 秒内没有送达——这时确认后台服务（Worker）在运行，再跑 `notify check`。
-4. 控制面页脚显示「后台服务运行中」，**Claude 登录**显示**有效**，**飞书机器人**显示**可送达**。
-5. 每次续跑判定都逐项目记进 `state\logs\worker-yyyyMMdd.log` 的 `resume.probe.evaluated`（`name=model|quota|session|evidence|reason`）。
+- 用新构建跑一次 `install`。它会把 Claude Code 的 hook 改写成带 `StopFailure` 的 exec form，把已启用的 OpenCode 通知迁到 2.x 目录插件，并删掉不再使用的 `claude-oauth-token.bin`。
+- 打开「飞书通知设置」，点「导入旧版凭据」，或者重新填写机器人凭据。`config.json` 里已有的收件人会沿用。
+- 解除布防后重新布防。Claude 账号身份现在取自 Claude Code 的账号记录，不再取自会轮换的访问令牌，所以 v2.1 的布防对不上了（被打断的项目会显示「账号已变化 · 重新布防」）；重新布防也会给每个项目固定模型。
+- AI Resume 不再管理 cc-connect，它的计划任务、npm 包和 `%USERPROFILE%\.cc-connect\` 都原样不动。不用了就自己删掉：那个目录里有明文密钥，记得一并吊销更换。
+- Codex、Cline、Qoder 的通知开关挪到了「视图 › 显示其他通知源」，原来开着的仍然开着。
+- DeepSeek 余额磁贴现在显示 OpenCode 那把密钥对应的账户；`DEEPSEEK_API_KEY` 只在 OpenCode 那边找不到密钥时兜底。
 
-2.2.0 待真机验证的事项（截至 2026-10-30）：一次真实用量上限中断后的逐项目自动续跑；OpenCode 2.x 真实加载新插件并发出通知；保存或导入机器人凭据后，会话 0 的 Worker 经机器范围凭据真实投递；登录到期提醒。
-
-## 从 v2.1 升级
-
-- 用新构建跑一次 `install`。它会把 Claude Code 钩子改写成带 `StopFailure` 的 exec form，把已启用的 OpenCode 通知迁到 2.x 目录插件，并删掉不再使用的 `claude-oauth-token.bin`。
-- 打开**飞书通知设置**：点**导入旧版凭据**，或重新填写机器人凭据。`config.json` 里已有的收件人会沿用。
-- 解除布防后重新布防。Claude 账号身份现在取自 Claude Code 的账号记录，而不是会轮换的访问令牌，所以 v2.1 的布防对不上了（被打断的项目会显示「账号已变化 · 重新布防」）；重新布防也会给每个项目固定模型。
-- AI Resume 不再管理 cc-connect，它的计划任务、npm 包和 `%USERPROFILE%\.cc-connect\` 都原样不动。不用了就自己删掉——那个目录里有明文密钥，记得一并吊销更换。
-- Codex、Cline、Qoder 的通知开关挪到了**视图 › 显示其他通知源**；原来开着的仍然开着。
-- DeepSeek 余额屏现在显示 OpenCode 那把密钥对应的账户；`DEEPSEEK_API_KEY` 只是兜底。
+</details>
 
 ## 开发
 
@@ -199,11 +324,11 @@ dotnet test csharp\AiResume.sln
 dotnet build csharp\AiResume.sln -c Release --no-restore -warnaserror
 ```
 
-测试使用临时状态、合成会话和注入的 runner，绝不续跑真实会话、不改真实项目、不发付费模型请求。测试需要 `PATH` 上有 Node.js：控制面的视图模型和 OpenCode 插件都在 Node 里驱动。`AiResume.Gui.exe --screenshot <png>` 用合成数据渲染控制面（加 `--screenshot-unarmed` 得到未布防态）；先把 `AIRESUME_SHADOW_DIR` 指向一个临时目录，免得碰到你真实的状态目录。
+测试只用临时状态、合成会话和注入的运行器：绝不续跑真实会话、不改真实项目、不发付费模型请求。部分用例要用 `PATH` 上的 Node.js 驱动界面的视图模型和 OpenCode 插件。`AiResume.Gui.exe --screenshot <png>` 用合成数据离屏渲染控制面（加 `--screenshot-unarmed` 得到未布防态），运行前先把 `AIRESUME_SHADOW_DIR` 指向一个临时目录，免得碰到真实的状态目录。
 
 ## 文档
 
-[架构](docs/ARCHITECTURE.md) · [额度获取](docs/CLAUDE-QUOTA-ACQUISITION.md) · [通知协议](docs/COMPLETION-NOTIFICATIONS.md) · [运行契约](docs/RUN-CONTRACT.md) · [决策记录（ADR）](docs/adr/) · [v2.2 决策（ADR-0006）](docs/adr/0006-retire-cc-connect-per-project-resume.md) · [工程教训](docs/LESSONS.md) · [AI 导览](AI_GUIDE.md) · [历史资料](docs/history/)
+[架构](docs/ARCHITECTURE.md) · [额度获取](docs/CLAUDE-QUOTA-ACQUISITION.md) · [完成通知](docs/COMPLETION-NOTIFICATIONS.md) · [运行契约](docs/RUN-CONTRACT.md) · [决策记录（ADR）](docs/adr/) · [工程教训](docs/LESSONS.md) · [AI 导览](AI_GUIDE.md) · [历史资料](docs/history/)
 
 ## 许可
 
