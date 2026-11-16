@@ -340,4 +340,4 @@ The tests use only temporary state, synthetic sessions and injected runners: the
 
 ## License
 
-MIT, see [LICENSE](LICENSE). The interface uses [Ark Pixel Font](https://github.com/TakWolf/ark-pixel-font) under SIL OFL 1.1 ([OFL.txt](csharp/src/AiResume.Gui/wwwroot/fonts/OFL.txt)).
+MIT, see [LICENSE](LICENSE). The interface uses [Fusion Pixel Font](https://github.com/TakWolf/fusion-pixel-font) (12px monospaced, zh_hans) under SIL OFL 1.1 ([OFL.txt](csharp/src/AiResume.Gui/wwwroot/fonts/OFL.txt)); it is built on Ark Pixel Font with glyphs from Cubic 11 and Galmuri, whose licenses ship alongside it in [fonts/LICENSES](csharp/src/AiResume.Gui/wwwroot/fonts/LICENSES).

@@ -15,10 +15,11 @@
 
    点阵字的纪律(违反任何一条字就糊):字号只用 1rem/2rem(1rem = 设计尺寸 12px,开机脚本按 DPR
    挪到像素网格上);字距用 1/12rem 的整数倍;font-synthesis:none;-webkit-font-smoothing:none。
-   布局尺寸仍用 px,不随字号缩放。 */
+   布局尺寸仍用 px,不随字号缩放。
+   字体是 Fusion Pixel 12px 等宽 zh_hans(来源、版本与许可见 fonts/README.txt)。 */
 @font-face{
-  font-family:"ArkPixel";
-  src:url("fonts/ark-pixel-12px-monospaced-zh_cn.woff2") format("woff2");
+  font-family:"FusionPixel";
+  src:url("fonts/fusion-pixel-12px-monospaced-zh_hans.woff2") format("woff2");
   font-weight:normal;font-style:normal;font-display:block;
 }
 :root{
@@ -37,7 +38,7 @@
   --bevel-hi:rgba(255,255,255,.86); --bevel-cast:rgba(90,80,60,.22);
   /* 动效词汇:进入/反馈用强 ease-out,屏内状态移动用强 ease-in-out */
   --ease-out:cubic-bezier(.23,1,.32,1); --ease-in-out:cubic-bezier(.77,0,.175,1);
-  --ui:"ArkPixel","Microsoft YaHei UI","Segoe UI",system-ui,sans-serif;
+  --ui:"FusionPixel","Microsoft YaHei UI","Segoe UI",system-ui,sans-serif;
 }
 *{box-sizing:border-box;margin:0;padding:0;font-synthesis:none}
 /* 作者样式会盖掉 [hidden] 的 UA 规则(.kv{display:grid} 之类),必须一次性根治 */

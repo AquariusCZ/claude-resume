@@ -340,4 +340,4 @@ dotnet build csharp\AiResume.sln -c Release --no-restore -warnaserror
 
 ## 许可
 
-MIT，见 [LICENSE](LICENSE)。界面使用[方舟像素字体](https://github.com/TakWolf/ark-pixel-font)，遵循 SIL OFL 1.1（[OFL.txt](csharp/src/AiResume.Gui/wwwroot/fonts/OFL.txt)）。
+MIT，见 [LICENSE](LICENSE)。界面使用[缝合像素字体](https://github.com/TakWolf/fusion-pixel-font)（12px 等宽，zh_hans），遵循 SIL OFL 1.1（[OFL.txt](csharp/src/AiResume.Gui/wwwroot/fonts/OFL.txt)）；它以方舟像素字体为底，用俐方體11號与 Galmuri 补字，这几款字体的许可一并放在 [fonts/LICENSES](csharp/src/AiResume.Gui/wwwroot/fonts/LICENSES)。

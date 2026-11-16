@@ -214,7 +214,7 @@ v2.2 的界面只回答四个问题,其余收进菜单栏:
 
 视图模型是 `index.html` 里 `<script id="vm">` 的纯函数 `AR.*`,由 `GuiPageContractTests` 放进 Node 隔离上下文直接驱动,断言「无证据不绿」「承接读数琥珀」「按模型满额不染红主窗口」「刷新失败不留旧绿」「隐藏的通知源仍启用必须提示」「Worker 不在时机器人行不得显示可送达」「每项目模型」等语义,不逐字断言 DOM。
 
-字号一律走 rem(1rem = 点阵字设计尺寸 12px),首次绘制前的开机脚本按 `devicePixelRatio` 把根字号挪到「乘上缩放率正好是 12 的整数倍」的值(150% → 16px),跨显示器改变 DPR 时重算;`font-synthesis:none` 与 `-webkit-font-smoothing:none` 是点阵字清晰的前提。布局尺寸仍用 px。动效全部是页面内联的原生 CSS 过渡/动画,不引任何外部脚本;每条过渡显式写出缓动(共用强 `ease-out` / `ease-in-out` 词汇),移动只用 transform/opacity。已知百分比的额度条是带名称的 ARIA `meter`;百分比未报告时用不带 `aria-valuenow` 的扫描动画,绝不合成一个百分比。`prefers-reduced-motion:reduce` 下去掉位移与扫描,忙碌转圈改为淡入淡出,只保留必要的进行中反馈。
+界面字体是随包的 Fusion Pixel 12px 等宽 zh_hans(`wwwroot/fonts/`,SIL OFL 1.1,版本、来源哈希与上游许可见同目录 `README.txt`;GB2312 一级汉字全有,缺的少数符号由字体栈尾的系统字体回退)。字号一律走 rem(1rem = 点阵字设计尺寸 12px),首次绘制前的开机脚本按 `devicePixelRatio` 把根字号挪到「乘上缩放率正好是 12 的整数倍」的值(150% → 16px),跨显示器改变 DPR 时重算;`font-synthesis:none` 与 `-webkit-font-smoothing:none` 是点阵字清晰的前提。布局尺寸仍用 px。动效全部是页面内联的原生 CSS 过渡/动画,不引任何外部脚本;每条过渡显式写出缓动(共用强 `ease-out` / `ease-in-out` 词汇),移动只用 transform/opacity。已知百分比的额度条是带名称的 ARIA `meter`;百分比未报告时用不带 `aria-valuenow` 的扫描动画,绝不合成一个百分比。`prefers-reduced-motion:reduce` 下去掉位移与扫描,忙碌转圈改为淡入淡出,只保留必要的进行中反馈。
 
 Worker 是 Generic Host。托管服务强制串行启动(`ServicesStartConcurrently=false`),顺序为:
 
